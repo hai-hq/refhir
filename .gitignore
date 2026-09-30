@@ -1,0 +1,8 @@
+/target
+**/*.sqlite
+**/*.sqlite-wal
+**/*.sqlite-shm
+.DS_Store
+
+docs/architecture.md
+.cursor/plans/haifhir_build_roadmap.plan.md
