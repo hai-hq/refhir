@@ -2,27 +2,26 @@ use haifhir_database::{Revision, Transaction};
 use haifhir_types::Timestamp;
 use serde_json::{json, Value};
 
-use crate::catalog::ResourceType;
+use crate::catalog::ResourceModel;
 use crate::error::FhirError;
 use crate::ops::decorate;
 
 pub fn vread(
     tx: &Transaction,
-    ty: ResourceType,
+    model: &ResourceModel,
     id: &str,
     version_id: &str,
 ) -> Result<Value, FhirError> {
     let ts = Timestamp::from_version_id(version_id)
         .map_err(|_| FhirError::Invalid(format!("invalid versionId {version_id}")))?;
-    match tx.exact_revision(&ty.tablet(), id, ts)? {
+    match tx.exact_revision(&model.tablet(), id, ts)? {
         None => Err(FhirError::NotFound(format!(
             "{}/{} version {version_id} not found",
-            ty.as_str(),
-            id
+            model.name, id
         ))),
         Some(rev) if rev.deleted => Err(FhirError::Gone(format!(
             "{}/{id} version {version_id} was deleted",
-            ty.as_str()
+            model.name
         ))),
         Some(rev) => {
             let json = rev.json.unwrap_or(Value::Null);
@@ -31,18 +30,17 @@ pub fn vread(
     }
 }
 
-pub fn history(tx: &mut Transaction, ty: ResourceType, id: &str) -> Result<Value, FhirError> {
-    let revisions = tx.history(&ty.tablet(), id, &ty.by_id())?;
+pub fn history(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Value, FhirError> {
+    let revisions = tx.history(&model.tablet(), id, &model.by_id())?;
     if revisions.is_empty() {
         return Err(FhirError::NotFound(format!(
             "{}/{} not found",
-            ty.as_str(),
-            id
+            model.name, id
         )));
     }
     let entries: Vec<Value> = revisions
         .into_iter()
-        .map(|rev| history_entry(ty, id, rev))
+        .map(|rev| history_entry(model, id, rev))
         .collect();
     Ok(json!({
         "resourceType": "Bundle",
@@ -52,7 +50,7 @@ pub fn history(tx: &mut Transaction, ty: ResourceType, id: &str) -> Result<Value
     }))
 }
 
-fn history_entry(ty: ResourceType, id: &str, rev: Revision) -> Value {
+fn history_entry(model: &ResourceModel, id: &str, rev: Revision) -> Value {
     let (method, status) = if rev.deleted {
         ("DELETE", "204")
     } else if rev.prev_ts.is_none() {
@@ -61,11 +59,11 @@ fn history_entry(ty: ResourceType, id: &str, rev: Revision) -> Value {
         ("PUT", "200")
     };
     let mut entry = json!({
-        "request": {"method": method, "url": format!("{}/{id}", ty.as_str())},
+        "request": {"method": method, "url": format!("{}/{id}", model.name)},
         "response": {
             "status": status,
             "etag": format!("W/\"{}\"", rev.ts),
-            "location": format!("{}/{id}/_history/{}", ty.as_str(), rev.ts)
+            "location": format!("{}/{id}/_history/{}", model.name, rev.ts)
         }
     });
     if let Some(json) = rev.json {

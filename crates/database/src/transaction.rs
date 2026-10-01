@@ -54,6 +54,13 @@ pub struct Delete {
     pub prev_ts: Timestamp,
 }
 
+/// Index rows for an existing document. No document revision is written.
+pub struct IndexPut {
+    pub tablet: TabletId,
+    pub id: String,
+    pub keys: Vec<(IndexId, Vec<u8>)>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct BufferedWrite {
     pub tablet: TabletId,
@@ -62,6 +69,8 @@ pub(crate) struct BufferedWrite {
     pub prev_ts: Option<Timestamp>,
     pub new_keys: Vec<(IndexId, Vec<u8>)>,
     pub old_keys: Vec<(IndexId, Vec<u8>)>,
+    /// `new_json: None` is a delete. This flag writes index rows and leaves the document alone.
+    pub index_only: bool,
 }
 
 pub struct Transaction {
@@ -114,15 +123,22 @@ impl Transaction {
         self.reads
             .record(by_id.clone(), Interval::point(exact_key(id)));
         let map_key = (tablet.clone(), id.to_string());
+        let index_only = self
+            .writes
+            .get(&map_key)
+            .map(|write| write.index_only)
+            .unwrap_or(false);
         if let Some(write) = self.writes.get(&map_key) {
-            return match &write.new_json {
-                Some(json) => Ok(Some(Stored {
-                    ts: None,
-                    prev_ts: write.prev_ts,
-                    json: parse_json(json)?,
-                })),
-                None => Ok(None),
-            };
+            if !index_only {
+                return match &write.new_json {
+                    Some(json) => Ok(Some(Stored {
+                        ts: None,
+                        prev_ts: write.prev_ts,
+                        json: parse_json(json)?,
+                    })),
+                    None => Ok(None),
+                };
+            }
         }
         let Some(entry) = self.reader.latest_document(
             &DocumentId::new(tablet.clone(), id.as_bytes()),
@@ -152,8 +168,9 @@ impl Transaction {
             .index_scan(index, self.begin_ts, &interval, Order::Asc)?;
         let buffered: BTreeSet<(String, String)> = self
             .writes
-            .keys()
-            .map(|(tablet, id)| (tablet.as_str().to_string(), id.clone()))
+            .iter()
+            .filter(|(_, write)| !write.index_only)
+            .map(|((tablet, id), _)| (tablet.as_str().to_string(), id.clone()))
             .collect();
         let mut rows = Vec::new();
         for row in persisted {
@@ -233,6 +250,7 @@ impl Transaction {
             .map_err(|err| PersistError::Definite(format!("json: {err}")))?;
         let map_key = (put.tablet.clone(), put.id.clone());
         if let Some(existing) = self.writes.get_mut(&map_key) {
+            existing.index_only = false;
             existing.new_json = Some(json);
             existing.new_keys = put.new_keys;
             return Ok(());
@@ -246,6 +264,7 @@ impl Transaction {
                 prev_ts: put.prev_ts,
                 new_keys: put.new_keys,
                 old_keys: put.old_keys,
+                index_only: false,
             },
         );
         Ok(())
@@ -259,6 +278,7 @@ impl Transaction {
                 self.writes.remove(&map_key);
                 return Ok(());
             }
+            existing.index_only = false;
             existing.new_json = None;
             existing.new_keys.clear();
             return Ok(());
@@ -272,6 +292,31 @@ impl Transaction {
                 prev_ts: Some(delete.prev_ts),
                 new_keys: Vec::new(),
                 old_keys: delete.old_keys,
+                index_only: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn stage_index(&mut self, put: IndexPut) -> Result<(), PersistError> {
+        self.record_keys(&put.keys);
+        let map_key = (put.tablet.clone(), put.id.clone());
+        if let Some(existing) = self.writes.get_mut(&map_key) {
+            if existing.index_only {
+                existing.new_keys.extend(put.keys);
+            }
+            return Ok(());
+        }
+        self.writes.insert(
+            map_key,
+            BufferedWrite {
+                tablet: put.tablet,
+                id: put.id,
+                new_json: None,
+                prev_ts: None,
+                new_keys: put.keys,
+                old_keys: Vec::new(),
+                index_only: true,
             },
         );
         Ok(())
@@ -304,12 +349,14 @@ impl Transaction {
         let mut documents = Vec::new();
         let mut indexes = Vec::new();
         for write in self.writes.values() {
-            documents.push(DocumentLogEntry {
-                ts,
-                id: DocumentId::new(write.tablet.clone(), write.id.as_bytes()),
-                value: write.new_json.clone(),
-                prev_ts: write.prev_ts,
-            });
+            if !write.index_only {
+                documents.push(DocumentLogEntry {
+                    ts,
+                    id: DocumentId::new(write.tablet.clone(), write.id.as_bytes()),
+                    value: write.new_json.clone(),
+                    prev_ts: write.prev_ts,
+                });
+            }
             for draft in diff_keys(write).0 {
                 indexes.push(PersistenceIndexEntry {
                     ts,
@@ -355,7 +402,7 @@ fn diff_keys(write: &BufferedWrite) -> (Vec<IndexDraft>, Vec<(IndexId, Vec<u8>)>
         });
         occ.push((index_id.clone(), key.clone()));
     }
-    if write.new_json.is_some() {
+    if write.index_only || write.new_json.is_some() {
         let doc_id = DocumentId::new(write.tablet.clone(), write.id.as_bytes());
         for (index_id, key) in &new_set {
             drafts.push(IndexDraft {

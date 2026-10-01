@@ -1,0 +1,13 @@
+[package]
+name = "haifhir-fhirpath"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+regex = "1"
+rust_decimal = "1"
+serde_json = { workspace = true }
+
+[dev-dependencies]
+roxmltree = "0.20"

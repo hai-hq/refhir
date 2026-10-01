@@ -1,121 +1,235 @@
-//! Closed resource catalog.
+//! Resource catalog loaded from conformance tables.
 //!
-//! Schema is the FHIR types HaiFHIR ships. Indexes are search parameters we
-//! declare. Clients do not define tables or indexes.
-//!
-//! Observation.subject must be a relative reference `Patient/{id}` to a Patient
-//! that exists in the same snapshot. FHIR allows a dangling reference. HaiFHIR
-//! rejects it, so `Observation?subject=` does not point at a missing Patient.
+//! Resource instances stay on the document log. This model is the compiled
+//! package: which types exist, which references they enforce, and which search
+//! parameters writers and search may use.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use haifhir_types::{exact_key, string_key, token_key, IndexId, TabletId};
-use serde_json::Value;
+use haifhir_fhirpath::{Host, Model};
+use haifhir_persistence::{
+    ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
+};
+use haifhir_types::{exact_key, IndexId, TabletId};
+use serde_json::{json, Value};
 
 use crate::error::FhirError;
+use crate::extract::{self, Extractor, SearchKind};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResourceType {
-    Patient,
-    Observation,
+#[derive(Clone, Debug)]
+pub struct ReferenceElement {
+    pub path: String,
+    pub min: u32,
+    pub targets: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SearchKind {
-    Token,
-    String,
-}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SearchParam {
-    pub name: &'static str,
+    pub name: String,
     pub kind: SearchKind,
+    pub status: ParamStatus,
+    pub extractor: Extractor,
 }
 
-const PATIENT_PARAMS: &[SearchParam] = &[
-    SearchParam {
-        name: "_id",
-        kind: SearchKind::Token,
-    },
-    SearchParam {
-        name: "identifier",
-        kind: SearchKind::Token,
-    },
-    SearchParam {
-        name: "name",
-        kind: SearchKind::String,
-    },
-    SearchParam {
-        name: "active",
-        kind: SearchKind::Token,
-    },
-];
+#[derive(Clone, Debug)]
+pub struct ResourceModel {
+    pub name: String,
+    pub references: Vec<ReferenceElement>,
+    pub params: Vec<SearchParam>,
+}
 
-const OBSERVATION_PARAMS: &[SearchParam] = &[
-    SearchParam {
-        name: "_id",
-        kind: SearchKind::Token,
-    },
-    SearchParam {
-        name: "subject",
-        kind: SearchKind::Token,
-    },
-    SearchParam {
-        name: "code",
-        kind: SearchKind::Token,
-    },
-    SearchParam {
-        name: "date",
-        kind: SearchKind::String,
-    },
-];
-
-impl ResourceType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ResourceType::Patient => "Patient",
-            ResourceType::Observation => "Observation",
-        }
+impl ResourceModel {
+    pub fn tablet(&self) -> TabletId {
+        TabletId::new(self.name.clone())
     }
 
-    pub fn parse(name: &str) -> Result<Self, FhirError> {
-        match name {
-            "Patient" => Ok(ResourceType::Patient),
-            "Observation" => Ok(ResourceType::Observation),
-            other => Err(FhirError::UnknownResource(format!(
-                "unknown resource type {other}"
-            ))),
-        }
+    pub fn by_id(&self) -> IndexId {
+        IndexId::new(format!("{}/by_id", self.name))
     }
 
-    pub fn all() -> &'static [ResourceType] {
-        &[ResourceType::Patient, ResourceType::Observation]
+    pub fn search_index(&self, name: &str) -> IndexId {
+        IndexId::new(format!("{}/{}", self.name, name))
     }
 
-    pub fn tablet(self) -> TabletId {
-        TabletId::new(self.as_str())
-    }
-
-    pub fn by_id(self) -> IndexId {
-        IndexId::new(format!("{}/by_id", self.as_str()))
-    }
-
-    pub fn search_index(self, name: &str) -> IndexId {
-        IndexId::new(format!("{}/{}", self.as_str(), name))
-    }
-
-    pub fn search_params(self) -> &'static [SearchParam] {
-        match self {
-            ResourceType::Patient => PATIENT_PARAMS,
-            ResourceType::Observation => OBSERVATION_PARAMS,
-        }
-    }
-
-    pub fn param(self, name: &str) -> Option<SearchParam> {
-        self.search_params()
+    pub fn ready_param(&self, name: &str) -> Option<&SearchParam> {
+        self.params
             .iter()
-            .copied()
-            .find(|param| param.name == name)
+            .find(|param| param.name == name && param.status == ParamStatus::Ready)
+    }
+
+    pub fn writer_params(&self) -> impl Iterator<Item = &SearchParam> {
+        self.params.iter().filter(|param| {
+            param.status == ParamStatus::Ready || param.status == ParamStatus::Pending
+        })
+    }
+
+    pub fn pending_params(&self) -> impl Iterator<Item = &SearchParam> {
+        self.params
+            .iter()
+            .filter(|param| param.status == ParamStatus::Pending)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Catalog {
+    fhir_version: Option<String>,
+    types: BTreeMap<String, ResourceModel>,
+    path_model: Model,
+}
+
+impl Catalog {
+    pub fn empty() -> Self {
+        Self {
+            fhir_version: None,
+            types: BTreeMap::new(),
+            path_model: Model::new(),
+        }
+    }
+
+    pub fn open(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
+        Self::load(
+            &store.load_packages()?,
+            &store.load_structure_definitions()?,
+            &store.load_search_parameters()?,
+        )
+    }
+
+    pub fn load(
+        packages: &[haifhir_persistence::StoredPackage],
+        definitions: &[StoredStructureDefinition],
+        parameters: &[StoredSearchParameter],
+    ) -> Result<Self, PersistError> {
+        let fhir_version = packages.first().map(|package| package.fhir_version.clone());
+        let mut definition_json = Vec::new();
+        let mut types = BTreeMap::new();
+        for definition in definitions {
+            let json: Value = serde_json::from_str(&definition.json).map_err(|err| {
+                PersistError::Definite(format!("structure definition json: {err}"))
+            })?;
+            if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
+                continue;
+            }
+            definition_json.push(json.clone());
+            if definition.kind != "resource" || definition.is_abstract {
+                continue;
+            }
+            let model = types
+                .entry(definition.type_name.clone())
+                .or_insert_with(|| ResourceModel {
+                    name: definition.type_name.clone(),
+                    references: Vec::new(),
+                    params: Vec::new(),
+                });
+            for reference in references_from(&definition.type_name, &json) {
+                if !model
+                    .references
+                    .iter()
+                    .any(|item| item.path == reference.path)
+                {
+                    model.references.push(reference);
+                }
+            }
+        }
+        for parameter in parameters {
+            if parameter.status == ParamStatus::Unsupported {
+                continue;
+            }
+            let Some(model) = types.get_mut(&parameter.base) else {
+                continue;
+            };
+            let Some(extractor) =
+                extract::compile(&parameter.param_type, parameter.expression.as_deref())
+            else {
+                continue;
+            };
+            if model
+                .params
+                .iter()
+                .any(|param| param.name == parameter.code)
+            {
+                continue;
+            }
+            model.params.push(SearchParam {
+                name: parameter.code.clone(),
+                kind: extractor.kind(),
+                status: parameter.status,
+                extractor,
+            });
+        }
+        for model in types.values_mut() {
+            model
+                .params
+                .sort_by(|left, right| left.name.cmp(&right.name));
+        }
+        Ok(Self {
+            fhir_version,
+            types,
+            path_model: Model::from_definitions(&definition_json),
+        })
+    }
+
+    pub fn path_model(&self) -> &Model {
+        &self.path_model
+    }
+
+    pub fn get(&self, name: &str) -> Result<&ResourceModel, FhirError> {
+        self.types
+            .get(name)
+            .ok_or_else(|| FhirError::UnknownResource(format!("unknown resource type {name}")))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.types.contains_key(name)
+    }
+
+    pub fn fhir_version(&self) -> &str {
+        self.fhir_version.as_deref().unwrap_or("4.0.1")
+    }
+
+    pub fn capability_statement(&self) -> Value {
+        let resources: Vec<Value> = self
+            .types
+            .values()
+            .map(|model| {
+                json!({
+                    "type": model.name,
+                    "interaction": [
+                        {"code": "create"},
+                        {"code": "read"},
+                        {"code": "vread"},
+                        {"code": "update"},
+                        {"code": "delete"},
+                        {"code": "search-type"},
+                        {"code": "history-instance"}
+                    ],
+                    "searchParam": model.params.iter().filter(|param| param.status == ParamStatus::Ready).map(|param| {
+                        json!({
+                            "name": param.name,
+                            "type": match param.kind {
+                                SearchKind::Token => "token",
+                                SearchKind::String => "string",
+                                SearchKind::Reference => "reference",
+                                SearchKind::Date => "date",
+                            }
+                        })
+                    }).collect::<Vec<_>>(),
+                    "versioning": "versioned",
+                    "readHistory": true
+                })
+            })
+            .collect();
+        json!({
+            "resourceType": "CapabilityStatement",
+            "status": "active",
+            "kind": "instance",
+            "fhirVersion": self.fhir_version(),
+            "format": ["json", "application/fhir+json"],
+            "rest": [{
+                "mode": "server",
+                "resource": resources,
+                "interaction": [{"code": "transaction"}]
+            }]
+        })
     }
 }
 
@@ -124,14 +238,40 @@ pub fn valid_id(id: &str) -> bool {
         && id.len() <= 64
         && id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
 }
 
-/// Index rows for one resource revision, including `by_id`.
 pub fn index_keys(
-    ty: ResourceType,
+    path_model: &Model,
+    model: &ResourceModel,
     resource: &Value,
+    host: &dyn Host,
 ) -> Result<Vec<(IndexId, Vec<u8>)>, FhirError> {
+    let id = resource_id(resource)?;
+    let mut keys = vec![(model.by_id(), exact_key(id))];
+    for param in model.writer_params() {
+        let index = model.search_index(&param.name);
+        keys.extend(param.extractor.keys(resource, id, &index, path_model, host));
+    }
+    Ok(dedup_keys(keys))
+}
+
+pub fn pending_index_keys(
+    path_model: &Model,
+    model: &ResourceModel,
+    resource: &Value,
+    host: &dyn Host,
+) -> Result<Vec<(IndexId, Vec<u8>)>, FhirError> {
+    let id = resource_id(resource)?;
+    let mut keys = Vec::new();
+    for param in model.pending_params() {
+        let index = model.search_index(&param.name);
+        keys.extend(param.extractor.keys(resource, id, &index, path_model, host));
+    }
+    Ok(dedup_keys(keys))
+}
+
+fn resource_id(resource: &Value) -> Result<&str, FhirError> {
     let id = resource
         .get("id")
         .and_then(|value| value.as_str())
@@ -139,155 +279,64 @@ pub fn index_keys(
     if !valid_id(id) {
         return Err(FhirError::Invalid(format!("invalid id {id}")));
     }
-    let mut keys = vec![(ty.by_id(), exact_key(id))];
-    match ty {
-        ResourceType::Patient => patient_keys(ty, id, resource, &mut keys)?,
-        ResourceType::Observation => observation_keys(ty, id, resource, &mut keys)?,
-    }
+    Ok(id)
+}
+
+fn dedup_keys(mut keys: Vec<(IndexId, Vec<u8>)>) -> Vec<(IndexId, Vec<u8>)> {
     let mut seen = BTreeSet::new();
     keys.retain(|key| seen.insert(key.clone()));
-    Ok(keys)
+    keys
 }
 
-fn patient_keys(
-    ty: ResourceType,
-    id: &str,
-    resource: &Value,
-    keys: &mut Vec<(IndexId, Vec<u8>)>,
-) -> Result<(), FhirError> {
-    if let Some(identifiers) = resource.get("identifier") {
-        let identifiers = identifiers
-            .as_array()
-            .ok_or_else(|| FhirError::Invalid("Patient.identifier must be an array".into()))?;
-        for identifier in identifiers {
-            let Some(value) = identifier.get("value").and_then(|item| item.as_str()) else {
-                continue;
-            };
-            keys.push((ty.search_index("identifier"), token_key(value, id)));
-            if let Some(system) = identifier.get("system").and_then(|item| item.as_str()) {
-                keys.push((
-                    ty.search_index("identifier"),
-                    token_key(&format!("{system}|{value}"), id),
-                ));
-            }
-        }
-    }
-    if let Some(names) = resource.get("name") {
-        let names = names
-            .as_array()
-            .ok_or_else(|| FhirError::Invalid("Patient.name must be an array".into()))?;
-        for name in names {
-            push_name(ty, id, name, keys);
-        }
-    }
-    if let Some(active) = resource.get("active") {
-        let active = active
-            .as_bool()
-            .ok_or_else(|| FhirError::Invalid("Patient.active must be a boolean".into()))?;
-        let token = if active { "true" } else { "false" };
-        keys.push((ty.search_index("active"), token_key(token, id)));
-    }
-    Ok(())
-}
-
-fn push_name(ty: ResourceType, id: &str, name: &Value, keys: &mut Vec<(IndexId, Vec<u8>)>) {
-    let Some(name) = name.as_object() else {
-        return;
-    };
-    let index = ty.search_index("name");
-    if let Some(family) = name.get("family").and_then(|value| value.as_str()) {
-        keys.push((index.clone(), string_key(family, id)));
-    }
-    if let Some(text) = name.get("text").and_then(|value| value.as_str()) {
-        keys.push((index.clone(), string_key(text, id)));
-    }
-    if let Some(given) = name.get("given").and_then(|value| value.as_array()) {
-        for item in given {
-            if let Some(text) = item.as_str() {
-                keys.push((index.clone(), string_key(text, id)));
-            }
-        }
-    }
-}
-
-fn observation_keys(
-    ty: ResourceType,
-    id: &str,
-    resource: &Value,
-    keys: &mut Vec<(IndexId, Vec<u8>)>,
-) -> Result<(), FhirError> {
-    if let Some(reference) = resource
-        .pointer("/subject/reference")
-        .and_then(|value| value.as_str())
-    {
-        keys.push((ty.search_index("subject"), token_key(reference, id)));
-    }
-    if let Some(codings) = resource
-        .pointer("/code/coding")
+fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
+    let Some(list) = json
+        .pointer("/snapshot/element")
         .and_then(|value| value.as_array())
-    {
-        for coding in codings {
-            let Some(code) = coding.get("code").and_then(|value| value.as_str()) else {
-                continue;
-            };
-            keys.push((ty.search_index("code"), token_key(code, id)));
-            if let Some(system) = coding.get("system").and_then(|value| value.as_str()) {
-                keys.push((
-                    ty.search_index("code"),
-                    token_key(&format!("{system}|{code}"), id),
-                ));
-            }
+    else {
+        return Vec::new();
+    };
+    let prefix = format!("{type_name}.");
+    let mut references = Vec::new();
+    for element in list {
+        let Some(path) = element.get("path").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(relative) = path.strip_prefix(&prefix) else {
+            continue;
+        };
+        if relative.is_empty() || relative.contains('.') {
+            continue;
         }
-    }
-    if let Some(date) = resource
-        .get("effectiveDateTime")
-        .and_then(|value| value.as_str())
-    {
-        keys.push((ty.search_index("date"), string_key(date, id)));
-    }
-    Ok(())
-}
-
-pub fn capability_statement() -> Value {
-    let resources: Vec<Value> = ResourceType::all()
-        .iter()
-        .copied()
-        .map(|ty| {
-            serde_json::json!({
-                "type": ty.as_str(),
-                "interaction": [
-                    {"code": "create"},
-                    {"code": "read"},
-                    {"code": "vread"},
-                    {"code": "update"},
-                    {"code": "delete"},
-                    {"code": "search-type"},
-                    {"code": "history-instance"}
-                ],
-                "searchParam": ty.search_params().iter().filter(|param| param.name != "_id").map(|param| {
-                    serde_json::json!({
-                        "name": param.name,
-                        "type": match param.kind {
-                            SearchKind::Token => "token",
-                            SearchKind::String => "string",
-                        }
-                    })
-                }).collect::<Vec<_>>(),
-                "versioning": "versioned",
-                "readHistory": true
+        let Some(types) = element.get("type").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        let reference = types
+            .iter()
+            .find(|item| item.get("code").and_then(|code| code.as_str()) == Some("Reference"));
+        let Some(reference) = reference else {
+            continue;
+        };
+        let targets = reference
+            .get("targetProfile")
+            .and_then(|value| value.as_array())
+            .map(|profiles| {
+                profiles
+                    .iter()
+                    .filter_map(|profile| profile.as_str())
+                    .filter_map(|profile| profile.rsplit('/').next())
+                    .map(|name| name.to_string())
+                    .collect()
             })
-        })
-        .collect();
-    serde_json::json!({
-        "resourceType": "CapabilityStatement",
-        "status": "active",
-        "kind": "instance",
-        "fhirVersion": "4.0.1",
-        "format": ["json", "application/fhir+json"],
-        "rest": [{
-            "mode": "server",
-            "resource": resources,
-            "interaction": [{"code": "transaction"}]
-        }]
-    })
+            .unwrap_or_default();
+        let min = element
+            .get("min")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0) as u32;
+        references.push(ReferenceElement {
+            path: relative.to_string(),
+            min,
+            targets,
+        });
+    }
+    references
 }

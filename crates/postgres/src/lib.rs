@@ -43,10 +43,46 @@ CREATE TABLE IF NOT EXISTS persistence_globals (
     json_value TEXT NOT NULL,
     PRIMARY KEY (key)
 );
+
+CREATE TABLE IF NOT EXISTS packages (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    fhir_version TEXT NOT NULL,
+    UNIQUE (name, version)
+);
+CREATE TABLE IF NOT EXISTS structure_definitions (
+    package_id BIGINT NOT NULL,
+    url TEXT NOT NULL,
+    type_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    is_abstract INTEGER NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url)
+);
+CREATE TABLE IF NOT EXISTS search_parameters (
+    package_id BIGINT NOT NULL,
+    url TEXT NOT NULL,
+    base TEXT NOT NULL,
+    code TEXT NOT NULL,
+    param_type TEXT NOT NULL,
+    expression TEXT,
+    status TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url, base)
+);
+CREATE TABLE IF NOT EXISTS index_backfills (
+    id BIGSERIAL PRIMARY KEY,
+    package_id BIGINT NOT NULL,
+    watermark_ts BIGINT NOT NULL,
+    tablet TEXT NOT NULL,
+    cursor_id TEXT,
+    done INTEGER NOT NULL
+);
 "#;
 
-struct Inner {
-    client: Client,
+pub(crate) struct Inner {
+    pub(crate) client: Client,
 }
 
 #[derive(Clone)]
@@ -160,7 +196,7 @@ impl PersistenceReader for PostgresPersistence {
         let ord = order_sql(order);
         let sql = format!(
             r#"
-SELECT B.key, B.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
+SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
 FROM (
     SELECT index_id, key, MAX(ts) as max_ts
     FROM indexes
@@ -173,9 +209,13 @@ JOIN indexes B
  AND A.key = B.key
  AND A.max_ts = B.ts
 JOIN documents C
-  ON B.ts = C.ts
- AND B.table_id = C.table_id
- AND B.document_id = C.id
+  ON C.table_id = B.table_id
+ AND C.id = B.document_id
+ AND C.deleted = 0
+ AND C.ts = (
+    SELECT MAX(D.ts) FROM documents D
+    WHERE D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= $2
+ )
 ORDER BY B.key {ord}
 "#
         );
@@ -402,7 +442,7 @@ fn write_in_tx(
         )
         .map_err(definite)?;
     }
-    if let Some(ts) = documents.iter().map(|document| document.ts).max() {
+    if let Some(ts) = commit_timestamp(documents, indexes) {
         let current = read_global_tx(tx, PersistenceGlobalKey::MaxRepeatableTimestamp)?;
         let current_ts = current
             .and_then(|value| value.as_u64())
@@ -422,6 +462,17 @@ fn write_in_tx(
         .map_err(definite)?;
     }
     Ok(())
+}
+
+fn commit_timestamp(
+    documents: &[DocumentLogEntry],
+    indexes: &[PersistenceIndexEntry],
+) -> Option<Timestamp> {
+    documents
+        .iter()
+        .map(|document| document.ts)
+        .chain(indexes.iter().map(|index| index.ts))
+        .max()
 }
 
 fn read_global(
@@ -482,13 +533,15 @@ fn i64_ts(ts: Timestamp) -> Result<i64, PersistError> {
         .map_err(|_| PersistError::Definite(format!("timestamp {ts} does not fit in i64")))
 }
 
-fn definite(err: impl ToString) -> PersistError {
+pub(crate) fn definite(err: impl ToString) -> PersistError {
     PersistError::Definite(err.to_string())
 }
 
 fn uncertain(err: impl ToString) -> PersistError {
     PersistError::Uncertain(err.to_string())
 }
+
+mod conformance_store;
 
 #[cfg(test)]
 mod tests {

@@ -4,12 +4,12 @@
 //! and `Transition`. `udfPath` is a FHIR operation name such as `Patient/read`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use haifhir_database::{Database, SubToken};
-use haifhir_fhir::RunResult;
+use haifhir_fhir::{Catalog, RunResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -21,7 +21,7 @@ struct LiveQuery {
     args: Value,
 }
 
-pub async fn handle_socket(socket: WebSocket, db: Arc<Database>) {
+pub async fn handle_socket(socket: WebSocket, db: Arc<Database>, catalog: Arc<RwLock<Catalog>>) {
     let (mut sink, mut stream) = socket.split();
     let (inv_tx, mut inv_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut queries: HashMap<u64, LiveQuery> = HashMap::new();
@@ -40,7 +40,7 @@ pub async fn handle_socket(socket: WebSocket, db: Arc<Database>) {
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Text(text))) => {
-                        if handle_text(&mut sink, &db, &inv_tx, &mut queries, &mut version, &text).await.is_err() {
+                        if handle_text(&mut sink, &db, &catalog, &inv_tx, &mut queries, &mut version, &text).await.is_err() {
                             break;
                         }
                     }
@@ -54,7 +54,7 @@ pub async fn handle_socket(socket: WebSocket, db: Arc<Database>) {
                 while let Ok(more) = inv_rx.try_recv() {
                     ids.insert(more.query_id);
                 }
-                if push_updates(&mut sink, &db, &inv_tx, &mut queries, &mut version, ids).await.is_err() {
+                if push_updates(&mut sink, &db, &catalog, &inv_tx, &mut queries, &mut version, ids).await.is_err() {
                     break;
                 }
             }
@@ -69,6 +69,7 @@ pub async fn handle_socket(socket: WebSocket, db: Arc<Database>) {
 async fn handle_text(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
     inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
@@ -115,7 +116,7 @@ async fn handle_text(
                         if let Some(old) = queries.remove(&query_id) {
                             db.unsubscribe(old.token);
                         }
-                        match add_query(db, inv_tx, query_id, &udf_path, args).await {
+                        match add_query(db, catalog, inv_tx, query_id, &udf_path, args).await {
                             Ok((value, token, args)) => {
                                 queries.insert(
                                     query_id,
@@ -158,7 +159,7 @@ async fn handle_text(
             udf_path,
             args,
         } => {
-            let response = match execute(db, &udf_path, args).await {
+            let response = match execute(db, catalog, &udf_path, args).await {
                 Ok(result) => json!({
                     "type": "MutationResponse",
                     "requestId": request_id,
@@ -181,13 +182,14 @@ async fn handle_text(
 
 async fn add_query(
     db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
     inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
     query_id: u64,
     path: &str,
     args: Value,
 ) -> Result<(Value, SubToken, Value), String> {
     for _ in 0..8 {
-        let result = execute(db, path, args.clone())
+        let result = execute(db, catalog, path, args.clone())
             .await
             .map_err(|err| err.to_string())?;
         if result.wrote {
@@ -204,6 +206,7 @@ async fn add_query(
 async fn push_updates(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
     inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
@@ -220,7 +223,7 @@ async fn push_updates(
         let path = query.path.clone();
         let args = query.args.clone();
         let token = query.token;
-        match rerun(db, inv_tx, token, query_id, &path, &args).await {
+        match rerun(db, catalog, inv_tx, token, query_id, &path, &args).await {
             Ok((value, new_token)) => {
                 if let Some(query) = queries.get_mut(&query_id) {
                     query.token = new_token;
@@ -249,6 +252,7 @@ async fn push_updates(
 
 async fn rerun(
     db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
     inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
     token: SubToken,
     query_id: u64,
@@ -258,7 +262,7 @@ async fn rerun(
     for _ in 0..8 {
         let RunResult {
             value, ts, reads, ..
-        } = execute(db, path, args.clone())
+        } = execute(db, catalog, path, args.clone())
             .await
             .map_err(|err| err.to_string())?;
         match db.refresh_subscription(token, reads.clone(), ts) {

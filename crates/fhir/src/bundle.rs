@@ -4,7 +4,7 @@ use haifhir_database::Transaction;
 use haifhir_types::Timestamp;
 use serde_json::{json, Value};
 
-use crate::catalog::{valid_id, ResourceType};
+use crate::catalog::{valid_id, Catalog};
 use crate::error::FhirError;
 use crate::ops;
 
@@ -12,7 +12,11 @@ use crate::ops;
 ///
 /// An Observation may name a Patient that another entry in this bundle writes.
 /// That Patient entry is applied first. The response entries stay in request order.
-pub fn transaction(tx: &mut Transaction, bundle: &Value) -> Result<Value, FhirError> {
+pub fn transaction(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    bundle: &Value,
+) -> Result<Value, FhirError> {
     if bundle.get("resourceType").and_then(|value| value.as_str()) != Some("Bundle") {
         return Err(FhirError::Invalid("resourceType Bundle is required".into()));
     }
@@ -25,9 +29,9 @@ pub fn transaction(tx: &mut Transaction, bundle: &Value) -> Result<Value, FhirEr
         .cloned()
         .unwrap_or_default();
     let mut response_entries = vec![Value::Null; entries.len()];
-    for index in apply_order(&entries) {
+    for index in apply_order(catalog, &entries) {
         response_entries[index] =
-            apply_entry(tx, &entries[index]).map_err(|err| annotate(index, err))?;
+            apply_entry(tx, catalog, &entries[index]).map_err(|err| annotate(index, err))?;
     }
     Ok(json!({
         "resourceType": "Bundle",
@@ -36,23 +40,22 @@ pub fn transaction(tx: &mut Transaction, bundle: &Value) -> Result<Value, FhirEr
     }))
 }
 
-/// Patient writes come before Observations that reference them. Every other entry keeps its place.
-fn apply_order(entries: &[Value]) -> Vec<usize> {
-    let writers = patient_writers(entries);
+/// Writes come before entries that reference them. Every other entry keeps its place.
+fn apply_order(catalog: &Catalog, entries: &[Value]) -> Vec<usize> {
+    let writers = resource_writers(entries);
     let mut waiting = vec![0usize; entries.len()];
     let mut after: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
     for (index, entry) in entries.iter().enumerate() {
-        let Some(patient_id) = referenced_patient(entry) else {
-            continue;
-        };
-        let Some(&writer) = writers.get(&patient_id) else {
-            continue;
-        };
-        if writer == index {
-            continue;
+        for dependency in referenced_resources(catalog, entry) {
+            let Some(&writer) = writers.get(&dependency) else {
+                continue;
+            };
+            if writer == index {
+                continue;
+            }
+            after[writer].push(index);
+            waiting[index] += 1;
         }
-        after[writer].push(index);
-        waiting[index] += 1;
     }
     let mut ready: VecDeque<usize> = (0..entries.len())
         .filter(|&index| waiting[index] == 0)
@@ -78,67 +81,76 @@ fn apply_order(entries: &[Value]) -> Vec<usize> {
     order
 }
 
-fn patient_writers(entries: &[Value]) -> HashMap<String, usize> {
+fn resource_writers(entries: &[Value]) -> HashMap<(String, String), usize> {
     let mut writers = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
-        let Some(id) = written_patient_id(entry) else {
+        let Some(key) = written_resource(entry) else {
             continue;
         };
-        writers.entry(id).or_insert(index);
+        writers.entry(key).or_insert(index);
     }
     writers
 }
 
-fn written_patient_id(entry: &Value) -> Option<String> {
+fn written_resource(entry: &Value) -> Option<(String, String)> {
     let method = request_method(entry)?;
     if method != "POST" && method != "PUT" {
         return None;
     }
-    let (ty, id) = parse_url(request_url(entry)?).ok()?;
-    if ty != ResourceType::Patient {
-        return None;
-    }
+    let (type_name, id) = parse_url(request_url(entry)?).ok()?;
     if let Some(id) = id {
-        return Some(id);
+        return Some((type_name, id));
     }
     let id = entry
         .pointer("/resource/id")
         .and_then(|value| value.as_str())?;
-    valid_id(id).then(|| id.to_string())
+    valid_id(id).then(|| (type_name, id.to_string()))
 }
 
-fn referenced_patient(entry: &Value) -> Option<String> {
-    observation_subject(entry).or_else(|| read_patient(entry))
-}
-
-fn read_patient(entry: &Value) -> Option<String> {
-    if request_method(entry)? != "GET" {
-        return None;
+fn referenced_resources(catalog: &Catalog, entry: &Value) -> Vec<(String, String)> {
+    let mut keys = Vec::new();
+    if request_method(entry) == Some("GET") {
+        if let Some(url) = request_url(entry) {
+            if let Ok((type_name, Some(id))) = parse_url(url) {
+                keys.push((type_name, id));
+            }
+        }
+        return keys;
     }
-    let (ty, id) = parse_url(request_url(entry)?).ok()?;
-    if ty != ResourceType::Patient {
-        return None;
+    let Some(resource) = entry.get("resource") else {
+        return keys;
+    };
+    let Some(type_name) = resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+    else {
+        return keys;
+    };
+    let Ok(model) = catalog.get(type_name) else {
+        return keys;
+    };
+    for element in &model.references {
+        let Some(node) = resource.get(&element.path) else {
+            continue;
+        };
+        let values = match node {
+            Value::Array(items) => items.iter().collect::<Vec<_>>(),
+            other => vec![other],
+        };
+        for value in values {
+            let Some(reference) = value.get("reference").and_then(|item| item.as_str()) else {
+                continue;
+            };
+            let Some((target_type, id)) = reference.split_once('/') else {
+                continue;
+            };
+            if reference.contains("://") || !valid_id(id) {
+                continue;
+            }
+            keys.push((target_type.to_string(), id.to_string()));
+        }
     }
-    id
-}
-
-fn observation_subject(entry: &Value) -> Option<String> {
-    let method = request_method(entry)?;
-    if method != "POST" && method != "PUT" {
-        return None;
-    }
-    let (ty, _) = parse_url(request_url(entry)?).ok()?;
-    if ty != ResourceType::Observation {
-        return None;
-    }
-    let reference = entry
-        .pointer("/resource/subject/reference")
-        .and_then(|value| value.as_str())?;
-    let id = reference.strip_prefix("Patient/")?;
-    if reference.contains("://") || !valid_id(id) {
-        return None;
-    }
-    Some(id.to_string())
+    keys
 }
 
 fn request_method(entry: &Value) -> Option<&str> {
@@ -153,7 +165,7 @@ fn request_url(entry: &Value) -> Option<&str> {
         .and_then(|value| value.as_str())
 }
 
-fn apply_entry(tx: &mut Transaction, entry: &Value) -> Result<Value, FhirError> {
+fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result<Value, FhirError> {
     let request = entry
         .get("request")
         .ok_or_else(|| FhirError::Invalid("entry.request is required".into()))?;
@@ -170,7 +182,8 @@ fn apply_entry(tx: &mut Transaction, entry: &Value) -> Result<Value, FhirError> 
             "search inside a transaction bundle is not supported".into(),
         ));
     }
-    let (ty, id) = parse_url(url)?;
+    let (type_name, id) = parse_url(url)?;
+    let model = catalog.get(&type_name)?;
     match method {
         "POST" => {
             let mut resource = entry
@@ -187,12 +200,12 @@ fn apply_entry(tx: &mut Transaction, entry: &Value) -> Result<Value, FhirError> 
                 }
                 resource["id"] = json!(id);
             }
-            let created = ops::create(tx, ty, resource)?;
+            let created = ops::create(tx, catalog, model, resource)?;
             let id = created["id"].as_str().unwrap_or("").to_string();
             Ok(json!({
                 "response": {
                     "status": "201 Created",
-                    "location": format!("{}/{id}/_history/0", ty.as_str()),
+                    "location": format!("{}/{id}/_history/0", model.name),
                     "etag": "W/\"0\""
                 },
                 "resource": created
@@ -204,11 +217,11 @@ fn apply_entry(tx: &mut Transaction, entry: &Value) -> Result<Value, FhirError> 
                 .get("resource")
                 .cloned()
                 .ok_or_else(|| FhirError::Invalid("PUT entry requires a resource".into()))?;
-            let updated = ops::update(tx, ty, &id, resource, None)?;
+            let updated = ops::update(tx, catalog, model, &id, resource, None)?;
             Ok(json!({
                 "response": {
                     "status": "200 OK",
-                    "location": format!("{}/{id}/_history/0", ty.as_str()),
+                    "location": format!("{}/{id}/_history/0", model.name),
                     "etag": "W/\"0\""
                 },
                 "resource": updated
@@ -216,14 +229,14 @@ fn apply_entry(tx: &mut Transaction, entry: &Value) -> Result<Value, FhirError> 
         }
         "DELETE" => {
             let id = id.ok_or_else(|| FhirError::Invalid("DELETE url requires an id".into()))?;
-            ops::delete(tx, ty, &id)?;
+            ops::delete(tx, catalog, model, &id)?;
             Ok(json!({
                 "response": {"status": "204 No Content"}
             }))
         }
         "GET" => {
             let id = id.ok_or_else(|| FhirError::Invalid("GET url requires an id".into()))?;
-            let resource = ops::read(tx, ty, &id)?;
+            let resource = ops::read(tx, model, &id)?;
             let version = resource
                 .pointer("/meta/versionId")
                 .and_then(|value| value.as_str())
@@ -242,14 +255,14 @@ fn apply_entry(tx: &mut Transaction, entry: &Value) -> Result<Value, FhirError> 
     }
 }
 
-fn parse_url(url: &str) -> Result<(ResourceType, Option<String>), FhirError> {
+fn parse_url(url: &str) -> Result<(String, Option<String>), FhirError> {
     let url = url.trim_start_matches('/');
     let mut parts = url.split('/');
     let type_name = parts
         .next()
         .filter(|part| !part.is_empty())
-        .ok_or_else(|| FhirError::Invalid(format!("bad request url {url}")))?;
-    let ty = ResourceType::parse(type_name)?;
+        .ok_or_else(|| FhirError::Invalid(format!("bad request url {url}")))?
+        .to_string();
     let id = match parts.next() {
         Some(id) if !id.is_empty() => {
             if !valid_id(id) {
@@ -267,7 +280,7 @@ fn parse_url(url: &str) -> Result<(ResourceType, Option<String>), FhirError> {
             "unsupported request url {url}"
         )));
     }
-    Ok((ty, id))
+    Ok((type_name, id))
 }
 
 pub fn finalize(value: &mut Value, written: &[haifhir_database::WrittenId], ts: Timestamp) {

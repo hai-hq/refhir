@@ -6,8 +6,11 @@
 mod bundle;
 mod catalog;
 mod error;
+mod extract;
 mod history;
 mod ops;
+mod package;
+mod resolve;
 mod run;
 mod search;
 
@@ -15,6 +18,10 @@ mod search;
 mod tests;
 
 pub use bundle::transaction;
-pub use catalog::{capability_statement, ResourceType};
+pub use catalog::Catalog;
 pub use error::{outcome_code, FhirError};
+pub use package::{
+    expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
+    stage_package_dir, version_clash_dir,
+};
 pub use run::{dispatch, run, stamp_stored_json, RunError, RunResult, MAX_OCC_FAILURES};

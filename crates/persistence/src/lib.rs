@@ -209,6 +209,184 @@ pub trait Persistence: PersistenceReader {
     ) -> Result<(), PersistError>;
 }
 
+/// Search parameter row state. `ready` is what search may use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParamStatus {
+    Pending,
+    Ready,
+    Unsupported,
+}
+
+impl ParamStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ParamStatus::Pending => "pending",
+            ParamStatus::Ready => "ready",
+            ParamStatus::Unsupported => "unsupported",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self, PersistError> {
+        match text {
+            "pending" => Ok(ParamStatus::Pending),
+            "ready" => Ok(ParamStatus::Ready),
+            "unsupported" => Ok(ParamStatus::Unsupported),
+            other => Err(PersistError::Definite(format!(
+                "unknown search parameter status {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPackage {
+    pub id: i64,
+    pub name: String,
+    pub version: String,
+    pub fhir_version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredStructureDefinition {
+    pub package_id: i64,
+    pub url: String,
+    pub type_name: String,
+    pub kind: String,
+    pub is_abstract: bool,
+    pub json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredSearchParameter {
+    pub package_id: i64,
+    pub url: String,
+    pub base: String,
+    pub code: String,
+    pub param_type: String,
+    pub expression: Option<String>,
+    pub status: ParamStatus,
+    pub json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBackfill {
+    pub id: i64,
+    pub package_id: i64,
+    pub watermark_ts: i64,
+    pub tablet: String,
+    pub cursor_id: Option<String>,
+    pub done: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewStructureDefinition {
+    pub url: String,
+    pub type_name: String,
+    pub kind: String,
+    pub is_abstract: bool,
+    pub json: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewSearchParameter {
+    pub url: String,
+    pub base: String,
+    pub code: String,
+    pub param_type: String,
+    pub expression: Option<String>,
+    pub status: ParamStatus,
+    pub json: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewPackage {
+    pub name: String,
+    pub version: String,
+    pub fhir_version: String,
+    pub structure_definitions: Vec<NewStructureDefinition>,
+    pub search_parameters: Vec<NewSearchParameter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingParam {
+    pub base: String,
+    pub code: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallOutcome {
+    pub package_id: i64,
+    pub inserted: bool,
+    pub newly_pending: Vec<PendingParam>,
+}
+
+#[derive(Debug)]
+pub enum InstallError {
+    FhirVersion { existing: String, incoming: String },
+    Expression { base: String, code: String },
+    Persist(PersistError),
+}
+
+impl std::fmt::Display for InstallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InstallError::FhirVersion { existing, incoming } => {
+                write!(f, "fhirVersion {incoming} does not match {existing}")
+            }
+            InstallError::Expression { base, code } => {
+                write!(f, "search parameter {base}.{code} expression differs")
+            }
+            InstallError::Persist(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for InstallError {}
+
+impl From<PersistError> for InstallError {
+    fn from(err: PersistError) -> Self {
+        InstallError::Persist(err)
+    }
+}
+
+/// Direct SQL for packages, structure definitions, and search parameters.
+/// Resource transactions do not use this trait.
+pub trait ConformanceStore: Send + Sync {
+    fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError>;
+
+    fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError>;
+
+    fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError>;
+
+    fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
+
+    fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError>;
+
+    fn set_search_parameter_status(
+        &self,
+        package_id: i64,
+        url: &str,
+        base: &str,
+        status: ParamStatus,
+    ) -> Result<(), PersistError>;
+
+    fn insert_backfill(
+        &self,
+        package_id: i64,
+        watermark_ts: i64,
+        tablet: &str,
+    ) -> Result<i64, PersistError>;
+
+    fn update_backfill(
+        &self,
+        id: i64,
+        cursor_id: Option<&str>,
+        done: bool,
+    ) -> Result<(), PersistError>;
+
+    fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError>;
+}
+
 pub mod conformance {
     use super::*;
     use haifhir_types::TabletId;

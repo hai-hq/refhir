@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/clinical-date",
+  "name": "date",
+  "status": "active",
+  "code": "date",
+  "base": ["Observation"],
+  "type": "date",
+  "expression": "Observation.effectiveDateTime"
+}

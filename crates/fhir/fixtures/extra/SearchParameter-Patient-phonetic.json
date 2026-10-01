@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://example.org/SearchParameter/Patient-phonetic",
+  "name": "phonetic",
+  "status": "active",
+  "code": "phonetic",
+  "base": ["Patient"],
+  "type": "string",
+  "expression": "Patient.name.where(use = 'nickname')"
+}

@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://example.org/SearchParameter/Patient-name-text",
+  "name": "name",
+  "status": "active",
+  "code": "name",
+  "base": ["Patient"],
+  "type": "string",
+  "expression": "Patient.name.text"
+}

@@ -2,19 +2,47 @@ use std::sync::Arc;
 
 use haifhir_database::Database;
 use haifhir_sqlite::SqlitePersistence;
-use haifhir_types::{token_interval, Order};
+use haifhir_types::{token_interval, IndexId, Order};
 use serde_json::{json, Value};
 
-use crate::catalog::ResourceType;
+use crate::catalog::Catalog;
 use crate::error::FhirError;
+use crate::package::{
+    expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
+    stage_package_dir, version_clash_dir,
+};
 use crate::run::{run, RunError};
 
-fn db() -> Database {
-    Database::open(Arc::new(SqlitePersistence::open_in_memory().unwrap())).unwrap()
+struct Harness {
+    store: SqlitePersistence,
+    db: Database,
+    catalog: std::sync::RwLock<Catalog>,
 }
 
-fn apply(db: &Database, path: &str, args: Value) -> Value {
-    run(db, path, &args).expect(path).value
+fn empty() -> Harness {
+    let store = SqlitePersistence::open_in_memory().unwrap();
+    let db = Database::open(Arc::new(store.clone())).unwrap();
+    Harness {
+        store,
+        db,
+        catalog: std::sync::RwLock::new(Catalog::empty()),
+    }
+}
+
+fn ready() -> Harness {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, minir4_dir()).unwrap();
+    harness
+}
+
+fn apply(harness: &Harness, path: &str, args: Value) -> Value {
+    let catalog = harness.catalog.read().expect("catalog");
+    run(&harness.db, &catalog, path, &args).expect(path).value
+}
+
+fn run_op(harness: &Harness, path: &str, args: &Value) -> Result<crate::run::RunResult, RunError> {
+    let catalog = harness.catalog.read().expect("catalog");
+    run(&harness.db, &catalog, path, args)
 }
 
 fn patient(id: &str, active: bool, family: &str) -> Value {
@@ -29,14 +57,22 @@ fn patient(id: &str, active: bool, family: &str) -> Value {
 
 #[test]
 fn unknown_resource_is_rejected() {
-    assert!(ResourceType::parse("Encounter").is_err());
-    let err = run(&db(), "Encounter/read", &json!({"id": "x"})).unwrap_err();
-    assert!(matches!(err, RunError::Fhir(FhirError::UnknownResource(_))));
+    let harness = empty();
+    let patient = run_op(&harness, "Patient/read", &json!({"id": "x"})).unwrap_err();
+    assert!(matches!(
+        patient,
+        RunError::Fhir(FhirError::UnknownResource(_))
+    ));
+    let encounter = run_op(&harness, "Encounter/read", &json!({"id": "x"})).unwrap_err();
+    assert!(matches!(
+        encounter,
+        RunError::Fhir(FhirError::UnknownResource(_))
+    ));
 }
 
 #[test]
 fn patient_crud_history_and_search() {
-    let db = db();
+    let db = ready();
     let created = apply(
         &db,
         "Patient/create",
@@ -46,10 +82,11 @@ fn patient_crud_history_and_search() {
     assert_eq!(created["id"], "p1");
 
     let by_id = db
+        .db
         .reader()
         .index_scan(
-            &ResourceType::Patient.by_id(),
-            db.latest_ts(),
+            &IndexId::new("Patient/by_id"),
+            db.db.latest_ts(),
             &haifhir_types::Interval::all(),
             Order::Asc,
         )
@@ -59,13 +96,13 @@ fn patient_crud_history_and_search() {
     let read = apply(&db, "Patient/read", json!({"id": "p1"}));
     assert_eq!(read["meta"]["versionId"], "1");
 
-    let missing = run(&db, "Patient/read", &json!({"id": "nope"})).unwrap_err();
+    let missing = run_op(&db, "Patient/read", &json!({"id": "nope"})).unwrap_err();
     assert!(matches!(missing, RunError::Fhir(FhirError::NotFound(_))));
 
     let mut updated_body = patient("p1", true, "Ann");
     updated_body["birthDate"] = json!("1990-01-01");
     updated_body["meta"] = json!({"versionId": "9"});
-    let wrong = run(
+    let wrong = run_op(
         &db,
         "Patient/update",
         &json!({"id": "p1", "resource": updated_body}),
@@ -110,21 +147,22 @@ fn patient_crud_history_and_search() {
     assert!(old.get("birthDate").is_none());
 
     apply(&db, "Patient/delete", json!({"id": "p1"}));
-    let after = run(&db, "Patient/read", &json!({"id": "p1"})).unwrap_err();
+    let after = run_op(&db, "Patient/read", &json!({"id": "p1"})).unwrap_err();
     assert!(matches!(after, RunError::Fhir(FhirError::NotFound(_))));
     let history = apply(&db, "Patient/history", json!({"id": "p1"}));
     assert_eq!(history["entry"][0]["request"]["method"], "DELETE");
     assert!(history["entry"][0].get("resource").is_none());
-    let gone = run(&db, "Patient/vread", &json!({"id": "p1", "versionId": "3"})).unwrap_err();
+    let gone = run_op(&db, "Patient/vread", &json!({"id": "p1", "versionId": "3"})).unwrap_err();
     assert!(matches!(gone, RunError::Fhir(FhirError::Gone(_))));
     let still = apply(&db, "Patient/vread", json!({"id": "p1", "versionId": "1"}));
     assert_eq!(still["meta"]["versionId"], "1");
 
     let hidden = db
+        .db
         .reader()
         .index_scan(
-            &ResourceType::Patient.by_id(),
-            db.latest_ts(),
+            &IndexId::new("Patient/by_id"),
+            db.db.latest_ts(),
             &haifhir_types::Interval::all(),
             Order::Asc,
         )
@@ -134,7 +172,7 @@ fn patient_crud_history_and_search() {
 
 #[test]
 fn search_conflicts_with_a_matching_update() {
-    let db = db();
+    let db = ready();
     apply(
         &db,
         "Patient/create",
@@ -146,28 +184,38 @@ fn search_conflicts_with_a_matching_update() {
         json!({"resource": patient("p2", false, "Bea")}),
     );
 
-    let mut reader = db.begin();
-    crate::dispatch(&mut reader, "Patient/search", &json!({"active": "true"})).unwrap();
+    let mut reader = db.db.begin();
+    let catalog = db.catalog.read().expect("catalog");
+    crate::dispatch(
+        &mut reader,
+        &catalog,
+        "Patient/search",
+        &json!({"active": "true"}),
+    )
+    .unwrap();
     let mut p2 = patient("p2", false, "Bea");
     p2["birthDate"] = json!("1980-01-01");
     crate::dispatch(
         &mut reader,
+        &catalog,
         "Patient/update",
         &json!({"id": "p2", "resource": p2}),
     )
     .unwrap();
 
-    let mut writer = db.begin();
+    let mut writer = db.db.begin();
     let mut p1 = patient("p1", true, "Ann");
     p1["birthDate"] = json!("1970-01-01");
     crate::dispatch(
         &mut writer,
+        &catalog,
         "Patient/update",
         &json!({"id": "p1", "resource": p1}),
     )
     .unwrap();
-    db.commit_with(writer, crate::stamp_stored_json).unwrap();
+    db.db.commit_with(writer, crate::stamp_stored_json).unwrap();
     let err = db
+        .db
         .commit_with(reader, crate::stamp_stored_json)
         .unwrap_err();
     assert!(err.is_occ(), "{err}");
@@ -177,8 +225,8 @@ fn search_conflicts_with_a_matching_update() {
 
 #[test]
 fn observation_requires_a_patient_and_is_searchable() {
-    let db = db();
-    let missing = run(
+    let db = ready();
+    let missing = run_op(
         &db,
         "Observation/create",
         &json!({"resource": {
@@ -218,7 +266,7 @@ fn observation_requires_a_patient_and_is_searchable() {
     assert_eq!(by_code["total"], 1);
     let by_date = apply(&db, "Observation/search", json!({"date": "2020-01"}));
     assert_eq!(by_date["total"], 1);
-    let absolute = run(
+    let absolute = run_op(
         &db,
         "Observation/create",
         &json!({"resource": {
@@ -232,7 +280,7 @@ fn observation_requires_a_patient_and_is_searchable() {
 
 #[test]
 fn transaction_bundle_is_one_commit() {
-    let db = db();
+    let db = ready();
     let bundle = json!({
         "resourceType": "Bundle",
         "type": "transaction",
@@ -285,15 +333,15 @@ fn transaction_bundle_is_one_commit() {
             }
         ]
     });
-    let err = run(&db, "Bundle/transaction", &json!({"resource": failed})).unwrap_err();
+    let err = run_op(&db, "Bundle/transaction", &json!({"resource": failed})).unwrap_err();
     assert!(matches!(err, RunError::Fhir(FhirError::Invalid(_))));
-    let missing = run(&db, "Patient/read", &json!({"id": "p2"})).unwrap_err();
+    let missing = run_op(&db, "Patient/read", &json!({"id": "p2"})).unwrap_err();
     assert!(matches!(missing, RunError::Fhir(FhirError::NotFound(_))));
 }
 
 #[test]
 fn transaction_creates_a_referenced_patient_before_the_observation() {
-    let db = db();
+    let db = ready();
     let bundle = json!({
         "resourceType": "Bundle",
         "type": "transaction",
@@ -334,16 +382,103 @@ fn transaction_creates_a_referenced_patient_before_the_observation() {
 
 #[test]
 fn capability_lists_shipped_resources_only() {
-    let statement = crate::capability_statement();
+    let db = ready();
+    let statement = db.catalog.read().expect("catalog").capability_statement();
     let resources = statement["rest"][0]["resource"].as_array().unwrap();
-    let types: Vec<_> = resources
+    let mut types: Vec<_> = resources
         .iter()
         .map(|resource| resource["type"].as_str().unwrap())
         .collect();
-    assert_eq!(types, ["Patient", "Observation"]);
+    types.sort();
+    assert_eq!(types, ["Observation", "Patient"]);
     assert!(statement["rest"][0]["interaction"]
         .as_array()
         .unwrap()
         .iter()
         .any(|item| item["code"] == "transaction"));
+}
+
+#[test]
+fn second_package_backfills_birthdate_without_a_new_version() {
+    let db = ready();
+    let mut body = patient("p1", true, "Ann");
+    body["birthDate"] = json!("1990-01-01");
+    let created = apply(&db, "Patient/create", json!({"resource": body}));
+    let version = created["meta"]["versionId"].clone();
+
+    stage_package_dir(&db.store, &db.db, &db.catalog, extra_dir()).unwrap();
+    let pending = run_op(&db, "Patient/search", &json!({"birthdate": "1990-01-01"})).unwrap_err();
+    assert!(matches!(pending, RunError::Fhir(FhirError::Invalid(_))));
+
+    run_backfills(&db.store, &db.db, &db.catalog).unwrap();
+    let found = apply(&db, "Patient/search", json!({"birthdate": "1990-01-01"}));
+    assert_eq!(found["total"], 1);
+    assert_eq!(found["entry"][0]["resource"]["id"], "p1");
+    let read = apply(&db, "Patient/read", json!({"id": "p1"}));
+    assert_eq!(read["meta"]["versionId"], version);
+
+    let encounter = apply(
+        &db,
+        "Encounter/create",
+        json!({"resource": {
+            "resourceType": "Encounter",
+            "id": "e1",
+            "status": "finished"
+        }}),
+    );
+    assert_eq!(encounter["id"], "e1");
+
+    let statement = db.catalog.read().expect("catalog").capability_statement();
+    let patient_params = statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Patient")
+        .unwrap();
+    let names: Vec<_> = patient_params["searchParam"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"birthdate"));
+    assert!(names.contains(&"phonetic"));
+}
+
+#[test]
+fn official_r4_package_installs_concrete_types() {
+    let db = empty();
+    install_package_dir(&db.store, &db.db, &db.catalog, r4_dir()).unwrap();
+    install_package_dir(&db.store, &db.db, &db.catalog, r4_dir()).unwrap();
+    let catalog = db.catalog.read().expect("catalog");
+    assert_eq!(catalog.fhir_version(), "4.0.1");
+    assert!(catalog.contains("Patient"));
+    assert!(catalog.contains("Encounter"));
+    assert!(catalog.contains("Observation"));
+    let statement = catalog.capability_statement();
+    let patient = statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Patient")
+        .unwrap();
+    let names: Vec<_> = patient["searchParam"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"name"));
+    assert!(names.contains(&"identifier"));
+    assert!(names.contains(&"active"));
+    assert!(names.contains(&"gender"));
+}
+
+#[test]
+fn package_install_rejects_version_and_expression_conflicts() {
+    let db = ready();
+    let version = install_package_dir(&db.store, &db.db, &db.catalog, version_clash_dir());
+    assert!(matches!(version, Err(FhirError::Invalid(_))));
+    let expression = install_package_dir(&db.store, &db.db, &db.catalog, expression_clash_dir());
+    assert!(matches!(expression, Err(FhirError::Invalid(_))));
 }

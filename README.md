@@ -1,6 +1,6 @@
 # HaiFHIR
 
-**FHIR defines the healthcare data. HaiFHIR keeps applications synchronized with it.**
+> **FHIR defines healthcare state. HaiFHIR keeps software and AI synchronized with it.**
 
 Open-source reactive FHIR server from [HAIHQ](https://github.com/hai-hq).  
 Repository: [github.com/hai-hq/haifhir](https://github.com/hai-hq/haifhir)
@@ -9,31 +9,31 @@ Repository: [github.com/hai-hq/haifhir](https://github.com/hai-hq/haifhir)
 
 ## Overview
 
-HaiFHIR explores a different programming model for healthcare applications. Instead of treating FHIR mainly as a request-response API over data, it treats FHIR data as **live application state**.
+HaiFHIR explores a different programming model for healthcare applications and AI systems. Instead of treating FHIR mainly as a request-response API over healthcare data, it treats FHIR data as **live application state**.
 
-Applications run FHIR queries and stay subscribed to their results. When underlying resources change, HaiFHIR finds which active queries are affected, recomputes those results, and pushes updated state to connected clients.
+Applications and AI agents can run FHIR queries and stay subscribed to their results. When underlying resources change, HaiFHIR finds which active queries are affected, updates those results, and keeps connected clients aligned with **committed** state.
 
-The goal is to make real-time apps on FHIR simpler while staying compatible with the FHIR ecosystem.
+The goal is to make real-time healthcare applications and healthcare AI systems simpler to build while staying compatible with the FHIR ecosystem.
 
 ## The problem
 
-Most FHIR servers are request-response.
+FHIR servers are usually request-response.
 
 ```http
 GET /Observation?patient=123&status=final
 ```
 
-returns a snapshot at one moment. Staying current usually means polling, Subscriptions, WebSockets, webhooks, caches, invalidation, refetch, reconciliation, reconnect handling, and careful UX so users never see inconsistent combinations.
+returns one snapshot. Healthcare state keeps moving: new results, discontinued orders, closed encounters, updated diagnoses, tasks completed elsewhere, authorization or care-team changes while software or an agent is still working.
 
-That works, but **keeping application state in sync** is largely the app developer’s job.
+Staying current typically means polling, Subscriptions, WebSockets, webhooks, caches, invalidation, refetch, reconciliation, and reconnect logic. The app or agent must decide what changed, whether it matters, which queries to rerun, whether caches are stale, whether related writes were one transaction, and how to recover after gaps.
 
-HaiFHIR asks whether the server can offer a higher-level abstraction.
+That burden is especially heavy for **AI agents**. An agent may read state at `t₀`, reason and call tools for seconds or minutes, then act at `t₂` on a snapshot that is no longer true. HaiFHIR asks whether the **data layer** can offer a better primitive than every runtime rebuilding its own sync stack.
 
 ## Product thesis
 
 FHIR queries should behave like **reactive queries**.
 
-You subscribe to the **result of a query**, not only to individual resource-change events.
+Subscribe to the **result of a query**, not only to per-resource change events.
 
 ```ts
 const observations = useFHIRQuery({
@@ -44,137 +44,166 @@ const observations = useFHIRQuery({
 });
 ```
 
-You get the current matches. The query stays active. Creates, updates, deletes, and membership changes update the result automatically. The app works with a live view of FHIR state instead of wiring HTTP, events, and cache by hand.
+The client gets current matches. The query stays active. Membership, ordering, creates, updates, and deletes update the result automatically.
 
 ### Core principle
 
 HaiFHIR is not simply “FHIR with WebSockets.” FHIR already has notifications and Subscriptions.
 
-The abstraction is different:
-
 > **Queries, not events, are the primary unit of synchronization.**
 
-Events may exist inside the server, but applications should not have to turn every event back into current query state by themselves.
+For applications, that means live UI state. For agents, it means **live working context**. Events may exist inside the server, but callers should not have to turn every event back into “what is true now?” by themselves.
+
+## Why this matters for AI and agents
+
+Agents often chain: read patient state, inspect meds and labs, check tasks, reason, call tools, act. Each FHIR call is a snapshot. The usual fix is more glue: refetch, poll, listen, invalidate context, rerun tools, check versions, reconcile.
+
+HaiFHIR shifts generic sync into the healthcare data layer so runtimes can ask **what is current now?** instead of only **what did I last fetch?** That does not make an agent clinically safe by itself; it gives a stronger primitive to build on.
+
+**Reactive context.** A live query over e.g. active `MedicationRequest`s can update while the agent works, so the runtime can refresh context, reconsider a plan, or block actions on stale assumptions.
+
+**Events vs state.** Event streams say “something changed.” Agents still rebuild context. Reactive queries say “the state you depend on changed; here is the updated result.”
+
+**Context as a dependency graph.** Instead of one-off `GET Patient`, `GET Observation`, …, a task can depend on a set of live queries (patient, encounter, open tasks). The runtime can tell **context still valid** from **context changed, re-evaluate**.
+
+**Long-running work.** Agents may span many steps while clinicians, devices, or other agents change the same data. HaiFHIR assumes **the world can change while software is acting.**
+
+**Commit-time revalidation (direction).** For consequential actions, the same dependency tracking that drives query sync can eventually support “assumptions at read time still hold at commit time” (not required in the first server release).
 
 ## Product goals
 
 HaiFHIR aims to provide:
 
 - a standards-compatible FHIR server;
-- reactive FHIR queries;
-- automatic query dependency tracking;
+- reactive FHIR queries and automatic dependency tracking;
 - real-time synchronization of query results;
 - consistent results across transactions;
 - reconnect and recovery semantics;
-- an ergonomic developer SDK;
-- standard FHIR REST for existing clients alongside reactive clients.
+- an ergonomic developer SDK (TypeScript first; other languages as the protocol stabilizes);
+- standard FHIR REST for existing clients;
+- primitives for AI-agent context synchronization;
+- ways to detect when state an agent depends on has changed.
 
-The intent is less infrastructure and less glue code for live healthcare applications.
+Less infrastructure for live apps and state-aware healthcare AI.
 
 ## Non-goals
 
-HaiFHIR is not meant to become:
+HaiFHIR is not:
 
-- an electronic medical record or hospital management system;
-- a workflow, analytics, or clinical decision-support product;
-- an AI agent framework;
-- a replacement for the FHIR specification or a proprietary fork of FHIR.
+- an EMR, hospital management system, or workflow product;
+- an **AI agent framework**, autonomous clinical agent, or CDS platform;
+- analytics, model inference, or a replacement for the FHIR spec.
 
-Scope is the **FHIR data and synchronization layer**. Other products build on top.
+Scope is the **FHIR data and synchronization layer**. Agent frameworks, clinical apps, and workflows build on top.
 
 ## Architecture (conceptual)
 
 ```text
-FHIR resources (Patient, Observation, …)
+FHIR resources (Patient, Observation, Encounter, …)
         ↓
-Standard FHIR REST (GET/POST/PUT/DELETE, search, transactions)
+Standard FHIR REST
         ↓
-Mutations → commit → new logical version of state (Sₙ → Sₙ₊₁)
+Mutations → commit → Sₙ → Sₙ₊₁
         ↓
-Dependency tracking (what each query read)
+Dependency tracking (reads + index ranges per query)
         ↓
-On change: affected queries → recompute → push updates
+Affected queries → recompute → push updates
         ↓
-Clients (HTTP and/or WebSocket sync)
+Web apps, backends, AI runtimes (/sync)
 ```
 
-**Mutation layer.** Writes are committed transitions. A FHIR transaction Bundle is one atomic commit. Reactive queries observe committed state, not half-finished writes.
+| Layer | Role |
+|--------|------|
+| **FHIR data** | Resources validated and stored per supported R4 profiles and catalog |
+| **REST** | `GET/POST/PUT/DELETE`, search, transactions for interoperability |
+| **Mutations** | Committed transitions; transaction Bundle = one atomic commit |
+| **Dependencies** | What each query read; which subscriptions to rerun on overlap |
+| **Reactive engine** | Recompute only queries whose results may have changed |
+| **Sync** | Initial result, ordered transitions, versions, reconnect (target: full recovery semantics) |
 
-**Dependency engine.** Each search or read records which index ranges and resources it depended on. When a commit touches overlapping data, only those subscriptions need to rerun.
-
-**Synchronization.** Clients receive an initial result, then transitions when commits invalidate their read set. Ordering and version semantics follow the sync protocol (see [This repository](#this-repository) below).
-
-**FHIR Subscriptions (future).** Standard Subscriptions remain valuable for system-to-system events and async workflows. Reactive queries address **keeping an app’s current view** in sync. Both can coexist:
+**FHIR Subscriptions (future).** Still valuable for system-to-system events and async workflows.
 
 ```text
 FHIR Subscription  →  another system learns something happened
-Reactive query     →  this app’s view stays current
+Reactive query     →  a client stays synchronized with what is true now
 ```
 
-### Reactive query semantics (target behavior)
+### Reactive query semantics (target)
 
 For `Observation?patient=123&status=final`:
 
-| Change | Expected effect |
-|--------|------------------|
-| Status `preliminary` → `final` | Resource appears in the result |
-| Status `final` → `entered-in-error` | Resource leaves the result |
-| Delete | Resource disappears |
-| New matching Observation | Resource appears |
-| Sort key changes (`_sort=-date`) | Order updates |
-| `_count` window | Result reflects the query, not a naive append |
+| Change | Effect |
+|--------|--------|
+| `preliminary` → `final` | Appears in result |
+| `final` → `entered-in-error` | Leaves result |
+| Delete | Disappears |
+| New match | Appears |
+| Sort key changes | Order updates |
+| `_count` window | Result matches the query, not a naive append stream |
 
 ### Transaction consistency
 
-Multi-resource updates (Encounter + Observation + Task in one Bundle) should not expose arbitrary mixes of old and new state. Subscribed queries should advance **S100 → S101** as a unit after commit.
+Multi-resource updates in one Bundle must not expose impossible mixes (e.g. new Observation + old MedicationRequest). Subscribed queries should advance **S100 → S101** as a unit. That matters for agents reasoning over combinations that never existed as a committed snapshot.
 
-### Developer experience (target)
+### Client SDK (target)
 
-Today many apps combine FHIR HTTP, WebSockets, subscriptions, filtering, cache, invalidation, refetch, reconciliation, and reconnect logic. HaiFHIR’s direction is closer to:
+```ts
+const observations = useFHIRSearch("Observation", {
+  patient: patientId,
+  status: "final",
+});
 
-```text
-declare query → receive current result → keep receiving current result
+// Agent-oriented (conceptual, not shipped yet):
+const context = await fhir.watch({
+  resourceType: "MedicationRequest",
+  patient: patientId,
+  status: "active",
+});
+context.onChange(() => agent.invalidate("medication-context"));
 ```
+
+Sync protocol today: WebSocket `/sync`, Convex-style messages, FHIR operation names (`Patient/search`, …). See [Live sync](#live-sync) and [crates/server/src/tests.rs](crates/server/src/tests.rs).
 
 ---
 
 ## This repository
 
-This tree is the **first implementation** of that model: a Rust server with a Convex-shaped engine (document log, index log, snapshot transactions, OCC committer, read sets, write log, invalidation). It is developed openly; not every product goal above is finished yet.
+First **Rust** implementation: Convex-shaped engine (document log, index log, snapshot transactions, OCC committer, read sets, write log, invalidation). Developed openly; product goals above are not all done yet.
 
 ### Implemented today
 
 | Area | Status |
 |------|--------|
 | FHIR R4 JSON | Yes |
-| Resource types | `Patient`, `Observation` only |
+| Resource types | `Patient`, `Observation` |
 | CRUD, `_history`, `vread` | Yes |
 | Search (selected params, index-backed) | Yes |
 | Transaction `Bundle` | Yes (atomic commit) |
 | FHIR REST | Yes (`application/fhir+json`) |
-| Reactive sync | Yes (`/sync` WebSocket, query rerun on invalidation) |
-| TypeScript SDK (`useFHIRQuery`, …) | **Not in this repo yet** |
+| Reactive sync | Yes (`/sync`, invalidation + query rerun) |
+| TypeScript / Go SDK | **Not in this repo yet** |
 | SMART / auth | **Not yet** |
-| Full spec, all search params, `_include`, `$everything` | **Deferred** |
-| FHIR Subscription delivery | **Deferred** (distinct from live query sync) |
+| Full spec, `_include`, `$everything`, all search params | **Deferred** |
+| FHIR Subscription delivery | **Deferred** (vs live query sync) |
+| Commit-time agent revalidation | **Deferred** (architecture direction) |
 
-**Persistence:** SQLite default (`haifhir.sqlite`); optional Postgres.
+**Persistence:** SQLite (`haifhir.sqlite`); optional Postgres.
 
-**Notable rules in this build:**
+**This build:**
 
-- `Observation.subject` must be `Patient/{id}` with that Patient present in the same snapshot (stricter than allowing dangling references).
-- `meta.versionId` is the commit timestamp; optimistic locking via `If-Match` / `meta.versionId`.
-- Concurrent writes use OCC with bounded retry, then HTTP 409.
+- `Observation.subject` must be `Patient/{id}` with Patient present in the same snapshot.
+- `meta.versionId` = commit timestamp; `If-Match` / version conflicts → 409 after OCC retries.
+- Engine reference: [get-convex/convex-backend](https://github.com/get-convex/convex-backend) (database layer only).
 
-**Workspace crates:** `types`, `persistence`, `sqlite`, `postgres`, `database`, `fhir`, `server`, `haifhir` (binary). Engine shape follows [get-convex/convex-backend](https://github.com/get-convex/convex-backend) at the database layer, without customer-defined schema or UDF hosting.
+**Crates:** `types`, `persistence`, `sqlite`, `postgres`, `database`, `fhir`, `server`, `haifhir` (binary).
 
-### Initial scope (project)
+### Roadmap vs defer
 
-**Include (roadmap):** subset of R4, CRUD, selected search, transactions, reactive search, WebSocket sync, dependency tracking, invalidation, reconnect handling, TS SDK, basic auth, benchmarks.
+**Toward initial release:** R4 subset, CRUD, selected search, transactions, reactive search, WebSocket sync, dependency tracking, invalidation, reconnect, version identifiers, TS SDK, basic auth, benchmarks.
 
-**Defer:** full spec, every search parameter, terminology, bulk export, analytics, workflow, AI, full certification.
+**Defer:** full spec, terminology, bulk export, analytics, workflow orchestration, agent framework, inference, autonomous clinical actions, full certification.
 
-**Success criteria** we care about: update latency, stale duration, membership correctness, transactional consistency, reconnect behavior, resource use, traffic, concurrent queries, and how little client sync code apps need.
+**Success measures:** update latency, stale duration, membership correctness, transactional consistency, reconnect behavior, resource and traffic cost, concurrent queries, unnecessary invalidation, less client sync code, detecting when agent context is stale.
 
 ---
 
@@ -186,21 +215,25 @@ This tree is the **first implementation** of that model: a Rust server with a Co
 cargo run -p haifhir -- --sqlite haifhir.sqlite
 ```
 
+That command installs the bundled `hl7.fhir.r4.core` 4.0.1 package, so the concrete R4 resource types are available on a fresh database. Pass `--package dir` to install a package directory instead. Repeat the flag for more than one package on the same FHIR version.
+
+Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It downloads the published core package and writes StructureDefinitions and SearchParameters into `crates/fhir/fixtures/r4`.
+
 - **http://127.0.0.1:8080**
 - `curl -s http://127.0.0.1:8080/metadata`
 
 | Flag | Purpose |
 |------|---------|
 | `--sqlite path` | SQLite file (default `haifhir.sqlite`) |
-| `--postgres url` | Postgres (do not use with `--sqlite`) |
-| `--bind host:port` | Listen address (default `127.0.0.1:8080`) |
+| `--postgres url` | Postgres (not with `--sqlite`) |
+| `--bind host:port` | Default `127.0.0.1:8080` |
+| `--package dir` | FHIR package directory. Repeatable. Replaces the bundled R4 core default. |
 
 Optional: `just run` ([justfile](justfile)) if you use [just](https://github.com/casey/just).
 
 ### HTTP examples
 
 ```bash
-# Create Patient
 curl -s -X POST http://127.0.0.1:8080/Patient \
   -H 'Content-Type: application/fhir+json' \
   -d '{"resourceType":"Patient","id":"p1","active":true,"name":[{"family":"Ann"}]}'
@@ -209,7 +242,6 @@ curl -s http://127.0.0.1:8080/Patient/p1
 curl -s 'http://127.0.0.1:8080/Patient?name=ann'
 curl -s http://127.0.0.1:8080/Patient/p1/_history
 
-# Observation (Patient must exist)
 curl -s -X POST http://127.0.0.1:8080/Observation \
   -H 'Content-Type: application/fhir+json' \
   -d '{"resourceType":"Observation","id":"o1","subject":{"reference":"Patient/p1"},"code":{"coding":[{"code":"8480-6"}]},"effectiveDateTime":"2020-01-02"}'
@@ -220,13 +252,13 @@ curl -s -X POST http://127.0.0.1:8080/Observation \
 | GET | `/metadata` | CapabilityStatement |
 | GET | `/sync` | WebSocket |
 | POST | `/` | Transaction Bundle |
-| * | `/{type}`, `/{type}/{id}`, search, `_history` | Standard FHIR-style routes |
+| * | `/{type}`, `/{type}/{id}`, search, `_history` | FHIR-style routes |
 
-Errors: `OperationOutcome` with 4xx/5xx as appropriate.
+Errors: `OperationOutcome` (4xx/5xx).
 
 ### Live sync
 
-Connect to `ws://127.0.0.1:8080/sync`. Messages follow a Convex-style shape with FHIR operation names (`Patient/search`, `Patient/update`, …): **ModifyQuerySet**, **Mutation**, **Transition**. Read-only operations can be subscribed; writes cannot. Example payloads: [crates/server/src/tests.rs](crates/server/src/tests.rs).
+`ws://127.0.0.1:8080/sync`: **ModifyQuerySet**, **Mutation**, **Transition** with paths like `Patient/search`, `Patient/update`. Subscribe read-only operations only. Examples: [crates/server/src/tests.rs](crates/server/src/tests.rs).
 
 ---
 
@@ -237,19 +269,19 @@ cargo test --workspace
 cargo fmt --all
 ```
 
-CI: [.github/workflows/ci.yml](.github/workflows/ci.yml) (format, build, test, release binary).  
-Postgres conformance: set `HAIFHIR_POSTGRES_URL` to run the postgres crate test against a real database.
+CI: [.github/workflows/ci.yml](.github/workflows/ci.yml).  
+Postgres test: set `HAIFHIR_POSTGRES_URL`.
 
 ---
 
 ## Open source
 
-HaiFHIR is developed openly under HAIHQ. Implementation, experiments, and architectural choices are public so others can use it as infrastructure or as a reference for reactive healthcare data systems.
+HaiFHIR is developed openly under HAIHQ: implementation, experiments, benchmarks, and architecture in public. Use it as **infrastructure** or as **research** on reactive healthcare data, consistency, and agent state.
 
 ## Long-term direction
 
-> What would FHIR look like if it were designed as a reactive application data layer?
+> What should the healthcare data layer look like when applications and AI agents continuously operate over changing clinical state?
 
-Preserve FHIR interoperability. Explore a better way for modern applications to stay continuously aligned with healthcare state.
+FHIR keeps interoperability. HaiFHIR explores making that state **reactive**: apps stay synchronized; agents can work against context that can stay current, surface dependency changes, and eventually support stronger checks before consequential commits.
 
-**FHIR defines the healthcare data. HaiFHIR keeps applications synchronized with it.**
+**FHIR defines healthcare state. HaiFHIR keeps software and AI synchronized with it.**

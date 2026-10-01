@@ -2,10 +2,11 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use haifhir_database::Database;
-use haifhir_persistence::Persistence;
+use haifhir_fhir::Catalog;
+use haifhir_persistence::{ConformanceStore, Persistence};
 use haifhir_postgres::PostgresPersistence;
 use haifhir_sqlite::SqlitePersistence;
 use tokio::net::TcpListener;
@@ -25,14 +26,17 @@ fn main() -> ExitCode {
 async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut sqlite: Option<String> = None;
     let mut postgres: Option<String> = None;
+    let mut packages = Vec::new();
     let mut bind = "127.0.0.1:8080".to_string();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "haifhir [--sqlite path] [--postgres url] [--bind 127.0.0.1:8080]\n\
-                     Default database is haifhir.sqlite."
+                    "haifhir [--sqlite path] [--postgres url] [--bind 127.0.0.1:8080] [--package dir]\n\
+                     Default database is haifhir.sqlite. With no --package, the bundled\n\
+                     hl7.fhir.r4.core 4.0.1 package is installed. --package may be repeated and\n\
+                     replaces that default."
                 );
                 return Ok(());
             }
@@ -43,6 +47,10 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "--postgres" => {
                 index += 1;
                 postgres = Some(required(&args, index, "--postgres")?);
+            }
+            "--package" => {
+                index += 1;
+                packages.push(required(&args, index, "--package")?);
             }
             "--bind" => {
                 index += 1;
@@ -57,18 +65,30 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing_subscriber::fmt::init();
-    let persistence: Arc<dyn Persistence> = if let Some(url) = postgres {
-        Arc::new(PostgresPersistence::connect(&url)?)
+    let (db, store): (Arc<dyn Persistence>, Arc<dyn ConformanceStore>) = if let Some(url) = postgres
+    {
+        let persistence = Arc::new(PostgresPersistence::connect(&url)?);
+        (persistence.clone(), persistence)
     } else {
         let path = sqlite.unwrap_or_else(|| "haifhir.sqlite".to_string());
-        Arc::new(SqlitePersistence::open(Path::new(&path))?)
+        let persistence = Arc::new(SqlitePersistence::open(Path::new(&path))?);
+        (persistence.clone(), persistence)
     };
-    let db = Arc::new(Database::open(persistence)?);
+    let db = Arc::new(Database::open(db)?);
+    let catalog = Arc::new(RwLock::new(Catalog::open(store.as_ref())?));
+    if packages.is_empty() {
+        haifhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, haifhir_fhir::r4_dir())?;
+    } else {
+        for path in &packages {
+            haifhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, Path::new(path))?;
+        }
+    }
+    haifhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!("listening on http://{local}");
-    haifhir_server::serve(db, listener).await?;
+    haifhir_server::serve(db, catalog, listener).await?;
     Ok(())
 }
 

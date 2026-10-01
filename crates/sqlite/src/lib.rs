@@ -51,6 +51,44 @@ CREATE TABLE IF NOT EXISTS persistence_globals (
 );
 "#;
 
+const CONFORMANCE_INIT: &str = r#"
+CREATE TABLE IF NOT EXISTS packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    fhir_version TEXT NOT NULL,
+    UNIQUE (name, version)
+);
+CREATE TABLE IF NOT EXISTS structure_definitions (
+    package_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    type_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    is_abstract INTEGER NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url)
+);
+CREATE TABLE IF NOT EXISTS search_parameters (
+    package_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    base TEXT NOT NULL,
+    code TEXT NOT NULL,
+    param_type TEXT NOT NULL,
+    expression TEXT,
+    status TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url, base)
+);
+CREATE TABLE IF NOT EXISTS index_backfills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    package_id INTEGER NOT NULL,
+    watermark_ts INTEGER NOT NULL,
+    tablet TEXT NOT NULL,
+    cursor_id TEXT,
+    done INTEGER NOT NULL
+);
+"#;
+
 const INSERT_DOCUMENT: &str = "INSERT INTO documents (id, ts, table_id, json_value, deleted, \
      prev_ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 const INSERT_OVERWRITE_DOCUMENT: &str =
@@ -61,8 +99,8 @@ const INSERT_INDEX: &str = "INSERT INTO indexes \
 const INSERT_OVERWRITE_INDEX: &str = "INSERT OR REPLACE INTO indexes \
      (index_id, ts, key, deleted, table_id, document_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
-struct Inner {
-    connection: Connection,
+pub(crate) struct Inner {
+    pub(crate) connection: Connection,
 }
 
 #[derive(Clone)]
@@ -90,6 +128,7 @@ impl SqlitePersistence {
             .execute_batch(DOCUMENTS_INIT)
             .and_then(|_| connection.execute_batch(INDEXES_INIT))
             .and_then(|_| connection.execute_batch(PERSISTENCE_GLOBALS_INIT))
+            .and_then(|_| connection.execute_batch(CONFORMANCE_INIT))
             .map_err(definite)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner { connection })),
@@ -199,6 +238,8 @@ impl PersistenceReader for SqlitePersistence {
         order: Order,
     ) -> Result<Vec<IndexScanRow>, PersistError> {
         // Convex `SqlitePersistence::_index_scan_inner`.
+        // Index-only backfill rows use a later commit than the document, so the
+        // document join is the latest live revision at the read timestamp.
         let upper = if interval.end.is_some() {
             " AND key < ?4"
         } else {
@@ -210,7 +251,7 @@ impl PersistenceReader for SqlitePersistence {
         };
         let sql = format!(
             r#"
-SELECT B.key, B.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
+SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
 FROM (
     SELECT index_id, key, MAX(ts) as max_ts
     FROM indexes
@@ -223,9 +264,13 @@ JOIN indexes B
  AND A.key = B.key
  AND A.max_ts = B.ts
 JOIN documents C
-  ON B.ts = C.ts
- AND B.table_id = C.table_id
- AND B.document_id = C.id
+  ON C.table_id = B.table_id
+ AND C.id = B.document_id
+ AND C.deleted = 0
+ AND C.ts = (
+    SELECT MAX(D.ts) FROM documents D
+    WHERE D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= ?2
+ )
 ORDER BY B.key {ord}
 "#
         );
@@ -447,7 +492,7 @@ fn write_in_tx(
             .map_err(definite)?;
         }
     }
-    if let Some(ts) = documents.iter().map(|document| document.ts).max() {
+    if let Some(ts) = commit_timestamp(documents, indexes) {
         let current = read_global(tx, PersistenceGlobalKey::MaxRepeatableTimestamp)?;
         let current_ts = current
             .and_then(|value| value.as_u64())
@@ -466,6 +511,17 @@ fn write_in_tx(
         .map_err(definite)?;
     }
     Ok(())
+}
+
+fn commit_timestamp(
+    documents: &[DocumentLogEntry],
+    indexes: &[PersistenceIndexEntry],
+) -> Option<Timestamp> {
+    documents
+        .iter()
+        .map(|document| document.ts)
+        .chain(indexes.iter().map(|index| index.ts))
+        .max()
 }
 
 fn read_global(
@@ -512,13 +568,15 @@ fn i64_ts(ts: Timestamp) -> Result<i64, PersistError> {
         .map_err(|_| PersistError::Definite(format!("timestamp {ts} does not fit in i64")))
 }
 
-fn definite(err: impl ToString) -> PersistError {
+pub(crate) fn definite(err: impl ToString) -> PersistError {
     PersistError::Definite(err.to_string())
 }
 
 fn uncertain(err: impl ToString) -> PersistError {
     PersistError::Uncertain(err.to_string())
 }
+
+mod conformance_store;
 
 #[cfg(test)]
 mod tests {

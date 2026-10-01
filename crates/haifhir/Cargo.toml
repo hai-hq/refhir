@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 haifhir-database = { path = "../database" }
+haifhir-fhir = { path = "../fhir" }
 haifhir-persistence = { path = "../persistence" }
 haifhir-postgres = { path = "../postgres" }
 haifhir-server = { path = "../server" }

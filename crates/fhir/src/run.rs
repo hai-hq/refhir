@@ -10,7 +10,7 @@ use haifhir_types::Timestamp;
 use serde_json::Value;
 
 use crate::bundle;
-use crate::catalog::ResourceType;
+use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::history;
 use crate::ops;
@@ -44,10 +44,15 @@ pub struct RunResult {
     pub wrote: bool,
 }
 
-pub fn run(db: &Database, path: &str, args: &Value) -> Result<RunResult, RunError> {
+pub fn run(
+    db: &Database,
+    catalog: &Catalog,
+    path: &str,
+    args: &Value,
+) -> Result<RunResult, RunError> {
     for attempt in 0..=MAX_OCC_FAILURES {
         let mut tx = db.begin();
-        let mut value = match dispatch(&mut tx, path, args) {
+        let mut value = match dispatch(&mut tx, catalog, path, args) {
             Ok(value) => value,
             Err(err) => return Err(RunError::Fhir(err)),
         };
@@ -88,6 +93,7 @@ pub fn stamp_stored_json(json: &mut String, ts: Timestamp) {
 
 pub fn dispatch(
     tx: &mut haifhir_database::Transaction,
+    catalog: &Catalog,
     path: &str,
     args: &Value,
 ) -> Result<Value, FhirError> {
@@ -96,34 +102,35 @@ pub fn dispatch(
             .get("resource")
             .cloned()
             .unwrap_or_else(|| args.clone());
-        return bundle::transaction(tx, &bundle);
+        return bundle::transaction(tx, catalog, &bundle);
     }
     let (type_name, op) = path
         .split_once('/')
         .ok_or_else(|| FhirError::Invalid(format!("bad operation {path}")))?;
-    let ty = ResourceType::parse(type_name)?;
+    let model = catalog.get(type_name)?;
     match op {
-        "create" => ops::create(tx, ty, resource_arg(args)?),
-        "read" => ops::read(tx, ty, &id_arg(args)?),
+        "create" => ops::create(tx, catalog, model, resource_arg(args)?),
+        "read" => ops::read(tx, model, &id_arg(args)?),
         "update" => ops::update(
             tx,
-            ty,
+            catalog,
+            model,
             &id_arg(args)?,
             resource_arg(args)?,
             args.get("ifMatch").and_then(|value| value.as_str()),
         ),
-        "delete" => ops::delete(tx, ty, &id_arg(args)?),
+        "delete" => ops::delete(tx, catalog, model, &id_arg(args)?),
         "vread" => {
             let version = args
                 .get("versionId")
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| FhirError::Invalid("versionId is required".into()))?;
-            history::vread(tx, ty, &id_arg(args)?, version)
+            history::vread(tx, model, &id_arg(args)?, version)
         }
-        "history" => history::history(tx, ty, &id_arg(args)?),
+        "history" => history::history(tx, model, &id_arg(args)?),
         "search" => {
             let params = search_args(args)?;
-            search::search(tx, ty, &params)
+            search::search(tx, catalog, model, &params)
         }
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"

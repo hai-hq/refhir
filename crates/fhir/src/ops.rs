@@ -3,15 +3,17 @@ use haifhir_types::Timestamp;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::catalog::{index_keys, valid_id, ResourceType};
+use crate::catalog::{index_keys, valid_id, Catalog, ResourceModel};
 use crate::error::FhirError;
+use crate::resolve::TxHost;
 
 pub fn create(
     tx: &mut Transaction,
-    ty: ResourceType,
+    catalog: &Catalog,
+    model: &ResourceModel,
     mut resource: Value,
 ) -> Result<Value, FhirError> {
-    expect_type(ty, &resource)?;
+    expect_type(model, &resource)?;
     let id = match resource.get("id").and_then(|value| value.as_str()) {
         Some(id) => {
             if !valid_id(id) {
@@ -25,19 +27,19 @@ pub fn create(
             id
         }
     };
-    if tx.get(&ty.tablet(), &id, &ty.by_id())?.is_some() {
+    if tx.get(&model.tablet(), &id, &model.by_id())?.is_some() {
         return Err(FhirError::Conflict(format!(
             "{}/{} already exists",
-            ty.as_str(),
-            id
+            model.name, id
         )));
     }
-    if ty == ResourceType::Observation {
-        require_patient_subject(tx, &resource)?;
-    }
-    let keys = index_keys(ty, &resource)?;
+    require_references(tx, catalog, model, &resource)?;
+    let keys = {
+        let host = TxHost::new(tx, catalog);
+        index_keys(catalog.path_model(), model, &resource, &host)?
+    };
     tx.stage_put(Put {
-        tablet: ty.tablet(),
+        tablet: model.tablet(),
         id: id.clone(),
         json: resource.clone(),
         new_keys: keys,
@@ -47,14 +49,15 @@ pub fn create(
     Ok(resource)
 }
 
-pub fn read(tx: &mut Transaction, ty: ResourceType, id: &str) -> Result<Value, FhirError> {
-    let stored = load(tx, ty, id)?;
+pub fn read(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Value, FhirError> {
+    let stored = load(tx, model, id)?;
     Ok(decorate(stored.json, id, stored.ts))
 }
 
 pub fn update(
     tx: &mut Transaction,
-    ty: ResourceType,
+    catalog: &Catalog,
+    model: &ResourceModel,
     id: &str,
     mut resource: Value,
     if_match: Option<&str>,
@@ -62,7 +65,7 @@ pub fn update(
     if !valid_id(id) {
         return Err(FhirError::Invalid(format!("invalid id {id}")));
     }
-    expect_type(ty, &resource)?;
+    expect_type(model, &resource)?;
     if let Some(body_id) = resource.get("id").and_then(|value| value.as_str()) {
         if body_id != id {
             return Err(FhirError::Invalid(format!(
@@ -71,15 +74,18 @@ pub fn update(
         }
     }
     resource["id"] = json!(id);
-    let current = load(tx, ty, id)?;
+    let current = load(tx, model, id)?;
     check_version(current.ts, if_match, &resource)?;
-    if ty == ResourceType::Observation {
-        require_patient_subject(tx, &resource)?;
-    }
-    let old_keys = index_keys(ty, &current.json)?;
-    let new_keys = index_keys(ty, &resource)?;
+    require_references(tx, catalog, model, &resource)?;
+    let (old_keys, new_keys) = {
+        let host = TxHost::new(tx, catalog);
+        (
+            index_keys(catalog.path_model(), model, &current.json, &host)?,
+            index_keys(catalog.path_model(), model, &resource, &host)?,
+        )
+    };
     tx.stage_put(Put {
-        tablet: ty.tablet(),
+        tablet: model.tablet(),
         id: id.to_string(),
         json: resource.clone(),
         new_keys,
@@ -89,12 +95,20 @@ pub fn update(
     Ok(resource)
 }
 
-pub fn delete(tx: &mut Transaction, ty: ResourceType, id: &str) -> Result<Value, FhirError> {
-    let current = load(tx, ty, id)?;
-    let old_keys = index_keys(ty, &current.json)?;
+pub fn delete(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    id: &str,
+) -> Result<Value, FhirError> {
+    let current = load(tx, model, id)?;
+    let old_keys = {
+        let host = TxHost::new(tx, catalog);
+        index_keys(catalog.path_model(), model, &current.json, &host)?
+    };
     let prev_ts = current.ts.unwrap_or(Timestamp::ZERO);
     tx.stage_delete(Delete {
-        tablet: ty.tablet(),
+        tablet: model.tablet(),
         id: id.to_string(),
         old_keys,
         prev_ts,
@@ -126,54 +140,127 @@ fn set_version_id(object: &mut serde_json::Map<String, Value>, ts: Timestamp) {
     }
 }
 
-fn load(tx: &mut Transaction, ty: ResourceType, id: &str) -> Result<Stored, FhirError> {
-    tx.get(&ty.tablet(), id, &ty.by_id())?
-        .ok_or_else(|| FhirError::NotFound(format!("{}/{} not found", ty.as_str(), id)))
+fn load(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Stored, FhirError> {
+    tx.get(&model.tablet(), id, &model.by_id())?
+        .ok_or_else(|| FhirError::NotFound(format!("{}/{} not found", model.name, id)))
 }
 
-fn expect_type(ty: ResourceType, resource: &Value) -> Result<(), FhirError> {
+fn expect_type(model: &ResourceModel, resource: &Value) -> Result<(), FhirError> {
     match resource
         .get("resourceType")
         .and_then(|value| value.as_str())
     {
-        Some(name) if name == ty.as_str() => Ok(()),
+        Some(name) if name == model.name => Ok(()),
         Some(name) => Err(FhirError::Invalid(format!(
             "resourceType {name} does not match {}",
-            ty.as_str()
+            model.name
         ))),
         None => Err(FhirError::Invalid("resourceType is required".into())),
     }
 }
 
-/// Observation.subject must name a Patient visible in this snapshot.
-pub fn require_patient_subject(tx: &mut Transaction, resource: &Value) -> Result<(), FhirError> {
-    let reference = resource
-        .pointer("/subject/reference")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| FhirError::Invalid("Observation.subject.reference is required".into()))?;
-    let Some(id) = reference.strip_prefix("Patient/") else {
-        return Err(FhirError::Invalid(
-            "Observation.subject must be a relative reference Patient/{id}".into(),
-        ));
-    };
-    if reference.contains("://") || !valid_id(id) {
-        return Err(FhirError::Invalid(
-            "Observation.subject must be a relative reference Patient/{id}".into(),
-        ));
+pub fn require_references(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: &Value,
+) -> Result<(), FhirError> {
+    for element in &model.references {
+        let references = reference_strings(resource, &element.path);
+        if element.min >= 1 && references.is_empty() {
+            return Err(FhirError::Invalid(format!(
+                "{}.{}.reference is required",
+                model.name, element.path
+            )));
+        }
+        for reference in references {
+            check_reference(tx, catalog, model, element, &reference)?;
+        }
     }
-    if tx
-        .get(
-            &ResourceType::Patient.tablet(),
-            id,
-            &ResourceType::Patient.by_id(),
-        )?
-        .is_none()
-    {
+    Ok(())
+}
+
+fn check_reference(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    element: &crate::catalog::ReferenceElement,
+    reference: &str,
+) -> Result<(), FhirError> {
+    let relative = format!(
+        "{}.{} must be a relative reference {}/{{id}}",
+        model.name,
+        element.path,
+        element
+            .targets
+            .first()
+            .map(String::as_str)
+            .unwrap_or("Resource")
+    );
+    if reference.contains("://") {
+        return Err(FhirError::Invalid(relative));
+    }
+    let Some((type_name, id)) = reference.split_once('/') else {
+        return Err(FhirError::Invalid(relative));
+    };
+    if type_name.is_empty() || reference.matches('/').count() != 1 || !valid_id(id) {
+        return Err(FhirError::Invalid(relative));
+    }
+    if !element.targets.is_empty() && !element.targets.iter().any(|target| target == type_name) {
+        return Err(FhirError::Invalid(relative));
+    }
+    let target = catalog.get(type_name)?;
+    if tx.get(&target.tablet(), id, &target.by_id())?.is_none() {
         return Err(FhirError::Invalid(format!(
-            "subject Patient/{id} does not exist"
+            "{} {type_name}/{id} does not exist",
+            element.path
         )));
     }
     Ok(())
+}
+
+fn reference_strings(resource: &Value, path: &str) -> Vec<String> {
+    let mut current = vec![resource];
+    for segment in path.split('.') {
+        let mut next = Vec::new();
+        for value in current {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        if let Some(child) = item.get(segment) {
+                            next.push(child);
+                        }
+                    }
+                }
+                other => {
+                    if let Some(child) = other.get(segment) {
+                        next.push(child);
+                    }
+                }
+            }
+        }
+        current = next;
+    }
+    let mut references = Vec::new();
+    for value in current {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    push_reference(&mut references, item);
+                }
+            }
+            other => push_reference(&mut references, other),
+        }
+    }
+    references
+}
+
+fn push_reference(references: &mut Vec<String>, value: &Value) {
+    if let Some(reference) = value.get("reference").and_then(|item| item.as_str()) {
+        if !reference.is_empty() {
+            references.push(reference.to_string());
+        }
+    }
 }
 
 fn check_version(

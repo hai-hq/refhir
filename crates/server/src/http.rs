@@ -2,7 +2,7 @@
 //! The router does not implement a second engine.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use haifhir_database::{CommitError, Database};
-use haifhir_fhir::{outcome_code, FhirError, RunError, RunResult};
+use haifhir_fhir::{outcome_code, Catalog, FhirError, RunError, RunResult};
 use serde_json::{json, Value};
 
 use crate::sync;
@@ -19,9 +19,10 @@ use crate::sync;
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
+    pub catalog: Arc<RwLock<Catalog>>,
 }
 
-pub fn app(db: Arc<Database>) -> Router {
+pub fn app(db: Arc<Database>, catalog: Arc<RwLock<Catalog>>) -> Router {
     Router::new()
         .route("/metadata", get(metadata))
         .route("/sync", get(sync_ws))
@@ -30,13 +31,24 @@ pub fn app(db: Arc<Database>) -> Router {
         .route("/:resource_type/:id/_history/:vid", get(vread))
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id", get(read).put(update).delete(remove))
-        .with_state(AppState { db })
+        .with_state(AppState { db, catalog })
 }
 
-pub async fn execute(db: &Arc<Database>, path: &str, args: Value) -> Result<RunResult, RunError> {
+pub async fn execute(
+    db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
+    path: &str,
+    args: Value,
+) -> Result<RunResult, RunError> {
     let db = db.clone();
+    let catalog = catalog.clone();
     let path = path.to_string();
-    match tokio::task::spawn_blocking(move || haifhir_fhir::run(&db, &path, &args)).await {
+    match tokio::task::spawn_blocking(move || {
+        let catalog = catalog.read().expect("catalog");
+        haifhir_fhir::run(&db, &catalog, &path, &args)
+    })
+    .await
+    {
         Ok(result) => result,
         Err(_) => Err(RunError::Commit(CommitError::Invalid(
             "operation worker stopped".into(),
@@ -44,12 +56,13 @@ pub async fn execute(db: &Arc<Database>, path: &str, args: Value) -> Result<RunR
     }
 }
 
-async fn metadata() -> Response {
-    fhir_json(StatusCode::OK, haifhir_fhir::capability_statement())
+async fn metadata(State(app): State<AppState>) -> Response {
+    let catalog = app.catalog.read().expect("catalog");
+    fhir_json(StatusCode::OK, catalog.capability_statement())
 }
 
 async fn sync_ws(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| sync::handle_socket(socket, app.db))
+    ws.on_upgrade(move |socket| sync::handle_socket(socket, app.db, app.catalog))
 }
 
 async fn bundle_post(State(app): State<AppState>, body: Bytes) -> Response {
@@ -57,7 +70,14 @@ async fn bundle_post(State(app): State<AppState>, body: Bytes) -> Response {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match execute(&app.db, "Bundle/transaction", json!({"resource": resource})).await {
+    match execute(
+        &app.db,
+        &app.catalog,
+        "Bundle/transaction",
+        json!({"resource": resource}),
+    )
+    .await
+    {
         Ok(result) => fhir_json(StatusCode::OK, result.value),
         Err(err) => error_response(err),
     }
@@ -74,6 +94,7 @@ async fn create(
     };
     match execute(
         &app.db,
+        &app.catalog,
         &format!("{resource_type}/create"),
         json!({"resource": resource}),
     )
@@ -92,7 +113,14 @@ async fn read(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
 ) -> Response {
-    match execute(&app.db, &format!("{resource_type}/read"), json!({"id": id})).await {
+    match execute(
+        &app.db,
+        &app.catalog,
+        &format!("{resource_type}/read"),
+        json!({"id": id}),
+    )
+    .await
+    {
         Ok(result) => resource_response(StatusCode::OK, result.value, None),
         Err(err) => error_response(err),
     }
@@ -115,7 +143,14 @@ async fn update(
     {
         args["ifMatch"] = json!(tag);
     }
-    match execute(&app.db, &format!("{resource_type}/update"), args).await {
+    match execute(
+        &app.db,
+        &app.catalog,
+        &format!("{resource_type}/update"),
+        args,
+    )
+    .await
+    {
         Ok(result) => {
             let location = format!("{resource_type}/{id}/_history/{}", result.ts);
             resource_response(StatusCode::OK, result.value, Some(location))
@@ -130,6 +165,7 @@ async fn remove(
 ) -> Response {
     match execute(
         &app.db,
+        &app.catalog,
         &format!("{resource_type}/delete"),
         json!({"id": id}),
     )
@@ -151,6 +187,7 @@ async fn search(
     }
     match execute(
         &app.db,
+        &app.catalog,
         &format!("{resource_type}/search"),
         Value::Object(args),
     )
@@ -167,6 +204,7 @@ async fn instance_history(
 ) -> Response {
     match execute(
         &app.db,
+        &app.catalog,
         &format!("{resource_type}/history"),
         json!({"id": id}),
     )
@@ -183,6 +221,7 @@ async fn vread(
 ) -> Response {
     match execute(
         &app.db,
+        &app.catalog,
         &format!("{resource_type}/vread"),
         json!({"id": id, "versionId": vid}),
     )

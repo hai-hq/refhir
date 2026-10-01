@@ -6,6 +6,7 @@ members = [
     "crates/sqlite",
     "crates/postgres",
     "crates/database",
+    "crates/fhirpath",
     "crates/fhir",
     "crates/server",
     "crates/haifhir",

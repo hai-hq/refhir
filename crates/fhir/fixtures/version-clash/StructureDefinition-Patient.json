@@ -1,0 +1,12 @@
+{
+  "resourceType": "StructureDefinition",
+  "url": "http://hl7.org/fhir/StructureDefinition/Patient",
+  "name": "Patient",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Patient",
+  "fhirVersion": "5.0.0",
+  "derivation": "specialization",
+  "snapshot": {"element": [{"path": "Patient", "min": 0, "max": "*"}]}
+}

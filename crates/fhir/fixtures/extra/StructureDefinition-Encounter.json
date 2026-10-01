@@ -1,0 +1,17 @@
+{
+  "resourceType": "StructureDefinition",
+  "url": "http://hl7.org/fhir/StructureDefinition/Encounter",
+  "name": "Encounter",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Encounter",
+  "fhirVersion": "4.0.1",
+  "derivation": "specialization",
+  "snapshot": {
+    "element": [
+      {"path": "Encounter", "min": 0, "max": "*"},
+      {"path": "Encounter.status", "min": 1, "max": "1", "type": [{"code": "code"}]}
+    ]
+  }
+}

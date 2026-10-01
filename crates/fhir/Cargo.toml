@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 haifhir-database = { path = "../database" }
+haifhir-fhirpath = { path = "../fhirpath" }
 haifhir-persistence = { path = "../persistence" }
 haifhir-types = { path = "../types" }
 serde_json = { workspace = true }
