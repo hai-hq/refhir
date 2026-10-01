@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use haifhir_types::{IndexId, Timestamp};
+use refhir_types::{IndexId, Timestamp};
 
 use crate::reads::ReadSet;
 use crate::OccConflict;

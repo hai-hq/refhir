@@ -8,8 +8,8 @@ use std::sync::{Arc, RwLock};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use haifhir_database::{Database, SubToken};
-use haifhir_fhir::{Catalog, RunResult};
+use refhir_database::{Database, SubToken};
+use refhir_fhir::{Catalog, RunResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -70,7 +70,7 @@ async fn handle_text(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     db: &Arc<Database>,
     catalog: &Arc<RwLock<Catalog>>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
+    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
     text: &str,
@@ -183,7 +183,7 @@ async fn handle_text(
 async fn add_query(
     db: &Arc<Database>,
     catalog: &Arc<RwLock<Catalog>>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
+    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
     query_id: u64,
     path: &str,
     args: Value,
@@ -207,7 +207,7 @@ async fn push_updates(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     db: &Arc<Database>,
     catalog: &Arc<RwLock<Catalog>>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
+    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
     ids: HashSet<u64>,
@@ -253,7 +253,7 @@ async fn push_updates(
 async fn rerun(
     db: &Arc<Database>,
     catalog: &Arc<RwLock<Catalog>>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<haifhir_database::Invalidation>,
+    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
     token: SubToken,
     query_id: u64,
     path: &str,
@@ -267,8 +267,8 @@ async fn rerun(
             .map_err(|err| err.to_string())?;
         match db.refresh_subscription(token, reads.clone(), ts) {
             Ok(()) => return Ok((value, token)),
-            Err(haifhir_database::SubscribeError::Stale) => continue,
-            Err(haifhir_database::SubscribeError::Gone) => {
+            Err(refhir_database::SubscribeError::Stale) => continue,
+            Err(refhir_database::SubscribeError::Gone) => {
                 match db.subscribe(reads, ts, query_id, inv_tx.clone()) {
                     Ok(new_token) => return Ok((value, new_token)),
                     Err(_) => continue,

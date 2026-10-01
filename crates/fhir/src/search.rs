@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use haifhir_database::Transaction;
-use haifhir_types::{exact_key, string_interval, token_interval, IndexId, Interval};
+use refhir_database::Transaction;
+use refhir_types::{exact_key, string_interval, token_interval, IndexId, Interval};
 use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};

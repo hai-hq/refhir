@@ -6,12 +6,12 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use haifhir_persistence::{
+use refhir_persistence::{
     document_from_parts, ConflictStrategy, DocumentLogEntry, IndexScanRow, LatestDocument,
     PersistError, Persistence, PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader,
     TimestampRange,
 };
-use haifhir_types::{DocumentId, IndexId, Interval, Order, Timestamp};
+use refhir_types::{DocumentId, IndexId, Interval, Order, Timestamp};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value as JsonValue;
 
@@ -581,7 +581,7 @@ mod conformance_store;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use haifhir_persistence::conformance;
+    use refhir_persistence::conformance;
 
     #[test]
     fn memory_log_roundtrip() {
@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn file_reopen_keeps_the_log() {
         let path = std::env::temp_dir().join(format!(
-            "haifhir-sqlite-{}-{}.sqlite",
+            "refhir-sqlite-{}-{}.sqlite",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

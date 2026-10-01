@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-use haifhir_database::Transaction;
-use haifhir_types::Timestamp;
+use refhir_database::Transaction;
+use refhir_types::Timestamp;
 use serde_json::{json, Value};
 
 use crate::catalog::{valid_id, Catalog};
@@ -283,12 +283,12 @@ fn parse_url(url: &str) -> Result<(String, Option<String>), FhirError> {
     Ok((type_name, id))
 }
 
-pub fn finalize(value: &mut Value, written: &[haifhir_database::WrittenId], ts: Timestamp) {
+pub fn finalize(value: &mut Value, written: &[refhir_database::WrittenId], ts: Timestamp) {
     stamp_tree(value, written, ts);
     rewrite_placeholders(value, ts);
 }
 
-fn stamp_tree(value: &mut Value, written: &[haifhir_database::WrittenId], ts: Timestamp) {
+fn stamp_tree(value: &mut Value, written: &[refhir_database::WrittenId], ts: Timestamp) {
     let resource_type = value
         .get("resourceType")
         .and_then(|item| item.as_str())

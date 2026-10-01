@@ -6,12 +6,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use haifhir_database::{CommitError, Database, IndexPut};
-use haifhir_persistence::{
+use refhir_database::{CommitError, Database, IndexPut};
+use refhir_persistence::{
     ConformanceStore, InstallError, NewPackage, NewSearchParameter, NewStructureDefinition,
     ParamStatus,
 };
-use haifhir_types::{IndexId, Interval, Order, Timestamp};
+use refhir_types::{IndexId, Interval, Order, Timestamp};
 use serde_json::Value;
 
 use crate::catalog::{pending_index_keys, Catalog};

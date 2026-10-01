@@ -1,4 +1,4 @@
-use haifhir_persistence::{
+use refhir_persistence::{
     ConformanceStore, InstallError, InstallOutcome, NewPackage, ParamStatus, PendingParam,
     PersistError, StoredBackfill, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
 };

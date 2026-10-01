@@ -46,5 +46,5 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build haifhir (release)
-        run: cargo build --release -p haifhir
+      - name: Build refhir (release)
+        run: cargo build --release -p refhir

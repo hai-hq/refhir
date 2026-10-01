@@ -9,7 +9,7 @@ members = [
     "crates/fhirpath",
     "crates/fhir",
     "crates/server",
-    "crates/haifhir",
+    "crates/refhir",
 ]
 
 [workspace.package]

@@ -1,12 +1,12 @@
-//! Axum HTTP and the `/sync` websocket. Both call `haifhir_fhir::run`.
+//! Axum HTTP and the `/sync` websocket. Both call `refhir_fhir::run`.
 
 mod http;
 mod sync;
 
 use std::sync::{Arc, RwLock};
 
-use haifhir_database::Database;
-use haifhir_fhir::Catalog;
+use refhir_database::Database;
+use refhir_fhir::Catalog;
 use tokio::net::TcpListener;
 
 pub use http::{app, AppState};

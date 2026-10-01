@@ -1,12 +1,12 @@
 [package]
-name = "haifhir-database"
+name = "refhir-database"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-haifhir-persistence = { path = "../persistence" }
-haifhir-types = { path = "../types" }
+refhir-persistence = { path = "../persistence" }
+refhir-types = { path = "../types" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 
@@ -14,4 +14,4 @@ tokio = { workspace = true }
 test-util = []
 
 [dev-dependencies]
-haifhir-sqlite = { path = "../sqlite" }
+refhir-sqlite = { path = "../sqlite" }

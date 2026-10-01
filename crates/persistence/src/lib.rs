@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use haifhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
+use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use serde_json::Value as JsonValue;
 
 /// How `Persistence::write` treats an existing primary key.
@@ -389,7 +389,7 @@ pub trait ConformanceStore: Send + Sync {
 
 pub mod conformance {
     use super::*;
-    use haifhir_types::TabletId;
+    use refhir_types::TabletId;
 
     /// Feature 1: a revision and its index row are visible at that timestamp,
     /// and a later tombstone hides them without erasing the earlier snapshot.

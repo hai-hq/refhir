@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use haifhir_types::{IndexId, Timestamp};
+use refhir_types::{IndexId, Timestamp};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::reads::ReadSet;

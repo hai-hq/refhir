@@ -6,11 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use haifhir_fhirpath::{Host, Model};
-use haifhir_persistence::{
+use refhir_fhirpath::{Host, Model};
+use refhir_persistence::{
     ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
 };
-use haifhir_types::{exact_key, IndexId, TabletId};
+use refhir_types::{exact_key, IndexId, TabletId};
 use serde_json::{json, Value};
 
 use crate::error::FhirError;
@@ -95,7 +95,7 @@ impl Catalog {
     }
 
     pub fn load(
-        packages: &[haifhir_persistence::StoredPackage],
+        packages: &[refhir_persistence::StoredPackage],
         definitions: &[StoredStructureDefinition],
         parameters: &[StoredSearchParameter],
     ) -> Result<Self, PersistError> {

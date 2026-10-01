@@ -6,12 +6,12 @@
 
 use std::sync::{Arc, Mutex};
 
-use haifhir_persistence::{
+use refhir_persistence::{
     document_from_parts, ConflictStrategy, DocumentLogEntry, IndexScanRow, LatestDocument,
     PersistError, Persistence, PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader,
     TimestampRange,
 };
-use haifhir_types::{DocumentId, IndexId, Interval, Order, Timestamp};
+use refhir_types::{DocumentId, IndexId, Interval, Order, Timestamp};
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
 use serde_json::Value as JsonValue;
@@ -546,7 +546,7 @@ mod conformance_store;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use haifhir_persistence::conformance;
+    use refhir_persistence::conformance;
 
     #[test]
     fn postgres_log_roundtrip_when_configured() {

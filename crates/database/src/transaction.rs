@@ -6,10 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use haifhir_persistence::{
+use refhir_persistence::{
     DocumentLogEntry, PersistError, PersistenceIndexEntry, PersistenceReader,
 };
-use haifhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
+use refhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use serde_json::Value;
 
 use crate::reads::ReadSet;

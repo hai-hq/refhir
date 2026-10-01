@@ -5,8 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use haifhir_database::{CommitError, Database, ReadSet};
-use haifhir_types::Timestamp;
+use refhir_database::{CommitError, Database, ReadSet};
+use refhir_types::Timestamp;
 use serde_json::Value;
 
 use crate::bundle;
@@ -92,7 +92,7 @@ pub fn stamp_stored_json(json: &mut String, ts: Timestamp) {
 }
 
 pub fn dispatch(
-    tx: &mut haifhir_database::Transaction,
+    tx: &mut refhir_database::Transaction,
     catalog: &Catalog,
     path: &str,
     args: &Value,

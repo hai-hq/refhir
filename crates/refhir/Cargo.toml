@@ -1,16 +1,16 @@
 [package]
-name = "haifhir"
+name = "refhir"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-haifhir-database = { path = "../database" }
-haifhir-fhir = { path = "../fhir" }
-haifhir-persistence = { path = "../persistence" }
-haifhir-postgres = { path = "../postgres" }
-haifhir-server = { path = "../server" }
-haifhir-sqlite = { path = "../sqlite" }
+refhir-database = { path = "../database" }
+refhir-fhir = { path = "../fhir" }
+refhir-persistence = { path = "../persistence" }
+refhir-postgres = { path = "../postgres" }
+refhir-server = { path = "../server" }
+refhir-sqlite = { path = "../sqlite" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

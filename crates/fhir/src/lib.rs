@@ -1,6 +1,6 @@
 //! FHIR resource catalog and operation handlers.
 //!
-//! Convex runs user functions in V8. HaiFHIR handlers are Rust functions on
+//! Convex runs user functions in V8. ReFHIR handlers are Rust functions on
 //! `Transaction`. Operation names look like `Patient/read`.
 
 mod bundle;

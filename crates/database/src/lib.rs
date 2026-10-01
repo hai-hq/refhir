@@ -15,8 +15,8 @@ mod write_log;
 use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex};
 
-use haifhir_persistence::{ConflictStrategy, PersistError, Persistence, PersistenceReader};
-use haifhir_types::{IndexId, Timestamp};
+use refhir_persistence::{ConflictStrategy, PersistError, Persistence, PersistenceReader};
+use refhir_types::{IndexId, Timestamp};
 use tokio::sync::mpsc::UnboundedSender;
 
 pub use reads::ReadSet;
@@ -92,7 +92,7 @@ fn uncertain_persist(message: String) -> ! {
     if let Some(hook) = hook {
         hook(message.clone());
     }
-    eprintln!("haifhir: uncertain persistence write, exiting: {message}");
+    eprintln!("refhir: uncertain persistence write, exiting: {message}");
     std::process::exit(70);
 }
 
@@ -305,12 +305,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use haifhir_persistence::{
+    use refhir_persistence::{
         ConflictStrategy, DocumentLogEntry, IndexScanRow, PersistError, Persistence,
         PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader, TimestampRange,
     };
-    use haifhir_sqlite::SqlitePersistence;
-    use haifhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId};
+    use refhir_sqlite::SqlitePersistence;
+    use refhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId};
     use serde_json::json;
 
     fn memory_db() -> Database {

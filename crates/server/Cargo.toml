@@ -1,12 +1,12 @@
 [package]
-name = "haifhir-server"
+name = "refhir-server"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-haifhir-database = { path = "../database" }
-haifhir-fhir = { path = "../fhir" }
+refhir-database = { path = "../database" }
+refhir-fhir = { path = "../fhir" }
 axum = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true }
@@ -14,8 +14,8 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
-haifhir-database = { path = "../database", features = ["test-util"] }
-haifhir-sqlite = { path = "../sqlite" }
+refhir-database = { path = "../database", features = ["test-util"] }
+refhir-sqlite = { path = "../sqlite" }
 http-body-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tower = { workspace = true }

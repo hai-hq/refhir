@@ -10,8 +10,8 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use haifhir_database::{CommitError, Database};
-use haifhir_fhir::{outcome_code, Catalog, FhirError, RunError, RunResult};
+use refhir_database::{CommitError, Database};
+use refhir_fhir::{outcome_code, Catalog, FhirError, RunError, RunResult};
 use serde_json::{json, Value};
 
 use crate::sync;
@@ -45,7 +45,7 @@ pub async fn execute(
     let path = path.to_string();
     match tokio::task::spawn_blocking(move || {
         let catalog = catalog.read().expect("catalog");
-        haifhir_fhir::run(&db, &catalog, &path, &args)
+        refhir_fhir::run(&db, &catalog, &path, &args)
     })
     .await
     {

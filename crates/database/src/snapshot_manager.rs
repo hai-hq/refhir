@@ -4,7 +4,7 @@
 //! Document bytes stay in the log. The manager only advances the repeatable
 //! timestamp readers are allowed to use.
 
-use haifhir_types::Timestamp;
+use refhir_types::Timestamp;
 
 #[derive(Clone, Debug)]
 pub struct SnapshotManager {

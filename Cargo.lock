@@ -439,104 +439,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "haifhir"
-version = "0.1.0"
-dependencies = [
- "haifhir-database",
- "haifhir-fhir",
- "haifhir-persistence",
- "haifhir-postgres",
- "haifhir-server",
- "haifhir-sqlite",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "haifhir-database"
-version = "0.1.0"
-dependencies = [
- "haifhir-persistence",
- "haifhir-sqlite",
- "haifhir-types",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "haifhir-fhir"
-version = "0.1.0"
-dependencies = [
- "haifhir-database",
- "haifhir-fhirpath",
- "haifhir-persistence",
- "haifhir-sqlite",
- "haifhir-types",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "haifhir-fhirpath"
-version = "0.1.0"
-dependencies = [
- "regex",
- "roxmltree",
- "rust_decimal",
- "serde_json",
-]
-
-[[package]]
-name = "haifhir-persistence"
-version = "0.1.0"
-dependencies = [
- "haifhir-types",
- "serde_json",
-]
-
-[[package]]
-name = "haifhir-postgres"
-version = "0.1.0"
-dependencies = [
- "haifhir-persistence",
- "haifhir-types",
- "postgres",
- "serde_json",
-]
-
-[[package]]
-name = "haifhir-server"
-version = "0.1.0"
-dependencies = [
- "axum",
- "futures-util",
- "haifhir-database",
- "haifhir-fhir",
- "haifhir-sqlite",
- "http-body-util",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tower",
-]
-
-[[package]]
-name = "haifhir-sqlite"
-version = "0.1.0"
-dependencies = [
- "haifhir-persistence",
- "haifhir-types",
- "rusqlite",
- "serde_json",
-]
-
-[[package]]
-name = "haifhir-types"
-version = "0.1.0"
-
-[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1050,6 +952,104 @@ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
 ]
+
+[[package]]
+name = "refhir"
+version = "0.1.0"
+dependencies = [
+ "refhir-database",
+ "refhir-fhir",
+ "refhir-persistence",
+ "refhir-postgres",
+ "refhir-server",
+ "refhir-sqlite",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "refhir-database"
+version = "0.1.0"
+dependencies = [
+ "refhir-persistence",
+ "refhir-sqlite",
+ "refhir-types",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "refhir-fhir"
+version = "0.1.0"
+dependencies = [
+ "refhir-database",
+ "refhir-fhirpath",
+ "refhir-persistence",
+ "refhir-sqlite",
+ "refhir-types",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "refhir-fhirpath"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "roxmltree",
+ "rust_decimal",
+ "serde_json",
+]
+
+[[package]]
+name = "refhir-persistence"
+version = "0.1.0"
+dependencies = [
+ "refhir-types",
+ "serde_json",
+]
+
+[[package]]
+name = "refhir-postgres"
+version = "0.1.0"
+dependencies = [
+ "postgres",
+ "refhir-persistence",
+ "refhir-types",
+ "serde_json",
+]
+
+[[package]]
+name = "refhir-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-util",
+ "http-body-util",
+ "refhir-database",
+ "refhir-fhir",
+ "refhir-sqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "tower",
+]
+
+[[package]]
+name = "refhir-sqlite"
+version = "0.1.0"
+dependencies = [
+ "refhir-persistence",
+ "refhir-types",
+ "rusqlite",
+ "serde_json",
+]
+
+[[package]]
+name = "refhir-types"
+version = "0.1.0"
 
 [[package]]
 name = "regex"

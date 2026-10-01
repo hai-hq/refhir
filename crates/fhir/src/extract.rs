@@ -4,8 +4,8 @@
 //! terminology service is configured. The indexed bytes are still the token,
 //! string, reference, and date keys this engine already stores.
 
-use haifhir_fhirpath::{Expr, Host, Model};
-use haifhir_types::{string_key, token_key, IndexId};
+use refhir_fhirpath::{Expr, Host, Model};
+use refhir_types::{string_key, token_key, IndexId};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,7 +63,7 @@ impl Extractor {
     }
 
     fn values(&self, resource: &Value, path_model: &Model, host: &dyn Host) -> Vec<String> {
-        let Ok(items) = haifhir_fhirpath::evaluate(&self.expr, resource, path_model, host) else {
+        let Ok(items) = refhir_fhirpath::evaluate(&self.expr, resource, path_model, host) else {
             return Vec::new();
         };
         let mut values = Vec::new();
@@ -77,7 +77,7 @@ impl Extractor {
 pub fn compile(param_type: &str, expression: Option<&str>) -> Option<Extractor> {
     let kind = search_kind(param_type)?;
     let expression = expression?.trim();
-    let expr = haifhir_fhirpath::parse(expression).ok()?;
+    let expr = refhir_fhirpath::parse(expression).ok()?;
     if expr.calls("memberOf") {
         return None;
     }
@@ -94,12 +94,12 @@ fn search_kind(param_type: &str) -> Option<SearchKind> {
     })
 }
 
-fn encode_value(kind: SearchKind, item: &haifhir_fhirpath::Value) -> Vec<String> {
+fn encode_value(kind: SearchKind, item: &refhir_fhirpath::Value) -> Vec<String> {
     let json = match item {
-        haifhir_fhirpath::Value::Node { json, .. } => json,
-        haifhir_fhirpath::Value::String(text) => return vec![text.clone()],
-        haifhir_fhirpath::Value::Boolean { value, .. } => return vec![value.to_string()],
-        haifhir_fhirpath::Value::Date(_) | haifhir_fhirpath::Value::DateTime(_) => {
+        refhir_fhirpath::Value::Node { json, .. } => json,
+        refhir_fhirpath::Value::String(text) => return vec![text.clone()],
+        refhir_fhirpath::Value::Boolean { value, .. } => return vec![value.to_string()],
+        refhir_fhirpath::Value::Date(_) | refhir_fhirpath::Value::DateTime(_) => {
             return vec![item.render().trim_start_matches('@').to_string()];
         }
         _ => return Vec::new(),

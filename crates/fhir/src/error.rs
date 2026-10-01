@@ -1,4 +1,4 @@
-use haifhir_persistence::PersistError;
+use refhir_persistence::PersistError;
 
 #[derive(Debug)]
 pub enum FhirError {

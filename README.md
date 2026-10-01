@@ -1,6 +1,6 @@
-# HaiFHIR
+# ReFHIR
 
-> **FHIR defines healthcare state. HaiFHIR keeps software and AI synchronized with it.**
+> **FHIR defines healthcare state. ReFHIR keeps software and AI synchronized with it.**
 
 Open-source reactive FHIR server from [HAIHQ](https://github.com/hai-hq).  
 Repository: [github.com/hai-hq/haifhir](https://github.com/hai-hq/haifhir)
@@ -9,9 +9,9 @@ Repository: [github.com/hai-hq/haifhir](https://github.com/hai-hq/haifhir)
 
 ## Overview
 
-HaiFHIR explores a different programming model for healthcare applications and AI systems. Instead of treating FHIR mainly as a request-response API over healthcare data, it treats FHIR data as **live application state**.
+ReFHIR explores a different programming model for healthcare applications and AI systems. Instead of treating FHIR mainly as a request-response API over healthcare data, it treats FHIR data as **live application state**.
 
-Applications and AI agents can run FHIR queries and stay subscribed to their results. When underlying resources change, HaiFHIR finds which active queries are affected, updates those results, and keeps connected clients aligned with **committed** state.
+Applications and AI agents can run FHIR queries and stay subscribed to their results. When underlying resources change, ReFHIR finds which active queries are affected, updates those results, and keeps connected clients aligned with **committed** state.
 
 The goal is to make real-time healthcare applications and healthcare AI systems simpler to build while staying compatible with the FHIR ecosystem.
 
@@ -27,7 +27,7 @@ returns one snapshot. Healthcare state keeps moving: new results, discontinued o
 
 Staying current typically means polling, Subscriptions, WebSockets, webhooks, caches, invalidation, refetch, reconciliation, and reconnect logic. The app or agent must decide what changed, whether it matters, which queries to rerun, whether caches are stale, whether related writes were one transaction, and how to recover after gaps.
 
-That burden is especially heavy for **AI agents**. An agent may read state at `t₀`, reason and call tools for seconds or minutes, then act at `t₂` on a snapshot that is no longer true. HaiFHIR asks whether the **data layer** can offer a better primitive than every runtime rebuilding its own sync stack.
+That burden is especially heavy for **AI agents**. An agent may read state at `t₀`, reason and call tools for seconds or minutes, then act at `t₂` on a snapshot that is no longer true. ReFHIR asks whether the **data layer** can offer a better primitive than every runtime rebuilding its own sync stack.
 
 ## Product thesis
 
@@ -48,7 +48,7 @@ The client gets current matches. The query stays active. Membership, ordering, c
 
 ### Core principle
 
-HaiFHIR is not simply “FHIR with WebSockets.” FHIR already has notifications and Subscriptions.
+ReFHIR is not simply “FHIR with WebSockets.” FHIR already has notifications and Subscriptions.
 
 > **Queries, not events, are the primary unit of synchronization.**
 
@@ -58,7 +58,7 @@ For applications, that means live UI state. For agents, it means **live working 
 
 Agents often chain: read patient state, inspect meds and labs, check tasks, reason, call tools, act. Each FHIR call is a snapshot. The usual fix is more glue: refetch, poll, listen, invalidate context, rerun tools, check versions, reconcile.
 
-HaiFHIR shifts generic sync into the healthcare data layer so runtimes can ask **what is current now?** instead of only **what did I last fetch?** That does not make an agent clinically safe by itself; it gives a stronger primitive to build on.
+ReFHIR shifts generic sync into the healthcare data layer so runtimes can ask **what is current now?** instead of only **what did I last fetch?** That does not make an agent clinically safe by itself; it gives a stronger primitive to build on.
 
 **Reactive context.** A live query over e.g. active `MedicationRequest`s can update while the agent works, so the runtime can refresh context, reconsider a plan, or block actions on stale assumptions.
 
@@ -66,13 +66,13 @@ HaiFHIR shifts generic sync into the healthcare data layer so runtimes can ask *
 
 **Context as a dependency graph.** Instead of one-off `GET Patient`, `GET Observation`, …, a task can depend on a set of live queries (patient, encounter, open tasks). The runtime can tell **context still valid** from **context changed, re-evaluate**.
 
-**Long-running work.** Agents may span many steps while clinicians, devices, or other agents change the same data. HaiFHIR assumes **the world can change while software is acting.**
+**Long-running work.** Agents may span many steps while clinicians, devices, or other agents change the same data. ReFHIR assumes **the world can change while software is acting.**
 
 **Commit-time revalidation (direction).** For consequential actions, the same dependency tracking that drives query sync can eventually support “assumptions at read time still hold at commit time” (not required in the first server release).
 
 ## Product goals
 
-HaiFHIR aims to provide:
+ReFHIR aims to provide:
 
 - a standards-compatible FHIR server;
 - reactive FHIR queries and automatic dependency tracking;
@@ -88,7 +88,7 @@ Less infrastructure for live apps and state-aware healthcare AI.
 
 ## Non-goals
 
-HaiFHIR is not:
+ReFHIR is not:
 
 - an EMR, hospital management system, or workflow product;
 - an **AI agent framework**, autonomous clinical agent, or CDS platform;
@@ -187,7 +187,7 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 | FHIR Subscription delivery | **Deferred** (vs live query sync) |
 | Commit-time agent revalidation | **Deferred** (architecture direction) |
 
-**Persistence:** SQLite (`haifhir.sqlite`); optional Postgres.
+**Persistence:** SQLite (`refhir.sqlite`); optional Postgres.
 
 **This build:**
 
@@ -195,7 +195,7 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 - `meta.versionId` = commit timestamp; `If-Match` / version conflicts → 409 after OCC retries.
 - Engine reference: [get-convex/convex-backend](https://github.com/get-convex/convex-backend) (database layer only).
 
-**Crates:** `types`, `persistence`, `sqlite`, `postgres`, `database`, `fhir`, `server`, `haifhir` (binary).
+**Crates:** `types`, `persistence`, `sqlite`, `postgres`, `database`, `fhir`, `server`, `refhir` (binary).
 
 ### Roadmap vs defer
 
@@ -212,7 +212,7 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 **Rust 1.85** ([rust-toolchain.toml](rust-toolchain.toml)).
 
 ```bash
-cargo run -p haifhir -- --sqlite haifhir.sqlite
+cargo run -p refhir -- --sqlite refhir.sqlite
 ```
 
 That command installs the bundled `hl7.fhir.r4.core` 4.0.1 package, so the concrete R4 resource types are available on a fresh database. Pass `--package dir` to install a package directory instead. Repeat the flag for more than one package on the same FHIR version.
@@ -224,7 +224,7 @@ Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It dow
 
 | Flag | Purpose |
 |------|---------|
-| `--sqlite path` | SQLite file (default `haifhir.sqlite`) |
+| `--sqlite path` | SQLite file (default `refhir.sqlite`) |
 | `--postgres url` | Postgres (not with `--sqlite`) |
 | `--bind host:port` | Default `127.0.0.1:8080` |
 | `--package dir` | FHIR package directory. Repeatable. Replaces the bundled R4 core default. |
@@ -276,12 +276,12 @@ Postgres test: set `HAIFHIR_POSTGRES_URL`.
 
 ## Open source
 
-HaiFHIR is developed openly under HAIHQ: implementation, experiments, benchmarks, and architecture in public. Use it as **infrastructure** or as **research** on reactive healthcare data, consistency, and agent state.
+ReFHIR is developed openly under HAIHQ: implementation, experiments, benchmarks, and architecture in public. Use it as **infrastructure** or as **research** on reactive healthcare data, consistency, and agent state.
 
 ## Long-term direction
 
 > What should the healthcare data layer look like when applications and AI agents continuously operate over changing clinical state?
 
-FHIR keeps interoperability. HaiFHIR explores making that state **reactive**: apps stay synchronized; agents can work against context that can stay current, surface dependency changes, and eventually support stronger checks before consequential commits.
+FHIR keeps interoperability. ReFHIR explores making that state **reactive**: apps stay synchronized; agents can work against context that can stay current, surface dependency changes, and eventually support stronger checks before consequential commits.
 
-**FHIR defines healthcare state. HaiFHIR keeps software and AI synchronized with it.**
+**FHIR defines healthcare state. ReFHIR keeps software and AI synchronized with it.**

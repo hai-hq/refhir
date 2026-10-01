@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use haifhir_types::{IndexId, Interval};
+use refhir_types::{IndexId, Interval};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadSet {

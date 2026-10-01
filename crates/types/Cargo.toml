@@ -1,5 +1,5 @@
 [package]
-name = "haifhir-types"
+name = "refhir-types"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

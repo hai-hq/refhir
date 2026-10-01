@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use haifhir_database::Database;
-use haifhir_sqlite::SqlitePersistence;
-use haifhir_types::{token_interval, IndexId, Order};
+use refhir_database::Database;
+use refhir_sqlite::SqlitePersistence;
+use refhir_types::{token_interval, IndexId, Order};
 use serde_json::{json, Value};
 
 use crate::catalog::Catalog;
@@ -87,7 +87,7 @@ fn patient_crud_history_and_search() {
         .index_scan(
             &IndexId::new("Patient/by_id"),
             db.db.latest_ts(),
-            &haifhir_types::Interval::all(),
+            &refhir_types::Interval::all(),
             Order::Asc,
         )
         .unwrap();
@@ -163,7 +163,7 @@ fn patient_crud_history_and_search() {
         .index_scan(
             &IndexId::new("Patient/by_id"),
             db.db.latest_ts(),
-            &haifhir_types::Interval::all(),
+            &refhir_types::Interval::all(),
             Order::Asc,
         )
         .unwrap();

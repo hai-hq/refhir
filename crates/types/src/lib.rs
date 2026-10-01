@@ -1,7 +1,7 @@
 //! Identifiers and timestamps shared by the engine.
 //!
 //! Convex equivalent: `Timestamp` and document/index ids in `crates/common`.
-//! HaiFHIR keeps the same roles and drops packed Convex values.
+//! ReFHIR keeps the same roles and drops packed Convex values.
 
 use std::fmt;
 

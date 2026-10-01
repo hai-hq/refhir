@@ -4,9 +4,9 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
-use haifhir_database::Database;
-use haifhir_fhir::{install_package_dir, minir4_dir, Catalog, MAX_OCC_FAILURES};
-use haifhir_sqlite::SqlitePersistence;
+use refhir_database::Database;
+use refhir_fhir::{install_package_dir, minir4_dir, Catalog, MAX_OCC_FAILURES};
+use refhir_sqlite::SqlitePersistence;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -220,7 +220,7 @@ async fn sync_subscription_transitions_after_mutation() {
     let (db, catalog) = memory();
     {
         let loaded = catalog.read().expect("catalog");
-        haifhir_fhir::run(
+        refhir_fhir::run(
             &db,
             &loaded,
             "Patient/create",

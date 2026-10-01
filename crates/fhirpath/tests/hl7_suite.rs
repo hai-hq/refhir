@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use haifhir_fhirpath::{evaluate, parse, Error, Host, Model, Value};
+use refhir_fhirpath::{evaluate, parse, Error, Host, Model, Value};
 use roxmltree::Node;
 use serde_json::{Map, Number, Value as Json};
 
@@ -124,7 +124,7 @@ fn resolve_contained_reference_and_member_of_without_terminology() {
 
     let member = parse("'code'.memberOf('http://example.org/ValueSet/demo')").unwrap();
     let error = evaluate(&member, &Json::Object(Map::new()), &Model::new(), &SuiteHost { strict: false }).unwrap_err();
-    assert!(matches!(error.kind, haifhir_fhirpath::ErrorKind::Unsupported));
+    assert!(matches!(error.kind, refhir_fhirpath::ErrorKind::Unsupported));
 }
 
 fn load_model() -> (Model, BTreeMap<String, Elem>) {

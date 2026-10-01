@@ -1,16 +1,16 @@
 [package]
-name = "haifhir-fhir"
+name = "refhir-fhir"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-haifhir-database = { path = "../database" }
-haifhir-fhirpath = { path = "../fhirpath" }
-haifhir-persistence = { path = "../persistence" }
-haifhir-types = { path = "../types" }
+refhir-database = { path = "../database" }
+refhir-fhirpath = { path = "../fhirpath" }
+refhir-persistence = { path = "../persistence" }
+refhir-types = { path = "../types" }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-haifhir-sqlite = { path = "../sqlite" }
+refhir-sqlite = { path = "../sqlite" }

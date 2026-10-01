@@ -1,5 +1,5 @@
-use haifhir_database::{Revision, Transaction};
-use haifhir_types::Timestamp;
+use refhir_database::{Revision, Transaction};
+use refhir_types::Timestamp;
 use serde_json::{json, Value};
 
 use crate::catalog::ResourceModel;
