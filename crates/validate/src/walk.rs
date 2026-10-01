@@ -485,19 +485,21 @@ impl State<'_> {
         if binding.strength == "preferred" || binding.strength == "example" {
             return;
         }
-        for (system, code) in bound_codes(value, type_code.unwrap_or("")) {
-            match self.terms.contains(&binding.value_set, system.as_deref(), &code) {
-                TermAnswer::Yes => {}
+        for bound in bound_codes(value, type_code.unwrap_or("")) {
+            match self.terms.contains(&binding.value_set, bound.system.as_deref(), &bound.code) {
+                TermAnswer::Yes => {
+                    self.bound_concept(element, &binding.value_set, binding.strength.as_str(), &bound)
+                }
                 TermAnswer::No if binding.strength == "required" => self.issue(
                     Severity::Error,
                     "code-invalid",
-                    format!("{} code {code} is not in {}", element.path, binding.value_set),
+                    format!("{} code {} is not in {}", element.path, bound.code, binding.value_set),
                     &element.path,
                 ),
                 TermAnswer::No => self.issue(
                     Severity::Warning,
                     "code-invalid",
-                    format!("{} code {code} is not in {}", element.path, binding.value_set),
+                    format!("{} code {} is not in {}", element.path, bound.code, binding.value_set),
                     &element.path,
                 ),
                 TermAnswer::Unknown => self.issue(
@@ -506,6 +508,30 @@ impl State<'_> {
                     format!("{} value set {} is not loaded", element.path, binding.value_set),
                     &element.path,
                 ),
+            }
+        }
+    }
+
+    fn bound_concept(&self, element: &ElementDef, value_set: &str, strength: &str, bound: &BoundCode) {
+        let Some(described) = self.terms.describe_bound(value_set, bound.system.as_deref(), &bound.code) else {
+            return;
+        };
+        if described.inactive && strength == "required" {
+            self.issue(
+                Severity::Error,
+                "code-invalid",
+                format!("{} code {} is inactive", element.path, bound.code),
+                &element.path,
+            );
+        }
+        if let (Some(given), Some(expected)) = (&bound.display, &described.display) {
+            if given != expected {
+                self.issue(
+                    Severity::Warning,
+                    "code-invalid",
+                    format!("{} display {given} does not match {expected}", element.path),
+                    &element.path,
+                );
             }
         }
     }
@@ -693,10 +719,16 @@ fn bare_contained(path: &str) -> ElementDef {
     }
 }
 
-fn bound_codes(value: &Json, type_code: &str) -> Vec<(Option<String>, String)> {
+struct BoundCode {
+    system: Option<String>,
+    code: String,
+    display: Option<String>,
+}
+
+fn bound_codes(value: &Json, type_code: &str) -> Vec<BoundCode> {
     if let Some(text) = value.as_str() {
         if type_code == "code" || type_code.is_empty() || is_primitive(type_code) {
-            return vec![(None, text.to_string())];
+            return vec![BoundCode { system: None, code: text.to_string(), display: None }];
         }
     }
     if value.get("coding").is_some() {
@@ -711,13 +743,13 @@ fn bound_codes(value: &Json, type_code: &str) -> Vec<(Option<String>, String)> {
     coding(value).into_iter().collect()
 }
 
-fn coding(value: &Json) -> Option<(Option<String>, String)> {
+fn coding(value: &Json) -> Option<BoundCode> {
     let code = value.get("code").and_then(|item| item.as_str())?;
-    let system = value
-        .get("system")
-        .and_then(|item| item.as_str())
-        .map(|system| system.to_string());
-    Some((system, code.to_string()))
+    Some(BoundCode {
+        system: value.get("system").and_then(|item| item.as_str()).map(|system| system.to_string()),
+        code: code.to_string(),
+        display: value.get("display").and_then(|item| item.as_str()).map(|display| display.to_string()),
+    })
 }
 
 fn ordered(left: &Json, right: &Json) -> bool {

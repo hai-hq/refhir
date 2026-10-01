@@ -1,9 +1,9 @@
-use refhir_persistence::{
-    ConformanceStore, InstallError, InstallOutcome, NewPackage, ParamStatus, PendingParam,
-    PersistError, StoredBackfill, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
-    StoredTerminology,
-};
 use postgres::Transaction;
+use refhir_persistence::{
+    ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage, NewSearchParameter,
+    NewTerminology, ParamStatus, PendingParam, PersistError, StoredBackfill, StoredExpansion,
+    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+};
 
 use crate::{definite, PostgresPersistence};
 
@@ -101,6 +101,25 @@ impl ConformanceStore for PostgresPersistence {
             .collect())
     }
 
+    fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let rows = guard
+            .client
+            .query(
+                "SELECT package_id, url, json FROM value_set_expansion ORDER BY package_id, url",
+                &[],
+            )
+            .map_err(definite)?;
+        Ok(rows
+            .iter()
+            .map(|row| StoredExpansion {
+                package_id: row.get(0),
+                url: row.get(1),
+                json: row.get(2),
+            })
+            .collect())
+    }
+
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
         let mut guard = self.inner.lock().expect("postgres");
         let mut tx = guard.client.transaction().map_err(definite)?;
@@ -131,6 +150,201 @@ impl ConformanceStore for PostgresPersistence {
         Ok(())
     }
 
+    fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let existing = guard
+            .client
+            .query_opt(
+                "SELECT id FROM packages WHERE name = 'refhir.local' AND version = '0'",
+                &[],
+            )
+            .map_err(definite)?;
+        if let Some(row) = existing {
+            return Ok(row.get(0));
+        }
+        let current = guard
+            .client
+            .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
+            .map_err(definite)?;
+        let version = current
+            .map(|row| row.get::<_, String>(0))
+            .unwrap_or_else(|| fhir_version.to_string());
+        let inserted = guard
+            .client
+            .query_one(
+                "INSERT INTO packages (name, version, fhir_version) \
+                 VALUES ('refhir.local', '0', $1) RETURNING id",
+                &[&version],
+            )
+            .map_err(definite)?;
+        Ok(inserted.get(0))
+    }
+
+    fn upsert_search_parameter(
+        &self,
+        package_id: i64,
+        param: &NewSearchParameter,
+    ) -> Result<bool, PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let prior = guard
+            .client
+            .query_opt(
+                "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
+                 WHERE package_id = $1 AND url = $2 AND base = $3",
+                &[&package_id, &param.url, &param.base],
+            )
+            .map_err(definite)?;
+        let incoming = param.expression.clone().unwrap_or_default();
+        if let Some(row) = prior {
+            let code: String = row.get(0);
+            let param_type: String = row.get(1);
+            let expression: String = row.get(2);
+            if code == param.code && param_type == param.param_type && expression == incoming {
+                guard
+                    .client
+                    .execute(
+                        "UPDATE search_parameters SET json = $1 \
+                         WHERE package_id = $2 AND url = $3 AND base = $4",
+                        &[&param.json, &package_id, &param.url, &param.base],
+                    )
+                    .map_err(definite)?;
+                return Ok(false);
+            }
+        }
+        let status = param.status.as_str();
+        guard
+            .client
+            .execute(
+                "INSERT INTO search_parameters \
+                 (package_id, url, base, code, param_type, expression, status, json) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+                 ON CONFLICT (package_id, url, base) DO UPDATE SET \
+                 code = EXCLUDED.code, param_type = EXCLUDED.param_type, \
+                 expression = EXCLUDED.expression, status = EXCLUDED.status, json = EXCLUDED.json",
+                &[
+                    &package_id,
+                    &param.url,
+                    &param.base,
+                    &param.code,
+                    &param.param_type,
+                    &param.expression,
+                    &status,
+                    &param.json,
+                ],
+            )
+            .map_err(definite)?;
+        Ok(true)
+    }
+
+    fn delete_search_parameter(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let url = url.to_string();
+        guard
+            .client
+            .execute(
+                "DELETE FROM search_parameters WHERE package_id = $1 AND url = $2",
+                &[&package_id, &url],
+            )
+            .map_err(definite)?;
+        Ok(())
+    }
+
+    fn upsert_terminology(
+        &self,
+        package_id: i64,
+        row: &NewTerminology,
+    ) -> Result<(), PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        guard
+            .client
+            .execute(
+                "INSERT INTO terminology (package_id, resource_type, url, json) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (package_id, url) DO UPDATE SET \
+                 resource_type = EXCLUDED.resource_type, json = EXCLUDED.json",
+                &[&package_id, &row.resource_type, &row.url, &row.json],
+            )
+            .map_err(definite)?;
+        Ok(())
+    }
+
+    fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let url = url.to_string();
+        guard
+            .client
+            .execute(
+                "DELETE FROM terminology WHERE package_id = $1 AND url = $2",
+                &[&package_id, &url],
+            )
+            .map_err(definite)?;
+        Ok(())
+    }
+
+    fn replace_expansions(
+        &self,
+        package_id: i64,
+        expansions: &[NewExpansion],
+    ) -> Result<(), PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        tx.execute(
+            "DELETE FROM value_set_expansion WHERE package_id = $1",
+            &[&package_id],
+        )
+        .map_err(definite)?;
+        for expansion in expansions {
+            tx.execute(
+                "INSERT INTO value_set_expansion (package_id, url, json) VALUES ($1, $2, $3)",
+                &[&package_id, &expansion.url, &expansion.json],
+            )
+            .map_err(definite)?;
+        }
+        tx.commit().map_err(definite)?;
+        Ok(())
+    }
+
+    fn complete_backfill(
+        &self,
+        backfill_id: i64,
+        package_id: i64,
+        base: &str,
+    ) -> Result<(), PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let urls: Vec<String> = {
+            let rows = guard
+                .client
+                .query(
+                    "SELECT url FROM backfill_parameter WHERE backfill_id = $1",
+                    &[&backfill_id],
+                )
+                .map_err(definite)?;
+            rows.iter().map(|row| row.get(0)).collect()
+        };
+        if urls.is_empty() {
+            guard
+                .client
+                .execute(
+                    "UPDATE search_parameters SET status = 'ready' \
+                     WHERE package_id = $1 AND base = $2 AND status = 'pending'",
+                    &[&package_id, &base],
+                )
+                .map_err(definite)?;
+            return Ok(());
+        }
+        for url in urls {
+            guard
+                .client
+                .execute(
+                    "UPDATE search_parameters SET status = 'ready' \
+                     WHERE package_id = $1 AND base = $2 AND url = $3 AND status = 'pending'",
+                    &[&package_id, &base, &url],
+                )
+                .map_err(definite)?;
+        }
+        Ok(())
+    }
+
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError> {
         let mut guard = self.inner.lock().expect("postgres");
         guard
@@ -149,6 +363,7 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         watermark_ts: i64,
         tablet: &str,
+        urls: &[String],
     ) -> Result<i64, PersistError> {
         let mut guard = self.inner.lock().expect("postgres");
         let row = guard
@@ -159,7 +374,30 @@ impl ConformanceStore for PostgresPersistence {
                 &[&package_id, &watermark_ts, &tablet],
             )
             .map_err(definite)?;
-        Ok(row.get(0))
+        let backfill_id: i64 = row.get(0);
+        if urls.is_empty() {
+            guard
+                .client
+                .execute(
+                    "INSERT INTO backfill_parameter (backfill_id, url) \
+                     SELECT $1, url FROM search_parameters \
+                     WHERE package_id = $2 AND base = $3 AND status = 'pending'",
+                    &[&backfill_id, &package_id, &tablet],
+                )
+                .map_err(definite)?;
+        } else {
+            for url in urls {
+                guard
+                    .client
+                    .execute(
+                        "INSERT INTO backfill_parameter (backfill_id, url) VALUES ($1, $2) \
+                         ON CONFLICT (backfill_id, url) DO NOTHING",
+                        &[&backfill_id, url],
+                    )
+                    .map_err(definite)?;
+            }
+        }
+        Ok(backfill_id)
     }
 
     fn update_backfill(
@@ -220,6 +458,7 @@ fn install_in_tx(
     if let Some(row) = existing {
         let package_id: i64 = row.get(0);
         insert_terminology(tx, package_id, package)?;
+        replace_expansions(tx, package_id, package)?;
         return Ok(InstallOutcome {
             package_id,
             inserted: false,
@@ -309,6 +548,7 @@ fn install_in_tx(
         .map_err(definite)?;
     }
     insert_terminology(tx, package_id, package)?;
+    replace_expansions(tx, package_id, package)?;
     Ok(InstallOutcome {
         package_id,
         inserted: true,
@@ -331,6 +571,26 @@ fn insert_terminology(
                 &resource.url,
                 &resource.json,
             ],
+        )
+        .map_err(definite)?;
+    }
+    Ok(())
+}
+
+fn replace_expansions(
+    tx: &mut Transaction<'_>,
+    package_id: i64,
+    package: &NewPackage,
+) -> Result<(), InstallError> {
+    tx.execute(
+        "DELETE FROM value_set_expansion WHERE package_id = $1",
+        &[&package_id],
+    )
+    .map_err(definite)?;
+    for expansion in &package.expansions {
+        tx.execute(
+            "INSERT INTO value_set_expansion (package_id, url, json) VALUES ($1, $2, $3)",
+            &[&package_id, &expansion.url, &expansion.json],
         )
         .map_err(definite)?;
     }

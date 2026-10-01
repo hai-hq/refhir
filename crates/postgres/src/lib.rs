@@ -6,14 +6,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use postgres::types::ToSql;
+use postgres::{Client, NoTls, Row, Transaction};
 use refhir_persistence::{
     document_from_parts, ConflictStrategy, DocumentLogEntry, IndexScanRow, LatestDocument,
     PersistError, Persistence, PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader,
     TimestampRange,
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, Timestamp};
-use postgres::types::ToSql;
-use postgres::{Client, NoTls, Row, Transaction};
 use serde_json::Value as JsonValue;
 
 const SCHEMA: &str = r#"
@@ -85,6 +85,17 @@ CREATE TABLE IF NOT EXISTS terminology (
     url TEXT NOT NULL,
     json TEXT NOT NULL,
     PRIMARY KEY (package_id, url)
+);
+CREATE TABLE IF NOT EXISTS value_set_expansion (
+    package_id BIGINT NOT NULL,
+    url TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url)
+);
+CREATE TABLE IF NOT EXISTS backfill_parameter (
+    backfill_id BIGINT NOT NULL,
+    url TEXT NOT NULL,
+    PRIMARY KEY (backfill_id, url)
 );
 "#;
 

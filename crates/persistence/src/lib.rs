@@ -313,6 +313,19 @@ pub struct NewTerminology {
     pub json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredExpansion {
+    pub package_id: i64,
+    pub url: String,
+    pub json: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewExpansion {
+    pub url: String,
+    pub json: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewPackage {
     pub name: String,
@@ -321,6 +334,7 @@ pub struct NewPackage {
     pub structure_definitions: Vec<NewStructureDefinition>,
     pub search_parameters: Vec<NewSearchParameter>,
     pub terminology: Vec<NewTerminology>,
+    pub expansions: Vec<NewExpansion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,9 +390,43 @@ pub trait ConformanceStore: Send + Sync {
 
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError>;
 
+    fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError>;
+
+    /// Package row for resources authored through the FHIR API.
+    fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError>;
+
+    /// Returns whether the index must be rebuilt. An unchanged expression keeps its status.
+    fn upsert_search_parameter(
+        &self,
+        package_id: i64,
+        param: &NewSearchParameter,
+    ) -> Result<bool, PersistError>;
+
+    fn delete_search_parameter(&self, package_id: i64, url: &str) -> Result<(), PersistError>;
+
+    fn upsert_terminology(&self, package_id: i64, row: &NewTerminology)
+        -> Result<(), PersistError>;
+
+    fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), PersistError>;
+
+    fn replace_expansions(
+        &self,
+        package_id: i64,
+        expansions: &[NewExpansion],
+    ) -> Result<(), PersistError>;
+
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
 
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError>;
+
+    /// Marks the parameters snapshotted onto this backfill ready.
+    /// A backfill with no snapshot marks every pending parameter on `base`.
+    fn complete_backfill(
+        &self,
+        backfill_id: i64,
+        package_id: i64,
+        base: &str,
+    ) -> Result<(), PersistError>;
 
     fn set_search_parameter_status(
         &self,
@@ -388,11 +436,14 @@ pub trait ConformanceStore: Send + Sync {
         status: ParamStatus,
     ) -> Result<(), PersistError>;
 
+    /// `urls` limits which parameters this job may mark ready.
+    /// An empty list snapshots every parameter that is pending for `tablet`.
     fn insert_backfill(
         &self,
         package_id: i64,
         watermark_ts: i64,
         tablet: &str,
+        urls: &[String],
     ) -> Result<i64, PersistError>;
 
     fn update_backfill(

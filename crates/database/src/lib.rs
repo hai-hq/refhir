@@ -21,7 +21,9 @@ use tokio::sync::mpsc::UnboundedSender;
 
 pub use reads::ReadSet;
 pub use subscription::{Invalidation, SubToken};
-pub use transaction::{Delete, IndexPut, Put, Revision, Scanned, Stored, Transaction, WrittenId};
+pub use transaction::{
+    Delete, DocumentWrite, IndexPut, Put, Revision, Scanned, Stored, Transaction, WrittenId,
+};
 
 /// OCC conflict. Convex `ConflictingRead` reduced to the index key and write ts.
 #[derive(Clone, Debug, PartialEq, Eq)]

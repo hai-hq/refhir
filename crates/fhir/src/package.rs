@@ -1,17 +1,18 @@
 //! Load a FHIR package directory into the conformance tables, then backfill
 //! search indexes for parameters that were not indexed yet.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    ConformanceStore, InstallError, NewPackage, NewSearchParameter, NewStructureDefinition,
-    NewTerminology, ParamStatus,
+    ConformanceStore, InstallError, NewExpansion, NewPackage, NewSearchParameter,
+    NewStructureDefinition, NewTerminology, ParamStatus,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
+use refhir_validate::MemoryTerminology;
 use serde_json::Value;
 
 use crate::catalog::{pending_index_keys, Catalog};
@@ -86,7 +87,7 @@ pub fn stage_package_dir(
         }
         for base in bases {
             store
-                .insert_backfill(outcome.package_id, watermark, &base)
+                .insert_backfill(outcome.package_id, watermark, &base, &[])
                 .map_err(FhirError::from)?;
         }
     }
@@ -103,6 +104,7 @@ pub fn run_backfills(
     for job in jobs.into_iter().filter(|job| !job.done) {
         let watermark = Timestamp::from_i64(job.watermark_ts)
             .map_err(|_| FhirError::Storage("bad backfill watermark".into()))?;
+        let old_keys = index_keys_for_pending(db, catalog, &job.tablet)?;
         let mut ids = live_ids(db, &job.tablet)?;
         if let Some(cursor) = &job.cursor_id {
             ids.retain(|id| id.as_str() > cursor.as_str());
@@ -111,11 +113,11 @@ pub fn run_backfills(
         while start < ids.len() {
             let end = (start + BATCH).min(ids.len());
             let batch = &ids[start..end];
-            match backfill_batch(db, catalog, &job.tablet, batch, watermark) {
+            match backfill_batch(db, catalog, &job.tablet, batch, watermark, &old_keys) {
                 Ok(()) => {}
                 Err(CommitError::Occ(_)) => {
                     for id in batch {
-                        backfill_id(db, catalog, &job.tablet, id, watermark)?;
+                        backfill_id(db, catalog, &job.tablet, id, watermark, &old_keys)?;
                     }
                 }
                 Err(err) => return Err(FhirError::Storage(err.to_string())),
@@ -126,7 +128,7 @@ pub fn run_backfills(
             start = end;
         }
         store
-            .mark_base_ready(job.package_id, &job.tablet)
+            .complete_backfill(job.id, job.package_id, &job.tablet)
             .map_err(FhirError::from)?;
         let cursor = ids.last().map(String::as_str).or(job.cursor_id.as_deref());
         store
@@ -140,13 +142,16 @@ pub fn run_backfills(
     Ok(())
 }
 
-fn publish(store: &dyn ConformanceStore, catalog: &RwLock<Catalog>) -> Result<(), FhirError> {
+pub(crate) fn publish(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+) -> Result<(), FhirError> {
     let loaded = Catalog::open(store)?;
     *catalog.write().expect("catalog") = loaded;
     Ok(())
 }
 
-fn live_ids(db: &Database, type_name: &str) -> Result<Vec<String>, FhirError> {
+pub(crate) fn live_ids(db: &Database, type_name: &str) -> Result<Vec<String>, FhirError> {
     let index = IndexId::new(format!("{type_name}/by_id"));
     let rows = db
         .reader()
@@ -162,12 +167,46 @@ fn live_ids(db: &Database, type_name: &str) -> Result<Vec<String>, FhirError> {
     Ok(ids)
 }
 
+fn same_keys(left: &[(IndexId, Vec<u8>)], right: &[(IndexId, Vec<u8>)]) -> bool {
+    let left: BTreeSet<_> = left.iter().cloned().collect();
+    let right: BTreeSet<_> = right.iter().cloned().collect();
+    left == right
+}
+
+fn index_keys_for_pending(
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    type_name: &str,
+) -> Result<HashMap<String, Vec<(IndexId, Vec<u8>)>>, FhirError> {
+    let guard = catalog.read().expect("catalog");
+    let Ok(model) = guard.get(type_name) else {
+        return Ok(HashMap::new());
+    };
+    let mut map: HashMap<String, Vec<(IndexId, Vec<u8>)>> = HashMap::new();
+    for param in model.pending_params() {
+        let index = model.search_index(&param.name);
+        let rows = db
+            .reader()
+            .index_scan(&index, db.latest_ts(), &Interval::all(), Order::Asc)?;
+        for row in rows {
+            let Some(id) = row.document.id.id_str() else {
+                continue;
+            };
+            map.entry(id.to_string())
+                .or_default()
+                .push((index.clone(), row.key));
+        }
+    }
+    Ok(map)
+}
+
 fn backfill_batch(
     db: &Database,
     catalog: &RwLock<Catalog>,
     type_name: &str,
     ids: &[String],
     watermark: Timestamp,
+    old_by_id: &HashMap<String, Vec<(IndexId, Vec<u8>)>>,
 ) -> Result<(), CommitError> {
     let mut tx = db.begin();
     let guard = catalog.read().expect("catalog");
@@ -185,20 +224,22 @@ fn backfill_batch(
         let Some(ts) = stored.ts else {
             continue;
         };
-        if ts > watermark {
-            continue;
-        }
         let keys = {
             let host = crate::resolve::TxHost::new(&mut tx, &guard);
             pending_index_keys(guard.path_model(), model, &stored.json, &host).unwrap_or_default()
         };
-        if keys.is_empty() {
+        let old_keys = old_by_id.get(id).cloned().unwrap_or_default();
+        if ts > watermark && old_keys.is_empty() {
+            continue;
+        }
+        if same_keys(&keys, &old_keys) {
             continue;
         }
         tx.stage_index(IndexPut {
             tablet: model.tablet(),
             id: id.clone(),
             keys,
+            old_keys,
         })
         .map_err(|err| CommitError::Invalid(err.to_string()))?;
         staged = true;
@@ -216,9 +257,17 @@ fn backfill_id(
     type_name: &str,
     id: &str,
     watermark: Timestamp,
+    old_by_id: &HashMap<String, Vec<(IndexId, Vec<u8>)>>,
 ) -> Result<(), FhirError> {
     for attempt in 0..=MAX_OCC_FAILURES {
-        match backfill_batch(db, catalog, type_name, &[id.to_string()], watermark) {
+        match backfill_batch(
+            db,
+            catalog,
+            type_name,
+            &[id.to_string()],
+            watermark,
+            old_by_id,
+        ) {
             Ok(()) => return Ok(()),
             Err(CommitError::Occ(_)) if attempt < MAX_OCC_FAILURES => continue,
             Err(CommitError::Occ(err)) => return Err(FhirError::Conflict(format!("{err:?}"))),
@@ -283,7 +332,7 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         match value.get("resourceType").and_then(|item| item.as_str()) {
             Some("StructureDefinition") => definitions.push(value),
             Some("SearchParameter") => parameters.push(value),
-            Some("CodeSystem") | Some("ValueSet") => terminology.push(value),
+            Some("CodeSystem") | Some("ValueSet") | Some("ConceptMap") => terminology.push(value),
             _ => {}
         }
     }
@@ -300,6 +349,16 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     for resource in &terminology {
         terminology_rows.push(terminology_row(resource)?);
     }
+    let expansions = MemoryTerminology::expansion_documents(&terminology)
+        .into_iter()
+        .filter_map(|document| {
+            let url = document.get("url")?.as_str()?.to_string();
+            Some(NewExpansion {
+                url,
+                json: document.to_string(),
+            })
+        })
+        .collect();
     Ok(NewPackage {
         name,
         version,
@@ -307,6 +366,7 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         structure_definitions,
         search_parameters,
         terminology: terminology_rows,
+        expansions,
     })
 }
 
@@ -383,15 +443,19 @@ fn reopen_unsupported(
 ) -> Result<(), FhirError> {
     let parameters = store.load_search_parameters().map_err(FhirError::from)?;
     let mut bases = BTreeSet::new();
-    for parameter in parameters
-        .iter()
-        .filter(|parameter| parameter.package_id == package_id && parameter.status == ParamStatus::Unsupported)
-    {
+    for parameter in parameters.iter().filter(|parameter| {
+        parameter.package_id == package_id && parameter.status == ParamStatus::Unsupported
+    }) {
         if extract::compile(&parameter.param_type, parameter.expression.as_deref()).is_none() {
             continue;
         }
         store
-            .set_search_parameter_status(package_id, &parameter.url, &parameter.base, ParamStatus::Pending)
+            .set_search_parameter_status(
+                package_id,
+                &parameter.url,
+                &parameter.base,
+                ParamStatus::Pending,
+            )
             .map_err(FhirError::from)?;
         bases.insert(parameter.base.clone());
     }
@@ -404,13 +468,13 @@ fn reopen_unsupported(
         .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
     for base in bases {
         store
-            .insert_backfill(package_id, watermark, &base)
+            .insert_backfill(package_id, watermark, &base, &[])
             .map_err(FhirError::from)?;
     }
     Ok(())
 }
 
-fn parameter_rows(parameter: &Value) -> Result<Vec<NewSearchParameter>, FhirError> {
+pub(crate) fn parameter_rows(parameter: &Value) -> Result<Vec<NewSearchParameter>, FhirError> {
     let url = required_str(parameter, "url")?;
     let code = required_str(parameter, "code")?;
     let param_type = required_str(parameter, "type")?;

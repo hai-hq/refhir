@@ -94,6 +94,17 @@ CREATE TABLE IF NOT EXISTS terminology (
     json TEXT NOT NULL,
     PRIMARY KEY (package_id, url)
 );
+CREATE TABLE IF NOT EXISTS value_set_expansion (
+    package_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url)
+);
+CREATE TABLE IF NOT EXISTS backfill_parameter (
+    backfill_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    PRIMARY KEY (backfill_id, url)
+);
 "#;
 
 const INSERT_DOCUMENT: &str = "INSERT INTO documents (id, ts, table_id, json_value, deleted, \

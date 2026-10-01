@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use refhir_database::{CommitError, Database, ReadSet};
+use refhir_database::{CommitError, Database, DocumentWrite, ReadSet};
 use refhir_types::Timestamp;
 use serde_json::Value;
 
@@ -42,6 +42,8 @@ pub struct RunResult {
     pub ts: Timestamp,
     pub reads: ReadSet,
     pub wrote: bool,
+    /// Document creates, updates, and deletes from the committed transaction.
+    pub writes: Vec<DocumentWrite>,
 }
 
 pub fn run(
@@ -59,6 +61,7 @@ pub fn run(
         let reads = tx.read_set().clone();
         let written = tx.written_ids();
         let wrote = tx.has_writes();
+        let writes = tx.document_writes();
         match db.commit_with(tx, stamp_stored_json) {
             Ok(ts) => {
                 if wrote {
@@ -69,6 +72,7 @@ pub fn run(
                     ts,
                     reads,
                     wrote,
+                    writes,
                 });
             }
             Err(CommitError::Occ(_)) if wrote && attempt < MAX_OCC_FAILURES => continue,
@@ -107,6 +111,9 @@ pub fn dispatch(
     let (type_name, op) = path
         .split_once('/')
         .ok_or_else(|| FhirError::Invalid(format!("bad operation {path}")))?;
+    if matches!(op, "$expand" | "$validate-code" | "$lookup" | "$translate") {
+        return crate::terms::operation(catalog, type_name, op, args);
+    }
     let model = catalog.get(type_name)?;
     match op {
         "create" => ops::create(tx, catalog, model, resource_arg(args)?),

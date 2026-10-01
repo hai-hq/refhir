@@ -4,10 +4,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
-use refhir_database::Database;
-use refhir_fhir::{install_package_dir, minir4_dir, Catalog, MAX_OCC_FAILURES};
-use refhir_sqlite::SqlitePersistence;
 use http_body_util::BodyExt;
+use refhir_database::Database;
+use refhir_fhir::{install_package_dir, minir4_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES};
+use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -16,12 +16,16 @@ use tower::ServiceExt;
 
 use crate::app;
 
-fn memory() -> (Arc<Database>, Arc<RwLock<Catalog>>) {
-    let store = SqlitePersistence::open_in_memory().unwrap();
-    let db = Arc::new(Database::open(Arc::new(store.clone())).unwrap());
+fn memory() -> (
+    Arc<Database>,
+    Arc<RwLock<Catalog>>,
+    Arc<dyn ConformanceStore>,
+) {
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::empty()));
-    install_package_dir(&store, &db, &catalog, minir4_dir()).unwrap();
-    (db, catalog)
+    install_package_dir(store.as_ref(), &db, &catalog, minir4_dir()).unwrap();
+    (db, catalog, store)
 }
 
 struct Reply {
@@ -77,8 +81,8 @@ fn patient(id: &str) -> Value {
 
 #[tokio::test]
 async fn http_crud_search_history_and_bundle() {
-    let (db, catalog) = memory();
-    let app = app(db, catalog);
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
     let metadata = send(&app, "GET", "/metadata", None, None).await;
     assert_eq!(metadata.status, StatusCode::OK);
     assert_eq!(metadata.body["resourceType"], "CapabilityStatement");
@@ -178,8 +182,8 @@ async fn http_crud_search_history_and_bundle() {
 
 #[tokio::test]
 async fn occ_retries_then_conflict() {
-    let (db, catalog) = memory();
-    let app = app(db.clone(), catalog);
+    let (db, catalog, store) = memory();
+    let app = app(db.clone(), catalog, store);
     let created = send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
     assert_eq!(created.status, StatusCode::CREATED);
 
@@ -195,8 +199,8 @@ async fn occ_retries_then_conflict() {
 
 #[tokio::test]
 async fn concurrent_puts_both_commit() {
-    let (db, catalog) = memory();
-    let app = app(db, catalog);
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
     send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
     let first = patient("p1");
     let mut second = patient("p1");
@@ -217,7 +221,7 @@ async fn concurrent_puts_both_commit() {
 
 #[tokio::test]
 async fn sync_subscription_transitions_after_mutation() {
-    let (db, catalog) = memory();
+    let (db, catalog, store) = memory();
     {
         let loaded = catalog.read().expect("catalog");
         refhir_fhir::run(
@@ -230,7 +234,7 @@ async fn sync_subscription_transitions_after_mutation() {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = app(db, catalog);
+    let app = app(db, catalog, store);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -327,8 +331,8 @@ async fn next_json(
 
 #[tokio::test]
 async fn invalid_patient_create_returns_outcome_and_validate_does_not_write() {
-    let (db, catalog) = memory();
-    let app = app(db, catalog);
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
     let mut body = patient("p1");
     body["birthDate"] = json!("yesterday");
     let rejected = send(&app, "POST", "/Patient", Some(body.clone()), None).await;
@@ -339,4 +343,102 @@ async fn invalid_patient_create_returns_outcome_and_validate_does_not_write() {
     assert_eq!(validated.body["resourceType"], "OperationOutcome");
     let missing = send(&app, "GET", "/Patient/p1", None, None).await;
     assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn terminology_operations_are_http_routes() {
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-http-terms-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.http.terms","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("CodeSystem-animals.json"),
+        r#"{"resourceType":"CodeSystem","url":"http://example.org/animals","name":"Animals","content":"complete","concept":[{"code":"dog","display":"Dog","definition":"A dog"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-pets.json"),
+        r#"{"resourceType":"ValueSet","url":"http://example.org/pets","compose":{"include":[{"system":"http://example.org/animals"}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ConceptMap-pets.json"),
+        r#"{"resourceType":"ConceptMap","url":"http://example.org/map","group":[{"source":"http://example.org/animals","target":"http://example.org/dst","element":[{"code":"dog","target":[{"code":"canine","equivalence":"equivalent"}]}]}]}"#,
+    )
+    .unwrap();
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let app = app(db, catalog, store);
+
+    let expanded = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": "http://example.org/pets", "filter": "dog"})),
+        None,
+    )
+    .await;
+    assert_eq!(expanded.status, StatusCode::OK);
+    assert_eq!(expanded.body["resourceType"], "ValueSet");
+    assert_eq!(expanded.body["expansion"]["contains"][0]["code"], "dog");
+
+    let checked = send(
+        &app,
+        "POST",
+        "/ValueSet/$validate-code",
+        Some(json!({"url": "http://example.org/pets", "code": "dog", "display": "Hound"})),
+        None,
+    )
+    .await;
+    assert_eq!(checked.status, StatusCode::OK);
+    assert_eq!(checked.body["parameter"][0]["valueBoolean"], true);
+    assert!(checked.body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["name"] == "message"));
+
+    let looked = send(
+        &app,
+        "POST",
+        "/CodeSystem/$lookup",
+        Some(json!({"system": "http://example.org/animals", "code": "dog"})),
+        None,
+    )
+    .await;
+    assert_eq!(looked.status, StatusCode::OK);
+    assert_eq!(looked.body["resourceType"], "Parameters");
+
+    let translated = send(
+        &app,
+        "POST",
+        "/ConceptMap/$translate",
+        Some(json!({"url": "http://example.org/map", "system": "http://example.org/animals", "code": "dog"})),
+        None,
+    )
+    .await;
+    assert_eq!(translated.status, StatusCode::OK);
+    assert_eq!(translated.body["parameter"][0]["valueBoolean"], true);
+
+    let wrong = send(
+        &app,
+        "POST",
+        "/Patient/$expand",
+        Some(json!({"url": "http://example.org/pets"})),
+        None,
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
 }

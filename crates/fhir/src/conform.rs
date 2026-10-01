@@ -1,0 +1,777 @@
+//! Project committed SearchParameter, ValueSet, CodeSystem, and ConceptMap
+//! documents into the conformance tables.
+//!
+//! The document log stays the source of the resource. Search indexes and value
+//! set expansions are filled from the same tables package install uses.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use refhir_database::{CommitError, Database, DocumentWrite, IndexPut};
+use refhir_persistence::{
+    ConformanceStore, NewExpansion, NewSearchParameter, NewTerminology, ParamStatus,
+    StoredSearchParameter, StoredTerminology,
+};
+use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
+use refhir_validate::MemoryTerminology;
+use serde_json::Value;
+
+use crate::error::FhirError;
+use crate::package::{self, parameter_rows};
+use crate::run::{self, RunError, RunResult, MAX_OCC_FAILURES};
+
+const CONFORMANCE: &[&str] = &["SearchParameter", "ValueSet", "CodeSystem", "ConceptMap"];
+
+pub fn commit_operation(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+    path: &str,
+    args: &Value,
+) -> Result<RunResult, RunError> {
+    preflight(store, catalog, path, args).map_err(RunError::Fhir)?;
+    let result = {
+        let guard = catalog.read().expect("catalog");
+        run::run(db, &guard, path, args)?
+    };
+    project_writes(store, db, catalog, result.ts, &result.writes).map_err(RunError::Fhir)?;
+    Ok(result)
+}
+
+pub fn repair_conformance(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+) -> Result<(), FhirError> {
+    let local_id = local_package(store, catalog)?;
+    let mut term_dirty = false;
+    for type_name in ["ValueSet", "CodeSystem", "ConceptMap"] {
+        if !catalog.read().expect("catalog").contains(type_name) {
+            continue;
+        }
+        let live = package::live_ids(db, type_name)?;
+        for id in &live {
+            let Some(resource) = live_json(db, type_name, id)? else {
+                continue;
+            };
+            if terminology_current(store, local_id, &resource)? {
+                continue;
+            }
+            if project_terminology(store, local_id, &resource, false)? {
+                term_dirty = true;
+            }
+        }
+        if delete_orphan_terminology(store, local_id, type_name, &live)? {
+            term_dirty = true;
+        }
+    }
+    if term_dirty {
+        sync_expansions(store)?;
+        package::publish(store, catalog)?;
+    }
+
+    if catalog.read().expect("catalog").contains("SearchParameter") {
+        let live = package::live_ids(db, "SearchParameter")?;
+        let mut jobs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut changed = false;
+        for id in &live {
+            let Some(resource) = live_json(db, "SearchParameter", id)? else {
+                continue;
+            };
+            if parameter_current(store, local_id, &resource)? {
+                continue;
+            }
+            let (dirty, more) = project_parameter(store, db, local_id, &resource, false)?;
+            changed |= dirty;
+            merge_jobs(&mut jobs, more);
+        }
+        if delete_orphan_parameters(store, db, local_id, &live)? {
+            changed = true;
+        }
+        finish_parameters(store, db, catalog, local_id, changed, jobs)?;
+    }
+    Ok(())
+}
+
+fn preflight(
+    store: &dyn ConformanceStore,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+    path: &str,
+    args: &Value,
+) -> Result<(), FhirError> {
+    let resources = candidate_resources(path, args);
+    if resources.is_empty() {
+        return Ok(());
+    }
+    let local_id = local_package(store, catalog)?;
+    let parameters = store.load_search_parameters()?;
+    let terminology = store.load_terminology()?;
+    let mut seen = Vec::new();
+    for resource in &resources {
+        match resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+        {
+            Some("SearchParameter") => {
+                let rows = check_parameter(&parameters, &seen, resource)?;
+                seen.extend(rows);
+            }
+            Some("ValueSet" | "CodeSystem" | "ConceptMap") => {
+                check_terminology(&terminology, local_id, resource)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn project_writes(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+    ts: Timestamp,
+    writes: &[DocumentWrite],
+) -> Result<(), FhirError> {
+    let interesting: Vec<_> = writes
+        .iter()
+        .filter(|write| CONFORMANCE.contains(&write.tablet.as_str()))
+        .collect();
+    if interesting.is_empty() {
+        return Ok(());
+    }
+    let local_id = local_package(store, catalog)?;
+    let mut term_dirty = false;
+    for write in &interesting {
+        if !matches!(
+            write.tablet.as_str(),
+            "ValueSet" | "CodeSystem" | "ConceptMap"
+        ) {
+            continue;
+        }
+        let Some(resource) = write_resource(db, write, ts)? else {
+            continue;
+        };
+        if write.json.is_none() {
+            if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
+                store.delete_terminology(local_id, url)?;
+                term_dirty = true;
+            }
+            continue;
+        }
+        if project_terminology(store, local_id, &resource, true)? {
+            term_dirty = true;
+        }
+    }
+    if term_dirty {
+        sync_expansions(store)?;
+        package::publish(store, catalog)?;
+    }
+
+    let mut jobs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut changed = false;
+    for write in &interesting {
+        if write.tablet != "SearchParameter" {
+            continue;
+        }
+        let Some(resource) = write_resource(db, write, ts)? else {
+            continue;
+        };
+        if write.json.is_none() {
+            if delete_parameter(store, db, local_id, &resource)? {
+                changed = true;
+            }
+            continue;
+        }
+        let (dirty, more) = project_parameter(store, db, local_id, &resource, true)?;
+        changed |= dirty;
+        merge_jobs(&mut jobs, more);
+    }
+    finish_parameters(store, db, catalog, local_id, changed, jobs)
+}
+
+fn finish_parameters(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+    local_id: i64,
+    changed: bool,
+    jobs: BTreeMap<String, BTreeSet<String>>,
+) -> Result<(), FhirError> {
+    if changed || !jobs.is_empty() {
+        package::publish(store, catalog)?;
+    }
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let watermark = db
+        .latest_ts()
+        .to_i64()
+        .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
+    for (base, urls) in &jobs {
+        let urls: Vec<String> = urls.iter().cloned().collect();
+        store.insert_backfill(local_id, watermark, base, &urls)?;
+    }
+    package::run_backfills(store, db, catalog)
+}
+
+fn project_terminology(
+    store: &dyn ConformanceStore,
+    local_id: i64,
+    resource: &Value,
+    strict: bool,
+) -> Result<bool, FhirError> {
+    let url = resource
+        .get("url")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| FhirError::Invalid("url is required".into()))?;
+    if terminology_owned_elsewhere(store, local_id, url)? {
+        if strict {
+            return Err(FhirError::Invalid(format!(
+                "canonical {url} belongs to an installed package"
+            )));
+        }
+        return Ok(false);
+    }
+    let resource_type = resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    store.upsert_terminology(
+        local_id,
+        &NewTerminology {
+            resource_type,
+            url: url.to_string(),
+            json: resource.to_string(),
+        },
+    )?;
+    Ok(true)
+}
+
+fn project_parameter(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    local_id: i64,
+    resource: &Value,
+    strict: bool,
+) -> Result<(bool, BTreeMap<String, BTreeSet<String>>), FhirError> {
+    let rows = parameter_rows(resource)?;
+    if rows.is_empty() {
+        return Err(FhirError::Invalid(
+            "SearchParameter base is required".into(),
+        ));
+    }
+    if rows
+        .iter()
+        .any(|row| row.status == ParamStatus::Unsupported)
+    {
+        if strict {
+            return Err(FhirError::Invalid(format!(
+                "search parameter {} expression is not supported",
+                rows[0].code
+            )));
+        }
+        return Ok((false, BTreeMap::new()));
+    }
+    let stored = store.load_search_parameters()?;
+    if let Some(message) = expression_conflict(&stored, &[], &rows) {
+        if strict {
+            return Err(FhirError::Invalid(message));
+        }
+        return Ok((false, BTreeMap::new()));
+    }
+    let url = rows[0].url.clone();
+    let priors: Vec<_> = stored
+        .into_iter()
+        .filter(|row| row.package_id == local_id && row.url == url)
+        .collect();
+    let removed: Vec<_> = priors
+        .iter()
+        .filter(|prior| !rows.iter().any(|row| row.base == prior.base))
+        .cloned()
+        .collect();
+    for prior in &removed {
+        tombstone_index(db, &prior.base, &prior.code)?;
+    }
+    for prior in &priors {
+        if rows
+            .iter()
+            .any(|row| row.base == prior.base && row.code != prior.code)
+        {
+            tombstone_index(db, &prior.base, &prior.code)?;
+        }
+    }
+    if !removed.is_empty() {
+        store.delete_search_parameter(local_id, &url)?;
+    }
+    let mut jobs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut changed = !removed.is_empty();
+    for row in &rows {
+        let pending = priors.iter().any(|prior| {
+            prior.base == row.base && prior.url == row.url && prior.status == ParamStatus::Pending
+        });
+        if store.upsert_search_parameter(local_id, row)? || pending {
+            changed = true;
+            jobs.entry(row.base.clone())
+                .or_default()
+                .insert(row.url.clone());
+        }
+    }
+    Ok((changed, jobs))
+}
+
+fn delete_parameter(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    local_id: i64,
+    resource: &Value,
+) -> Result<bool, FhirError> {
+    let Some(url) = resource.get("url").and_then(|value| value.as_str()) else {
+        return Ok(false);
+    };
+    let stored = store.load_search_parameters()?;
+    let priors: Vec<_> = stored
+        .into_iter()
+        .filter(|row| row.package_id == local_id && row.url == url)
+        .collect();
+    if priors.is_empty() {
+        return Ok(false);
+    }
+    for prior in &priors {
+        tombstone_index(db, &prior.base, &prior.code)?;
+    }
+    store.delete_search_parameter(local_id, url)?;
+    Ok(true)
+}
+
+fn parameter_current(
+    store: &dyn ConformanceStore,
+    local_id: i64,
+    resource: &Value,
+) -> Result<bool, FhirError> {
+    let rows = match parameter_rows(resource) {
+        Ok(rows) => rows,
+        Err(_) => return Ok(false),
+    };
+    if rows.is_empty()
+        || rows
+            .iter()
+            .any(|row| row.status == ParamStatus::Unsupported)
+    {
+        return Ok(true);
+    }
+    let stored = store.load_search_parameters()?;
+    let local: Vec<_> = stored
+        .iter()
+        .filter(|row| row.package_id == local_id && row.url == rows[0].url)
+        .collect();
+    if local.len() != rows.len() {
+        return Ok(false);
+    }
+    for row in &rows {
+        let Some(prior) = local.iter().find(|prior| prior.base == row.base) else {
+            return Ok(false);
+        };
+        if prior.status != ParamStatus::Ready || prior.code != row.code {
+            return Ok(false);
+        }
+        if prior.expression.clone().unwrap_or_default()
+            != row.expression.clone().unwrap_or_default()
+        {
+            return Ok(false);
+        }
+        if comparable(&prior.json) != comparable_value(resource) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn terminology_current(
+    store: &dyn ConformanceStore,
+    local_id: i64,
+    resource: &Value,
+) -> Result<bool, FhirError> {
+    let Some(url) = resource.get("url").and_then(|value| value.as_str()) else {
+        return Ok(true);
+    };
+    let stored = store.load_terminology()?;
+    let Some(row) = stored
+        .iter()
+        .find(|row| row.package_id == local_id && canonical_url(&row.url) == canonical_url(url))
+    else {
+        return Ok(false);
+    };
+    if comparable(&row.json) != comparable_value(resource) {
+        return Ok(false);
+    }
+    if resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        == Some("ValueSet")
+    {
+        let expansions = store.load_expansions()?;
+        return Ok(expansions.iter().any(|row| {
+            row.package_id == local_id && canonical_url(&row.url) == canonical_url(url)
+        }));
+    }
+    Ok(true)
+}
+
+fn delete_orphan_terminology(
+    store: &dyn ConformanceStore,
+    local_id: i64,
+    type_name: &str,
+    live: &[String],
+) -> Result<bool, FhirError> {
+    let live: BTreeSet<_> = live.iter().cloned().collect();
+    let stored = store.load_terminology()?;
+    let mut dirty = false;
+    for row in stored {
+        if row.package_id != local_id || row.resource_type != type_name {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(&row.json) else {
+            continue;
+        };
+        let Some(id) = json.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if live.contains(id) {
+            continue;
+        }
+        store.delete_terminology(local_id, &row.url)?;
+        dirty = true;
+    }
+    Ok(dirty)
+}
+
+fn delete_orphan_parameters(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    local_id: i64,
+    live: &[String],
+) -> Result<bool, FhirError> {
+    let live: BTreeSet<_> = live.iter().cloned().collect();
+    let stored = store.load_search_parameters()?;
+    let mut seen = BTreeSet::new();
+    let mut dirty = false;
+    for row in &stored {
+        if row.package_id != local_id || !seen.insert(row.url.clone()) {
+            continue;
+        }
+        let Ok(json) = serde_json::from_str::<Value>(&row.json) else {
+            continue;
+        };
+        let Some(id) = json.get("id").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if live.contains(id) {
+            continue;
+        }
+        for item in stored
+            .iter()
+            .filter(|item| item.package_id == local_id && item.url == row.url)
+        {
+            tombstone_index(db, &item.base, &item.code)?;
+        }
+        store.delete_search_parameter(local_id, &row.url)?;
+        dirty = true;
+    }
+    Ok(dirty)
+}
+
+fn sync_expansions(store: &dyn ConformanceStore) -> Result<(), FhirError> {
+    let terminology = store.load_terminology()?;
+    let existing = store.load_expansions()?;
+    let mut resources = Vec::new();
+    let mut owners: HashMap<String, i64> = HashMap::new();
+    let mut by_package: BTreeMap<i64, Vec<NewExpansion>> = BTreeMap::new();
+    for row in &terminology {
+        by_package.entry(row.package_id).or_default();
+        let value: Value = serde_json::from_str(&row.json)
+            .map_err(|err| FhirError::Invalid(format!("terminology json: {err}")))?;
+        if let Some(url) = value.get("url").and_then(|item| item.as_str()) {
+            owners
+                .entry(canonical_url(url).to_string())
+                .or_insert(row.package_id);
+        }
+        resources.push(value);
+    }
+    for row in &existing {
+        by_package.entry(row.package_id).or_default();
+    }
+    for document in MemoryTerminology::expansion_documents(&resources) {
+        let Some(url) = document.get("url").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(package_id) = owners.get(canonical_url(url)).copied() else {
+            continue;
+        };
+        by_package
+            .entry(package_id)
+            .or_default()
+            .push(NewExpansion {
+                url: canonical_url(url).to_string(),
+                json: document.to_string(),
+            });
+    }
+    for (package_id, expansions) in &by_package {
+        store.replace_expansions(*package_id, expansions)?;
+    }
+    Ok(())
+}
+
+fn tombstone_index(db: &Database, base: &str, code: &str) -> Result<(), FhirError> {
+    for _ in 0..=MAX_OCC_FAILURES {
+        match tombstone_once(db, base, code) {
+            Ok(()) => return Ok(()),
+            Err(CommitError::Occ(_)) => continue,
+            Err(err) => return Err(FhirError::Storage(err.to_string())),
+        }
+    }
+    Err(FhirError::Conflict("index tombstone conflicted".into()))
+}
+
+fn tombstone_once(db: &Database, base: &str, code: &str) -> Result<(), CommitError> {
+    let index = IndexId::new(format!("{base}/{code}"));
+    let rows = db
+        .reader()
+        .index_scan(&index, db.latest_ts(), &Interval::all(), Order::Asc)
+        .map_err(|err| CommitError::Persist(err.to_string()))?;
+    let mut by_id: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+    for row in rows {
+        let Some(id) = row.document.id.id_str() else {
+            continue;
+        };
+        by_id.entry(id.to_string()).or_default().push(row.key);
+    }
+    if by_id.is_empty() {
+        return Ok(());
+    }
+    let tablet = TabletId::new(base);
+    let entries: Vec<_> = by_id.into_iter().collect();
+    for chunk in entries.chunks(16) {
+        let mut tx = db.begin();
+        for (id, keys) in chunk {
+            let old_keys = keys
+                .iter()
+                .map(|key| (index.clone(), key.clone()))
+                .collect();
+            tx.stage_index(IndexPut {
+                tablet: tablet.clone(),
+                id: id.clone(),
+                keys: Vec::new(),
+                old_keys,
+            })
+            .map_err(|err| CommitError::Persist(err.to_string()))?;
+        }
+        db.commit(tx)?;
+    }
+    Ok(())
+}
+
+fn check_parameter(
+    stored: &[StoredSearchParameter],
+    seen: &[NewSearchParameter],
+    resource: &Value,
+) -> Result<Vec<NewSearchParameter>, FhirError> {
+    let rows = parameter_rows(resource)?;
+    if rows.is_empty() {
+        return Err(FhirError::Invalid(
+            "SearchParameter base is required".into(),
+        ));
+    }
+    if rows
+        .iter()
+        .any(|row| row.status == ParamStatus::Unsupported)
+    {
+        return Err(FhirError::Invalid(format!(
+            "search parameter {} expression is not supported",
+            rows[0].code
+        )));
+    }
+    if let Some(message) = expression_conflict(stored, seen, &rows) {
+        return Err(FhirError::Invalid(message));
+    }
+    Ok(rows)
+}
+
+fn expression_conflict(
+    stored: &[StoredSearchParameter],
+    seen: &[NewSearchParameter],
+    rows: &[NewSearchParameter],
+) -> Option<String> {
+    for row in rows {
+        let incoming = row.expression.clone().unwrap_or_default();
+        for other in stored {
+            if other.base == row.base && other.code == row.code && other.url != row.url {
+                let existing = other.expression.clone().unwrap_or_default();
+                if existing != incoming {
+                    return Some(format!(
+                        "search parameter {}.{} expression differs",
+                        row.base, row.code
+                    ));
+                }
+            }
+        }
+        for other in seen {
+            if other.base == row.base && other.code == row.code && other.url != row.url {
+                let existing = other.expression.clone().unwrap_or_default();
+                if existing != incoming {
+                    return Some(format!(
+                        "search parameter {}.{} expression differs",
+                        row.base, row.code
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn check_terminology(
+    stored: &[StoredTerminology],
+    local_id: i64,
+    resource: &Value,
+) -> Result<(), FhirError> {
+    let url = resource
+        .get("url")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| FhirError::Invalid("url is required".into()))?;
+    if stored
+        .iter()
+        .any(|row| row.package_id != local_id && canonical_url(&row.url) == canonical_url(url))
+    {
+        return Err(FhirError::Invalid(format!(
+            "canonical {url} belongs to an installed package"
+        )));
+    }
+    Ok(())
+}
+
+fn terminology_owned_elsewhere(
+    store: &dyn ConformanceStore,
+    local_id: i64,
+    url: &str,
+) -> Result<bool, FhirError> {
+    let stored = store.load_terminology()?;
+    Ok(stored
+        .iter()
+        .any(|row| row.package_id != local_id && canonical_url(&row.url) == canonical_url(url)))
+}
+
+fn candidate_resources(path: &str, args: &Value) -> Vec<Value> {
+    if path == "Bundle/transaction" {
+        let bundle = args
+            .get("resource")
+            .cloned()
+            .unwrap_or_else(|| args.clone());
+        let Some(entries) = bundle.get("entry").and_then(|value| value.as_array()) else {
+            return Vec::new();
+        };
+        return entries
+            .iter()
+            .filter_map(|entry| entry.get("resource").cloned())
+            .filter(|resource| {
+                matches!(
+                    resource
+                        .get("resourceType")
+                        .and_then(|value| value.as_str()),
+                    Some("SearchParameter" | "ValueSet" | "CodeSystem" | "ConceptMap")
+                )
+            })
+            .collect();
+    }
+    let Some((type_name, op)) = path.split_once('/') else {
+        return Vec::new();
+    };
+    if !matches!(op, "create" | "update") || !CONFORMANCE.contains(&type_name) {
+        return Vec::new();
+    }
+    args.get("resource").cloned().into_iter().collect()
+}
+
+fn write_resource(
+    db: &Database,
+    write: &DocumentWrite,
+    ts: Timestamp,
+) -> Result<Option<Value>, FhirError> {
+    let text = if let Some(json) = &write.json {
+        json.clone()
+    } else {
+        let Some(previous) = previous_body(db, &write.tablet, &write.id, ts)? else {
+            return Ok(None);
+        };
+        previous
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| FhirError::Invalid(err.to_string()))
+}
+
+fn previous_body(
+    db: &Database,
+    tablet: &str,
+    id: &str,
+    at: Timestamp,
+) -> Result<Option<String>, FhirError> {
+    let document = DocumentId::new(TabletId::new(tablet), id.as_bytes());
+    let previous = db.reader().previous_revision(&document, at)?;
+    Ok(previous.and_then(|entry| entry.value))
+}
+
+fn live_json(db: &Database, type_name: &str, id: &str) -> Result<Option<Value>, FhirError> {
+    let document = DocumentId::new(TabletId::new(type_name), id.as_bytes());
+    let Some(entry) = db.reader().latest_document(&document, db.latest_ts())? else {
+        return Ok(None);
+    };
+    let Some(text) = entry.value else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|err| FhirError::Invalid(err.to_string()))
+}
+
+fn local_package(
+    store: &dyn ConformanceStore,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+) -> Result<i64, FhirError> {
+    let version = catalog.read().expect("catalog").fhir_version().to_string();
+    store
+        .ensure_local_package(&version)
+        .map_err(FhirError::from)
+}
+
+fn merge_jobs(
+    into: &mut BTreeMap<String, BTreeSet<String>>,
+    more: BTreeMap<String, BTreeSet<String>>,
+) {
+    for (base, urls) in more {
+        into.entry(base).or_default().extend(urls);
+    }
+}
+
+fn canonical_url(url: &str) -> &str {
+    url.split('|').next().unwrap_or(url)
+}
+
+fn comparable(text: &str) -> Value {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Value::String(text.to_string());
+    };
+    comparable_value(&value)
+}
+
+fn comparable_value(value: &Value) -> Value {
+    let mut value = value.clone();
+    if let Some(object) = value.as_object_mut() {
+        if let Some(meta) = object.get_mut("meta").and_then(|meta| meta.as_object_mut()) {
+            meta.remove("versionId");
+            if meta.is_empty() {
+                object.remove("meta");
+            }
+        }
+    }
+    value
+}

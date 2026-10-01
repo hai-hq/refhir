@@ -97,6 +97,7 @@ impl Catalog {
             &store.load_structure_definitions()?,
             &store.load_search_parameters()?,
             &store.load_terminology()?,
+            &store.load_expansions()?,
         )
     }
 
@@ -105,6 +106,7 @@ impl Catalog {
         definitions: &[StoredStructureDefinition],
         parameters: &[StoredSearchParameter],
         terminology: &[refhir_persistence::StoredTerminology],
+        expansions: &[refhir_persistence::StoredExpansion],
     ) -> Result<Self, PersistError> {
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
         let mut definition_json = Vec::new();
@@ -117,12 +119,18 @@ impl Catalog {
         let schema = Schema::from_definitions(&definition_json);
         let mut term_json = Vec::new();
         for resource in terminology {
-            let json: Value = serde_json::from_str(&resource.json).map_err(|err| {
-                PersistError::Definite(format!("terminology json: {err}"))
-            })?;
+            let json: Value = serde_json::from_str(&resource.json)
+                .map_err(|err| PersistError::Definite(format!("terminology json: {err}")))?;
             term_json.push(json);
         }
-        let terms = MemoryTerminology::from_resources(&term_json);
+        let mut expansion_json = Vec::new();
+        for expansion in expansions {
+            let json: Value = serde_json::from_str(&expansion.json).map_err(|err| {
+                PersistError::Definite(format!("value set expansion json: {err}"))
+            })?;
+            expansion_json.push(json);
+        }
+        let terms = MemoryTerminology::from_stored(&term_json, &expansion_json);
         let mut types = BTreeMap::new();
         for (definition, json) in definitions.iter().zip(&definition_json) {
             if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
@@ -181,7 +189,9 @@ impl Catalog {
         }
         let model_json: Vec<Value> = definition_json
             .iter()
-            .filter(|json| json.get("derivation").and_then(|value| value.as_str()) != Some("constraint"))
+            .filter(|json| {
+                json.get("derivation").and_then(|value| value.as_str()) != Some("constraint")
+            })
             .cloned()
             .collect();
         Ok(Self {

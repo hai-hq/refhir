@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use refhir_database::Database;
+use refhir_persistence::ConformanceStore;
 use refhir_sqlite::SqlitePersistence;
 use refhir_types::{token_interval, IndexId, Order};
 use serde_json::{json, Value};
 
+use refhir_validate::{TermAnswer, Terminology};
+
 use crate::catalog::Catalog;
+use crate::conform::{commit_operation, repair_conformance};
 use crate::error::FhirError;
 use crate::package::{
     expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
@@ -497,6 +501,60 @@ fn official_r4_package_installs_concrete_types() {
     assert!(names.contains(&"identifier"));
     assert!(names.contains(&"active"));
     assert!(names.contains(&"gender"));
+    assert_eq!(
+        catalog.terms().contains(
+            "http://hl7.org/fhir/ValueSet/administrative-gender",
+            Some("http://hl7.org/fhir/administrative-gender"),
+            "female",
+        ),
+        TermAnswer::Yes
+    );
+    assert_eq!(
+        catalog.terms().contains(
+            "http://hl7.org/fhir/ValueSet/administrative-gender",
+            Some("http://hl7.org/fhir/administrative-gender"),
+            "not-a-gender",
+        ),
+        TermAnswer::No
+    );
+    let accepted = run(
+        &db.db,
+        &catalog,
+        "Patient/$validate",
+        &json!({"resource": {"resourceType": "Patient", "gender": "female", "name": [{"family": "Ann"}]}}),
+    )
+    .unwrap();
+    assert!(
+        !accepted.value["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| {
+                issue["severity"] == "error"
+                    && issue["diagnostics"]
+                        .as_str()
+                        .unwrap_or("")
+                        .contains("gender")
+            }),
+        "{}",
+        accepted.value
+    );
+    let rejected = run(
+        &db.db,
+        &catalog,
+        "Patient/$validate",
+        &json!({"resource": {"resourceType": "Patient", "gender": "not-a-gender"}}),
+    )
+    .unwrap();
+    assert!(
+        rejected.value["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| { issue["severity"] == "error" && issue["code"] == "code-invalid" }),
+        "{}",
+        rejected.value
+    );
 }
 
 #[test]
@@ -516,11 +574,440 @@ fn invalid_patient_is_rejected_and_validate_reports_issues() {
     let rejected = run_op(&db, "Patient/create", &json!({"resource": body})).unwrap_err();
     assert!(matches!(rejected, RunError::Fhir(FhirError::Outcome(_))));
     let catalog = db.catalog.read().expect("catalog");
-    let report = run(&db.db, &catalog, "Patient/$validate", &json!({"resource": body})).unwrap();
+    let report = run(
+        &db.db,
+        &catalog,
+        "Patient/$validate",
+        &json!({"resource": body}),
+    )
+    .unwrap();
     assert_eq!(report.value["resourceType"], "OperationOutcome");
     assert!(report.value["issue"]
         .as_array()
         .unwrap()
         .iter()
         .any(|issue| issue["severity"] == "error"));
+}
+
+fn write_terms_package(dir: &std::path::Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.terms","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("CodeSystem-animals.json"),
+        r#"{
+            "resourceType": "CodeSystem",
+            "url": "http://example.org/animals",
+            "name": "Animals",
+            "content": "complete",
+            "concept": [
+                {"code": "mammal", "display": "Mammal", "definition": "A mammal", "concept": [
+                    {"code": "dog", "display": "Dog"}
+                ]}
+            ]
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-pets.json"),
+        r#"{
+            "resourceType": "ValueSet",
+            "url": "http://example.org/pets",
+            "compose": {"include": [{"system": "http://example.org/animals", "filter": [
+                {"property": "concept", "op": "is-a", "value": "mammal"}
+            ]}]}
+        }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ConceptMap-pets.json"),
+        r#"{
+            "resourceType": "ConceptMap",
+            "url": "http://example.org/map",
+            "group": [{
+                "source": "http://example.org/animals",
+                "target": "http://example.org/dst",
+                "element": [{"code": "dog", "target": [{"code": "canine", "equivalence": "equivalent"}]}]
+            }]
+        }"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn terminology_operations_read_the_installed_expansion() {
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-terms-ops-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    write_terms_package(&dir);
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let expanded = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://example.org/pets", "filter": "dog"}),
+    );
+    assert_eq!(expanded["resourceType"], "ValueSet");
+    assert_eq!(expanded["expansion"]["contains"][0]["code"], "dog");
+    assert!(
+        !run_op(
+            &harness,
+            "ValueSet/$expand",
+            &json!({"url": "http://example.org/pets", "filter": "dog"})
+        )
+        .unwrap()
+        .wrote
+    );
+    let missing = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://example.org/missing"}),
+    );
+    assert_eq!(missing["resourceType"], "OperationOutcome");
+    assert_eq!(missing["issue"][0]["code"], "not-supported");
+
+    let valid = apply(
+        &harness,
+        "ValueSet/$validate-code",
+        json!({
+            "resourceType": "Parameters",
+            "parameter": [
+                {"name": "url", "valueUri": "http://example.org/pets"},
+                {"name": "system", "valueUri": "http://example.org/animals"},
+                {"name": "code", "valueCode": "dog"},
+                {"name": "display", "valueString": "Dog"}
+            ]
+        }),
+    );
+    assert_eq!(valid["parameter"][0]["valueBoolean"], true);
+    let invalid = apply(
+        &harness,
+        "CodeSystem/$validate-code",
+        json!({"url": "http://example.org/animals", "code": "fish"}),
+    );
+    assert_eq!(invalid["parameter"][0]["valueBoolean"], false);
+
+    let looked = apply(
+        &harness,
+        "CodeSystem/$lookup",
+        json!({"system": "http://example.org/animals", "code": "mammal"}),
+    );
+    assert_eq!(looked["resourceType"], "Parameters");
+    assert!(looked["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["name"] == "display" && item["valueString"] == "Mammal"));
+    assert!(looked["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|item| item["name"] == "definition" && item["valueString"] == "A mammal"));
+
+    let translated = apply(
+        &harness,
+        "ConceptMap/$translate",
+        json!({"url": "http://example.org/map", "system": "http://example.org/animals", "code": "dog"}),
+    );
+    assert_eq!(translated["parameter"][0]["valueBoolean"], true);
+    assert_eq!(
+        translated["parameter"][1]["part"][1]["valueCoding"]["code"],
+        "canine"
+    );
+    let unsupported = run_op(
+        &harness,
+        "Patient/$expand",
+        &json!({"url": "http://example.org/pets"}),
+    );
+    assert!(matches!(
+        unsupported,
+        Err(RunError::Fhir(FhirError::Unsupported(_)))
+    ));
+}
+
+#[test]
+fn sqlite_reloads_a_stored_expansion_without_the_package_directory() {
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-terms-pkg-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = std::env::temp_dir().join(format!(
+        "refhir-terms-{}-{}.sqlite",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    write_terms_package(&dir);
+    {
+        let store = SqlitePersistence::open(&path).unwrap();
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let catalog = std::sync::RwLock::new(Catalog::empty());
+        install_package_dir(&store, &db, &catalog, &dir).unwrap();
+        assert!(!store.load_expansions().unwrap().is_empty());
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    let store = SqlitePersistence::open(&path).unwrap();
+    let catalog = Catalog::open(&store).unwrap();
+    assert_eq!(
+        catalog.terms().contains(
+            "http://example.org/pets",
+            Some("http://example.org/animals"),
+            "dog",
+        ),
+        TermAnswer::Yes
+    );
+    assert_eq!(
+        catalog.terms().contains(
+            "http://example.org/pets",
+            Some("http://example.org/animals"),
+            "fish",
+        ),
+        TermAnswer::No
+    );
+    drop(catalog);
+    drop(store);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
+    let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
+}
+
+fn commit(harness: &Harness, path: &str, args: Value) -> Result<Value, RunError> {
+    commit_operation(&harness.store, &harness.db, &harness.catalog, path, &args)
+        .map(|result| result.value)
+}
+
+fn install_resource_types(harness: &Harness) {
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-local-types-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.structures","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    for type_name in ["SearchParameter", "ValueSet", "CodeSystem", "ConceptMap"] {
+        std::fs::write(
+            dir.join(format!("StructureDefinition-{type_name}.json")),
+            format!(
+                r#"{{"resourceType":"StructureDefinition","url":"http://hl7.org/fhir/StructureDefinition/{type_name}","name":"{type_name}","status":"active","kind":"resource","abstract":false,"type":"{type_name}","fhirVersion":"4.0.1","derivation":"specialization","snapshot":{{"element":[{{"path":"{type_name}","min":0,"max":"*"}}]}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn label_parameter(expression: &str) -> Value {
+    json!({
+        "resourceType": "SearchParameter",
+        "id": "label",
+        "url": "http://example.org/SearchParameter/label",
+        "name": "label",
+        "status": "active",
+        "description": "A label",
+        "code": "label",
+        "base": ["Patient"],
+        "type": "string",
+        "expression": expression
+    })
+}
+
+#[test]
+fn user_search_parameter_reindexes_when_the_expression_changes() {
+    let harness = ready();
+    install_resource_types(&harness);
+    commit(
+        &harness,
+        "SearchParameter/create",
+        json!({"resource": label_parameter("Patient.name")}),
+    )
+    .unwrap();
+    commit(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    )
+    .unwrap();
+    let found = commit(&harness, "Patient/search", json!({"label": "Ann"})).unwrap();
+    assert_eq!(found["total"], 1);
+    assert_eq!(found["entry"][0]["resource"]["id"], "p1");
+
+    commit(
+        &harness,
+        "SearchParameter/update",
+        json!({"id": "label", "resource": label_parameter("Patient.birthDate")}),
+    )
+    .unwrap();
+    let missed = commit(&harness, "Patient/search", json!({"label": "Ann"})).unwrap();
+    assert_eq!(missed["total"], 0);
+
+    commit(&harness, "SearchParameter/delete", json!({"id": "label"})).unwrap();
+    let unsupported = commit(&harness, "Patient/search", json!({"label": "Ann"})).unwrap_err();
+    let RunError::Fhir(FhirError::Invalid(message)) = unsupported else {
+        panic!("expected an unsupported parameter");
+    };
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+}
+
+#[test]
+fn user_value_set_expands_until_it_is_deleted() {
+    let harness = ready();
+    install_resource_types(&harness);
+    let mut colors = json!({
+        "resourceType": "ValueSet",
+        "id": "colors",
+        "url": "http://example.org/colors",
+        "status": "active",
+        "compose": {"include": [{"system": "http://example.org/colors", "concept": [
+            {"code": "red", "display": "Red"},
+            {"code": "blue", "display": "Blue"}
+        ]}]}
+    });
+    commit(&harness, "ValueSet/create", json!({"resource": colors})).unwrap();
+    let expanded = commit(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://example.org/colors"}),
+    )
+    .unwrap();
+    let codes: Vec<_> = expanded["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| entry.get("code").and_then(|code| code.as_str()))
+        .collect();
+    assert!(codes.contains(&"red"), "{codes:?}");
+    assert!(codes.contains(&"blue"), "{codes:?}");
+    assert_eq!(
+        harness.catalog.read().unwrap().terms().contains(
+            "http://example.org/colors",
+            Some("http://example.org/colors"),
+            "blue",
+        ),
+        TermAnswer::Yes
+    );
+
+    colors["compose"]["include"][0]["concept"] = json!([{"code": "red", "display": "Red"}]);
+    commit(
+        &harness,
+        "ValueSet/update",
+        json!({"id": "colors", "resource": colors}),
+    )
+    .unwrap();
+    assert_eq!(
+        harness.catalog.read().unwrap().terms().contains(
+            "http://example.org/colors",
+            Some("http://example.org/colors"),
+            "blue",
+        ),
+        TermAnswer::No
+    );
+
+    commit(&harness, "ValueSet/delete", json!({"id": "colors"})).unwrap();
+    let gone = commit(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://example.org/colors"}),
+    )
+    .unwrap();
+    let text = gone.to_string();
+    assert!(text.contains("not supported"), "{text}");
+}
+
+#[test]
+fn user_value_set_cannot_reuse_a_package_url() {
+    let harness = ready();
+    install_resource_types(&harness);
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-owned-vs-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.owned","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-owned.json"),
+        r#"{"resourceType":"ValueSet","url":"http://example.org/owned","status":"active","compose":{"include":[{"system":"http://example.org/owned","concept":[{"code":"a"}]}]}}"#,
+    )
+    .unwrap();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let err = commit(
+        &harness,
+        "ValueSet/create",
+        json!({"resource": {
+            "resourceType": "ValueSet",
+            "id": "owned",
+            "url": "http://example.org/owned",
+            "status": "active",
+            "compose": {"include": [{"system": "http://example.org/owned", "concept": [{"code": "b"}]}]}
+        }}),
+    )
+    .unwrap_err();
+    let RunError::Fhir(FhirError::Invalid(message)) = err else {
+        panic!("expected a canonical clash");
+    };
+    assert!(
+        message.contains("belongs to an installed package"),
+        "{message}"
+    );
+}
+
+#[test]
+fn repair_projects_a_value_set_that_was_only_stored() {
+    let harness = ready();
+    install_resource_types(&harness);
+    let colors = json!({
+        "resourceType": "ValueSet",
+        "id": "repair",
+        "url": "http://example.org/repair",
+        "status": "active",
+        "compose": {"include": [{"system": "http://example.org/repair", "concept": [
+            {"code": "red", "display": "Red"}
+        ]}]}
+    });
+    apply(&harness, "ValueSet/create", json!({"resource": colors}));
+    let before = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://example.org/repair"}),
+    );
+    assert!(before.to_string().contains("not supported"), "{before}");
+
+    repair_conformance(&harness.store, &harness.db, &harness.catalog).unwrap();
+    let expanded = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://example.org/repair"}),
+    );
+    assert_eq!(expanded["expansion"]["contains"][0]["code"], "red");
 }

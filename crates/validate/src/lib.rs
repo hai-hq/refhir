@@ -312,4 +312,68 @@ mod tests {
             unmatched.issues
         );
     }
+
+    #[test]
+    fn inactive_required_code_is_an_error_and_display_mismatch_warns() {
+        let schema = Schema::from_definitions(&[json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/Widget",
+            "name": "Widget",
+            "type": "Widget",
+            "kind": "resource",
+            "derivation": "specialization",
+            "snapshot": {"element": [
+                {"path": "Widget", "min": 0, "max": "*"},
+                {"path": "Widget.status", "min": 0, "max": "1", "type": [{"code": "Coding"}], "binding": {
+                    "strength": "required",
+                    "valueSet": "http://example.org/ValueSet/status"
+                }}
+            ]}
+        })]);
+        let terms = MemoryTerminology::from_resources(&[
+            json!({
+                "resourceType": "CodeSystem",
+                "url": "http://example.org/status",
+                "content": "complete",
+                "concept": [
+                    {"code": "active", "display": "Active"},
+                    {"code": "retired", "display": "Retired", "inactive": true}
+                ]
+            }),
+            json!({
+                "resourceType": "ValueSet",
+                "url": "http://example.org/ValueSet/status",
+                "compose": {"include": [{"system": "http://example.org/status"}]}
+            }),
+        ]);
+        let retired = validate_resource(
+            &json!({
+                "resourceType": "Widget",
+                "status": {"system": "http://example.org/status", "code": "retired", "display": "Retired"}
+            }),
+            &schema,
+            &terms,
+            &NoHost,
+        );
+        assert!(
+            retired.issues.iter().any(|issue| issue.severity.fails() && issue.diagnostics.contains("inactive")),
+            "{:#?}",
+            retired.issues
+        );
+        let mismatched = validate_resource(
+            &json!({
+                "resourceType": "Widget",
+                "status": {"system": "http://example.org/status", "code": "active", "display": "Nope"}
+            }),
+            &schema,
+            &terms,
+            &NoHost,
+        );
+        assert!(!mismatched.has_errors(), "{:#?}", mismatched.issues);
+        assert!(
+            mismatched.issues.iter().any(|issue| issue.diagnostics.contains("does not match")),
+            "{:#?}",
+            mismatched.issues
+        );
+    }
 }

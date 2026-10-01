@@ -3,7 +3,7 @@
 
 The server installs a local directory. This script fetches the published R4
 core package once and keeps StructureDefinition, SearchParameter, CodeSystem,
-and ValueSet resources so bindings resolve without a terminology server.
+ValueSet, and ConceptMap resources so bindings and translation work offline.
 
 A few SearchParameters are left out because the loader cannot install them:
 the draft example uses base Resource and code _id with a different expression
@@ -39,19 +39,51 @@ def main() -> None:
         f"{counts['SearchParameter']} SearchParameters, "
         f"{counts['CodeSystem']} CodeSystems, "
         f"{counts['ValueSet']} ValueSets, "
+        f"{counts['ConceptMap']} ConceptMaps, "
         f"skipped {counts['skipped']} SearchParameters)"
     )
 
 
 def download(url: str, path: Path) -> None:
-    subprocess.run(
-        ["curl", "-fsSL", "--retry", "5", "--retry-all-errors", "-o", str(path), url],
-        check=True,
-    )
+    for _attempt in range(6):
+        if path.exists():
+            path.unlink()
+        result = subprocess.run(
+            [
+                "curl",
+                "-fL",
+                "--http1.1",
+                "--connect-timeout",
+                "20",
+                "--speed-limit",
+                "5000",
+                "--speed-time",
+                "20",
+                "--retry",
+                "3",
+                "--retry-all-errors",
+                "--retry-delay",
+                "2",
+                "-s",
+                "-o",
+                str(path),
+                url,
+            ]
+        )
+        if result.returncode == 0 and tarfile.is_tarfile(path):
+            return
+    raise SystemExit("download of hl7.fhir.r4.core failed")
 
 
 def extract(archive_path: Path, staging: Path) -> dict[str, int]:
-    counts = {"StructureDefinition": 0, "SearchParameter": 0, "CodeSystem": 0, "ValueSet": 0, "skipped": 0}
+    counts = {
+        "StructureDefinition": 0,
+        "SearchParameter": 0,
+        "CodeSystem": 0,
+        "ValueSet": 0,
+        "ConceptMap": 0,
+        "skipped": 0,
+    }
     with tarfile.open(archive_path, "r:gz") as archive:
         manifest = None
         for member in archive.getmembers():
@@ -62,7 +94,13 @@ def extract(archive_path: Path, staging: Path) -> dict[str, int]:
             if not name.endswith(".json"):
                 continue
             resource_type = name.split("-", 1)[0]
-            if resource_type not in ("StructureDefinition", "SearchParameter", "CodeSystem", "ValueSet"):
+            if resource_type not in (
+                "StructureDefinition",
+                "SearchParameter",
+                "CodeSystem",
+                "ValueSet",
+                "ConceptMap",
+            ):
                 continue
             payload = archive.extractfile(member).read()
             if resource_type == "SearchParameter" and not keep_search(payload):

@@ -1,7 +1,7 @@
 use refhir_persistence::{
-    ConformanceStore, InstallError, InstallOutcome, NewPackage, ParamStatus, PendingParam,
-    PersistError, StoredBackfill, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
-    StoredTerminology,
+    ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage, NewSearchParameter,
+    NewTerminology, ParamStatus, PendingParam, PersistError, StoredBackfill, StoredExpansion,
+    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -123,6 +123,28 @@ impl ConformanceStore for SqlitePersistence {
         Ok(rows)
     }
 
+    fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        let mut stmt = guard
+            .connection
+            .prepare(
+                "SELECT package_id, url, json FROM value_set_expansion ORDER BY package_id, url",
+            )
+            .map_err(definite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredExpansion {
+                    package_id: row.get(0)?,
+                    url: row.get(1)?,
+                    json: row.get(2)?,
+                })
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?;
+        Ok(rows)
+    }
+
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
         let guard = self.inner.lock().expect("sqlite");
         let tx = guard.connection.unchecked_transaction().map_err(definite)?;
@@ -150,6 +172,199 @@ impl ConformanceStore for SqlitePersistence {
         Ok(())
     }
 
+    fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        let existing: Option<i64> = guard
+            .connection
+            .query_row(
+                "SELECT id FROM packages WHERE name = 'refhir.local' AND version = '0'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(definite)?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        let current: Option<String> = guard
+            .connection
+            .query_row("SELECT fhir_version FROM packages LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(definite)?;
+        let version = current.unwrap_or_else(|| fhir_version.to_string());
+        guard
+            .connection
+            .execute(
+                "INSERT INTO packages (name, version, fhir_version) VALUES ('refhir.local', '0', ?1)",
+                params![version],
+            )
+            .map_err(definite)?;
+        Ok(guard.connection.last_insert_rowid())
+    }
+
+    fn upsert_search_parameter(
+        &self,
+        package_id: i64,
+        param: &NewSearchParameter,
+    ) -> Result<bool, PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        let prior: Option<(String, String, String, String)> = guard
+            .connection
+            .query_row(
+                "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
+                 WHERE package_id = ?1 AND url = ?2 AND base = ?3",
+                params![package_id, param.url, param.base],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(definite)?;
+        let incoming = param.expression.clone().unwrap_or_default();
+        if let Some((code, param_type, expression, _status)) = &prior {
+            if code == &param.code && param_type == &param.param_type && expression == &incoming {
+                guard
+                    .connection
+                    .execute(
+                        "UPDATE search_parameters SET json = ?1 \
+                         WHERE package_id = ?2 AND url = ?3 AND base = ?4",
+                        params![param.json, package_id, param.url, param.base],
+                    )
+                    .map_err(definite)?;
+                return Ok(false);
+            }
+        }
+        guard
+            .connection
+            .execute(
+                "INSERT INTO search_parameters \
+                 (package_id, url, base, code, param_type, expression, status, json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT (package_id, url, base) DO UPDATE SET \
+                 code = excluded.code, param_type = excluded.param_type, \
+                 expression = excluded.expression, status = excluded.status, json = excluded.json",
+                params![
+                    package_id,
+                    param.url,
+                    param.base,
+                    param.code,
+                    param.param_type,
+                    param.expression,
+                    param.status.as_str(),
+                    param.json
+                ],
+            )
+            .map_err(definite)?;
+        Ok(true)
+    }
+
+    fn delete_search_parameter(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        guard
+            .connection
+            .execute(
+                "DELETE FROM search_parameters WHERE package_id = ?1 AND url = ?2",
+                params![package_id, url],
+            )
+            .map_err(definite)?;
+        Ok(())
+    }
+
+    fn upsert_terminology(
+        &self,
+        package_id: i64,
+        row: &NewTerminology,
+    ) -> Result<(), PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        guard
+            .connection
+            .execute(
+                "INSERT INTO terminology (package_id, resource_type, url, json) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (package_id, url) DO UPDATE SET \
+                 resource_type = excluded.resource_type, json = excluded.json",
+                params![package_id, row.resource_type, row.url, row.json],
+            )
+            .map_err(definite)?;
+        Ok(())
+    }
+
+    fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        guard
+            .connection
+            .execute(
+                "DELETE FROM terminology WHERE package_id = ?1 AND url = ?2",
+                params![package_id, url],
+            )
+            .map_err(definite)?;
+        Ok(())
+    }
+
+    fn replace_expansions(
+        &self,
+        package_id: i64,
+        expansions: &[NewExpansion],
+    ) -> Result<(), PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        let tx = guard.connection.unchecked_transaction().map_err(definite)?;
+        tx.execute(
+            "DELETE FROM value_set_expansion WHERE package_id = ?1",
+            params![package_id],
+        )
+        .map_err(definite)?;
+        for expansion in expansions {
+            tx.execute(
+                "INSERT INTO value_set_expansion (package_id, url, json) VALUES (?1, ?2, ?3)",
+                params![package_id, expansion.url, expansion.json],
+            )
+            .map_err(definite)?;
+        }
+        tx.commit().map_err(definite)?;
+        Ok(())
+    }
+
+    fn complete_backfill(
+        &self,
+        backfill_id: i64,
+        package_id: i64,
+        base: &str,
+    ) -> Result<(), PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        let urls = {
+            let mut stmt = guard
+                .connection
+                .prepare("SELECT url FROM backfill_parameter WHERE backfill_id = ?1")
+                .map_err(definite)?;
+            let mapped = stmt
+                .query_map(params![backfill_id], |row| row.get::<_, String>(0))
+                .map_err(definite)?;
+            mapped.collect::<Result<Vec<_>, _>>().map_err(definite)?
+        };
+        if urls.is_empty() {
+            guard
+                .connection
+                .execute(
+                    "UPDATE search_parameters SET status = 'ready' \
+                     WHERE package_id = ?1 AND base = ?2 AND status = 'pending'",
+                    params![package_id, base],
+                )
+                .map_err(definite)?;
+            return Ok(());
+        }
+        for url in urls {
+            guard
+                .connection
+                .execute(
+                    "UPDATE search_parameters SET status = 'ready' \
+                     WHERE package_id = ?1 AND base = ?2 AND url = ?3 AND status = 'pending'",
+                    params![package_id, base, url],
+                )
+                .map_err(definite)?;
+        }
+        Ok(())
+    }
+
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError> {
         let guard = self.inner.lock().expect("sqlite");
         guard
@@ -168,6 +383,7 @@ impl ConformanceStore for SqlitePersistence {
         package_id: i64,
         watermark_ts: i64,
         tablet: &str,
+        urls: &[String],
     ) -> Result<i64, PersistError> {
         let guard = self.inner.lock().expect("sqlite");
         guard
@@ -178,7 +394,29 @@ impl ConformanceStore for SqlitePersistence {
                 params![package_id, watermark_ts, tablet],
             )
             .map_err(definite)?;
-        Ok(guard.connection.last_insert_rowid())
+        let backfill_id = guard.connection.last_insert_rowid();
+        if urls.is_empty() {
+            guard
+                .connection
+                .execute(
+                    "INSERT INTO backfill_parameter (backfill_id, url) \
+                     SELECT ?1, url FROM search_parameters \
+                     WHERE package_id = ?2 AND base = ?3 AND status = 'pending'",
+                    params![backfill_id, package_id, tablet],
+                )
+                .map_err(definite)?;
+        } else {
+            for url in urls {
+                guard
+                    .connection
+                    .execute(
+                        "INSERT OR IGNORE INTO backfill_parameter (backfill_id, url) VALUES (?1, ?2)",
+                        params![backfill_id, url],
+                    )
+                    .map_err(definite)?;
+            }
+        }
+        Ok(backfill_id)
     }
 
     fn update_backfill(
@@ -241,6 +479,7 @@ fn install_in_tx(
         .map_err(definite)?;
     if let Some(package_id) = existing_id {
         insert_terminology(tx, package_id, package)?;
+        replace_expansions(tx, package_id, package)?;
         return Ok(InstallOutcome {
             package_id,
             inserted: false,
@@ -331,6 +570,7 @@ fn install_in_tx(
         .map_err(definite)?;
     }
     insert_terminology(tx, package_id, package)?;
+    replace_expansions(tx, package_id, package)?;
     Ok(InstallOutcome {
         package_id,
         inserted: true,
@@ -353,6 +593,26 @@ fn insert_terminology(
                 resource.url,
                 resource.json
             ],
+        )
+        .map_err(definite)?;
+    }
+    Ok(())
+}
+
+fn replace_expansions(
+    tx: &Transaction<'_>,
+    package_id: i64,
+    package: &NewPackage,
+) -> Result<(), InstallError> {
+    tx.execute(
+        "DELETE FROM value_set_expansion WHERE package_id = ?1",
+        params![package_id],
+    )
+    .map_err(definite)?;
+    for expansion in &package.expansions {
+        tx.execute(
+            "INSERT INTO value_set_expansion (package_id, url, json) VALUES (?1, ?2, ?3)",
+            params![package_id, expansion.url, expansion.json],
         )
         .map_err(definite)?;
     }

@@ -55,10 +55,20 @@ pub struct Delete {
 }
 
 /// Index rows for an existing document. No document revision is written.
+/// `old_keys` are tombstoned when they are absent from `keys`.
 pub struct IndexPut {
     pub tablet: TabletId,
     pub id: String,
     pub keys: Vec<(IndexId, Vec<u8>)>,
+    pub old_keys: Vec<(IndexId, Vec<u8>)>,
+}
+
+/// A document create, update, or delete staged in this transaction.
+#[derive(Clone, Debug)]
+pub struct DocumentWrite {
+    pub tablet: String,
+    pub id: String,
+    pub json: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +110,37 @@ impl Transaction {
 
     pub fn has_writes(&self) -> bool {
         !self.writes.is_empty()
+    }
+
+    pub fn document_writes(&self) -> Vec<DocumentWrite> {
+        self.writes
+            .values()
+            .filter(|write| !write.index_only)
+            .map(|write| DocumentWrite {
+                tablet: write.tablet.as_str().to_string(),
+                id: write.id.clone(),
+                json: write.new_json.clone(),
+            })
+            .collect()
+    }
+
+    /// Live keys in `index` at this transaction's snapshot. One entry per key.
+    pub fn live_index_keys(
+        &mut self,
+        index: &IndexId,
+    ) -> Result<Vec<(String, Vec<u8>)>, PersistError> {
+        self.reads.record(index.clone(), Interval::all());
+        let rows = self
+            .reader
+            .index_scan(index, self.begin_ts, &Interval::all(), Order::Asc)?;
+        let mut keys = Vec::new();
+        for row in rows {
+            let Some(id) = row.document.id.id_str() else {
+                continue;
+            };
+            keys.push((id.to_string(), row.key));
+        }
+        Ok(keys)
     }
 
     pub fn written_ids(&self) -> Vec<WrittenId> {
@@ -300,10 +341,12 @@ impl Transaction {
 
     pub fn stage_index(&mut self, put: IndexPut) -> Result<(), PersistError> {
         self.record_keys(&put.keys);
+        self.record_keys(&put.old_keys);
         let map_key = (put.tablet.clone(), put.id.clone());
         if let Some(existing) = self.writes.get_mut(&map_key) {
             if existing.index_only {
                 existing.new_keys.extend(put.keys);
+                existing.old_keys.extend(put.old_keys);
             }
             return Ok(());
         }
@@ -315,7 +358,7 @@ impl Transaction {
                 new_json: None,
                 prev_ts: None,
                 new_keys: put.keys,
-                old_keys: Vec::new(),
+                old_keys: put.old_keys,
                 index_only: true,
             },
         );

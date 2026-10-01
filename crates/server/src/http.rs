@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use refhir_database::{CommitError, Database};
-use refhir_fhir::{outcome_code, Catalog, FhirError, RunError, RunResult};
+use refhir_fhir::{outcome_code, Catalog, ConformanceStore, FhirError, RunError, RunResult};
 use serde_json::{json, Value};
 
 use crate::sync;
@@ -20,33 +20,43 @@ use crate::sync;
 pub struct AppState {
     pub db: Arc<Database>,
     pub catalog: Arc<RwLock<Catalog>>,
+    pub store: Arc<dyn ConformanceStore>,
 }
 
-pub fn app(db: Arc<Database>, catalog: Arc<RwLock<Catalog>>) -> Router {
+pub fn app(
+    db: Arc<Database>,
+    catalog: Arc<RwLock<Catalog>>,
+    store: Arc<dyn ConformanceStore>,
+) -> Router {
     Router::new()
         .route("/metadata", get(metadata))
         .route("/sync", get(sync_ws))
         .route("/", post(bundle_post))
         .route("/:resource_type", get(search).post(create))
         .route("/:resource_type/$validate", post(validate_op))
+        .route("/:resource_type/$expand", post(expand_op))
+        .route("/:resource_type/$validate-code", post(validate_code_op))
+        .route("/:resource_type/$lookup", post(lookup_op))
+        .route("/:resource_type/$translate", post(translate_op))
         .route("/:resource_type/:id/_history/:vid", get(vread))
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id", get(read).put(update).delete(remove))
-        .with_state(AppState { db, catalog })
+        .with_state(AppState { db, catalog, store })
 }
 
 pub async fn execute(
     db: &Arc<Database>,
     catalog: &Arc<RwLock<Catalog>>,
+    store: &Arc<dyn ConformanceStore>,
     path: &str,
     args: Value,
 ) -> Result<RunResult, RunError> {
     let db = db.clone();
     let catalog = catalog.clone();
+    let store = store.clone();
     let path = path.to_string();
     match tokio::task::spawn_blocking(move || {
-        let catalog = catalog.read().expect("catalog");
-        refhir_fhir::run(&db, &catalog, &path, &args)
+        refhir_fhir::commit_operation(store.as_ref(), &db, &catalog, &path, &args)
     })
     .await
     {
@@ -63,7 +73,7 @@ async fn metadata(State(app): State<AppState>) -> Response {
 }
 
 async fn sync_ws(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| sync::handle_socket(socket, app.db, app.catalog))
+    ws.on_upgrade(move |socket| sync::handle_socket(socket, app.db, app.catalog, app.store))
 }
 
 async fn bundle_post(State(app): State<AppState>, body: Bytes) -> Response {
@@ -74,6 +84,7 @@ async fn bundle_post(State(app): State<AppState>, body: Bytes) -> Response {
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         "Bundle/transaction",
         json!({"resource": resource}),
     )
@@ -96,6 +107,7 @@ async fn create(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/create"),
         json!({"resource": resource}),
     )
@@ -122,8 +134,60 @@ async fn validate_op(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/$validate"),
         json!({"resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Err(err) => error_response(err),
+    }
+}
+
+async fn expand_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    terminology_op(app, resource_type, "$expand", body).await
+}
+
+async fn validate_code_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    terminology_op(app, resource_type, "$validate-code", body).await
+}
+
+async fn lookup_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    terminology_op(app, resource_type, "$lookup", body).await
+}
+
+async fn translate_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    terminology_op(app, resource_type, "$translate", body).await
+}
+
+async fn terminology_op(app: AppState, resource_type: String, op: &str, body: Bytes) -> Response {
+    let args = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/{op}"),
+        args,
     )
     .await
     {
@@ -139,6 +203,7 @@ async fn read(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/read"),
         json!({"id": id}),
     )
@@ -169,6 +234,7 @@ async fn update(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/update"),
         args,
     )
@@ -189,6 +255,7 @@ async fn remove(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/delete"),
         json!({"id": id}),
     )
@@ -211,6 +278,7 @@ async fn search(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/search"),
         Value::Object(args),
     )
@@ -228,6 +296,7 @@ async fn instance_history(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/history"),
         json!({"id": id}),
     )
@@ -245,6 +314,7 @@ async fn vread(
     match execute(
         &app.db,
         &app.catalog,
+        &app.store,
         &format!("{resource_type}/vread"),
         json!({"id": id, "versionId": vid}),
     )
@@ -356,6 +426,8 @@ fn fhir_status(err: &FhirError) -> StatusCode {
         FhirError::Gone(_) => StatusCode::GONE,
         FhirError::Conflict(_) => StatusCode::CONFLICT,
         FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => StatusCode::BAD_REQUEST,
+        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
+            StatusCode::BAD_REQUEST
+        }
     }
 }

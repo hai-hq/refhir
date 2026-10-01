@@ -84,11 +84,12 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     refhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;
+    refhir_fhir::repair_conformance(store.as_ref(), &db, &catalog)?;
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!("listening on http://{local}");
-    refhir_server::serve(db, catalog, listener).await?;
+    refhir_server::serve(db, catalog, store, listener).await?;
     Ok(())
 }
 
