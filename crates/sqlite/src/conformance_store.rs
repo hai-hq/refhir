@@ -1,6 +1,7 @@
 use refhir_persistence::{
     ConformanceStore, InstallError, InstallOutcome, NewPackage, ParamStatus, PendingParam,
     PersistError, StoredBackfill, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
+    StoredTerminology,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -97,6 +98,29 @@ impl ConformanceStore for SqlitePersistence {
                 },
             )
             .collect()
+    }
+
+    fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
+        let guard = self.inner.lock().expect("sqlite");
+        let mut stmt = guard
+            .connection
+            .prepare(
+                "SELECT package_id, resource_type, url, json FROM terminology ORDER BY package_id, url",
+            )
+            .map_err(definite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredTerminology {
+                    package_id: row.get(0)?,
+                    resource_type: row.get(1)?,
+                    url: row.get(2)?,
+                    json: row.get(3)?,
+                })
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?;
+        Ok(rows)
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -216,6 +240,7 @@ fn install_in_tx(
         .optional()
         .map_err(definite)?;
     if let Some(package_id) = existing_id {
+        insert_terminology(tx, package_id, package)?;
         return Ok(InstallOutcome {
             package_id,
             inserted: false,
@@ -305,9 +330,31 @@ fn install_in_tx(
         )
         .map_err(definite)?;
     }
+    insert_terminology(tx, package_id, package)?;
     Ok(InstallOutcome {
         package_id,
         inserted: true,
         newly_pending,
     })
+}
+
+fn insert_terminology(
+    tx: &Transaction<'_>,
+    package_id: i64,
+    package: &NewPackage,
+) -> Result<(), InstallError> {
+    for resource in &package.terminology {
+        tx.execute(
+            "INSERT OR IGNORE INTO terminology (package_id, resource_type, url, json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                package_id,
+                resource.resource_type,
+                resource.url,
+                resource.json
+            ],
+        )
+        .map_err(definite)?;
+    }
+    Ok(())
 }

@@ -11,6 +11,7 @@ use refhir_persistence::{
     ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
 };
 use refhir_types::{exact_key, IndexId, TabletId};
+use refhir_validate::{MemoryTerminology, Schema};
 use serde_json::{json, Value};
 
 use crate::error::FhirError;
@@ -75,6 +76,8 @@ pub struct Catalog {
     fhir_version: Option<String>,
     types: BTreeMap<String, ResourceModel>,
     path_model: Model,
+    schema: Schema,
+    terms: MemoryTerminology,
 }
 
 impl Catalog {
@@ -83,6 +86,8 @@ impl Catalog {
             fhir_version: None,
             types: BTreeMap::new(),
             path_model: Model::new(),
+            schema: Schema::default(),
+            terms: MemoryTerminology::default(),
         }
     }
 
@@ -91,6 +96,7 @@ impl Catalog {
             &store.load_packages()?,
             &store.load_structure_definitions()?,
             &store.load_search_parameters()?,
+            &store.load_terminology()?,
         )
     }
 
@@ -98,18 +104,30 @@ impl Catalog {
         packages: &[refhir_persistence::StoredPackage],
         definitions: &[StoredStructureDefinition],
         parameters: &[StoredSearchParameter],
+        terminology: &[refhir_persistence::StoredTerminology],
     ) -> Result<Self, PersistError> {
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
         let mut definition_json = Vec::new();
-        let mut types = BTreeMap::new();
         for definition in definitions {
             let json: Value = serde_json::from_str(&definition.json).map_err(|err| {
                 PersistError::Definite(format!("structure definition json: {err}"))
             })?;
+            definition_json.push(json);
+        }
+        let schema = Schema::from_definitions(&definition_json);
+        let mut term_json = Vec::new();
+        for resource in terminology {
+            let json: Value = serde_json::from_str(&resource.json).map_err(|err| {
+                PersistError::Definite(format!("terminology json: {err}"))
+            })?;
+            term_json.push(json);
+        }
+        let terms = MemoryTerminology::from_resources(&term_json);
+        let mut types = BTreeMap::new();
+        for (definition, json) in definitions.iter().zip(&definition_json) {
             if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
                 continue;
             }
-            definition_json.push(json.clone());
             if definition.kind != "resource" || definition.is_abstract {
                 continue;
             }
@@ -120,7 +138,7 @@ impl Catalog {
                     references: Vec::new(),
                     params: Vec::new(),
                 });
-            for reference in references_from(&definition.type_name, &json) {
+            for reference in references_from(&definition.type_name, json) {
                 if !model
                     .references
                     .iter()
@@ -161,15 +179,30 @@ impl Catalog {
                 .params
                 .sort_by(|left, right| left.name.cmp(&right.name));
         }
+        let model_json: Vec<Value> = definition_json
+            .iter()
+            .filter(|json| json.get("derivation").and_then(|value| value.as_str()) != Some("constraint"))
+            .cloned()
+            .collect();
         Ok(Self {
             fhir_version,
             types,
-            path_model: Model::from_definitions(&definition_json),
+            path_model: Model::from_definitions(&model_json),
+            schema,
+            terms,
         })
     }
 
     pub fn path_model(&self) -> &Model {
         &self.path_model
+    }
+
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
+    pub fn terms(&self) -> &MemoryTerminology {
+        &self.terms
     }
 
     pub fn get(&self, name: &str) -> Result<&ResourceModel, FhirError> {

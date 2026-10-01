@@ -3,6 +3,8 @@ use refhir_types::Timestamp;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use refhir_validate::validate;
+
 use crate::catalog::{index_keys, valid_id, Catalog, ResourceModel};
 use crate::error::FhirError;
 use crate::resolve::TxHost;
@@ -34,6 +36,7 @@ pub fn create(
         )));
     }
     require_references(tx, catalog, model, &resource)?;
+    check_instance(tx, catalog, &resource)?;
     let keys = {
         let host = TxHost::new(tx, catalog);
         index_keys(catalog.path_model(), model, &resource, &host)?
@@ -77,6 +80,7 @@ pub fn update(
     let current = load(tx, model, id)?;
     check_version(current.ts, if_match, &resource)?;
     require_references(tx, catalog, model, &resource)?;
+    check_instance(tx, catalog, &resource)?;
     let (old_keys, new_keys) = {
         let host = TxHost::new(tx, catalog);
         (
@@ -143,6 +147,20 @@ fn set_version_id(object: &mut serde_json::Map<String, Value>, ts: Timestamp) {
 fn load(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Stored, FhirError> {
     tx.get(&model.tablet(), id, &model.by_id())?
         .ok_or_else(|| FhirError::NotFound(format!("{}/{} not found", model.name, id)))
+}
+
+fn check_instance(tx: &mut Transaction, catalog: &Catalog, resource: &Value) -> Result<(), FhirError> {
+    let host = TxHost::new(tx, catalog);
+    let outcome = validate(resource, &[], catalog.schema(), catalog.terms(), &host);
+    if outcome.has_errors() {
+        return Err(FhirError::Outcome(outcome.operation_outcome()));
+    }
+    Ok(())
+}
+
+pub fn validation_report(tx: &mut Transaction, catalog: &Catalog, resource: &Value) -> Value {
+    let host = TxHost::new(tx, catalog);
+    validate(resource, &[], catalog.schema(), catalog.terms(), &host).operation_outcome()
 }
 
 fn expect_type(model: &ResourceModel, resource: &Value) -> Result<(), FhirError> {

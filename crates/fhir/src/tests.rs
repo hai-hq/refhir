@@ -337,6 +337,31 @@ fn transaction_bundle_is_one_commit() {
     assert!(matches!(err, RunError::Fhir(FhirError::Invalid(_))));
     let missing = run_op(&db, "Patient/read", &json!({"id": "p2"})).unwrap_err();
     assert!(matches!(missing, RunError::Fhir(FhirError::NotFound(_))));
+
+    let mut invalid = patient("bad", true, "Cam");
+    invalid["birthDate"] = json!("yesterday");
+    let failed = json!({
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": [
+            {
+                "request": {"method": "POST", "url": "Patient"},
+                "resource": patient("p3", true, "Cam")
+            },
+            {
+                "request": {"method": "POST", "url": "Patient"},
+                "resource": invalid
+            }
+        ]
+    });
+    let err = run_op(&db, "Bundle/transaction", &json!({"resource": failed})).unwrap_err();
+    let RunError::Fhir(FhirError::Outcome(outcome)) = err else {
+        panic!("expected a validation outcome, got {err}");
+    };
+    let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(diagnostics.starts_with("entry 1:"), "{diagnostics}");
+    let missing = run_op(&db, "Patient/read", &json!({"id": "p3"})).unwrap_err();
+    assert!(matches!(missing, RunError::Fhir(FhirError::NotFound(_))));
 }
 
 #[test]
@@ -481,4 +506,21 @@ fn package_install_rejects_version_and_expression_conflicts() {
     assert!(matches!(version, Err(FhirError::Invalid(_))));
     let expression = install_package_dir(&db.store, &db.db, &db.catalog, expression_clash_dir());
     assert!(matches!(expression, Err(FhirError::Invalid(_))));
+}
+
+#[test]
+fn invalid_patient_is_rejected_and_validate_reports_issues() {
+    let db = ready();
+    let mut body = patient("p1", true, "Ann");
+    body["birthDate"] = json!("yesterday");
+    let rejected = run_op(&db, "Patient/create", &json!({"resource": body})).unwrap_err();
+    assert!(matches!(rejected, RunError::Fhir(FhirError::Outcome(_))));
+    let catalog = db.catalog.read().expect("catalog");
+    let report = run(&db.db, &catalog, "Patient/$validate", &json!({"resource": body})).unwrap();
+    assert_eq!(report.value["resourceType"], "OperationOutcome");
+    assert!(report.value["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue["severity"] == "error"));
 }

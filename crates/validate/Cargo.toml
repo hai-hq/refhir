@@ -1,0 +1,10 @@
+[package]
+name = "refhir-validate"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+refhir-fhirpath = { path = "../fhirpath" }
+regex = "1"
+serde_json = { workspace = true }

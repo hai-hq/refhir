@@ -1,4 +1,5 @@
 use refhir_persistence::PersistError;
+use serde_json::Value;
 
 #[derive(Debug)]
 pub enum FhirError {
@@ -6,6 +7,7 @@ pub enum FhirError {
     Gone(String),
     Conflict(String),
     Invalid(String),
+    Outcome(Value),
     UnknownResource(String),
     Unsupported(String),
     Storage(String),
@@ -21,6 +23,13 @@ impl std::fmt::Display for FhirError {
             | FhirError::UnknownResource(message)
             | FhirError::Unsupported(message)
             | FhirError::Storage(message) => write!(f, "{message}"),
+            FhirError::Outcome(value) => {
+                let diagnostics = value
+                    .pointer("/issue/0/diagnostics")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("validation failed");
+                write!(f, "{diagnostics}")
+            }
         }
     }
 }
@@ -38,7 +47,7 @@ pub fn outcome_code(err: &FhirError) -> &'static str {
         FhirError::NotFound(_) | FhirError::UnknownResource(_) => "not-found",
         FhirError::Gone(_) => "deleted",
         FhirError::Conflict(_) => "conflict",
-        FhirError::Invalid(_) | FhirError::Unsupported(_) => "invalid",
+        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => "invalid",
         FhirError::Storage(_) => "exception",
     }
 }

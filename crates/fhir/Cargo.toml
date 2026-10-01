@@ -7,6 +7,7 @@ publish.workspace = true
 [dependencies]
 refhir-database = { path = "../database" }
 refhir-fhirpath = { path = "../fhirpath" }
+refhir-validate = { path = "../validate" }
 refhir-persistence = { path = "../persistence" }
 refhir-types = { path = "../types" }
 serde_json = { workspace = true }

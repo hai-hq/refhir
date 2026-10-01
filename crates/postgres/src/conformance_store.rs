@@ -1,6 +1,7 @@
 use refhir_persistence::{
     ConformanceStore, InstallError, InstallOutcome, NewPackage, ParamStatus, PendingParam,
     PersistError, StoredBackfill, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
+    StoredTerminology,
 };
 use postgres::Transaction;
 
@@ -78,6 +79,26 @@ impl ConformanceStore for PostgresPersistence {
                 })
             })
             .collect()
+    }
+
+    fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
+        let mut guard = self.inner.lock().expect("postgres");
+        let rows = guard
+            .client
+            .query(
+                "SELECT package_id, resource_type, url, json FROM terminology ORDER BY package_id, url",
+                &[],
+            )
+            .map_err(definite)?;
+        Ok(rows
+            .iter()
+            .map(|row| StoredTerminology {
+                package_id: row.get(0),
+                resource_type: row.get(1),
+                url: row.get(2),
+                json: row.get(3),
+            })
+            .collect())
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -197,8 +218,10 @@ fn install_in_tx(
         )
         .map_err(definite)?;
     if let Some(row) = existing {
+        let package_id: i64 = row.get(0);
+        insert_terminology(tx, package_id, package)?;
         return Ok(InstallOutcome {
-            package_id: row.get(0),
+            package_id,
             inserted: false,
             newly_pending: Vec::new(),
         });
@@ -285,9 +308,31 @@ fn install_in_tx(
         )
         .map_err(definite)?;
     }
+    insert_terminology(tx, package_id, package)?;
     Ok(InstallOutcome {
         package_id,
         inserted: true,
         newly_pending,
     })
+}
+
+fn insert_terminology(
+    tx: &mut Transaction<'_>,
+    package_id: i64,
+    package: &NewPackage,
+) -> Result<(), InstallError> {
+    for resource in &package.terminology {
+        tx.execute(
+            "INSERT INTO terminology (package_id, resource_type, url, json) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (package_id, url) DO NOTHING",
+            &[
+                &package_id,
+                &resource.resource_type,
+                &resource.url,
+                &resource.json,
+            ],
+        )
+        .map_err(definite)?;
+    }
+    Ok(())
 }

@@ -14,12 +14,16 @@ use crate::value::{
 };
 
 struct Ctx<'a> {
-    root: &'a Json,
+    resource: &'a Json,
+    root_resource: &'a Json,
+    context: Value,
     model: &'a Model,
     host: &'a dyn Host,
     this_item: Option<Value>,
     index: Option<i64>,
     total: Option<Value>,
+    /// R4 invariants apply `as()` to each item. Normative FHIRPath rejects a collection.
+    map_cast: bool,
 }
 
 pub fn evaluate_expr(
@@ -28,17 +32,82 @@ pub fn evaluate_expr(
     model: &Model,
     host: &dyn Host,
 ) -> Result<Vec<Value>, Error> {
+    evaluate_at(expr, root, "", root, root, model, host)
+}
+
+/// Evaluate `expr` with `focus` as the context node.
+///
+/// `%context` is the focus. `%resource` is the resource that contains it.
+/// `%rootResource` is the outermost resource when the focus sits in a contained
+/// resource. `evaluate_expr` passes the same JSON for all three.
+pub fn evaluate_at(
+    expr: &Expr,
+    focus: &Json,
+    focus_path: &str,
+    resource: &Json,
+    root_resource: &Json,
+    model: &Model,
+    host: &dyn Host,
+) -> Result<Vec<Value>, Error> {
+    evaluate_focused(expr, focus, focus_path, resource, root_resource, model, host, false)
+}
+
+/// Like `evaluate_at`, but `as()` keeps every item that casts.
+///
+/// R4 `ElementDefinition.constraint` expressions were written for that behavior.
+/// `dom-3` calls `descendants().as(canonical)`.
+pub fn evaluate_invariant(
+    expr: &Expr,
+    focus: &Json,
+    focus_path: &str,
+    resource: &Json,
+    root_resource: &Json,
+    model: &Model,
+    host: &dyn Host,
+) -> Result<Vec<Value>, Error> {
+    evaluate_focused(expr, focus, focus_path, resource, root_resource, model, host, true)
+}
+
+fn evaluate_focused(
+    expr: &Expr,
+    focus: &Json,
+    focus_path: &str,
+    resource: &Json,
+    root_resource: &Json,
+    model: &Model,
+    host: &dyn Host,
+    map_cast: bool,
+) -> Result<Vec<Value>, Error> {
+    let focus_node = node_from_json(
+        focus,
+        focus_type(focus, focus_path, model),
+        focus_path.to_string(),
+        Vec::new(),
+    );
     let ctx = Ctx {
-        root,
+        resource,
+        root_resource,
+        context: focus_node.clone(),
         model,
         host,
         this_item: None,
         index: None,
         total: None,
+        map_cast,
     };
-    let focus = vec![node_from_json(root, resource_type(root), String::new(), Vec::new())];
-    let outcome = ctx.eval(expr, &focus, true)?;
+    let outcome = ctx.eval(expr, &[focus_node], true)?;
     Ok(outcome.items)
+}
+
+fn focus_type(focus: &Json, focus_path: &str, model: &Model) -> Option<String> {
+    if focus_path.is_empty() {
+        return resource_type(focus);
+    }
+    model
+        .element_types(focus_path)
+        .first()
+        .cloned()
+        .or_else(|| resource_type(focus))
 }
 
 struct Outcome {
@@ -220,25 +289,17 @@ impl Ctx<'_> {
     }
 
     fn cast(&self, items: &[Value], target: &str) -> Result<Vec<Value>, Error> {
+        if self.map_cast && items.len() > 1 {
+            let mut kept = Vec::new();
+            for item in items {
+                kept.extend(cast_one(item, target));
+            }
+            return Ok(kept);
+        }
         let Some(item) = singleton(items)? else {
             return Ok(vec![]);
         };
-        let (want_namespace, target) = split_type(target);
-        let (namespace, name) = item.type_name();
-        if let Some(want_namespace) = want_namespace {
-            if namespace != want_namespace {
-                return Ok(vec![]);
-            }
-        }
-        if name == target {
-            return Ok(vec![item.clone()]);
-        }
-        if let Value::Node { fhir_type: Some(fhir_type), .. } = item {
-            if fhir_type == target {
-                return Ok(vec![item.clone()]);
-            }
-        }
-        Ok(vec![])
+        Ok(cast_one(item, target))
     }
 
     fn eval_unary(&self, op: UnaryOp, inner: &Expr, focus: &[Value], ordered: bool) -> Result<Outcome, Error> {
@@ -283,9 +344,22 @@ impl Ctx<'_> {
         if matches!(op, BinOp::Union) {
             return Ok(Outcome { items: union(&left_out.items, &right_out.items), ordered: true });
         }
+        if matches!(op, BinOp::In | BinOp::Contains) {
+            let (needle, haystack) = match op {
+                BinOp::In => (&left_out.items, &right_out.items),
+                _ => (&right_out.items, &left_out.items),
+            };
+            if needle.is_empty() {
+                return Ok(Outcome { items: vec![], ordered: true });
+            }
+            if haystack.is_empty() {
+                return Ok(one(Value::system_bool(false)));
+            }
+            return Ok(one(Value::system_bool(membership(needle, haystack))));
+        }
         if left_out.items.is_empty() || right_out.items.is_empty() {
             return match op {
-                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::In | BinOp::Contains => {
+                BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                     Ok(Outcome { items: vec![], ordered: true })
                 }
                 BinOp::Equiv => Ok(one(Value::system_bool(left_out.items.is_empty() && right_out.items.is_empty()))),
@@ -298,8 +372,6 @@ impl Ctx<'_> {
             BinOp::NotEq => Ok(bool_outcome(collections_equal(&left_out.items, &right_out.items).map(|value| !value))),
             BinOp::Equiv => Ok(one(Value::system_bool(collections_equivalent(&left_out.items, &right_out.items)))),
             BinOp::NotEquiv => Ok(one(Value::system_bool(!collections_equivalent(&left_out.items, &right_out.items)))),
-            BinOp::In => Ok(one(Value::system_bool(membership(&left_out.items, &right_out.items)))),
-            BinOp::Contains => Ok(one(Value::system_bool(membership(&right_out.items, &left_out.items)))),
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 let left = singleton(&left_out.items)?.ok_or_else(|| Error::eval("comparison expected one item"))?;
                 let right = singleton(&right_out.items)?.ok_or_else(|| Error::eval("comparison expected one item"))?;
@@ -563,12 +635,15 @@ impl Ctx<'_> {
 
     fn scoped(&self, this_item: Option<Value>, index: Option<i64>, total: Option<Value>) -> Ctx<'_> {
         Ctx {
-            root: self.root,
+            resource: self.resource,
+            root_resource: self.root_resource,
+            context: self.context.clone(),
             model: self.model,
             host: self.host,
             this_item,
             index,
             total,
+            map_cast: self.map_cast,
         }
     }
 
@@ -694,7 +769,7 @@ impl Ctx<'_> {
                         Value::Node { json, .. } => resource_type(json),
                         _ => None,
                     })
-                    .or_else(|| resource_type(self.root))
+                    .or_else(|| resource_type(self.resource))
                     .unwrap_or_default();
                 Ok(one(Value::system_bool(actual == expected)))
             }
@@ -733,7 +808,9 @@ impl Ctx<'_> {
                 continue;
             };
             if let Some(id) = reference.strip_prefix('#') {
-                if let Some(resource) = contained(self.root, id) {
+                if let Some(resource) = contained(self.root_resource, id)
+                    .or_else(|| contained(self.resource, id))
+                {
                     items.push(node_from_json(&resource, resource_type(&resource), String::new(), Vec::new()));
                 }
                 continue;
@@ -935,8 +1012,22 @@ impl Ctx<'_> {
             "sct" => "http://snomed.info/sct",
             "loinc" => "http://loinc.org",
             "ucum" => "http://unitsofmeasure.org",
-            "context" | "resource" | "rootResource" => {
-                return Ok(node_from_json(self.root, resource_type(self.root), String::new(), Vec::new()))
+            "context" => return Ok(self.context.clone()),
+            "resource" => {
+                return Ok(node_from_json(
+                    self.resource,
+                    resource_type(self.resource),
+                    String::new(),
+                    Vec::new(),
+                ))
+            }
+            "rootResource" => {
+                return Ok(node_from_json(
+                    self.root_resource,
+                    resource_type(self.root_resource),
+                    String::new(),
+                    Vec::new(),
+                ))
             }
             other => {
                 if let Some(name) = other.strip_prefix("vs-") {
@@ -962,6 +1053,25 @@ fn one(value: Value) -> Outcome {
 
 fn bool_outcome(value: Option<bool>) -> Outcome {
     value.map(|value| one(Value::system_bool(value))).unwrap_or(Outcome { items: vec![], ordered: true })
+}
+
+fn cast_one(item: &Value, target: &str) -> Vec<Value> {
+    let (want_namespace, target) = split_type(target);
+    let (namespace, name) = item.type_name();
+    if let Some(want_namespace) = want_namespace {
+        if namespace != want_namespace {
+            return Vec::new();
+        }
+    }
+    if name == target {
+        return vec![item.clone()];
+    }
+    if let Value::Node { fhir_type: Some(fhir_type), .. } = item {
+        if fhir_type == target {
+            return vec![item.clone()];
+        }
+    }
+    Vec::new()
 }
 
 fn singleton(items: &[Value]) -> Result<Option<&Value>, Error> {

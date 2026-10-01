@@ -132,6 +132,7 @@ pub fn dispatch(
             let params = search_args(args)?;
             search::search(tx, catalog, model, &params)
         }
+        "$validate" => Ok(ops::validation_report(tx, catalog, &resource_arg(args)?)),
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"
         ))),

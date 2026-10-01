@@ -87,6 +87,13 @@ CREATE TABLE IF NOT EXISTS index_backfills (
     cursor_id TEXT,
     done INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS terminology (
+    package_id INTEGER NOT NULL,
+    resource_type TEXT NOT NULL,
+    url TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url)
+);
 "#;
 
 const INSERT_DOCUMENT: &str = "INSERT INTO documents (id, ts, table_id, json_value, deleted, \

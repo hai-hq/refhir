@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
     ConformanceStore, InstallError, NewPackage, NewSearchParameter, NewStructureDefinition,
-    ParamStatus,
+    NewTerminology, ParamStatus,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
 use serde_json::Value;
@@ -266,6 +266,7 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         .to_string();
     let mut definitions = Vec::new();
     let mut parameters = Vec::new();
+    let mut terminology = Vec::new();
     for entry in fs::read_dir(&root).map_err(|err| FhirError::Invalid(err.to_string()))? {
         let entry = entry.map_err(|err| FhirError::Invalid(err.to_string()))?;
         let file = entry.path();
@@ -282,6 +283,7 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         match value.get("resourceType").and_then(|item| item.as_str()) {
             Some("StructureDefinition") => definitions.push(value),
             Some("SearchParameter") => parameters.push(value),
+            Some("CodeSystem") | Some("ValueSet") => terminology.push(value),
             _ => {}
         }
     }
@@ -294,12 +296,17 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     for parameter in &parameters {
         search_parameters.extend(parameter_rows(parameter)?);
     }
+    let mut terminology_rows = Vec::new();
+    for resource in &terminology {
+        terminology_rows.push(terminology_row(resource)?);
+    }
     Ok(NewPackage {
         name,
         version,
         fhir_version,
         structure_definitions,
         search_parameters,
+        terminology: terminology_rows,
     })
 }
 
@@ -338,6 +345,14 @@ fn fhir_version(manifest: &Value, definitions: &[Value]) -> Result<String, FhirE
         }
     }
     Err(FhirError::Invalid("package fhirVersion is required".into()))
+}
+
+fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
+    Ok(NewTerminology {
+        resource_type: required_str(resource, "resourceType")?,
+        url: required_str(resource, "url")?,
+        json: resource.to_string(),
+    })
 }
 
 fn structure_row(definition: &Value) -> Result<NewStructureDefinition, FhirError> {

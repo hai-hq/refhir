@@ -298,6 +298,21 @@ pub struct NewSearchParameter {
     pub json: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredTerminology {
+    pub package_id: i64,
+    pub resource_type: String,
+    pub url: String,
+    pub json: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct NewTerminology {
+    pub resource_type: String,
+    pub url: String,
+    pub json: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewPackage {
     pub name: String,
@@ -305,6 +320,7 @@ pub struct NewPackage {
     pub fhir_version: String,
     pub structure_definitions: Vec<NewStructureDefinition>,
     pub search_parameters: Vec<NewSearchParameter>,
+    pub terminology: Vec<NewTerminology>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -357,6 +373,8 @@ pub trait ConformanceStore: Send + Sync {
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError>;
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError>;
+
+    fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError>;
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
 

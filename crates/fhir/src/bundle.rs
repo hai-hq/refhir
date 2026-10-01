@@ -344,6 +344,27 @@ fn rewrite_placeholders(value: &mut Value, ts: Timestamp) {
     }
 }
 
+fn prefix_outcome(index: usize, mut value: Value) -> Value {
+    let Some(issues) = value.get_mut("issue").and_then(|item| item.as_array_mut()) else {
+        return value;
+    };
+    for issue in issues {
+        let Some(object) = issue.as_object_mut() else {
+            continue;
+        };
+        let diagnostics = object
+            .get("diagnostics")
+            .and_then(|item| item.as_str())
+            .unwrap_or("validation failed")
+            .to_string();
+        object.insert(
+            "diagnostics".to_string(),
+            Value::String(format!("entry {index}: {diagnostics}")),
+        );
+    }
+    value
+}
+
 fn annotate(index: usize, err: FhirError) -> FhirError {
     let message = format!("entry {index}: {err}");
     match err {
@@ -351,6 +372,7 @@ fn annotate(index: usize, err: FhirError) -> FhirError {
         FhirError::Gone(_) => FhirError::Gone(message),
         FhirError::Conflict(_) => FhirError::Conflict(message),
         FhirError::Invalid(_) => FhirError::Invalid(message),
+        FhirError::Outcome(value) => FhirError::Outcome(prefix_outcome(index, value)),
         FhirError::UnknownResource(_) => FhirError::UnknownResource(message),
         FhirError::Unsupported(_) => FhirError::Unsupported(message),
         FhirError::Storage(_) => FhirError::Storage(message),

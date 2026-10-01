@@ -988,6 +988,7 @@ dependencies = [
  "refhir-persistence",
  "refhir-sqlite",
  "refhir-types",
+ "refhir-validate",
  "serde_json",
  "uuid",
 ]
@@ -1050,6 +1051,15 @@ dependencies = [
 [[package]]
 name = "refhir-types"
 version = "0.1.0"
+
+[[package]]
+name = "refhir-validate"
+version = "0.1.0"
+dependencies = [
+ "refhir-fhirpath",
+ "regex",
+ "serde_json",
+]
 
 [[package]]
 name = "regex"

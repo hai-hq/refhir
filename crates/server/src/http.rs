@@ -28,6 +28,7 @@ pub fn app(db: Arc<Database>, catalog: Arc<RwLock<Catalog>>) -> Router {
         .route("/sync", get(sync_ws))
         .route("/", post(bundle_post))
         .route("/:resource_type", get(search).post(create))
+        .route("/:resource_type/$validate", post(validate_op))
         .route("/:resource_type/:id/_history/:vid", get(vread))
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id", get(read).put(update).delete(remove))
@@ -105,6 +106,28 @@ async fn create(
             let location = format!("{resource_type}/{id}/_history/{}", result.ts);
             resource_response(StatusCode::CREATED, result.value, Some(location))
         }
+        Err(err) => error_response(err),
+    }
+}
+
+async fn validate_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match execute(
+        &app.db,
+        &app.catalog,
+        &format!("{resource_type}/$validate"),
+        json!({"resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
         Err(err) => error_response(err),
     }
 }
@@ -275,6 +298,9 @@ fn fhir_json(status: StatusCode, value: Value) -> Response {
 }
 
 pub(crate) fn error_response(err: RunError) -> Response {
+    if let RunError::Fhir(FhirError::Outcome(value)) = &err {
+        return fhir_json(StatusCode::BAD_REQUEST, value.clone());
+    }
     let (status, code, diagnostics) = match &err {
         RunError::Fhir(fhir) => (fhir_status(fhir), outcome_code(fhir), fhir.to_string()),
         RunError::Commit(CommitError::Occ(_)) => (
@@ -292,6 +318,9 @@ pub(crate) fn error_response(err: RunError) -> Response {
 }
 
 pub(crate) fn outcome_value(err: &RunError) -> Value {
+    if let RunError::Fhir(FhirError::Outcome(value)) = err {
+        return value.clone();
+    }
     let (code, diagnostics) = match err {
         RunError::Fhir(fhir) => (outcome_code(fhir), fhir.to_string()),
         RunError::Commit(CommitError::Occ(_)) => ("conflict", "OCC retries exhausted".into()),
@@ -327,6 +356,6 @@ fn fhir_status(err: &FhirError) -> StatusCode {
         FhirError::Gone(_) => StatusCode::GONE,
         FhirError::Conflict(_) => StatusCode::CONFLICT,
         FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        FhirError::Invalid(_) | FhirError::Unsupported(_) => StatusCode::BAD_REQUEST,
+        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => StatusCode::BAD_REQUEST,
     }
 }

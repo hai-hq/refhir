@@ -324,3 +324,19 @@ async fn next_json(
         other => panic!("unexpected websocket message {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn invalid_patient_create_returns_outcome_and_validate_does_not_write() {
+    let (db, catalog) = memory();
+    let app = app(db, catalog);
+    let mut body = patient("p1");
+    body["birthDate"] = json!("yesterday");
+    let rejected = send(&app, "POST", "/Patient", Some(body.clone()), None).await;
+    assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rejected.body["resourceType"], "OperationOutcome");
+    let validated = send(&app, "POST", "/Patient/$validate", Some(body), None).await;
+    assert_eq!(validated.status, StatusCode::OK);
+    assert_eq!(validated.body["resourceType"], "OperationOutcome");
+    let missing = send(&app, "GET", "/Patient/p1", None, None).await;
+    assert_eq!(missing.status, StatusCode::NOT_FOUND);
+}
