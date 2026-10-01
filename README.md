@@ -79,7 +79,7 @@ ReFHIR aims to provide:
 - real-time synchronization of query results;
 - consistent results across transactions;
 - reconnect and recovery semantics;
-- an ergonomic developer SDK (TypeScript first; other languages as the protocol stabilizes);
+- an ergonomic developer SDK (Go first: `github.com/hai-hq/haifhir/clients/go`; TypeScript later);
 - standard FHIR REST for existing clients;
 - primitives for AI-agent context synchronization;
 - ways to detect when state an agent depends on has changed.
@@ -181,7 +181,8 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 | Transaction `Bundle` | Yes (atomic commit) |
 | FHIR REST | Yes (`application/fhir+json`) |
 | Reactive sync | Yes (`/sync`, invalidation + query rerun) |
-| TypeScript / Go SDK | **Not in this repo yet** |
+| Go SDK | Yes (`clients/go`, `github.com/hai-hq/haifhir/clients/go`) |
+| TypeScript SDK | **Not yet** |
 | SMART / auth | **Not yet** |
 | Full spec, `_include`, `$everything`, all search params | **Deferred** |
 | FHIR Subscription delivery | **Deferred** (vs live query sync) |

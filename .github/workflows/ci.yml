@@ -33,6 +33,17 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace -- --test-threads=8
 
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Test Go client
+        working-directory: clients/go
+        env:
+          REFHIR_BIN: ../../target/debug/refhir
+        run: go test ./...
+
   release-binary:
     name: Build release binary
     runs-on: ubuntu-latest

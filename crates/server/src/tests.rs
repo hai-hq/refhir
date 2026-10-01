@@ -261,6 +261,12 @@ async fn sync_subscription_transitions_after_mutation() {
         .unwrap();
     let first = next_json(&mut subscriber).await;
     assert_eq!(first["type"], "Transition");
+    assert!(first.get("startVersion").is_some());
+    assert!(first.get("endVersion").is_some());
+    assert_eq!(first["modifications"][0]["type"], "QueryUpdated");
+    assert!(first["modifications"][0].get("queryId").is_some());
+    assert!(first["modifications"][0].get("value").is_some());
+    assert!(first["modifications"][0].get("logLines").is_some());
     assert_eq!(first["modifications"][0]["value"]["total"], 1);
 
     let (mut writer, _) = connect(&url).await;
@@ -287,6 +293,9 @@ async fn sync_subscription_transitions_after_mutation() {
     let mutation = next_json(&mut writer).await;
     assert_eq!(mutation["type"], "MutationResponse");
     assert_eq!(mutation["success"], true);
+    assert!(mutation.get("requestId").is_some());
+    assert!(mutation.get("result").is_some());
+    assert!(mutation.get("ts").is_some());
 
     let transition = next_json(&mut subscriber).await;
     assert_eq!(transition["type"], "Transition");
