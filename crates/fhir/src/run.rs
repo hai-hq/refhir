@@ -3,17 +3,20 @@
 //! Convex `UDF_EXECUTOR_OCC_MAX_RETRIES` in `crates/common/src/knobs.rs` defaults
 //! to 4. Handlers only touch `Transaction`, so retrying them is safe.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use refhir_database::{CommitError, Database, DocumentWrite, ReadSet};
 use refhir_types::Timestamp;
 use serde_json::Value;
+use refhir_validate::validate;
 
 use crate::bundle;
 use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::history;
 use crate::ops;
+use crate::resolve::TxHost;
 use crate::search;
 
 /// Retries after an OCC conflict. The first attempt is not counted.
@@ -44,6 +47,20 @@ pub struct RunResult {
     pub wrote: bool,
     /// Document creates, updates, and deletes from the committed transaction.
     pub writes: Vec<DocumentWrite>,
+    /// HTTP status when the handler chooses one. `0` means the route default.
+    pub status: u16,
+}
+
+thread_local! {
+    static STATUS: Cell<u16> = const { Cell::new(0) };
+}
+
+fn set_status(status: u16) {
+    STATUS.set(status);
+}
+
+fn take_status() -> u16 {
+    STATUS.replace(0)
 }
 
 pub fn run(
@@ -52,12 +69,17 @@ pub fn run(
     path: &str,
     args: &Value,
 ) -> Result<RunResult, RunError> {
+    if path == "Bundle/batch" {
+        return bundle::batch(db, catalog, args);
+    }
     for attempt in 0..=MAX_OCC_FAILURES {
         let mut tx = db.begin();
+        set_status(0);
         let mut value = match dispatch(&mut tx, catalog, path, args) {
             Ok(value) => value,
             Err(err) => return Err(RunError::Fhir(err)),
         };
+        let status = take_status();
         let reads = tx.read_set().clone();
         let written = tx.written_ids();
         let wrote = tx.has_writes();
@@ -73,6 +95,7 @@ pub fn run(
                     reads,
                     wrote,
                     writes,
+                    status,
                 });
             }
             Err(CommitError::Occ(_)) if wrote && attempt < MAX_OCC_FAILURES => continue,
@@ -111,12 +134,28 @@ pub fn dispatch(
     let (type_name, op) = path
         .split_once('/')
         .ok_or_else(|| FhirError::Invalid(format!("bad operation {path}")))?;
-    if matches!(op, "$expand" | "$validate-code" | "$lookup" | "$translate") {
+    if matches!(
+        op,
+        "$expand" | "$validate-code" | "$lookup" | "$translate" | "$subsumes"
+    ) {
         return crate::terms::operation(catalog, type_name, op, args);
+    }
+    if path == "system/history" {
+        return history::system_history(
+            tx,
+            catalog,
+            optional_ts(args, "_since")?,
+            optional_usize(args, "_count")?,
+            optional_usize(args, "_offset")?.unwrap_or(0),
+        );
     }
     let model = catalog.get(type_name)?;
     match op {
-        "create" => ops::create(tx, catalog, model, resource_arg(args)?),
+        "create" => {
+            let value = ops::create(tx, catalog, model, resource_arg(args)?)?;
+            set_status(201);
+            Ok(value)
+        }
         "read" => ops::read(tx, model, &id_arg(args)?),
         "update" => ops::update(
             tx,
@@ -127,6 +166,50 @@ pub fn dispatch(
             args.get("ifMatch").and_then(|value| value.as_str()),
         ),
         "delete" => ops::delete(tx, catalog, model, &id_arg(args)?),
+        "patch" => ops::patch(
+            tx,
+            catalog,
+            model,
+            &id_arg(args)?,
+            args.get("patch")
+                .cloned()
+                .ok_or_else(|| FhirError::Invalid("patch is required".into()))?,
+            args.get("ifMatch").and_then(|value| value.as_str()),
+        ),
+        "conditional-create" => {
+            let (value, status) = ops::conditional_create(
+                tx,
+                catalog,
+                model,
+                resource_arg(args)?,
+                args.get("ifNoneExist")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            )?;
+            set_status(status);
+            Ok(value)
+        }
+        "conditional-update" => {
+            let (value, status) = ops::conditional_update(
+                tx,
+                catalog,
+                model,
+                resource_arg(args)?,
+                args.get("query")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            )?;
+            set_status(status);
+            Ok(value)
+        }
+        "conditional-delete" => ops::conditional_delete(
+            tx,
+            catalog,
+            model,
+            args.get("query")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+        ),
         "vread" => {
             let version = args
                 .get("versionId")
@@ -134,12 +217,40 @@ pub fn dispatch(
                 .ok_or_else(|| FhirError::Invalid("versionId is required".into()))?;
             history::vread(tx, model, &id_arg(args)?, version)
         }
-        "history" => history::history(tx, model, &id_arg(args)?),
+        "history" => {
+            if let Some(id) = args.get("id").and_then(|value| value.as_str()) {
+                if !id.is_empty() {
+                    return history::history(tx, model, id);
+                }
+            }
+            history::type_history(
+                tx,
+                model,
+                optional_ts(args, "_since")?,
+                optional_usize(args, "_count")?,
+                optional_usize(args, "_offset")?.unwrap_or(0),
+            )
+        }
         "search" => {
             let params = search_args(args)?;
             search::search(tx, catalog, model, &params)
         }
-        "$validate" => Ok(ops::validation_report(tx, catalog, &resource_arg(args)?)),
+        "$validate" => {
+            let resource = if args.get("resource").is_some() {
+                resource_arg(args)?
+            } else {
+                ops::read(tx, model, &id_arg(args)?)?
+            };
+            let profiles = profile_arg(args);
+            Ok(validation_with_profile(tx, catalog, &resource, &profiles))
+        }
+        "$meta" => crate::meta::get(tx, model, &id_arg(args)?),
+        "$meta-add" => crate::meta::add(tx, catalog, model, &id_arg(args)?, &resource_arg(args)?),
+        "$meta-delete" => {
+            crate::meta::delete(tx, catalog, model, &id_arg(args)?, &resource_arg(args)?)
+        }
+        "$everything" => crate::meta::everything(tx, catalog, model, &id_arg(args)?),
+        "$document" => crate::meta::document(tx, catalog, model, &id_arg(args)?),
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"
         ))),
@@ -173,4 +284,48 @@ fn search_args(args: &Value) -> Result<BTreeMap<String, String>, FhirError> {
         params.insert(key.clone(), text.to_string());
     }
     Ok(params)
+}
+
+fn profile_arg(args: &Value) -> Vec<String> {
+    let mut profiles = Vec::new();
+    if let Some(profile) = args.get("profile").and_then(|value| value.as_str()) {
+        profiles.push(profile.to_string());
+    }
+    if let Some(items) = args.get("profile").and_then(|value| value.as_array()) {
+        for item in items {
+            if let Some(profile) = item.as_str() {
+                profiles.push(profile.to_string());
+            }
+        }
+    }
+    profiles
+}
+
+fn validation_with_profile(
+    tx: &mut refhir_database::Transaction,
+    catalog: &Catalog,
+    resource: &Value,
+    profiles: &[String],
+) -> Value {
+    let host = TxHost::new(tx, catalog);
+    validate(resource, profiles, catalog.schema(), catalog.terms(), &host).operation_outcome()
+}
+
+fn optional_ts(args: &Value, name: &str) -> Result<Option<Timestamp>, FhirError> {
+    match args.get(name).and_then(|value| value.as_str()) {
+        None => Ok(None),
+        Some(text) => Timestamp::from_version_id(text)
+            .map(Some)
+            .map_err(|_| FhirError::Invalid(format!("invalid {name}"))),
+    }
+}
+
+fn optional_usize(args: &Value, name: &str) -> Result<Option<usize>, FhirError> {
+    match args.get(name).and_then(|value| value.as_str()) {
+        None => Ok(None),
+        Some(text) => text
+            .parse()
+            .map(Some)
+            .map_err(|_| FhirError::Invalid(format!("{name} must be an integer"))),
+    }
 }

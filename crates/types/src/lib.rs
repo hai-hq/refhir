@@ -244,6 +244,88 @@ pub fn string_interval(prefix: &str) -> Interval {
     Interval::prefix(prefix.to_lowercase().into_bytes())
 }
 
+/// Keys at or after this string. The match function still applies the prefix.
+pub fn string_at_least(prefix: &str) -> Interval {
+    Interval {
+        start: prefix.to_lowercase().into_bytes(),
+        end: None,
+    }
+}
+
+/// Keys before or within this string prefix. Exclusive end is the next byte prefix.
+pub fn string_at_most(prefix: &str) -> Interval {
+    let bytes = prefix.to_lowercase().into_bytes();
+    Interval {
+        start: Vec::new(),
+        end: prefix_upper_bound(&bytes),
+    }
+}
+
+/// Order-preserving IEEE-754 encoding. Negative numbers sort before positives.
+pub fn sortable_f64(value: f64) -> [u8; 8] {
+    let bits = value.to_bits();
+    let ordered = if bits & (1 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    };
+    ordered.to_be_bytes()
+}
+
+pub fn number_key(value: f64, doc_id: &str) -> Vec<u8> {
+    let mut key = sortable_f64(value).to_vec();
+    key.push(0);
+    key.extend_from_slice(doc_id.as_bytes());
+    key
+}
+
+/// Inclusive `start`, exclusive `end`. `None` is unbounded on that side.
+pub fn number_range(start: Option<f64>, end_exclusive: Option<f64>) -> Interval {
+    Interval {
+        start: start.map(|value| sortable_f64(value).to_vec()).unwrap_or_default(),
+        end: end_exclusive.map(|value| sortable_f64(value).to_vec()),
+    }
+}
+
+fn quantity_prefix(code: &str) -> Vec<u8> {
+    let mut key = exact_key(code);
+    key.push(0);
+    key
+}
+
+fn quantity_prefix_end(code: &str) -> Vec<u8> {
+    let mut key = exact_key(code);
+    key.push(1);
+    key
+}
+
+pub fn quantity_key(code: &str, value: f64, doc_id: &str) -> Vec<u8> {
+    let mut key = quantity_prefix(code);
+    key.extend_from_slice(&sortable_f64(value));
+    key.push(0);
+    key.extend_from_slice(doc_id.as_bytes());
+    key
+}
+
+pub fn quantity_range(code: &str, start: Option<f64>, end_exclusive: Option<f64>) -> Interval {
+    let mut lower = quantity_prefix(code);
+    if let Some(value) = start {
+        lower.extend_from_slice(&sortable_f64(value));
+    }
+    let upper = match end_exclusive {
+        Some(value) => {
+            let mut end = quantity_prefix(code);
+            end.extend_from_slice(&sortable_f64(value));
+            end
+        }
+        None => quantity_prefix_end(code),
+    };
+    Interval {
+        start: lower,
+        end: Some(upper),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +348,26 @@ mod tests {
         assert!(interval.contains(&string_key("jo", "b")));
         assert!(!interval.contains(&string_key("jp", "c")));
         assert_ne!(string_key("John", "a"), string_key("John", "b"));
+    }
+
+    #[test]
+    fn number_keys_sort_with_the_value() {
+        let keys = [-2.0, -0.5, 0.0, 1.0, 10.0]
+            .map(|value| number_key(value, "a"));
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted);
+        let above = number_range(Some(1.0), None);
+        assert!(!above.contains(&number_key(0.5, "a")));
+        assert!(above.contains(&number_key(1.0, "a")));
+        assert!(above.contains(&number_key(10.0, "b")));
+        let below = number_range(None, Some(1.0));
+        assert!(below.contains(&number_key(0.5, "a")));
+        assert!(!below.contains(&number_key(1.0, "a")));
+        let mg = quantity_range("mg", Some(5.0), None);
+        assert!(mg.contains(&quantity_key("mg", 5.4, "o1")));
+        assert!(!mg.contains(&quantity_key("mg", 4.0, "o1")));
+        assert!(!mg.contains(&quantity_key("g", 9.0, "o1")));
     }
 
     #[test]

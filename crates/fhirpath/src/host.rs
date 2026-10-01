@@ -32,6 +32,11 @@ pub trait Host {
     fn strict(&self) -> bool {
         false
     }
+
+    /// `Some` when this host can check a profile. `None` leaves the type-name fallback.
+    fn conforms_to(&self, _resource: &Json, _url: &str) -> Result<Option<bool>, Error> {
+        Ok(None)
+    }
 }
 
 pub struct EmptyHost;

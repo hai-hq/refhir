@@ -6,6 +6,7 @@ pub enum FhirError {
     NotFound(String),
     Gone(String),
     Conflict(String),
+    Precondition(String),
     Invalid(String),
     Outcome(Value),
     UnknownResource(String),
@@ -19,6 +20,7 @@ impl std::fmt::Display for FhirError {
             FhirError::NotFound(message)
             | FhirError::Gone(message)
             | FhirError::Conflict(message)
+            | FhirError::Precondition(message)
             | FhirError::Invalid(message)
             | FhirError::UnknownResource(message)
             | FhirError::Unsupported(message)
@@ -46,7 +48,7 @@ pub fn outcome_code(err: &FhirError) -> &'static str {
     match err {
         FhirError::NotFound(_) | FhirError::UnknownResource(_) => "not-found",
         FhirError::Gone(_) => "deleted",
-        FhirError::Conflict(_) => "conflict",
+        FhirError::Conflict(_) | FhirError::Precondition(_) => "conflict",
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => "invalid",
         FhirError::Storage(_) => "exception",
     }

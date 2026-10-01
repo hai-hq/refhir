@@ -28,15 +28,21 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut postgres: Option<String> = None;
     let mut packages = Vec::new();
     let mut bind = "127.0.0.1:8080".to_string();
+    let mut references = "strict".to_string();
+    let mut auth = false;
+    let mut export_dir = "export".to_string();
+    let mut terminology_urls = Vec::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "refhir [--sqlite path] [--postgres url] [--bind 127.0.0.1:8080] [--package dir]\n\
+                    "refhir [--sqlite path] [--postgres url] [--bind 127.0.0.1:8080]\n\
+                     [--package dir] [--references strict|fhir] [--smart]\n\
+                     [--export-dir path] [--terminology url]\n\
                      Default database is refhir.sqlite. With no --package, the bundled\n\
                      hl7.fhir.r4.core 4.0.1 package is installed. --package may be repeated and\n\
-                     replaces that default."
+                     replaces that default. --references defaults to strict."
                 );
                 return Ok(());
             }
@@ -55,6 +61,19 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "--bind" => {
                 index += 1;
                 bind = required(&args, index, "--bind")?;
+            }
+            "--references" => {
+                index += 1;
+                references = required(&args, index, "--references")?;
+            }
+            "--smart" => auth = true,
+            "--export-dir" => {
+                index += 1;
+                export_dir = required(&args, index, "--export-dir")?;
+            }
+            "--terminology" => {
+                index += 1;
+                terminology_urls.push(required(&args, index, "--terminology")?);
             }
             other => return Err(format!("unknown argument {other}").into()),
         }
@@ -85,11 +104,28 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
     refhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;
     refhir_fhir::repair_conformance(store.as_ref(), &db, &catalog)?;
+    let policy = refhir_fhir::ReferencePolicy::parse(&references)
+        .ok_or_else(|| format!("--references must be strict or fhir"))?;
+    catalog
+        .write()
+        .expect("catalog")
+        .set_reference_policy(policy);
     let addr: SocketAddr = bind.parse()?;
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!("listening on http://{local}");
-    refhir_server::serve(db, catalog, store, listener).await?;
+    refhir_server::serve(
+        db,
+        catalog,
+        store,
+        listener,
+        refhir_server::ServerConfig {
+            auth,
+            export_dir,
+            terminology_urls,
+        },
+    )
+    .await?;
     Ok(())
 }
 

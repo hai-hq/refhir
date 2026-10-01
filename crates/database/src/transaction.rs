@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use refhir_persistence::{
-    DocumentLogEntry, PersistError, PersistenceIndexEntry, PersistenceReader,
+    DocumentLogEntry, PersistError, PersistenceIndexEntry, PersistenceReader, TimestampRange,
 };
 use refhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use serde_json::Value;
@@ -263,6 +263,26 @@ impl Transaction {
             self.begin_ts,
         )?;
         entries.into_iter().map(revision_from_entry).collect()
+    }
+
+    /// Document log rows visible at this snapshot, newest first.
+    /// `start` is inclusive. Callers record the read set that should wake subscribers.
+    pub fn log_since(&self, start: Timestamp) -> Result<Vec<DocumentLogEntry>, PersistError> {
+        let end = self
+            .begin_ts
+            .succ()
+            .unwrap_or(Timestamp::MAX_PERSISTED);
+        self.reader.load_documents(
+            TimestampRange {
+                start_inclusive: start,
+                end_exclusive: end,
+            },
+            Order::Desc,
+        )
+    }
+
+    pub fn record_span(&mut self, index: IndexId, interval: Interval) {
+        self.reads.record(index, interval);
     }
 
     /// A historical row does not change, so this does not record a read.

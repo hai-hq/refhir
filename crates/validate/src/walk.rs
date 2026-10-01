@@ -442,6 +442,14 @@ impl State<'_> {
     }
 
     fn cardinality(&self, element: &ElementDef, count: usize, path: &str) {
+        if count == 0 && element.must_support && element.min == 0 {
+            self.issue(
+                Severity::Warning,
+                "informational",
+                format!("{path} is must-support"),
+                path,
+            );
+        }
         if count < element.min as usize {
             self.issue(
                 Severity::Error,
@@ -716,6 +724,7 @@ fn bare_contained(path: &str) -> ElementDef {
         max_value: None,
         slicing: None,
         content_reference: None,
+        must_support: false,
     }
 }
 

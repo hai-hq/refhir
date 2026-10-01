@@ -376,4 +376,33 @@ mod tests {
             mismatched.issues
         );
     }
+
+    #[test]
+    fn missing_must_support_is_a_warning() {
+        let schema = Schema::from_definitions(&[json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/Note",
+            "name": "Note",
+            "kind": "resource",
+            "derivation": "specialization",
+            "type": "Note",
+            "abstract": false,
+            "snapshot": {"element": [
+                {"path": "Note", "min": 0, "max": "*"},
+                {"path": "Note.text", "min": 0, "max": "1", "mustSupport": true, "type": [{"code": "string"}]}
+            ]}
+        })]);
+        let outcome = validate_resource(
+            &json!({"resourceType": "Note"}),
+            &schema,
+            &MemoryTerminology::default(),
+            &NoHost,
+        );
+        assert!(!outcome.has_errors(), "{:#?}", outcome.issues);
+        assert!(
+            outcome.issues.iter().any(|issue| issue.diagnostics.contains("must-support")),
+            "{:#?}",
+            outcome.issues
+        );
+    }
 }

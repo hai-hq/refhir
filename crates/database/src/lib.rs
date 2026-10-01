@@ -173,6 +173,7 @@ pub struct Database {
     reader: Arc<dyn PersistenceReader>,
     state: Mutex<Committer>,
     cv: Condvar,
+    commit_listeners: Mutex<Vec<UnboundedSender<Timestamp>>>,
 }
 
 impl Database {
@@ -184,6 +185,7 @@ impl Database {
             reader,
             state: Mutex::new(Committer::new(latest)),
             cv: Condvar::new(),
+            commit_listeners: Mutex::new(Vec::new()),
         })
     }
 
@@ -250,6 +252,23 @@ impl Database {
         state.snapshot.push(ts);
         state.subscriptions.invalidate(&keys, ts);
         self.cv.notify_all();
+        drop(state);
+        let listeners = self
+            .commit_listeners
+            .lock()
+            .expect("commit listeners")
+            .clone();
+        for listener in listeners {
+            let _ = listener.send(ts);
+        }
+    }
+
+    /// Wakes `listener` after a commit is durable and live queries have been invalidated.
+    pub fn on_commit(&self, listener: UnboundedSender<Timestamp>) {
+        self.commit_listeners
+            .lock()
+            .expect("commit listeners")
+            .push(listener);
     }
 
     pub fn subscribe(

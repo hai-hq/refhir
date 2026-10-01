@@ -98,6 +98,29 @@ impl MemoryTerminology {
     /// Membership comes from `expansions`. Code systems and concept maps still come from `resources`.
     pub fn from_stored(resources: &[Json], expansions: &[Json]) -> Self {
         let (mut terms, _) = index_resources(resources);
+        for resource in resources {
+            if resource.get("resourceType").and_then(|value| value.as_str()) != Some("ValueSet") {
+                continue;
+            }
+            if let Some((url, expansion)) = resource
+                .pointer("/expansion/contains")
+                .and_then(|value| value.as_array())
+                .map(|contains| {
+                    (
+                        resource
+                            .get("url")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        expansion_from_contains(contains),
+                    )
+                })
+            {
+                if !url.is_empty() {
+                    terms.expansions.insert(canonical(&url).to_string(), expansion);
+                }
+            }
+        }
         for document in expansions {
             if let Some((url, expansion)) = expansion_from_document(document) {
                 terms.expansions.insert(url, expansion);
@@ -198,6 +221,38 @@ impl MemoryTerminology {
                 }]
             }),
         }
+    }
+
+    /// `ancestor` subsumes `code` when they are equal or `ancestor` is a parent.
+    pub fn subsumes(&self, system: &str, ancestor: &str, code: &str) -> bool {
+        let Some(index) = self.systems.get(canonical(system)) else {
+            return false;
+        };
+        is_a(index, code, ancestor)
+    }
+
+    pub fn expand_page(
+        &self,
+        url: &str,
+        text_filter: Option<&str>,
+        offset: usize,
+        count: Option<usize>,
+    ) -> Option<Json> {
+        let mut expanded = self.expand(url, text_filter)?;
+        let Some(contains) = expanded
+            .pointer_mut("/expansion/contains")
+            .and_then(|value| value.as_array_mut())
+        else {
+            return Some(expanded);
+        };
+        let total = contains.len();
+        let page: Vec<Json> = contains.iter().skip(offset).take(count.unwrap_or(total)).cloned().collect();
+        *contains = page;
+        if let Some(expansion) = expanded.get_mut("expansion").and_then(|value| value.as_object_mut()) {
+            expansion.insert("total".into(), json!(total));
+            expansion.insert("offset".into(), json!(offset));
+        }
+        Some(expanded)
     }
 
     pub fn lookup(&self, system: &str, code: &str) -> Option<Json> {
@@ -478,7 +533,7 @@ fn note_system(expansion: &mut Expansion, expander: &Expander<'_>, system: &str)
 fn filter_supported(filter: &Json) -> bool {
     matches!(
         filter.get("op").and_then(|value| value.as_str()),
-        Some("=" | "is-a" | "descendent-of" | "exists")
+        Some("=" | "is-a" | "descendent-of" | "is-not-a" | "exists" | "in" | "not-in" | "generalizes")
     )
 }
 
@@ -510,7 +565,11 @@ fn code_matches(index: &SystemIndex, code: &str, filter: &Json) -> bool {
         .unwrap_or("");
     match op {
         "is-a" if property == "concept" => is_a(index, code, value),
+        "generalizes" if property == "concept" => is_a(index, value, code),
+        "is-not-a" if property == "concept" => !is_a(index, code, value),
         "descendent-of" if property == "concept" => code != value && is_a(index, code, value),
+        "in" => value.split(',').any(|item| item == code),
+        "not-in" => value.split(',').all(|item| item != code),
         "=" if property == "concept" => code == value,
         "=" => index.codes.get(code).is_some_and(|concept| {
             concept
@@ -534,20 +593,22 @@ fn code_matches(index: &SystemIndex, code: &str, filter: &Json) -> bool {
 }
 
 fn is_a(index: &SystemIndex, code: &str, ancestor: &str) -> bool {
-    let mut current = code;
-    for _ in 0..64 {
-        if current == ancestor {
+    fn walk(index: &SystemIndex, code: &str, ancestor: &str, depth: usize) -> bool {
+        if code == ancestor {
             return true;
         }
-        let Some(concept) = index.codes.get(current) else {
+        if depth > 64 {
+            return false;
+        }
+        let Some(concept) = index.codes.get(code) else {
             return false;
         };
-        let Some(parent) = concept.parents.first() else {
-            return false;
-        };
-        current = parent;
+        let parents = concept.parents.clone();
+        parents
+            .iter()
+            .any(|parent| walk(index, parent, ancestor, depth + 1))
     }
-    false
+    walk(index, code, ancestor, 0)
 }
 
 fn merge_expansion(into: &mut Expansion, other: Expansion) {
@@ -956,6 +1017,13 @@ mod tests {
             ),
             TermAnswer::No
         );
+        assert!(terms.subsumes("http://example.org/animals", "mammal", "dog"));
+        assert!(!terms.subsumes("http://example.org/animals", "dog", "mammal"));
+        let page = terms
+            .expand_page("http://example.org/pets", None, 0, Some(1))
+            .expect("page");
+        assert_eq!(page["expansion"]["total"], 3);
+        assert_eq!(page["expansion"]["contains"].as_array().unwrap().len(), 1);
 
         let fragment = json!({
             "resourceType": "CodeSystem",

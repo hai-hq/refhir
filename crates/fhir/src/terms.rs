@@ -16,7 +16,9 @@ pub fn operation(
         ("ValueSet", "$expand") => {
             let url = required(args, &["url"])?;
             let filter = optional(args, &["filter"]);
-            Ok(terms.expand(url, filter).unwrap_or_else(|| {
+            let offset = optional_usize(args, &["offset"]).unwrap_or(0);
+            let count = optional_usize(args, &["count"]);
+            Ok(terms.expand_page(url, filter, offset, count).unwrap_or_else(|| {
                 outcome(
                     "warning",
                     "not-supported",
@@ -53,6 +55,26 @@ pub fn operation(
                 )
             }))
         }
+        ("CodeSystem", "$subsumes") => {
+            let system = optional(args, &["system", "url"])
+                .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
+            let code_a = required(args, &["codeA", "code"])?;
+            let code_b = required(args, &["codeB"])?;
+            let outcome = if terms.subsumes(system, code_a, code_b) && terms.subsumes(system, code_b, code_a)
+            {
+                "equivalent"
+            } else if terms.subsumes(system, code_a, code_b) {
+                "subsumes"
+            } else if terms.subsumes(system, code_b, code_a) {
+                "subsumed-by"
+            } else {
+                "not-subsumed"
+            };
+            Ok(json!({
+                "resourceType": "Parameters",
+                "parameter": [{"name": "outcome", "valueCode": outcome}]
+            }))
+        }
         ("ConceptMap", "$translate") => {
             let (system, code, _) = code_parts(args)?;
             let system = system.ok_or_else(|| FhirError::Invalid("system is required".into()))?;
@@ -63,7 +85,7 @@ pub fn operation(
                 optional(args, &["targetsystem", "targetSystem"]),
             ))
         }
-        (_, "$expand" | "$validate-code" | "$lookup" | "$translate") => Err(
+        (_, "$expand" | "$validate-code" | "$lookup" | "$translate" | "$subsumes") => Err(
             FhirError::Unsupported(format!("unsupported operation {type_name}/{op}")),
         ),
         _ => Err(FhirError::Unsupported(format!(
@@ -156,6 +178,31 @@ fn parameters(args: &Value) -> Option<&Vec<Value>> {
             args.pointer("/resource/parameter")
                 .and_then(|value| value.as_array())
         })
+}
+
+fn optional_usize(args: &Value, names: &[&str]) -> Option<usize> {
+    for name in names {
+        if let Some(value) = args.get(*name).and_then(|item| item.as_u64()) {
+            return Some(value as usize);
+        }
+        if let Some(text) = args.get(*name).and_then(|item| item.as_str()) {
+            if let Ok(value) = text.parse::<usize>() {
+                return Some(value);
+            }
+        }
+    }
+    let parameters = parameters(args)?;
+    for name in names {
+        for parameter in parameters {
+            if parameter.get("name").and_then(|value| value.as_str()) != Some(*name) {
+                continue;
+            }
+            if let Some(value) = parameter.get("valueInteger").and_then(|item| item.as_u64()) {
+                return Some(value as usize);
+            }
+        }
+    }
+    None
 }
 
 fn required<'a>(args: &'a Value, names: &[&str]) -> Result<&'a str, FhirError> {

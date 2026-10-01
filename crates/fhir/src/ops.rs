@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use refhir_validate::validate;
 
-use crate::catalog::{index_keys, valid_id, Catalog, ResourceModel};
+use crate::catalog::{index_keys, valid_id, Catalog, ReferencePolicy, ResourceModel};
 use crate::error::FhirError;
 use crate::resolve::TxHost;
 
@@ -149,7 +149,11 @@ fn load(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Stored,
         .ok_or_else(|| FhirError::NotFound(format!("{}/{} not found", model.name, id)))
 }
 
-fn check_instance(tx: &mut Transaction, catalog: &Catalog, resource: &Value) -> Result<(), FhirError> {
+fn check_instance(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    resource: &Value,
+) -> Result<(), FhirError> {
     let host = TxHost::new(tx, catalog);
     let outcome = validate(resource, &[], catalog.schema(), catalog.terms(), &host);
     if outcome.has_errors() {
@@ -215,8 +219,22 @@ fn check_reference(
             .map(String::as_str)
             .unwrap_or("Resource")
     );
+    if reference.starts_with('#') {
+        return match catalog.reference_policy() {
+            ReferencePolicy::Fhir => Ok(()),
+            ReferencePolicy::Strict => Err(FhirError::Invalid(relative)),
+        };
+    }
     if reference.contains("://") {
-        return Err(FhirError::Invalid(relative));
+        return match catalog.reference_policy() {
+            ReferencePolicy::Strict => Err(FhirError::Invalid(relative)),
+            ReferencePolicy::Fhir => {
+                if let Some(type_name) = absolute_type(reference) {
+                    reject_target(element, type_name, &relative)?;
+                }
+                Ok(())
+            }
+        };
     }
     let Some((type_name, id)) = reference.split_once('/') else {
         return Err(FhirError::Invalid(relative));
@@ -224,17 +242,40 @@ fn check_reference(
     if type_name.is_empty() || reference.matches('/').count() != 1 || !valid_id(id) {
         return Err(FhirError::Invalid(relative));
     }
-    if !element.targets.is_empty() && !element.targets.iter().any(|target| target == type_name) {
-        return Err(FhirError::Invalid(relative));
-    }
+    reject_target(element, type_name, &relative)?;
     let target = catalog.get(type_name)?;
     if tx.get(&target.tablet(), id, &target.by_id())?.is_none() {
+        if catalog.reference_policy() == ReferencePolicy::Fhir {
+            return Ok(());
+        }
         return Err(FhirError::Invalid(format!(
             "{} {type_name}/{id} does not exist",
             element.path
         )));
     }
     Ok(())
+}
+
+fn reject_target(
+    element: &crate::catalog::ReferenceElement,
+    type_name: &str,
+    relative: &str,
+) -> Result<(), FhirError> {
+    if !element.targets.is_empty() && !element.targets.iter().any(|target| target == type_name) {
+        return Err(FhirError::Invalid(relative.to_string()));
+    }
+    Ok(())
+}
+
+fn absolute_type(reference: &str) -> Option<&str> {
+    let path = reference.split(['?', '#']).next().unwrap_or(reference);
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let type_name = segments.get(segments.len().checked_sub(2)?)?;
+    if type_name.chars().next()?.is_ascii_uppercase() {
+        Some(*type_name)
+    } else {
+        None
+    }
 }
 
 fn reference_strings(resource: &Value, path: &str) -> Vec<String> {
@@ -315,6 +356,107 @@ fn check_version(
         }
     }
     Ok(())
+}
+
+pub fn patch(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    id: &str,
+    patch_body: Value,
+    if_match: Option<&str>,
+) -> Result<Value, FhirError> {
+    let current = read(tx, model, id)?;
+    let mut resource = current;
+    crate::patch::apply(&mut resource, &patch_body)?;
+    update(tx, catalog, model, id, resource, if_match)
+}
+
+pub fn conditional_create(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: Value,
+    if_none_exist: &str,
+) -> Result<(Value, u16), FhirError> {
+    let found = search_ids(tx, catalog, model, if_none_exist)?;
+    match found.len() {
+        0 => Ok((create(tx, catalog, model, resource)?, 201)),
+        1 => {
+            let existing = read(tx, model, &found[0])?;
+            Ok((existing, 200))
+        }
+        _ => Err(FhirError::Precondition(format!(
+            "{} conditional create matched {} resources",
+            model.name,
+            found.len()
+        ))),
+    }
+}
+
+pub fn conditional_update(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: Value,
+    query: &str,
+) -> Result<(Value, u16), FhirError> {
+    let found = search_ids(tx, catalog, model, query)?;
+    match found.len() {
+        0 => Ok((create(tx, catalog, model, resource)?, 201)),
+        1 => Ok((update(tx, catalog, model, &found[0], resource, None)?, 200)),
+        _ => Err(FhirError::Precondition(format!(
+            "{} conditional update matched {} resources",
+            model.name,
+            found.len()
+        ))),
+    }
+}
+
+pub fn conditional_delete(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    query: &str,
+) -> Result<Value, FhirError> {
+    let found = search_ids(tx, catalog, model, query)?;
+    match found.len() {
+        0 => Err(FhirError::NotFound(format!(
+            "{} conditional delete matched nothing",
+            model.name
+        ))),
+        1 => delete(tx, catalog, model, &found[0]),
+        _ => Err(FhirError::Precondition(format!(
+            "{} conditional delete matched {} resources",
+            model.name,
+            found.len()
+        ))),
+    }
+}
+
+fn search_ids(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    query: &str,
+) -> Result<Vec<String>, FhirError> {
+    let params = crate::patch::parse_query(query);
+    let bundle = crate::search::search(tx, catalog, model, &params)?;
+    let mut ids = Vec::new();
+    for entry in bundle
+        .get("entry")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if entry.pointer("/search/mode").and_then(|value| value.as_str()) == Some("include") {
+            continue;
+        }
+        if let Some(id) = entry.pointer("/resource/id").and_then(|value| value.as_str()) {
+            ids.push(id.to_string());
+        }
+    }
+    Ok(ids)
 }
 
 fn parse_if_match(tag: &str) -> Result<Timestamp, FhirError> {

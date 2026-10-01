@@ -1,8 +1,8 @@
 use refhir_database::{Revision, Transaction};
-use refhir_types::Timestamp;
+use refhir_types::{Interval, Timestamp};
 use serde_json::{json, Value};
 
-use crate::catalog::ResourceModel;
+use crate::catalog::{Catalog, ResourceModel};
 use crate::error::FhirError;
 use crate::ops::decorate;
 
@@ -47,6 +47,80 @@ pub fn history(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<
         "type": "history",
         "total": entries.len(),
         "entry": entries
+    }))
+}
+
+pub fn type_history(
+    tx: &mut Transaction,
+    model: &ResourceModel,
+    since: Option<Timestamp>,
+    count: Option<usize>,
+    offset: usize,
+) -> Result<Value, FhirError> {
+    tx.record_span(model.by_id(), Interval::all());
+    log_bundle(tx, Some(model), since, count, offset)
+}
+
+pub fn system_history(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    since: Option<Timestamp>,
+    count: Option<usize>,
+    offset: usize,
+) -> Result<Value, FhirError> {
+    for model in catalog.resource_models() {
+        tx.record_span(model.by_id(), Interval::all());
+    }
+    log_bundle(tx, None, since, count, offset)
+}
+
+fn log_bundle(
+    tx: &Transaction,
+    model: Option<&ResourceModel>,
+    since: Option<Timestamp>,
+    count: Option<usize>,
+    offset: usize,
+) -> Result<Value, FhirError> {
+    let start = since.unwrap_or(Timestamp::ZERO);
+    let rows = tx.log_since(start)?;
+    let mut entries = Vec::new();
+    for row in rows {
+        let type_name = row.id.tablet.as_str();
+        if model.is_some_and(|item| item.name != type_name) {
+            continue;
+        }
+        let Some(id) = row.id.id_str() else {
+            continue;
+        };
+        let deleted = row.value.is_none();
+        let rev = Revision {
+            ts: row.ts,
+            prev_ts: row.prev_ts,
+            deleted,
+            json: row
+                .value
+                .as_deref()
+                .and_then(|text| serde_json::from_str(text).ok()),
+        };
+        let placeholder = ResourceModel {
+            name: type_name.to_string(),
+            references: Vec::new(),
+            params: Vec::new(),
+        };
+        let model = model.unwrap_or(&placeholder);
+        entries.push(history_entry(model, id, rev));
+    }
+    let total = entries.len();
+    let page: Vec<_> = entries
+        .into_iter()
+        .skip(offset)
+        .take(count.unwrap_or(usize::MAX))
+        .collect();
+    Ok(json!({
+        "resourceType": "Bundle",
+        "type": "history",
+        "total": total,
+        "entry": page
     }))
 }
 

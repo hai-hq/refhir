@@ -104,6 +104,7 @@ pub struct ElementDef {
     pub slicing: Option<Slicing>,
     /// Element id this node reuses (`contentReference` without the leading `#`).
     pub content_reference: Option<String>,
+    pub must_support: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -349,6 +350,10 @@ fn compile_element(element: &Json) -> Option<ElementDef> {
         max_value: prefixed(element, "maxValue"),
         slicing: element.get("slicing").and_then(compile_slicing),
         content_reference,
+        must_support: element
+            .get("mustSupport")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
     })
 }
 

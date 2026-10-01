@@ -38,6 +38,17 @@ impl Host for TxHost<'_> {
             .map_err(|err| Error::eval(err.to_string()))?;
         Ok(stored.map(|stored| stored.json))
     }
+
+    fn conforms_to(&self, resource: &Json, url: &str) -> Result<Option<bool>, Error> {
+        let outcome = refhir_validate::validate(
+            resource,
+            &[url.to_string()],
+            self.catalog.schema(),
+            self.catalog.terms(),
+            self,
+        );
+        Ok(Some(!outcome.has_errors()))
+    }
 }
 
 fn split_reference(reference: &str) -> Option<(&str, &str)> {

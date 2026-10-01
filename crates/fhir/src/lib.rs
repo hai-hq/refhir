@@ -5,12 +5,15 @@
 
 mod bundle;
 mod catalog;
+mod compartment;
 mod conform;
 mod error;
 mod extract;
 mod history;
+mod meta;
 mod ops;
 mod package;
+mod patch;
 mod resolve;
 mod run;
 mod search;
@@ -20,7 +23,7 @@ mod terms;
 mod tests;
 
 pub use bundle::transaction;
-pub use catalog::Catalog;
+pub use catalog::{Catalog, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
 pub use package::{

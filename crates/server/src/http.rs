@@ -1,12 +1,14 @@
 //! HTTP FHIR mapped onto the operation registry.
 //! The router does not implement a second engine.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::body::Bytes;
+use axum::extract::ws::Message;
 use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::{header, HeaderMap, StatusCode};
+use futures_util::{SinkExt, StreamExt};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -16,11 +18,29 @@ use serde_json::{json, Value};
 
 use crate::sync;
 
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub auth: bool,
+    pub export_dir: String,
+    pub terminology_urls: Vec<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            auth: false,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Database>,
     pub catalog: Arc<RwLock<Catalog>>,
     pub store: Arc<dyn ConformanceStore>,
+    pub config: ServerConfig,
 }
 
 pub fn app(
@@ -28,20 +48,65 @@ pub fn app(
     catalog: Arc<RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
 ) -> Router {
-    Router::new()
+    app_with(db, catalog, store, ServerConfig::default())
+}
+
+pub fn app_with(
+    db: Arc<Database>,
+    catalog: Arc<RwLock<Catalog>>,
+    store: Arc<dyn ConformanceStore>,
+    config: ServerConfig,
+) -> Router {
+    let router = Router::new()
         .route("/metadata", get(metadata))
+        .route("/.well-known/smart-configuration", get(smart_config))
+        .route("/oauth/token", post(oauth_token))
+        .route("/graphql", post(graphql_route))
         .route("/sync", get(sync_ws))
+        .route("/_history", get(system_history))
+        .route("/$export", post(export_system))
+        .route("/export/:job", get(export_status))
+        .route("/export/:job/file", get(export_file))
         .route("/", post(bundle_post))
-        .route("/:resource_type", get(search).post(create))
+        .route(
+            "/:resource_type",
+            get(search)
+                .post(create)
+                .put(conditional_update)
+                .delete(conditional_delete),
+        )
+        .route("/:resource_type/_history", get(type_history))
         .route("/:resource_type/$validate", post(validate_op))
         .route("/:resource_type/$expand", post(expand_op))
         .route("/:resource_type/$validate-code", post(validate_code_op))
         .route("/:resource_type/$lookup", post(lookup_op))
         .route("/:resource_type/$translate", post(translate_op))
+        .route("/:resource_type/$subsumes", post(subsumes_op))
+        .route("/:resource_type/$export", post(export_type))
         .route("/:resource_type/:id/_history/:vid", get(vread))
         .route("/:resource_type/:id/_history", get(instance_history))
-        .route("/:resource_type/:id", get(read).put(update).delete(remove))
-        .with_state(AppState { db, catalog, store })
+        .route("/:resource_type/:id/$meta", get(meta_get).post(meta_post))
+        .route("/:resource_type/:id/$validate", post(validate_instance))
+        .route("/:resource_type/:id/$everything", get(everything))
+        .route("/:resource_type/:id/$document", get(document_op))
+        .route("/:resource_type/:id/$websocket", get(subscription_socket))
+        .route("/:resource_type/:id/$export", post(export_instance))
+        .route(
+            "/:resource_type/:id",
+            get(read).put(update).delete(remove).patch(patch_op),
+        )
+        .route("/:resource_type/:id/:compartment", get(compartment_search));
+    let state = AppState {
+        db: db.clone(),
+        catalog: catalog.clone(),
+        store: store.clone(),
+        config: config.clone(),
+    };
+    let router = router
+        .layer(middleware::from_fn_with_state(state.clone(), smart_guard))
+        .with_state(state);
+    crate::jobs::attach(db, catalog, store, &config);
+    router
 }
 
 pub async fn execute(
@@ -68,29 +133,89 @@ pub async fn execute(
 }
 
 async fn metadata(State(app): State<AppState>) -> Response {
-    let catalog = app.catalog.read().expect("catalog");
-    fhir_json(StatusCode::OK, catalog.capability_statement())
+    let mut statement = app.catalog.read().expect("catalog").capability_statement();
+    if app.config.auth {
+        if let Some(rest) = statement
+            .pointer_mut("/rest/0")
+            .and_then(|value| value.as_object_mut())
+        {
+            rest.insert(
+                "security".into(),
+                json!({
+                    "service": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/restful-security-service", "code": "SMART-on-FHIR"}]}],
+                    "extension": [{
+                        "url": "http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris",
+                        "extension": [
+                            {"url": "authorize", "valueUri": "/oauth/authorize"},
+                            {"url": "token", "valueUri": "/oauth/token"}
+                        ]
+                    }]
+                }),
+            );
+        }
+    }
+    fhir_json(StatusCode::OK, statement)
+}
+
+async fn smart_guard(
+    State(app): State<AppState>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if app.config.auth {
+        let path = request.uri().path();
+        let open = path == "/metadata"
+            || path.starts_with("/.well-known")
+            || path.starts_with("/oauth/");
+        if !open {
+            let method = request.method().as_str().to_string();
+            let resource = fhir_type_from_path(path);
+            if let Some(response) = crate::auth::check(&app, request.headers(), &method, &resource, None)
+            {
+                return response;
+            }
+        }
+    }
+    next.run(request).await
+}
+
+fn fhir_type_from_path(path: &str) -> String {
+    let segment = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    if segment.is_empty()
+        || segment.starts_with('$')
+        || segment.starts_with('_')
+        || matches!(segment, "graphql" | "sync" | "export")
+    {
+        "*".into()
+    } else {
+        segment.to_string()
+    }
 }
 
 async fn sync_ws(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| sync::handle_socket(socket, app.db, app.catalog, app.store))
 }
 
-async fn bundle_post(State(app): State<AppState>, body: Bytes) -> Response {
+async fn bundle_post(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     let resource = match parse_body(&body) {
         Ok(value) => value,
         Err(response) => return response,
+    };
+    let path = if resource.get("type").and_then(|value| value.as_str()) == Some("batch") {
+        "Bundle/batch"
+    } else {
+        "Bundle/transaction"
     };
     match execute(
         &app.db,
         &app.catalog,
         &app.store,
-        "Bundle/transaction",
+        path,
         json!({"resource": resource}),
     )
     .await
     {
-        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Ok(result) => render(StatusCode::OK, result.value, prefer_xml(&headers, &[])),
         Err(err) => error_response(err),
     }
 }
@@ -98,25 +223,37 @@ async fn bundle_post(State(app): State<AppState>, body: Bytes) -> Response {
 async fn create(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let resource = match parse_body(&body) {
         Ok(value) => value,
         Err(response) => return response,
     };
-    match execute(
-        &app.db,
-        &app.catalog,
-        &app.store,
-        &format!("{resource_type}/create"),
-        json!({"resource": resource}),
-    )
-    .await
-    {
+    let if_none_exist = headers
+        .get("if-none-exist")
+        .and_then(|value| value.to_str().ok());
+    let (path, args) = if let Some(query) = if_none_exist {
+        (
+            format!("{resource_type}/conditional-create"),
+            json!({"resource": resource, "ifNoneExist": query}),
+        )
+    } else {
+        (
+            format!("{resource_type}/create"),
+            json!({"resource": resource}),
+        )
+    };
+    match execute(&app.db, &app.catalog, &app.store, &path, args).await {
         Ok(result) => {
             let id = result.value["id"].as_str().unwrap_or("");
             let location = format!("{resource_type}/{id}/_history/{}", result.ts);
-            resource_response(StatusCode::CREATED, result.value, Some(location))
+            let status = if result.status == 200 {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
+            resource_response(status, result.value, Some(location), prefer_xml(&headers, &[]))
         }
         Err(err) => error_response(err),
     }
@@ -199,6 +336,8 @@ async fn terminology_op(app: AppState, resource_type: String, op: &str, body: By
 async fn read(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     match execute(
         &app.db,
@@ -209,7 +348,7 @@ async fn read(
     )
     .await
     {
-        Ok(result) => resource_response(StatusCode::OK, result.value, None),
+        Ok(result) => resource_response(StatusCode::OK, result.value, None, prefer_xml(&headers, &params)),
         Err(err) => error_response(err),
     }
 }
@@ -242,7 +381,12 @@ async fn update(
     {
         Ok(result) => {
             let location = format!("{resource_type}/{id}/_history/{}", result.ts);
-            resource_response(StatusCode::OK, result.value, Some(location))
+            resource_response(
+                StatusCode::OK,
+                result.value,
+                Some(location),
+                prefer_xml(&headers, &[]),
+            )
         }
         Err(err) => error_response(err),
     }
@@ -269,22 +413,29 @@ async fn remove(
 async fn search(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
-    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let mut args = serde_json::Map::new();
-    for (key, value) in params {
-        args.insert(key, Value::String(value));
+    if let Some(response) = authorize(&app, &headers, "GET", &resource_type, None) {
+        return response;
     }
+    let xml = prefer_xml(&headers, &params);
+    let mut args = query_object(params);
+    if let Some(compartment) = crate::auth::patient_compartment(&app, &headers) {
+        args.entry("_compartment".to_string())
+            .or_insert(Value::String(compartment));
+    }
+    let args = Value::Object(args);
     match execute(
         &app.db,
         &app.catalog,
         &app.store,
         &format!("{resource_type}/search"),
-        Value::Object(args),
+        args,
     )
     .await
     {
-        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Ok(result) => render(StatusCode::OK, result.value, xml),
         Err(err) => error_response(err),
     }
 }
@@ -292,13 +443,16 @@ async fn search(
 async fn instance_history(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    let mut args = query_object(params);
+    args.insert("id".into(), Value::String(id));
     match execute(
         &app.db,
         &app.catalog,
         &app.store,
         &format!("{resource_type}/history"),
-        json!({"id": id}),
+        Value::Object(args),
     )
     .await
     {
@@ -320,9 +474,328 @@ async fn vread(
     )
     .await
     {
-        Ok(result) => resource_response(StatusCode::OK, result.value, None),
+        Ok(result) => resource_response(StatusCode::OK, result.value, None, false),
         Err(err) => error_response(err),
     }
+}
+
+fn query_object(params: Vec<(String, String)>) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    for (key, value) in params {
+        if let Some(existing) = args.get(&key).and_then(|item| item.as_str()) {
+            args.insert(key, Value::String(format!("{existing},{value}")));
+        } else {
+            args.insert(key, Value::String(value));
+        }
+    }
+    args
+}
+
+async fn type_history(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    run_read(
+        &app,
+        &format!("{resource_type}/history"),
+        Value::Object(query_object(params)),
+    )
+    .await
+}
+
+async fn system_history(
+    State(app): State<AppState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    run_read(&app, "system/history", Value::Object(query_object(params))).await
+}
+
+async fn conditional_update(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let query = query_object(params)
+        .iter()
+        .map(|(key, value)| format!("{key}={}", value.as_str().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("&");
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/conditional-update"),
+        json!({"resource": resource, "query": query}),
+    )
+    .await
+    {
+        Ok(result) => {
+            let status = if result.status == 201 {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
+            resource_response(status, result.value, None, false)
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+async fn conditional_delete(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let query = query_object(params)
+        .iter()
+        .map(|(key, value)| format!("{key}={}", value.as_str().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("&");
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/conditional-delete"),
+        json!({"query": query}),
+    )
+    .await
+    {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(err) => error_response(err),
+    }
+}
+
+async fn patch_op(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let patch = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let mut args = json!({"id": id, "patch": patch});
+    if let Some(tag) = headers
+        .get(header::IF_MATCH)
+        .and_then(|value| value.to_str().ok())
+    {
+        args["ifMatch"] = json!(tag);
+    }
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/patch"),
+        args,
+    )
+    .await
+    {
+        Ok(result) => {
+            resource_response(StatusCode::OK, result.value, None, prefer_xml(&headers, &[]))
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+async fn subscription_socket(
+    ws: WebSocketUpgrade,
+    Path((_resource_type, id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let mut rx = crate::jobs::register_socket(id);
+        let (mut sink, mut stream) = socket.split();
+        loop {
+            tokio::select! {
+                payload = rx.recv() => {
+                    let Some(payload) = payload else { break };
+                    if sink.send(Message::Text(payload)).await.is_err() {
+                        break;
+                    }
+                }
+                incoming = stream.next() => {
+                    if incoming.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn compartment_search(
+    State(app): State<AppState>,
+    Path((compartment, id, resource_type)): Path<(String, String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let mut args = query_object(params);
+    args.insert(
+        "_compartment".into(),
+        Value::String(format!("{compartment}/{id}")),
+    );
+    run_read(
+        &app,
+        &format!("{resource_type}/search"),
+        Value::Object(args),
+    )
+    .await
+}
+
+async fn meta_get(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+) -> Response {
+    run_read(
+        &app,
+        &format!("{resource_type}/$meta"),
+        json!({"id": id}),
+    )
+    .await
+}
+
+async fn meta_post(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let delete = params.iter().any(|(key, _)| key == "_delete");
+    let op = if delete { "$meta-delete" } else { "$meta-add" };
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/{op}"),
+        json!({"id": id, "resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Err(err) => error_response(err),
+    }
+}
+
+async fn validate_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    let mut args = query_object(params);
+    args.insert("id".into(), Value::String(id));
+    if !body.is_empty() {
+        match parse_body(&body) {
+            Ok(value) => {
+                args.insert("resource".into(), value);
+            }
+            Err(response) => return response,
+        }
+    }
+    run_read(
+        &app,
+        &format!("{resource_type}/$validate"),
+        Value::Object(args),
+    )
+    .await
+}
+
+async fn everything(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+) -> Response {
+    run_read(
+        &app,
+        &format!("{resource_type}/$everything"),
+        json!({"id": id}),
+    )
+    .await
+}
+
+async fn document_op(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+) -> Response {
+    run_read(
+        &app,
+        &format!("{resource_type}/$document"),
+        json!({"id": id}),
+    )
+    .await
+}
+
+async fn subsumes_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    terminology_op(app, resource_type, "$subsumes", body).await
+}
+
+async fn smart_config(State(app): State<AppState>) -> Response {
+    crate::auth::configuration(&app)
+}
+
+async fn oauth_token(State(app): State<AppState>, body: Bytes) -> Response {
+    crate::auth::issue(&app, &body)
+}
+
+async fn graphql_route(State(app): State<AppState>, body: Bytes) -> Response {
+    crate::graphql::handle(&app, &body).await
+}
+
+async fn export_system(State(app): State<AppState>, body: Bytes) -> Response {
+    crate::jobs::accept_export(&app, None, None, &body).await
+}
+
+async fn export_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    crate::jobs::accept_export(&app, Some(resource_type), None, &body).await
+}
+
+async fn export_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    crate::jobs::accept_export(&app, Some(resource_type), Some(id), &body).await
+}
+
+async fn export_status(State(app): State<AppState>, Path(job): Path<String>) -> Response {
+    crate::jobs::status(&app, &job)
+}
+
+async fn export_file(State(app): State<AppState>, Path(job): Path<String>) -> Response {
+    crate::jobs::file(&app, &job)
+}
+
+async fn run_read(app: &AppState, path: &str, args: Value) -> Response {
+    match execute(&app.db, &app.catalog, &app.store, path, args).await {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Err(err) => error_response(err),
+    }
+}
+
+fn authorize(
+    app: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    resource_type: &str,
+    patient: Option<&str>,
+) -> Option<Response> {
+    crate::auth::check(app, headers, method, resource_type, patient)
 }
 
 fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
@@ -333,6 +806,10 @@ fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
             "request body is required",
         ));
     }
+    if bytes.first() == Some(&b'<') {
+        let text = std::str::from_utf8(bytes).unwrap_or("");
+        return crate::xml::to_json(text).map_err(|err| outcome(StatusCode::BAD_REQUEST, "invalid", &err));
+    }
     serde_json::from_slice(bytes).map_err(|err| {
         outcome(
             StatusCode::BAD_REQUEST,
@@ -342,12 +819,46 @@ fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
     })
 }
 
-fn resource_response(status: StatusCode, value: Value, location: Option<String>) -> Response {
+fn prefer_xml(headers: &HeaderMap, params: &[(String, String)]) -> bool {
+    if params.iter().any(|(key, value)| {
+        key == "_format" && (value == "xml" || value.contains("fhir+xml") || value == "application/xml")
+    }) {
+        return true;
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| {
+            let accept = accept.to_ascii_lowercase();
+            (accept.contains("fhir+xml") || accept.contains("application/xml") || accept.contains("text/xml"))
+                && !accept.contains("json")
+        })
+}
+
+fn render(status: StatusCode, value: Value, xml: bool) -> Response {
+    if xml {
+        let text = crate::xml::from_json(&value);
+        return (
+            status,
+            [(header::CONTENT_TYPE, "application/fhir+xml")],
+            text,
+        )
+            .into_response();
+    }
+    fhir_json(status, value)
+}
+
+fn resource_response(
+    status: StatusCode,
+    value: Value,
+    location: Option<String>,
+    xml: bool,
+) -> Response {
     let etag = value
         .pointer("/meta/versionId")
         .and_then(|item| item.as_str())
         .map(|version| format!("W/\"{version}\""));
-    let mut response = fhir_json(status, value);
+    let mut response = render(status, value, xml);
     let headers = response.headers_mut();
     if let Some(location) = location.and_then(|value| value.parse().ok()) {
         headers.insert(header::LOCATION, location);
@@ -356,6 +867,10 @@ fn resource_response(status: StatusCode, value: Value, location: Option<String>)
         headers.insert(header::ETAG, etag);
     }
     response
+}
+
+pub fn fhir_json_public(status: StatusCode, value: Value) -> Response {
+    fhir_json(status, value)
 }
 
 fn fhir_json(status: StatusCode, value: Value) -> Response {
@@ -425,6 +940,7 @@ fn fhir_status(err: &FhirError) -> StatusCode {
         FhirError::NotFound(_) | FhirError::UnknownResource(_) => StatusCode::NOT_FOUND,
         FhirError::Gone(_) => StatusCode::GONE,
         FhirError::Conflict(_) => StatusCode::CONFLICT,
+        FhirError::Precondition(_) => StatusCode::PRECONDITION_FAILED,
         FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
             StatusCode::BAD_REQUEST

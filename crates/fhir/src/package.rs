@@ -146,7 +146,9 @@ pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let loaded = Catalog::open(store)?;
+    let policy = catalog.read().expect("catalog").reference_policy();
+    let mut loaded = Catalog::open(store)?;
+    loaded.set_reference_policy(policy);
     *catalog.write().expect("catalog") = loaded;
     Ok(())
 }
@@ -332,7 +334,10 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         match value.get("resourceType").and_then(|item| item.as_str()) {
             Some("StructureDefinition") => definitions.push(value),
             Some("SearchParameter") => parameters.push(value),
-            Some("CodeSystem") | Some("ValueSet") | Some("ConceptMap") => terminology.push(value),
+            Some("CodeSystem")
+            | Some("ValueSet")
+            | Some("ConceptMap")
+            | Some("CompartmentDefinition") => terminology.push(value),
             _ => {}
         }
     }

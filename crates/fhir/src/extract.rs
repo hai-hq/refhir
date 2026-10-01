@@ -2,13 +2,16 @@
 //!
 //! Token, string, reference, date, uri, number, quantity, and composite
 //! parameters from the R4 set all compile. `memberOf()` stays out of the
-//! index expression. Number and quantity comparisons run while matching,
-//! because a range does not fit in one index key.
+//! index expression. Number and quantity prefixes narrow to a sortable range.
+//! The matcher still applies implicit precision.
 
 use std::collections::BTreeMap;
 
 use refhir_fhirpath::{Expr, Host, Model};
-use refhir_types::{string_key, token_key, IndexId};
+use refhir_types::{
+    number_key, number_range, quantity_key, quantity_range, string_key, token_key, IndexId,
+    Interval,
+};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,10 +44,16 @@ impl SearchKind {
 }
 
 /// How a query value can narrow the index. `Scan` leaves that to `matches`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Probe<'a> {
     Token(&'a str),
     Prefix(&'a str),
+    /// Inclusive lower bound on a string or date key. Matching still applies the prefix.
+    AtLeast(&'a str),
+    /// Exclusive upper bound on a string or date key.
+    AtMost(&'a str),
+    /// Inclusive start, exclusive end, over number or quantity keys.
+    Range(Interval),
     Scan,
 }
 
@@ -103,12 +112,142 @@ impl Extractor {
         path_model: &Model,
         host: &dyn Host,
     ) -> Vec<(IndexId, Vec<u8>)> {
+        if self.kind == SearchKind::Number {
+            return number_values(self, resource, path_model, host)
+                .into_iter()
+                .filter(|value| value.is_finite())
+                .map(|value| (index.clone(), number_key(value, id)))
+                .collect();
+        }
+        if self.kind == SearchKind::Quantity {
+            return quantity_values(self, resource, path_model, host)
+                .into_iter()
+                .filter(|span| span.exact.is_finite())
+                .map(|span| {
+                    (
+                        index.clone(),
+                        quantity_key(span.code.as_deref().unwrap_or(""), span.exact, id),
+                    )
+                })
+                .collect();
+        }
         let values = self.indexed_values(resource, path_model, host);
         match self.probe("") {
             Probe::Token(_) => token_rows(index, id, &values),
-            Probe::Prefix(_) => string_rows(index, id, &values),
-            Probe::Scan => Vec::new(),
+            Probe::Prefix(_) | Probe::AtLeast(_) | Probe::AtMost(_) => string_rows(index, id, &values),
+            Probe::Range(_) | Probe::Scan => Vec::new(),
         }
+    }
+
+    pub fn indexed(
+        &self,
+        resource: &Value,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> Vec<String> {
+        self.indexed_values(resource, path_model, host)
+    }
+
+    pub fn matches_modifier(
+        &self,
+        resource: &Value,
+        modifier: &str,
+        expected: &str,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        match modifier {
+            "missing" => self.matches_op(resource, "pr", expected, path_model, host),
+            "exact" => self.exact_match(resource, expected, path_model, host),
+            "contains" => self.contains_match(resource, expected, path_model, host),
+            "not" => !self.matches(resource, expected, path_model, host),
+            "text" => self.display_match(resource, expected, path_model, host),
+            "of-type" => self.of_type_match(resource, expected, path_model, host),
+            "identifier" => self.identifier_match(resource, expected, path_model, host),
+            _ => false,
+        }
+    }
+
+    fn exact_match(
+        &self,
+        resource: &Value,
+        expected: &str,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        self.indexed_values(resource, path_model, host)
+            .iter()
+            .any(|text| text == expected)
+    }
+
+    fn contains_match(
+        &self,
+        resource: &Value,
+        expected: &str,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        let needle = expected.to_lowercase();
+        self.indexed_values(resource, path_model, host)
+            .iter()
+            .any(|text| text.to_lowercase().contains(&needle))
+    }
+
+    fn display_match(
+        &self,
+        resource: &Value,
+        expected: &str,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        let needle = expected.to_lowercase();
+        let Source::Path(expr) = &self.source else {
+            return self.contains_match(resource, expected, path_model, host);
+        };
+        display_strings(&eval_items(expr, resource, path_model, host))
+            .iter()
+            .any(|text| text.to_lowercase().contains(&needle))
+    }
+
+    fn of_type_match(
+        &self,
+        resource: &Value,
+        expected: &str,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        let mut parts = expected.split('|');
+        let Some(system) = parts.next() else {
+            return false;
+        };
+        let Some(code) = parts.next() else {
+            return false;
+        };
+        let Some(value) = parts.next() else {
+            return false;
+        };
+        let Source::Path(expr) = &self.source else {
+            return false;
+        };
+        focus_nodes(expr, resource, path_model, host)
+            .iter()
+            .any(|node| identifier_of_type(node, system, code, value))
+    }
+
+    fn identifier_match(
+        &self,
+        resource: &Value,
+        expected: &str,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        let Source::Path(expr) = &self.source else {
+            return false;
+        };
+        let (system, value) = expected.split_once('|').unwrap_or(("", expected));
+        focus_nodes(expr, resource, path_model, host)
+            .iter()
+            .any(|node| reference_identifier(node, system, value))
     }
 
     pub fn matches(
@@ -131,7 +270,7 @@ impl Extractor {
     ) -> bool {
         if op == "pr" {
             let present = self.has_value(resource, path_model, host);
-            return (expected == "true" && present) || (expected == "false" && !present);
+            return (expected == "true" && !present) || (expected == "false" && present);
         }
         match &self.source {
             Source::Filter | Source::Query => false,
@@ -304,16 +443,147 @@ fn probe_kind(kind: Option<SearchKind>, query: &str) -> Probe<'_> {
         Some(SearchKind::String) => Probe::Prefix(query),
         Some(SearchKind::Date) => {
             let (op, rest) = split_prefix(query);
-            if op == "eq" && !query.starts_with("eq") {
-                Probe::Prefix(query)
-            } else if op == "eq" {
-                Probe::Prefix(rest)
-            } else {
-                Probe::Scan
+            match op {
+                "eq" if !query.starts_with("eq") => Probe::Prefix(query),
+                "eq" => Probe::Prefix(rest),
+                "gt" | "ge" | "sa" => Probe::AtLeast(rest),
+                "lt" | "le" | "eb" => Probe::AtMost(rest),
+                _ => Probe::Scan,
             }
         }
+        Some(SearchKind::Number) => number_probe(query),
+        Some(SearchKind::Quantity) => quantity_probe(query),
         _ => Probe::Scan,
     }
+}
+
+fn number_values(
+    extractor: &Extractor,
+    resource: &Value,
+    path_model: &Model,
+    host: &dyn Host,
+) -> Vec<f64> {
+    let Source::Path(expr) = &extractor.source else {
+        return Vec::new();
+    };
+    numbers_of(&eval_items(expr, resource, path_model, host))
+}
+
+fn quantity_values(
+    extractor: &Extractor,
+    resource: &Value,
+    path_model: &Model,
+    host: &dyn Host,
+) -> Vec<Span> {
+    let Source::Path(expr) = &extractor.source else {
+        return Vec::new();
+    };
+    quantities_of(&eval_items(expr, resource, path_model, host))
+}
+
+fn number_probe(query: &str) -> Probe<'_> {
+    let (op, rest) = split_prefix(query);
+    let Some(span) = number_span(rest) else {
+        return Probe::Scan;
+    };
+    bound_probe(op, &span, "")
+}
+
+fn quantity_probe(query: &str) -> Probe<'_> {
+    let (op, rest) = split_prefix(query);
+    let Some((span, _system, code)) = quantity_query(rest) else {
+        return Probe::Scan;
+    };
+    let Some(code) = code else {
+        return Probe::Range(Interval::all());
+    };
+    bound_probe(op, &span, &code)
+}
+
+fn bound_probe(op: &str, span: &Span, code: &str) -> Probe<'static> {
+    let (start, end) = match op {
+        "gt" | "sa" => (Some(span.exact.next_up()), None),
+        "ge" => (Some(span.exact), None),
+        "lt" | "eb" => (None, Some(span.exact)),
+        "le" => (None, Some(span.exact.next_up())),
+        "eq" => (Some(span.start), Some(span.end)),
+        "ap" => {
+            let width = (span.exact.abs() * 0.1).max(span.end - span.start);
+            (Some(span.exact - width), Some((span.exact + width).next_up()))
+        }
+        _ => return Probe::Scan,
+    };
+    let interval = if code.is_empty() {
+        number_range(start, end)
+    } else {
+        quantity_range(code, start, end)
+    };
+    Probe::Range(interval)
+}
+
+fn display_strings(items: &[refhir_fhirpath::Value]) -> Vec<String> {
+    let mut found = Vec::new();
+    for item in items {
+        let refhir_fhirpath::Value::Node { json, .. } = item else {
+            continue;
+        };
+        collect_display(json, &mut found);
+    }
+    found
+}
+
+fn collect_display(value: &Value, found: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for name in ["display", "text"] {
+                if let Some(text) = map.get(name).and_then(|item| item.as_str()) {
+                    found.push(text.to_string());
+                }
+            }
+            for item in map.values() {
+                collect_display(item, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_display(item, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn identifier_of_type(node: &Value, system: &str, code: &str, value: &str) -> bool {
+    let Some(actual) = node.get("value").and_then(|item| item.as_str()) else {
+        return false;
+    };
+    if actual != value {
+        return false;
+    }
+    let Some(codings) = node
+        .pointer("/type/coding")
+        .and_then(|item| item.as_array())
+    else {
+        return false;
+    };
+    codings.iter().any(|coding| {
+        coding.get("system").and_then(|item| item.as_str()) == Some(system)
+            && coding.get("code").and_then(|item| item.as_str()) == Some(code)
+    })
+}
+
+fn reference_identifier(node: &Value, system: &str, value: &str) -> bool {
+    let Some(identifier) = node.get("identifier") else {
+        return false;
+    };
+    let actual = identifier.get("value").and_then(|item| item.as_str());
+    if actual != Some(value) {
+        return false;
+    }
+    if system.is_empty() {
+        return true;
+    }
+    identifier.get("system").and_then(|item| item.as_str()) == Some(system)
 }
 
 fn path_strings(
@@ -1154,7 +1424,9 @@ mod tests {
     use refhir_fhirpath::{EmptyHost, Model};
     use serde_json::{json, Value};
 
-    use super::{compile_parameter, date_match, number_match};
+    use refhir_types::IndexId;
+
+    use super::{compile_parameter, date_match, number_match, Probe};
 
     #[test]
     fn every_r4_search_parameter_compiles() {
@@ -1202,6 +1474,57 @@ mod tests {
         assert!(!number_match("eq", &[100.01], "100.00"));
         assert!(number_match("gt", &[100.1], "100"));
         assert!(!number_match("gt", &[100.0], "100"));
+    }
+
+    #[test]
+    fn number_and_quantity_prefixes_use_an_index_range() {
+        let host = EmptyHost;
+        let model = Model::new();
+        let number = compile_parameter(
+            &json!({
+                "code": "probability",
+                "type": "number",
+                "expression": "RiskAssessment.prediction.probabilityDecimal"
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let above = json!({"resourceType": "RiskAssessment", "prediction": [{"probabilityDecimal": 100.1}]});
+        let equal = json!({"resourceType": "RiskAssessment", "prediction": [{"probabilityDecimal": 100.0}]});
+        let index = IndexId::new("RiskAssessment/probability");
+        let above_key = &number.keys(&above, "a", &index, &model, &host)[0].1;
+        let equal_key = &number.keys(&equal, "b", &index, &model, &host)[0].1;
+        let Probe::Range(interval) = number.probe("gt100") else {
+            panic!("gt100 should be a range");
+        };
+        assert!(interval.contains(above_key));
+        assert!(!interval.contains(equal_key));
+
+        let quantity = compile_parameter(
+            &json!({
+                "code": "value-quantity",
+                "type": "quantity",
+                "expression": "Observation.valueQuantity"
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let resource = json!({
+            "resourceType": "Observation",
+            "valueQuantity": {"value": 5.4, "system": "http://unitsofmeasure.org", "code": "mg"}
+        });
+        assert!(quantity.matches(&resource, "5.4||mg", &model, &host));
+        let keys = quantity.keys(&resource, "o1", &IndexId::new("Observation/value-quantity"), &model, &host);
+        assert_eq!(keys.len(), 1, "quantity was not indexed");
+        let key = &keys[0].1;
+        let Probe::Range(interval) = quantity.probe("gt5||mg") else {
+            panic!("gt5||mg should be a range");
+        };
+        assert!(interval.contains(key));
+        let Probe::Range(low) = quantity.probe("gt6||mg") else {
+            panic!("gt6||mg should be a range");
+        };
+        assert!(!low.contains(key));
     }
 
     #[test]

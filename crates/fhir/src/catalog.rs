@@ -14,8 +14,30 @@ use refhir_types::{exact_key, IndexId, TabletId};
 use refhir_validate::{MemoryTerminology, Schema};
 use serde_json::{json, Value};
 
+use crate::compartment::{self, Compartment};
 use crate::error::FhirError;
 use crate::extract::{self, Extractor, SearchKind};
+
+/// How reference targets are checked on write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReferencePolicy {
+    /// Relative `Type/id` only, and the target must exist in the snapshot.
+    #[default]
+    Strict,
+    /// Allow absolute URLs and targets that are not in this server.
+    /// A type that is not in `targetProfile` is still rejected.
+    Fhir,
+}
+
+impl ReferencePolicy {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "strict" => Some(ReferencePolicy::Strict),
+            "fhir" => Some(ReferencePolicy::Fhir),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ReferenceElement {
@@ -78,6 +100,8 @@ pub struct Catalog {
     path_model: Model,
     schema: Schema,
     terms: MemoryTerminology,
+    reference_policy: ReferencePolicy,
+    compartments: BTreeMap<String, Compartment>,
 }
 
 impl Catalog {
@@ -88,6 +112,8 @@ impl Catalog {
             path_model: Model::new(),
             schema: Schema::default(),
             terms: MemoryTerminology::default(),
+            reference_policy: ReferencePolicy::Strict,
+            compartments: compartment::load(&[]),
         }
     }
 
@@ -207,7 +233,25 @@ impl Catalog {
             path_model: Model::from_definitions(&model_json),
             schema,
             terms,
+            reference_policy: ReferencePolicy::Strict,
+            compartments: compartment::load(&term_json),
         })
+    }
+
+    pub fn reference_policy(&self) -> ReferencePolicy {
+        self.reference_policy
+    }
+
+    pub fn set_reference_policy(&mut self, policy: ReferencePolicy) {
+        self.reference_policy = policy;
+    }
+
+    pub fn compartment(&self, code: &str) -> Option<&Compartment> {
+        self.compartments.get(code)
+    }
+
+    pub fn resource_models(&self) -> impl Iterator<Item = &ResourceModel> {
+        self.types.values()
     }
 
     pub fn path_model(&self) -> &Model {
@@ -248,10 +292,14 @@ impl Catalog {
                         {"code": "read"},
                         {"code": "vread"},
                         {"code": "update"},
+                        {"code": "patch"},
                         {"code": "delete"},
                         {"code": "search-type"},
-                        {"code": "history-instance"}
+                        {"code": "history-instance"},
+                        {"code": "history-type"}
                     ],
+                    "searchInclude": model.params.iter().filter(|param| param.status == ParamStatus::Ready && param.kind == SearchKind::Reference).map(|param| format!("{}:{}", model.name, param.name)).collect::<Vec<_>>(),
+                    "searchRevInclude": model.params.iter().filter(|param| param.status == ParamStatus::Ready && param.kind == SearchKind::Reference).map(|param| format!("{}:{}", model.name, param.name)).collect::<Vec<_>>(),
                     "searchParam": model.params.iter().filter(|param| param.status == ParamStatus::Ready).map(|param| {
                         json!({
                             "name": param.name,
@@ -272,7 +320,12 @@ impl Catalog {
             "rest": [{
                 "mode": "server",
                 "resource": resources,
-                "interaction": [{"code": "transaction"}]
+                "interaction": [
+                    {"code": "transaction"},
+                    {"code": "batch"},
+                    {"code": "history-system"},
+                    {"code": "search-system"}
+                ]
             }]
         })
     }

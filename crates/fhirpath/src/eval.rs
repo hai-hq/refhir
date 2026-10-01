@@ -1162,6 +1162,17 @@ impl Ctx<'_> {
             }
             "conformsTo" => {
                 let url = arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default();
+                let json = input
+                    .items
+                    .first()
+                    .and_then(|item| match item {
+                        Value::Node { json, .. } => Some(json),
+                        _ => None,
+                    })
+                    .unwrap_or(self.resource);
+                if let Some(answer) = self.host.conforms_to(json, &url)? {
+                    return Ok(one(Value::system_bool(answer)));
+                }
                 if !url.contains("StructureDefinition") {
                     return Ok(Outcome {
                         items: vec![],
@@ -1169,15 +1180,7 @@ impl Ctx<'_> {
                     });
                 }
                 let expected = url.rsplit('/').next().unwrap_or("");
-                let actual = input
-                    .items
-                    .first()
-                    .and_then(|item| match item {
-                        Value::Node { json, .. } => resource_type(json),
-                        _ => None,
-                    })
-                    .or_else(|| resource_type(self.resource))
-                    .unwrap_or_default();
+                let actual = resource_type(json).unwrap_or_default();
                 Ok(one(Value::system_bool(actual == expected)))
             }
             "length" | "upper" | "lower" | "toChars" | "indexOf" | "substring" | "startsWith"

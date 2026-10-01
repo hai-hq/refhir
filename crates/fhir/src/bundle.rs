@@ -5,7 +5,7 @@ use refhir_types::Timestamp;
 use serde_json::{json, Value};
 
 use crate::catalog::{valid_id, Catalog};
-use crate::error::FhirError;
+use crate::error::{outcome_code, FhirError};
 use crate::ops;
 
 /// One FHIR transaction Bundle is one Convex transaction: one begin timestamp, one commit.
@@ -23,11 +23,12 @@ pub fn transaction(
     if bundle.get("type").and_then(|value| value.as_str()) != Some("transaction") {
         return Err(FhirError::Invalid("Bundle.type must be transaction".into()));
     }
-    let entries = bundle
+    let mut entries = bundle
         .get("entry")
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
+    rewrite_urns(&mut entries);
     let mut response_entries = vec![Value::Null; entries.len()];
     for index in apply_order(catalog, &entries) {
         response_entries[index] =
@@ -177,15 +178,32 @@ fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result
         .get("url")
         .and_then(|value| value.as_str())
         .ok_or_else(|| FhirError::Invalid("entry.request.url is required".into()))?;
-    if url.contains('?') {
-        return Err(FhirError::Unsupported(
-            "search inside a transaction bundle is not supported".into(),
-        ));
+    if let Some((path, query)) = url.split_once('?') {
+        return conditional_entry(tx, catalog, entry, method, path, query);
     }
     let (type_name, id) = parse_url(url)?;
     let model = catalog.get(&type_name)?;
     match method {
         "POST" => {
+            if let Some(query) = request.get("ifNoneExist").and_then(|value| value.as_str()) {
+                let resource = entry.get("resource").cloned().unwrap_or(Value::Null);
+                let (created, status) =
+                    ops::conditional_create(tx, catalog, model, resource, query)?;
+                let code = if status == 201 {
+                    "201 Created"
+                } else {
+                    "200 OK"
+                };
+                let id = created["id"].as_str().unwrap_or("");
+                return Ok(json!({
+                    "response": {
+                        "status": code,
+                        "location": format!("{}/{id}/_history/0", model.name),
+                        "etag": "W/\"0\""
+                    },
+                    "resource": created
+                }));
+            }
             let mut resource = entry
                 .get("resource")
                 .cloned()
@@ -283,6 +301,307 @@ fn parse_url(url: &str) -> Result<(String, Option<String>), FhirError> {
     Ok((type_name, id))
 }
 
+fn conditional_entry(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    entry: &Value,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> Result<Value, FhirError> {
+    let (type_name, _) = parse_url(path)?;
+    let model = catalog.get(&type_name)?;
+    let resource = entry.get("resource").cloned().unwrap_or(Value::Null);
+    match method {
+        "POST" | "PUT" => {
+            let (updated, status) = ops::conditional_update(tx, catalog, model, resource, query)?;
+            let code = if status == 201 { "201 Created" } else { "200 OK" };
+            let id = updated["id"].as_str().unwrap_or("");
+            Ok(json!({
+                "response": {
+                    "status": code,
+                    "location": format!("{type_name}/{id}/_history/0"),
+                    "etag": "W/\"0\""
+                },
+                "resource": updated
+            }))
+        }
+        "DELETE" => {
+            ops::conditional_delete(tx, catalog, model, query)?;
+            Ok(json!({"response": {"status": "204 No Content"}}))
+        }
+        "GET" => {
+            let bundle = crate::search::search(tx, catalog, model, &crate::patch::parse_query(query))?;
+            Ok(json!({
+                "response": {"status": "200 OK"},
+                "resource": bundle
+            }))
+        }
+        other => Err(FhirError::Unsupported(format!(
+            "bundle method {other} is not supported"
+        ))),
+    }
+}
+
+fn rewrite_urns(entries: &mut [Value]) {
+    let mut assigned = std::collections::BTreeMap::new();
+    for entry in entries.iter_mut() {
+        let Some(full) = entry
+            .get("fullUrl")
+            .and_then(|value| value.as_str())
+            .map(|value| value.to_string())
+        else {
+            continue;
+        };
+        if !full.starts_with("urn:uuid:") {
+            continue;
+        }
+        let type_name = entry
+            .pointer("/request/url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .split(['/', '?'])
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+        if type_name.is_empty() {
+            continue;
+        }
+        let id = entry
+            .pointer("/resource/id")
+            .and_then(|value| value.as_str())
+            .filter(|id| valid_id(id))
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let resolved = format!("{type_name}/{id}");
+        if let Some(resource) = entry.get_mut("resource") {
+            resource["id"] = json!(id);
+            if resource.get("resourceType").is_none() {
+                resource["resourceType"] = json!(type_name);
+            }
+        }
+        assigned.insert(full, resolved);
+    }
+    if assigned.is_empty() {
+        return;
+    }
+    for entry in entries.iter_mut() {
+        replace_urns(entry, &assigned);
+    }
+}
+
+fn replace_urns(value: &mut Value, assigned: &std::collections::BTreeMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(resolved) = assigned.get(text) {
+                *text = resolved.clone();
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                replace_urns(item, assigned);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                replace_urns(item, assigned);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn batch(
+    db: &refhir_database::Database,
+    catalog: &Catalog,
+    args: &Value,
+) -> Result<crate::run::RunResult, crate::run::RunError> {
+    let bundle = args
+        .get("resource")
+        .cloned()
+        .unwrap_or_else(|| args.clone());
+    if bundle.get("type").and_then(|value| value.as_str()) != Some("batch") {
+        return Err(crate::run::RunError::Fhir(FhirError::Invalid(
+            "Bundle.type must be batch".into(),
+        )));
+    }
+    let entries = bundle
+        .get("entry")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut response = Vec::new();
+    let mut last = db.latest_ts();
+    let mut wrote = false;
+    let mut writes = Vec::new();
+    for entry in entries {
+        match batch_entry(db, catalog, &entry) {
+            Ok(result) => {
+                wrote |= result.wrote;
+                last = result.ts;
+                writes.extend(result.writes);
+                response.push(result.value);
+            }
+            Err(err) => response.push(batch_failure(&err)),
+        }
+    }
+    Ok(crate::run::RunResult {
+        value: json!({
+            "resourceType": "Bundle",
+            "type": "batch-response",
+            "entry": response
+        }),
+        ts: last,
+        reads: refhir_database::ReadSet::default(),
+        wrote,
+        writes,
+        status: 200,
+    })
+}
+
+fn batch_entry(
+    db: &refhir_database::Database,
+    catalog: &Catalog,
+    entry: &Value,
+) -> Result<crate::run::RunResult, crate::run::RunError> {
+    let method = request_method(entry).unwrap_or("");
+    let url = request_url(entry).unwrap_or("");
+    let (path, args) = batch_call(method, url, entry).map_err(crate::run::RunError::Fhir)?;
+    let result = crate::run::run(db, catalog, &path, &args)?;
+    let value = bundle_response(&result);
+    Ok(crate::run::RunResult { value, ..result })
+}
+
+fn batch_failure(err: &crate::run::RunError) -> Value {
+    let (status, outcome) = match err {
+        crate::run::RunError::Fhir(FhirError::Outcome(value)) => ("400 Bad Request", value.clone()),
+        crate::run::RunError::Fhir(fhir) => (
+            entry_status(fhir),
+            operation_outcome(outcome_code(fhir), &fhir.to_string()),
+        ),
+        crate::run::RunError::Commit(refhir_database::CommitError::Occ(_)) => (
+            "409 Conflict",
+            operation_outcome("conflict", "OCC retries exhausted"),
+        ),
+        crate::run::RunError::Commit(other) => (
+            "500 Internal Server Error",
+            operation_outcome("exception", &other.to_string()),
+        ),
+    };
+    json!({
+        "response": {
+            "status": status,
+            "outcome": outcome
+        }
+    })
+}
+
+fn entry_status(err: &FhirError) -> &'static str {
+    match err {
+        FhirError::NotFound(_) | FhirError::UnknownResource(_) => "404 Not Found",
+        FhirError::Gone(_) => "410 Gone",
+        FhirError::Conflict(_) => "409 Conflict",
+        FhirError::Precondition(_) => "412 Precondition Failed",
+        FhirError::Storage(_) => "500 Internal Server Error",
+        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
+            "400 Bad Request"
+        }
+    }
+}
+
+fn operation_outcome(code: &str, diagnostics: &str) -> Value {
+    json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": code,
+            "diagnostics": diagnostics
+        }]
+    })
+}
+
+fn bundle_response(result: &crate::run::RunResult) -> Value {
+    let status = if result.status == 201 {
+        "201 Created"
+    } else if result.status == 204 || result.value.is_null() {
+        "204 No Content"
+    } else {
+        "200 OK"
+    };
+    let mut entry = json!({"response": {"status": status}});
+    if !result.value.is_null() {
+        entry["resource"] = result.value.clone();
+    }
+    entry
+}
+
+fn batch_call(method: &str, url: &str, entry: &Value) -> Result<(String, Value), FhirError> {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    let (type_name, id) = parse_url(path)?;
+    let resource = entry.get("resource").cloned();
+    match method {
+        "POST" if !query.is_empty() || entry.pointer("/request/ifNoneExist").is_some() => {
+            let query = if query.is_empty() {
+                entry
+                    .pointer("/request/ifNoneExist")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+            } else {
+                query
+            };
+            Ok((
+                format!("{type_name}/conditional-create"),
+                json!({
+                    "resource": resource.unwrap_or(Value::Null),
+                    "ifNoneExist": query
+                }),
+            ))
+        }
+        "POST" => Ok((
+            format!("{type_name}/create"),
+            json!({"resource": resource.unwrap_or(Value::Null)}),
+        )),
+        "PUT" if !query.is_empty() => Ok((
+            format!("{type_name}/conditional-update"),
+            json!({"resource": resource.unwrap_or(Value::Null), "query": query}),
+        )),
+        "PUT" => Ok((
+            format!("{type_name}/update"),
+            json!({"id": id.unwrap_or_default(), "resource": resource.unwrap_or(Value::Null)}),
+        )),
+        "DELETE" if !query.is_empty() => Ok((
+            format!("{type_name}/conditional-delete"),
+            json!({"query": query}),
+        )),
+        "DELETE" => Ok((
+            format!("{type_name}/delete"),
+            json!({"id": id.unwrap_or_default()}),
+        )),
+        "GET" if id.is_some() => Ok((
+            format!("{type_name}/read"),
+            json!({"id": id.unwrap_or_default()}),
+        )),
+        "GET" => {
+            let mut args = serde_json::Map::new();
+            for (key, value) in crate::patch::parse_query(query) {
+                args.insert(key, Value::String(value));
+            }
+            Ok((format!("{type_name}/search"), Value::Object(args)))
+        }
+        "PATCH" => Ok((
+            format!("{type_name}/patch"),
+            json!({
+                "id": id.unwrap_or_default(),
+                "patch": resource.unwrap_or(Value::Null)
+            }),
+        )),
+        other => Err(FhirError::Unsupported(format!(
+            "bundle method {other} is not supported"
+        ))),
+    }
+}
+
 pub fn finalize(value: &mut Value, written: &[refhir_database::WrittenId], ts: Timestamp) {
     stamp_tree(value, written, ts);
     rewrite_placeholders(value, ts);
@@ -371,6 +690,7 @@ fn annotate(index: usize, err: FhirError) -> FhirError {
         FhirError::NotFound(_) => FhirError::NotFound(message),
         FhirError::Gone(_) => FhirError::Gone(message),
         FhirError::Conflict(_) => FhirError::Conflict(message),
+        FhirError::Precondition(_) => FhirError::Precondition(message),
         FhirError::Invalid(_) => FhirError::Invalid(message),
         FhirError::Outcome(value) => FhirError::Outcome(prefix_outcome(index, value)),
         FhirError::UnknownResource(_) => FhirError::UnknownResource(message),
