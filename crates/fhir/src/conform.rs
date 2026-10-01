@@ -16,7 +16,7 @@ use refhir_validate::MemoryTerminology;
 use serde_json::Value;
 
 use crate::error::FhirError;
-use crate::package::{self, parameter_rows};
+use crate::package::{self, parameter_rows, SearchScope};
 use crate::run::{self, RunError, RunResult, MAX_OCC_FAILURES};
 
 const CONFORMANCE: &[&str] = &["SearchParameter", "ValueSet", "CodeSystem", "ConceptMap"];
@@ -70,6 +70,7 @@ pub fn repair_conformance(
     }
 
     if catalog.read().expect("catalog").contains("SearchParameter") {
+        let scope = SearchScope::from_store(store)?;
         let live = package::live_ids(db, "SearchParameter")?;
         let mut jobs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut changed = false;
@@ -77,10 +78,10 @@ pub fn repair_conformance(
             let Some(resource) = live_json(db, "SearchParameter", id)? else {
                 continue;
             };
-            if parameter_current(store, local_id, &resource)? {
+            if parameter_current(store, local_id, &resource, &scope)? {
                 continue;
             }
-            let (dirty, more) = project_parameter(store, db, local_id, &resource, false)?;
+            let (dirty, more) = project_parameter(store, db, local_id, &resource, false, &scope)?;
             changed |= dirty;
             merge_jobs(&mut jobs, more);
         }
@@ -105,6 +106,7 @@ fn preflight(
     let local_id = local_package(store, catalog)?;
     let parameters = store.load_search_parameters()?;
     let terminology = store.load_terminology()?;
+    let scope = SearchScope::from_store(store)?.with_parameters(&resources);
     let mut seen = Vec::new();
     for resource in &resources {
         match resource
@@ -112,7 +114,7 @@ fn preflight(
             .and_then(|value| value.as_str())
         {
             Some("SearchParameter") => {
-                let rows = check_parameter(&parameters, &seen, resource)?;
+                let rows = check_parameter(&parameters, &seen, resource, &scope)?;
                 seen.extend(rows);
             }
             Some("ValueSet" | "CodeSystem" | "ConceptMap") => {
@@ -166,6 +168,19 @@ fn project_writes(
         package::publish(store, catalog)?;
     }
 
+    let scope = SearchScope::from_store(store)?.with_parameters(
+        &interesting
+            .iter()
+            .filter_map(|write| write.json.as_ref())
+            .filter_map(|json| serde_json::from_str::<Value>(json).ok())
+            .filter(|resource| {
+                resource
+                    .get("resourceType")
+                    .and_then(|value| value.as_str())
+                    == Some("SearchParameter")
+            })
+            .collect::<Vec<_>>(),
+    );
     let mut jobs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut changed = false;
     for write in &interesting {
@@ -181,7 +196,7 @@ fn project_writes(
             }
             continue;
         }
-        let (dirty, more) = project_parameter(store, db, local_id, &resource, true)?;
+        let (dirty, more) = project_parameter(store, db, local_id, &resource, true, &scope)?;
         changed |= dirty;
         merge_jobs(&mut jobs, more);
     }
@@ -253,8 +268,9 @@ fn project_parameter(
     local_id: i64,
     resource: &Value,
     strict: bool,
+    scope: &SearchScope,
 ) -> Result<(bool, BTreeMap<String, BTreeSet<String>>), FhirError> {
-    let rows = parameter_rows(resource)?;
+    let rows = parameter_rows(resource, scope)?;
     if rows.is_empty() {
         return Err(FhirError::Invalid(
             "SearchParameter base is required".into(),
@@ -347,8 +363,9 @@ fn parameter_current(
     store: &dyn ConformanceStore,
     local_id: i64,
     resource: &Value,
+    scope: &SearchScope,
 ) -> Result<bool, FhirError> {
-    let rows = match parameter_rows(resource) {
+    let rows = match parameter_rows(resource, scope) {
         Ok(rows) => rows,
         Err(_) => return Ok(false),
     };
@@ -574,8 +591,9 @@ fn check_parameter(
     stored: &[StoredSearchParameter],
     seen: &[NewSearchParameter],
     resource: &Value,
+    scope: &SearchScope,
 ) -> Result<Vec<NewSearchParameter>, FhirError> {
-    let rows = parameter_rows(resource)?;
+    let rows = parameter_rows(resource, scope)?;
     if rows.is_empty() {
         return Err(FhirError::Invalid(
             "SearchParameter base is required".into(),

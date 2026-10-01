@@ -119,7 +119,10 @@ fn digit_count(mut value: u64) -> u32 {
 
 impl Value {
     pub fn system_bool(value: bool) -> Self {
-        Self::Boolean { value, system: true }
+        Self::Boolean {
+            value,
+            system: true,
+        }
     }
 
     pub fn fhir_bool(value: bool) -> Self {
@@ -177,7 +180,9 @@ impl Value {
             Self::Quantity { value, scale, unit } => {
                 format!("{} '{unit}'", format_decimal(*value, *scale))
             }
-            Self::Node { json, fhir_type, .. } => match (fhir_type.as_deref(), json) {
+            Self::Node {
+                json, fhir_type, ..
+            } => match (fhir_type.as_deref(), json) {
                 (Some("date" | "dateTime" | "instant"), Json::String(value)) => format!("@{value}"),
                 (Some("time"), Json::String(value)) => format!("@T{value}"),
                 (_, Json::String(value)) => value.clone(),
@@ -194,7 +199,11 @@ impl Value {
 pub fn format_decimal(value: Decimal, scale: u32) -> String {
     let scaled = value.round_dp(scale);
     if scaled.is_zero() {
-        let digits = if scale == 0 { "0".to_string() } else { format!("0.{:0<width$}", "", width = scale as usize) };
+        let digits = if scale == 0 {
+            "0".to_string()
+        } else {
+            format!("0.{:0<width$}", "", width = scale as usize)
+        };
         return digits;
     }
     if scale == 0 {
@@ -264,18 +273,68 @@ pub fn equal_pair(left: &Value, right: &Value) -> Option<bool> {
         | (Value::Decimal { value: b, .. }, Value::Integer(a)) => Some(Decimal::from(*a) == *b),
         (Value::Decimal { value: a, .. }, Value::Decimal { value: b, .. }) => Some(a == b),
         (Value::String(a), Value::String(b)) => Some(a == b),
-        (Value::String(a), Value::Node { json: Json::String(b), .. })
-        | (Value::Node { json: Json::String(a), .. }, Value::String(b)) => Some(a == b),
+        (
+            Value::String(a),
+            Value::Node {
+                json: Json::String(b),
+                ..
+            },
+        )
+        | (
+            Value::Node {
+                json: Json::String(a),
+                ..
+            },
+            Value::String(b),
+        ) => Some(a == b),
         (Value::Node { json: a, .. }, Value::Node { json: b, .. }) => Some(a == b),
         (Value::Date(a), Value::Date(b)) => same_precision_date(a, b, TimeKind::Date),
-        (Value::Date(a), Value::Node { json: Json::String(text), .. })
-        | (Value::Node { json: Json::String(text), .. }, Value::Date(a)) => temporal_text_equal(a, text, TimeKind::Date),
+        (
+            Value::Date(a),
+            Value::Node {
+                json: Json::String(text),
+                ..
+            },
+        )
+        | (
+            Value::Node {
+                json: Json::String(text),
+                ..
+            },
+            Value::Date(a),
+        ) => temporal_text_equal(a, text, TimeKind::Date),
         (Value::DateTime(a), Value::DateTime(b)) => same_precision_date(a, b, TimeKind::DateTime),
-        (Value::DateTime(a), Value::Node { json: Json::String(text), .. })
-        | (Value::Node { json: Json::String(text), .. }, Value::DateTime(a)) => temporal_text_equal(a, text, TimeKind::DateTime),
+        (
+            Value::DateTime(a),
+            Value::Node {
+                json: Json::String(text),
+                ..
+            },
+        )
+        | (
+            Value::Node {
+                json: Json::String(text),
+                ..
+            },
+            Value::DateTime(a),
+        ) => temporal_text_equal(a, text, TimeKind::DateTime),
         (Value::Time(a), Value::Time(b)) => same_precision_date(a, b, TimeKind::Time),
-        (Value::Time(a), Value::Node { json: Json::String(text), fhir_type, .. })
-        | (Value::Node { json: Json::String(text), fhir_type, .. }, Value::Time(a)) => match fhir_type.as_deref() {
+        (
+            Value::Time(a),
+            Value::Node {
+                json: Json::String(text),
+                fhir_type,
+                ..
+            },
+        )
+        | (
+            Value::Node {
+                json: Json::String(text),
+                fhir_type,
+                ..
+            },
+            Value::Time(a),
+        ) => match fhir_type.as_deref() {
             Some("time") => temporal_text_equal(a, text, TimeKind::Time),
             Some("date" | "dateTime" | "instant") => Some(false),
             _ => temporal_text_equal(a, text, TimeKind::Time),
@@ -283,7 +342,11 @@ pub fn equal_pair(left: &Value, right: &Value) -> Option<bool> {
         (Value::Quantity { .. }, _) | (_, Value::Quantity { .. }) => quantity_equal(left, right),
         _ => {
             match (temporal_kind(left), temporal_kind(right)) {
-                (Some(TimeKind::Time), Some(other)) | (Some(other), Some(TimeKind::Time)) if other != TimeKind::Time => return Some(false),
+                (Some(TimeKind::Time), Some(other)) | (Some(other), Some(TimeKind::Time))
+                    if other != TimeKind::Time =>
+                {
+                    return Some(false)
+                }
                 (Some(_), Some(_)) => return None,
                 _ => {}
             }
@@ -300,7 +363,11 @@ fn temporal_kind(value: &Value) -> Option<TimeKind> {
         Value::Date(_) => Some(TimeKind::Date),
         Value::DateTime(_) => Some(TimeKind::DateTime),
         Value::Time(_) => Some(TimeKind::Time),
-        Value::Node { json: Json::String(_), fhir_type, .. } => match fhir_type.as_deref() {
+        Value::Node {
+            json: Json::String(_),
+            fhir_type,
+            ..
+        } => match fhir_type.as_deref() {
             Some("date") => Some(TimeKind::Date),
             Some("dateTime" | "instant") => Some(TimeKind::DateTime),
             Some("time") => Some(TimeKind::Time),
@@ -313,7 +380,9 @@ fn temporal_kind(value: &Value) -> Option<TimeKind> {
 fn temporal_text_equal(literal: &Temporal, text: &str, kind: TimeKind) -> Option<bool> {
     let parsed = crate::parse::parse(&format!("@{text}")).ok()?;
     let other = match parsed {
-        crate::ast::Expr::Date(value) | crate::ast::Expr::DateTime(value) | crate::ast::Expr::Time(value) => value,
+        crate::ast::Expr::Date(value)
+        | crate::ast::Expr::DateTime(value)
+        | crate::ast::Expr::Time(value) => value,
         _ => return None,
     };
     same_precision_date(literal, &other, kind)
@@ -390,18 +459,40 @@ pub fn precision_rank(value: &Temporal, kind: TimeKind) -> u8 {
 pub fn equivalent_pair(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::String(a), Value::String(b))
-        | (Value::String(a), Value::Node { json: Json::String(b), .. })
-        | (Value::Node { json: Json::String(a), .. }, Value::String(b))
         | (
-            Value::Node { json: Json::String(a), .. },
-            Value::Node { json: Json::String(b), .. },
+            Value::String(a),
+            Value::Node {
+                json: Json::String(b),
+                ..
+            },
+        )
+        | (
+            Value::Node {
+                json: Json::String(a),
+                ..
+            },
+            Value::String(b),
+        )
+        | (
+            Value::Node {
+                json: Json::String(a),
+                ..
+            },
+            Value::Node {
+                json: Json::String(b),
+                ..
+            },
         ) => a.eq_ignore_ascii_case(b),
-        (Value::Decimal { .. }, _) | (_, Value::Decimal { .. }) | (Value::Integer(_), Value::Integer(_)) => {
-            number_equivalent(left, right)
+        (Value::Decimal { .. }, _)
+        | (_, Value::Decimal { .. })
+        | (Value::Integer(_), Value::Integer(_)) => number_equivalent(left, right),
+        (Value::Quantity { .. }, _) | (_, Value::Quantity { .. }) => {
+            quantity_equivalent(left, right)
         }
-        (Value::Quantity { .. }, _) | (_, Value::Quantity { .. }) => quantity_equivalent(left, right),
         (Value::Date(a), Value::Date(b)) => same_precision_date(a, b, TimeKind::Date) == Some(true),
-        (Value::DateTime(a), Value::DateTime(b)) => same_precision_date(a, b, TimeKind::DateTime) == Some(true),
+        (Value::DateTime(a), Value::DateTime(b)) => {
+            same_precision_date(a, b, TimeKind::DateTime) == Some(true)
+        }
         (Value::Time(a), Value::Time(b)) => same_precision_date(a, b, TimeKind::Time) == Some(true),
         (Value::Date(_), Value::DateTime(_)) | (Value::DateTime(_), Value::Date(_)) => false,
         _ => equal_pair(left, right).unwrap_or(false),
@@ -423,10 +514,18 @@ pub fn as_number(value: &Value) -> Option<(Decimal, u32)> {
     match value {
         Value::Integer(value) => Some((Decimal::from(*value), 0)),
         Value::Decimal { value, scale } => Some((*value, *scale)),
-        Value::Node { json: Json::Number(number), .. } => {
+        Value::Node {
+            json: Json::Number(number),
+            ..
+        } => {
             let text = number.to_string();
-            let scale = text.split_once('.').map(|(_, fraction)| fraction.len() as u32).unwrap_or(0);
-            Decimal::from_str_exact(&text).ok().map(|value| (value, scale))
+            let scale = text
+                .split_once('.')
+                .map(|(_, fraction)| fraction.len() as u32)
+                .unwrap_or(0);
+            Decimal::from_str_exact(&text)
+                .ok()
+                .map(|value| (value, scale))
         }
         _ => None,
     }
@@ -438,10 +537,13 @@ fn as_quantity(value: &Value) -> Option<Measured> {
             value: *value,
             unit,
         }),
-        Value::Node { json, fhir_type, .. } if is_quantity_type(fhir_type.as_deref()) => {
-            let magnitude = json.get("value").and_then(|item| item.as_str()).or_else(|| {
-                json.get("value").and_then(|item| item.as_f64()).map(|_| "")
-            });
+        Value::Node {
+            json, fhir_type, ..
+        } if is_quantity_type(fhir_type.as_deref()) => {
+            let magnitude = json
+                .get("value")
+                .and_then(|item| item.as_str())
+                .or_else(|| json.get("value").and_then(|item| item.as_f64()).map(|_| ""));
             let text = if let Some(text) = json.get("value").and_then(|item| item.as_str()) {
                 text.to_string()
             } else if let Some(number) = json.get("value").and_then(|item| item.as_f64()) {
@@ -468,7 +570,18 @@ fn as_quantity(value: &Value) -> Option<Measured> {
 }
 
 fn is_quantity_type(name: Option<&str>) -> bool {
-    matches!(name, Some("Quantity" | "Age" | "Duration" | "SimpleQuantity" | "MoneyQuantity" | "Count" | "Distance"))
+    matches!(
+        name,
+        Some(
+            "Quantity"
+                | "Age"
+                | "Duration"
+                | "SimpleQuantity"
+                | "MoneyQuantity"
+                | "Count"
+                | "Distance"
+        )
+    )
 }
 
 fn quantity_equal(left: &Value, right: &Value) -> Option<bool> {
@@ -481,7 +594,9 @@ fn quantity_equivalent(left: &Value, right: &Value) -> bool {
     let (Some(left_q), Some(right_q)) = (as_quantity(left), as_quantity(right)) else {
         return false;
     };
-    let (Some((left_scale, _)), Some((right_scale, _))) = (quantity_scale(left), quantity_scale(right)) else {
+    let (Some((left_scale, _)), Some((right_scale, _))) =
+        (quantity_scale(left), quantity_scale(right))
+    else {
         return false;
     };
     left_q.equivalent(&right_q, left_scale.min(right_scale))
@@ -491,9 +606,15 @@ fn quantity_scale(value: &Value) -> Option<(u32, ())> {
     match value {
         Value::Quantity { scale, .. } => Some((*scale, ())),
         Value::Node { json, .. } => {
-            let text = json.get("value").map(|item| item.to_string()).unwrap_or_default();
+            let text = json
+                .get("value")
+                .map(|item| item.to_string())
+                .unwrap_or_default();
             let text = text.trim_matches('"');
-            let scale = text.split_once('.').map(|(_, fraction)| fraction.len() as u32).unwrap_or(0);
+            let scale = text
+                .split_once('.')
+                .map(|(_, fraction)| fraction.len() as u32)
+                .unwrap_or(0);
             Some((scale, ()))
         }
         _ => None,
@@ -525,9 +646,11 @@ pub fn collections_equivalent(left: &[Value], right: &[Value]) -> bool {
     }
     let mut used = vec![false; right.len()];
     for item in left {
-        let Some(index) = right.iter().enumerate().position(|(index, candidate)| {
-            !used[index] && equivalent_pair(item, candidate)
-        }) else {
+        let Some(index) = right
+            .iter()
+            .enumerate()
+            .position(|(index, candidate)| !used[index] && equivalent_pair(item, candidate))
+        else {
             return false;
         };
         used[index] = true;

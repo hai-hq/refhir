@@ -1,7 +1,7 @@
 //! Load a FHIR package directory into the conformance tables, then backfill
 //! search indexes for parameters that were not indexed yet.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
@@ -341,9 +341,10 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     for definition in &definitions {
         structure_definitions.push(structure_row(definition)?);
     }
+    let scope = SearchScope::from_documents(&definitions, &parameters);
     let mut search_parameters = Vec::new();
     for parameter in &parameters {
-        search_parameters.extend(parameter_rows(parameter)?);
+        search_parameters.extend(parameter_rows(parameter, &scope)?);
     }
     let mut terminology_rows = Vec::new();
     for resource in &terminology {
@@ -442,11 +443,13 @@ fn reopen_unsupported(
     package_id: i64,
 ) -> Result<(), FhirError> {
     let parameters = store.load_search_parameters().map_err(FhirError::from)?;
+    let scope = SearchScope::from_store(store)?;
     let mut bases = BTreeSet::new();
     for parameter in parameters.iter().filter(|parameter| {
         parameter.package_id == package_id && parameter.status == ParamStatus::Unsupported
     }) {
-        if extract::compile(&parameter.param_type, parameter.expression.as_deref()).is_none() {
+        let json = serde_json::from_str(&parameter.json).unwrap_or(Value::Null);
+        if extract::compile_parameter(&json, &scope.kinds).is_none() {
             continue;
         }
         store
@@ -474,7 +477,139 @@ fn reopen_unsupported(
     Ok(())
 }
 
-pub(crate) fn parameter_rows(parameter: &Value) -> Result<Vec<NewSearchParameter>, FhirError> {
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SearchScope {
+    pub(crate) kinds: BTreeMap<String, String>,
+    parents: BTreeMap<String, String>,
+    concrete: Vec<String>,
+}
+
+impl SearchScope {
+    pub(crate) fn from_documents(definitions: &[Value], parameters: &[Value]) -> Self {
+        let mut scope = Self::default();
+        for definition in definitions {
+            scope.note_definition(definition);
+        }
+        for parameter in parameters {
+            scope.note_parameter(parameter);
+        }
+        scope
+    }
+
+    pub(crate) fn from_store(store: &dyn ConformanceStore) -> Result<Self, FhirError> {
+        let mut scope = Self::default();
+        for definition in store
+            .load_structure_definitions()
+            .map_err(FhirError::from)?
+        {
+            if definition.kind != "resource" {
+                continue;
+            }
+            let json = serde_json::from_str(&definition.json).unwrap_or(Value::Null);
+            scope.note_definition(&json);
+        }
+        for parameter in store.load_search_parameters().map_err(FhirError::from)? {
+            scope
+                .kinds
+                .entry(parameter.url)
+                .or_insert(parameter.param_type);
+        }
+        Ok(scope)
+    }
+
+    pub(crate) fn with_parameters(mut self, parameters: &[Value]) -> Self {
+        for parameter in parameters {
+            self.note_parameter(parameter);
+        }
+        self
+    }
+
+    fn note_parameter(&mut self, parameter: &Value) {
+        let Some(url) = parameter.get("url").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(param_type) = parameter.get("type").and_then(|value| value.as_str()) else {
+            return;
+        };
+        self.kinds
+            .entry(url.to_string())
+            .or_insert_with(|| param_type.to_string());
+    }
+
+    fn note_definition(&mut self, definition: &Value) {
+        if definition.get("kind").and_then(|value| value.as_str()) != Some("resource") {
+            return;
+        }
+        let Some(name) = definition
+            .get("type")
+            .and_then(|value| value.as_str())
+            .or_else(|| definition.get("name").and_then(|value| value.as_str()))
+        else {
+            return;
+        };
+        if let Some(parent) = definition
+            .get("baseDefinition")
+            .and_then(|value| value.as_str())
+            .and_then(|url| url.rsplit('/').next())
+        {
+            if parent != name {
+                self.parents
+                    .entry(name.to_string())
+                    .or_insert_with(|| parent.to_string());
+            }
+        }
+        let abstract_type = definition
+            .get("abstract")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let constraint = definition
+            .get("derivation")
+            .and_then(|value| value.as_str())
+            == Some("constraint");
+        if abstract_type || constraint {
+            return;
+        }
+        if !self.concrete.iter().any(|item| item == name) {
+            self.concrete.push(name.to_string());
+        }
+    }
+
+    fn bases(&self, base: &str) -> Vec<String> {
+        if self.concrete.is_empty() {
+            return vec![base.to_string()];
+        }
+        let found: Vec<String> = self
+            .concrete
+            .iter()
+            .filter(|name| inherits(name, base, &self.parents))
+            .cloned()
+            .collect();
+        if found.is_empty() {
+            vec![base.to_string()]
+        } else {
+            found
+        }
+    }
+}
+
+fn inherits(name: &str, target: &str, parents: &BTreeMap<String, String>) -> bool {
+    let mut current = name.to_string();
+    for _ in 0..24 {
+        if current == target {
+            return true;
+        }
+        match parents.get(&current) {
+            Some(parent) => current = parent.clone(),
+            None => return false,
+        }
+    }
+    false
+}
+
+pub(crate) fn parameter_rows(
+    parameter: &Value,
+    scope: &SearchScope,
+) -> Result<Vec<NewSearchParameter>, FhirError> {
     let url = required_str(parameter, "url")?;
     let code = required_str(parameter, "code")?;
     let param_type = required_str(parameter, "type")?;
@@ -486,25 +621,31 @@ pub(crate) fn parameter_rows(parameter: &Value) -> Result<Vec<NewSearchParameter
         .get("base")
         .and_then(|value| value.as_array())
         .ok_or_else(|| FhirError::Invalid(format!("SearchParameter {code} base is required")))?;
+    let status = if extract::compile_parameter(parameter, &scope.kinds).is_some() {
+        ParamStatus::Pending
+    } else {
+        ParamStatus::Unsupported
+    };
+    let mut seen = BTreeSet::new();
     let mut rows = Vec::new();
     for base in bases {
         let Some(base) = base.as_str() else {
             continue;
         };
-        let status = if extract::compile(&param_type, expression.as_deref()).is_some() {
-            ParamStatus::Pending
-        } else {
-            ParamStatus::Unsupported
-        };
-        rows.push(NewSearchParameter {
-            url: url.clone(),
-            base: base.to_string(),
-            code: code.clone(),
-            param_type: param_type.clone(),
-            expression: expression.clone(),
-            status,
-            json: parameter.to_string(),
-        });
+        for base in scope.bases(base) {
+            if !seen.insert(base.clone()) {
+                continue;
+            }
+            rows.push(NewSearchParameter {
+                url: url.clone(),
+                base,
+                code: code.clone(),
+                param_type: param_type.clone(),
+                expression: expression.clone(),
+                status,
+                json: parameter.to_string(),
+            });
+        }
     }
     Ok(rows)
 }

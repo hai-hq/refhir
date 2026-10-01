@@ -501,6 +501,9 @@ fn official_r4_package_installs_concrete_types() {
     assert!(names.contains(&"identifier"));
     assert!(names.contains(&"active"));
     assert!(names.contains(&"gender"));
+    assert!(names.contains(&"_lastUpdated"));
+    assert!(names.contains(&"_filter"));
+    assert!(names.contains(&"age"));
     assert_eq!(
         catalog.terms().contains(
             "http://hl7.org/fhir/ValueSet/administrative-gender",
@@ -555,6 +558,32 @@ fn official_r4_package_installs_concrete_types() {
         "{}",
         rejected.value
     );
+    run(
+        &db.db,
+        &catalog,
+        "Patient/create",
+        &json!({"resource": {"resourceType": "Patient", "name": [{"family": "Ann"}]}}),
+    )
+    .unwrap();
+    let filtered = run(
+        &db.db,
+        &catalog,
+        "Patient/search",
+        &json!({"_filter": "name eq Ann"}),
+    )
+    .unwrap();
+    assert_eq!(filtered.value["total"], 1);
+    let query = run(
+        &db.db,
+        &catalog,
+        "Patient/search",
+        &json!({"_query": "missing"}),
+    )
+    .unwrap_err();
+    let RunError::Fhir(FhirError::Invalid(message)) = query else {
+        panic!("expected an unknown query");
+    };
+    assert!(message.contains("unknown query missing"), "{message}");
 }
 
 #[test]
@@ -814,6 +843,38 @@ fn install_resource_types(harness: &Harness) {
     }
     install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn number_search_matches_precision_and_comparators() {
+    let harness = ready();
+    install_resource_types(&harness);
+    commit(
+        &harness,
+        "SearchParameter/create",
+        json!({"resource": {
+            "resourceType": "SearchParameter",
+            "id": "year",
+            "url": "http://example.org/SearchParameter/year",
+            "name": "year",
+            "status": "active",
+            "description": "Birth year",
+            "code": "year",
+            "base": ["Patient"],
+            "type": "number",
+            "expression": "Patient.birthDate.substring(0, 4).toInteger()"
+        }}),
+    )
+    .unwrap();
+    let mut born = patient("p1", true, "Ann");
+    born["birthDate"] = json!("1990-01-01");
+    commit(&harness, "Patient/create", json!({"resource": born})).unwrap();
+    let found = commit(&harness, "Patient/search", json!({"year": "1990"})).unwrap();
+    assert_eq!(found["total"], 1);
+    let later = commit(&harness, "Patient/search", json!({"year": "gt1989"})).unwrap();
+    assert_eq!(later["total"], 1);
+    let earlier = commit(&harness, "Patient/search", json!({"year": "lt1990"})).unwrap();
+    assert_eq!(earlier["total"], 0);
 }
 
 fn label_parameter(expression: &str) -> Value {

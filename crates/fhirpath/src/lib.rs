@@ -13,19 +13,23 @@ mod value;
 
 pub use ast::Expr;
 pub use error::{Error, ErrorKind};
-pub use host::{days_from_civil, Host};
+pub use host::{days_from_civil, EmptyHost, Host};
 pub use model::Model;
 pub use parse::parse;
-pub use value::Value;
+pub use value::{Temporal, Value};
 
-use host::EmptyHost;
 use serde_json::Value as Json;
 
 use crate::eval::evaluate_expr;
 
 mod eval;
 
-pub fn evaluate(expr: &Expr, root: &Json, model: &Model, host: &dyn Host) -> Result<Vec<Value>, Error> {
+pub fn evaluate(
+    expr: &Expr,
+    root: &Json,
+    model: &Model,
+    host: &dyn Host,
+) -> Result<Vec<Value>, Error> {
     evaluate_expr(expr, root, model, host)
 }
 
@@ -38,7 +42,15 @@ pub fn evaluate_at(
     model: &Model,
     host: &dyn Host,
 ) -> Result<Vec<Value>, Error> {
-    crate::eval::evaluate_at(expr, focus, focus_path, resource, root_resource, model, host)
+    crate::eval::evaluate_at(
+        expr,
+        focus,
+        focus_path,
+        resource,
+        root_resource,
+        model,
+        host,
+    )
 }
 
 pub fn evaluate_invariant(
@@ -50,7 +62,15 @@ pub fn evaluate_invariant(
     model: &Model,
     host: &dyn Host,
 ) -> Result<Vec<Value>, Error> {
-    crate::eval::evaluate_invariant(expr, focus, focus_path, resource, root_resource, model, host)
+    crate::eval::evaluate_invariant(
+        expr,
+        focus,
+        focus_path,
+        resource,
+        root_resource,
+        model,
+        host,
+    )
 }
 
 pub fn evaluate_owned(expression: &str, root: &Json) -> Result<Vec<Value>, Error> {
@@ -71,8 +91,18 @@ mod context_tests {
             "contact": [{"name": {"family": "Ann"}}]
         });
         let focus = &resource["contact"][0];
-        let expr = parse("name.exists() and %resource.id = 'p1' and %context.name.family = 'Ann'").unwrap();
-        let items = evaluate_at(&expr, focus, "Patient.contact", &resource, &resource, &Model::new(), &EmptyHost).unwrap();
+        let expr = parse("name.exists() and %resource.id = 'p1' and %context.name.family = 'Ann'")
+            .unwrap();
+        let items = evaluate_at(
+            &expr,
+            focus,
+            "Patient.contact",
+            &resource,
+            &resource,
+            &Model::new(),
+            &EmptyHost,
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert!(items[0].as_singleton_bool().unwrap());
     }
@@ -83,7 +113,8 @@ mod context_tests {
         let root = json!({});
         let strict = evaluate(&expr, &root, &Model::new(), &EmptyHost);
         assert!(strict.is_err());
-        let items = evaluate_invariant(&expr, &root, "", &root, &root, &Model::new(), &EmptyHost).unwrap();
+        let items =
+            evaluate_invariant(&expr, &root, "", &root, &root, &Model::new(), &EmptyHost).unwrap();
         let text: Vec<_> = items.iter().map(Value::render).collect();
         assert_eq!(text, vec!["a".to_string(), "b".to_string()]);
     }

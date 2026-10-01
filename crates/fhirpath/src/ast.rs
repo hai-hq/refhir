@@ -71,15 +71,23 @@ impl Expr {
 
     pub fn calls(&self, name: &str) -> bool {
         match self {
-            Self::Call { name: called, focus, args, .. } => {
+            Self::Call {
+                name: called,
+                focus,
+                args,
+                ..
+            } => {
                 called == name
                     || focus.as_ref().is_some_and(|focus| focus.calls(name))
                     || args.iter().any(|arg| arg.calls(name))
             }
-            Self::Member(focus, _) | Self::Unary(_, focus) | Self::Is(focus, _) | Self::As(focus, _) => {
-                focus.calls(name)
+            Self::Member(focus, _)
+            | Self::Unary(_, focus)
+            | Self::Is(focus, _)
+            | Self::As(focus, _) => focus.calls(name),
+            Self::Index(left, right) | Self::Binary(_, left, right) => {
+                left.calls(name) || right.calls(name)
             }
-            Self::Index(left, right) | Self::Binary(_, left, right) => left.calls(name) || right.calls(name),
             _ => false,
         }
     }

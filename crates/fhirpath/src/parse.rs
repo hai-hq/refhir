@@ -481,7 +481,9 @@ fn lex(input: &str) -> Result<Vec<Tok>, Error> {
         if ch == '_' || ch.is_ascii_alphabetic() {
             let start = index;
             index += 1;
-            while index < chars.len() && (chars[index].is_ascii_alphanumeric() || chars[index] == '_') {
+            while index < chars.len()
+                && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+            {
                 index += 1;
             }
             let name: String = chars[start..index].iter().collect();
@@ -603,7 +605,10 @@ fn lex_string(chars: &[char], start: usize) -> Result<(String, usize), Error> {
             return Ok((value, index + 1));
         }
         if ch == '\\' {
-            let next = chars.get(index + 1).copied().ok_or_else(|| Error::parse("bad escape"))?;
+            let next = chars
+                .get(index + 1)
+                .copied()
+                .ok_or_else(|| Error::parse("bad escape"))?;
             let escaped = match next {
                 '\'' | '"' | '\\' | '/' => next,
                 'r' => '\r',
@@ -612,10 +617,17 @@ fn lex_string(chars: &[char], start: usize) -> Result<(String, usize), Error> {
                 'f' => '\u{000c}',
                 '`' => '`',
                 'u' => {
-                    let hex: String = chars.get(index + 2..index + 6).unwrap_or(&[]).iter().collect();
+                    let hex: String = chars
+                        .get(index + 2..index + 6)
+                        .unwrap_or(&[])
+                        .iter()
+                        .collect();
                     index += 4;
-                    char::from_u32(u32::from_str_radix(&hex, 16).map_err(|_| Error::parse("bad unicode escape"))?)
-                        .ok_or_else(|| Error::parse("bad unicode escape"))?
+                    char::from_u32(
+                        u32::from_str_radix(&hex, 16)
+                            .map_err(|_| Error::parse("bad unicode escape"))?,
+                    )
+                    .ok_or_else(|| Error::parse("bad unicode escape"))?
                 }
                 _ => return Err(Error::parse("bad escape")),
             };
@@ -636,7 +648,8 @@ fn lex_number(chars: &[char], start: usize) -> Result<(Tok, usize), Error> {
     }
     let mut scale = 0;
     let mut decimal = false;
-    if chars.get(index) == Some(&'.') && chars.get(index + 1).is_some_and(|ch| ch.is_ascii_digit()) {
+    if chars.get(index) == Some(&'.') && chars.get(index + 1).is_some_and(|ch| ch.is_ascii_digit())
+    {
         decimal = true;
         index += 1;
         let mark = index;
@@ -650,7 +663,9 @@ fn lex_number(chars: &[char], start: usize) -> Result<(Tok, usize), Error> {
         let value = Decimal::from_str_exact(&text).map_err(|_| Error::parse("bad decimal"))?;
         Ok((Tok::Decimal(value, scale), index))
     } else {
-        let value = text.parse::<i64>().map_err(|_| Error::parse("bad integer"))?;
+        let value = text
+            .parse::<i64>()
+            .map_err(|_| Error::parse("bad integer"))?;
         Ok((Tok::Int(value), index))
     }
 }
@@ -662,13 +677,27 @@ fn lex_temporal(chars: &[char], start: usize) -> Result<(Tok, usize), Error> {
         return Ok((Tok::Time(time), next));
     }
     let year = take_n(chars, &mut index, 4).ok_or_else(|| Error::parse("bad date"))?;
-    let mut temporal = Temporal::date(year.parse().map_err(|_| Error::parse("bad date"))?, None, None);
+    let mut temporal = Temporal::date(
+        year.parse().map_err(|_| Error::parse("bad date"))?,
+        None,
+        None,
+    );
     if chars.get(index) == Some(&'-') {
         index += 1;
-        temporal.month = Some(take_n(chars, &mut index, 2).ok_or_else(|| Error::parse("bad date"))?.parse().map_err(|_| Error::parse("bad date"))?);
+        temporal.month = Some(
+            take_n(chars, &mut index, 2)
+                .ok_or_else(|| Error::parse("bad date"))?
+                .parse()
+                .map_err(|_| Error::parse("bad date"))?,
+        );
         if chars.get(index) == Some(&'-') {
             index += 1;
-            temporal.day = Some(take_n(chars, &mut index, 2).ok_or_else(|| Error::parse("bad date"))?.parse().map_err(|_| Error::parse("bad date"))?);
+            temporal.day = Some(
+                take_n(chars, &mut index, 2)
+                    .ok_or_else(|| Error::parse("bad date"))?
+                    .parse()
+                    .map_err(|_| Error::parse("bad date"))?,
+            );
         }
     }
     if chars.get(index) == Some(&'T') {
@@ -696,7 +725,10 @@ fn lex_time(chars: &[char], start: usize) -> Result<(Temporal, usize), Error> {
 }
 
 fn lex_time_into(chars: &[char], index: &mut usize) -> Result<Temporal, Error> {
-    let hour = take_n(chars, index, 2).ok_or_else(|| Error::parse("bad time"))?.parse().map_err(|_| Error::parse("bad time"))?;
+    let hour = take_n(chars, index, 2)
+        .ok_or_else(|| Error::parse("bad time"))?
+        .parse()
+        .map_err(|_| Error::parse("bad time"))?;
     let mut time = Temporal {
         year: None,
         month: None,
@@ -709,11 +741,23 @@ fn lex_time_into(chars: &[char], index: &mut usize) -> Result<Temporal, Error> {
     };
     if chars.get(*index) == Some(&':') {
         *index += 1;
-        time.minute = Some(take_n(chars, index, 2).ok_or_else(|| Error::parse("bad time"))?.parse().map_err(|_| Error::parse("bad time"))?);
+        time.minute = Some(
+            take_n(chars, index, 2)
+                .ok_or_else(|| Error::parse("bad time"))?
+                .parse()
+                .map_err(|_| Error::parse("bad time"))?,
+        );
         if chars.get(*index) == Some(&':') {
             *index += 1;
-            time.second = Some(take_n(chars, index, 2).ok_or_else(|| Error::parse("bad time"))?.parse().map_err(|_| Error::parse("bad time"))?);
-            if chars.get(*index) == Some(&'.') && chars.get(*index + 1).is_some_and(|ch| ch.is_ascii_digit()) {
+            time.second = Some(
+                take_n(chars, index, 2)
+                    .ok_or_else(|| Error::parse("bad time"))?
+                    .parse()
+                    .map_err(|_| Error::parse("bad time"))?,
+            );
+            if chars.get(*index) == Some(&'.')
+                && chars.get(*index + 1).is_some_and(|ch| ch.is_ascii_digit())
+            {
                 *index += 1;
                 let start = *index;
                 while chars.get(*index).is_some_and(|ch| ch.is_ascii_digit()) {
@@ -740,11 +784,17 @@ fn lex_offset(chars: &[char], index: &mut usize) -> Result<Option<i16>, Error> {
         _ => return Ok(None),
     };
     *index += 1;
-    let hour: i16 = take_n(chars, index, 2).ok_or_else(|| Error::parse("bad timezone"))?.parse().map_err(|_| Error::parse("bad timezone"))?;
+    let hour: i16 = take_n(chars, index, 2)
+        .ok_or_else(|| Error::parse("bad timezone"))?
+        .parse()
+        .map_err(|_| Error::parse("bad timezone"))?;
     if chars.get(*index) == Some(&':') {
         *index += 1;
     }
-    let minute: i16 = take_n(chars, index, 2).ok_or_else(|| Error::parse("bad timezone"))?.parse().map_err(|_| Error::parse("bad timezone"))?;
+    let minute: i16 = take_n(chars, index, 2)
+        .ok_or_else(|| Error::parse("bad timezone"))?
+        .parse()
+        .map_err(|_| Error::parse("bad timezone"))?;
     Ok(Some(sign * (hour * 60 + minute)))
 }
 

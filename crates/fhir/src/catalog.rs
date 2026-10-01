@@ -156,6 +156,12 @@ impl Catalog {
                 }
             }
         }
+        let mut component_types = BTreeMap::new();
+        for parameter in parameters {
+            component_types
+                .entry(parameter.url.clone())
+                .or_insert_with(|| parameter.param_type.clone());
+        }
         for parameter in parameters {
             if parameter.status == ParamStatus::Unsupported {
                 continue;
@@ -163,9 +169,10 @@ impl Catalog {
             let Some(model) = types.get_mut(&parameter.base) else {
                 continue;
             };
-            let Some(extractor) =
-                extract::compile(&parameter.param_type, parameter.expression.as_deref())
-            else {
+            let Ok(json) = serde_json::from_str::<Value>(&parameter.json) else {
+                continue;
+            };
+            let Some(extractor) = extract::compile_parameter(&json, &component_types) else {
                 continue;
             };
             if model
@@ -248,12 +255,7 @@ impl Catalog {
                     "searchParam": model.params.iter().filter(|param| param.status == ParamStatus::Ready).map(|param| {
                         json!({
                             "name": param.name,
-                            "type": match param.kind {
-                                SearchKind::Token => "token",
-                                SearchKind::String => "string",
-                                SearchKind::Reference => "reference",
-                                SearchKind::Date => "date",
-                            }
+                            "type": param.kind.fhir_type()
                         })
                     }).collect::<Vec<_>>(),
                     "versioning": "versioned",

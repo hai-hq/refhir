@@ -10,14 +10,22 @@ pub trait Host {
     }
 
     /// `None` means no terminology service is configured.
-    fn member_of(&self, system: Option<&str>, code: &str, value_set: &str) -> Result<Option<bool>, Error> {
+    fn member_of(
+        &self,
+        system: Option<&str>,
+        code: &str,
+        value_set: &str,
+    ) -> Result<Option<bool>, Error> {
         let _ = (system, code, value_set);
         Ok(None)
     }
 
     fn now(&self) -> Temporal {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         utc_temporal(secs)
     }
 
@@ -67,7 +75,11 @@ pub fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = (year - era * 400) as u64;
-    let mp = if month > 2 { month as u64 - 3 } else { month as u64 + 9 };
+    let mp = if month > 2 {
+        month as u64 - 3
+    } else {
+        month as u64 + 9
+    };
     let doy = (153 * mp + 2) / 5 + day as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era as i64 * 146_097 + doe as i64 - 719_468

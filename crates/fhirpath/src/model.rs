@@ -44,7 +44,10 @@ impl Model {
                     inner.types.insert(parent.to_string());
                 }
             }
-            let Some(elements) = definition.pointer("/snapshot/element").and_then(|value| value.as_array()) else {
+            let Some(elements) = definition
+                .pointer("/snapshot/element")
+                .and_then(|value| value.as_array())
+            else {
                 continue;
             };
             for element in elements {
@@ -64,8 +67,14 @@ impl Model {
                     .unwrap_or_default();
                 if !codes.is_empty() {
                     inner.elements.insert(path.to_string(), codes);
-                } else if let Some(reference) = element.get("contentReference").and_then(|value| value.as_str()) {
-                    references.push((path.to_string(), reference.trim_start_matches('#').to_string()));
+                } else if let Some(reference) = element
+                    .get("contentReference")
+                    .and_then(|value| value.as_str())
+                {
+                    references.push((
+                        path.to_string(),
+                        reference.trim_start_matches('#').to_string(),
+                    ));
                 }
             }
         }
@@ -75,7 +84,9 @@ impl Model {
             }
             inner.references.insert(path, target);
         }
-        Self { inner: Arc::new(inner) }
+        Self {
+            inner: Arc::new(inner),
+        }
     }
 
     /// Follow `contentReference` so a repeated backbone keeps the original element's children.
@@ -96,12 +107,22 @@ impl Model {
     }
 
     pub fn element_types(&self, path: &str) -> &[String] {
-        self.inner.elements.get(self.canonical(path)).map(Vec::as_slice).unwrap_or(&[])
+        self.inner
+            .elements
+            .get(self.canonical(path))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     pub fn is_choice(&self, path: &str, name: &str) -> bool {
-        self.inner.elements.contains_key(&format!("{path}.{name}[x]"))
-            || self.inner.elements.keys().any(|key| key == &format!("{name}[x]"))
+        self.inner
+            .elements
+            .contains_key(&format!("{path}.{name}[x]"))
+            || self
+                .inner
+                .elements
+                .keys()
+                .any(|key| key == &format!("{name}[x]"))
     }
 
     pub fn choice_path(&self, path: &str, name: &str) -> Option<String> {
@@ -111,13 +132,19 @@ impl Model {
         } else {
             format!("{path}.{name}[x]")
         };
-        self.inner.elements.contains_key(&candidate).then_some(candidate)
+        self.inner
+            .elements
+            .contains_key(&candidate)
+            .then_some(candidate)
     }
 
     pub fn has_descendants(&self, path: &str) -> bool {
         let path = self.canonical(path);
         let prefix = format!("{path}.");
-        self.inner.elements.keys().any(|key| key.starts_with(&prefix))
+        self.inner
+            .elements
+            .keys()
+            .any(|key| key.starts_with(&prefix))
     }
 
     pub fn known_child(&self, path: &str, name: &str) -> bool {
@@ -127,7 +154,10 @@ impl Model {
         } else {
             format!("{path}.{name}")
         };
-        self.inner.elements.keys().any(|key| key == &prefix || key == &format!("{prefix}[x]"))
+        self.inner
+            .elements
+            .keys()
+            .any(|key| key == &prefix || key == &format!("{prefix}[x]"))
     }
 
     /// `code` is a `string`. `boolean` is not a `Boolean`.

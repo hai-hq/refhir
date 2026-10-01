@@ -50,7 +50,12 @@ pub fn parse(raw: &str) -> Option<Unit> {
         return Some(bare(text, Decimal::new(254, 4), single("m"), false));
     }
     if text == "wk" {
-        return Some(bare(text, Decimal::from(7 * 24 * 60 * 60), single("s"), false));
+        return Some(bare(
+            text,
+            Decimal::from(7 * 24 * 60 * 60),
+            single("s"),
+            false,
+        ));
     }
     let indefinite = text == "mo" || text == "a";
     parse_product(text, indefinite)

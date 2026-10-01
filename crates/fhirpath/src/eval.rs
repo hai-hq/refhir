@@ -6,11 +6,12 @@ use serde_json::{Map, Value as Json};
 
 use crate::ast::{BinOp, Expr, UnaryOp};
 use crate::error::Error;
-use crate::host::{days_from_civil, civil_from_days, Host};
+use crate::host::{civil_from_days, days_from_civil, Host};
 use crate::model::{simple_name, Model};
 use crate::ucum::{self, Measured};
 use crate::value::{
-    collections_equal, collections_equivalent, equal_pair, equivalent_pair, format_decimal, Temporal, Value,
+    collections_equal, collections_equivalent, equal_pair, equivalent_pair, format_decimal,
+    Temporal, Value,
 };
 
 struct Ctx<'a> {
@@ -49,7 +50,16 @@ pub fn evaluate_at(
     model: &Model,
     host: &dyn Host,
 ) -> Result<Vec<Value>, Error> {
-    evaluate_focused(expr, focus, focus_path, resource, root_resource, model, host, false)
+    evaluate_focused(
+        expr,
+        focus,
+        focus_path,
+        resource,
+        root_resource,
+        model,
+        host,
+        false,
+    )
 }
 
 /// Like `evaluate_at`, but `as()` keeps every item that casts.
@@ -65,7 +75,16 @@ pub fn evaluate_invariant(
     model: &Model,
     host: &dyn Host,
 ) -> Result<Vec<Value>, Error> {
-    evaluate_focused(expr, focus, focus_path, resource, root_resource, model, host, true)
+    evaluate_focused(
+        expr,
+        focus,
+        focus_path,
+        resource,
+        root_resource,
+        model,
+        host,
+        true,
+    )
 }
 
 fn evaluate_focused(
@@ -118,10 +137,16 @@ struct Outcome {
 impl Ctx<'_> {
     fn eval(&self, expr: &Expr, focus: &[Value], ordered: bool) -> Result<Outcome, Error> {
         match expr {
-            Expr::Empty => Ok(Outcome { items: vec![], ordered: true }),
+            Expr::Empty => Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            }),
             Expr::Bool(value) => Ok(one(Value::system_bool(*value))),
             Expr::Int(value) => Ok(one(Value::Integer(*value))),
-            Expr::Decimal(value, scale) => Ok(one(Value::Decimal { value: *value, scale: *scale })),
+            Expr::Decimal(value, scale) => Ok(one(Value::Decimal {
+                value: *value,
+                scale: *scale,
+            })),
             Expr::Str(value) => Ok(one(Value::String(value.clone()))),
             Expr::Date(value) => Ok(one(Value::Date(value.clone()))),
             Expr::DateTime(value) => Ok(one(Value::DateTime(value.clone()))),
@@ -131,9 +156,25 @@ impl Ctx<'_> {
                 scale: *scale,
                 unit: unit.clone(),
             })),
-            Expr::This => Ok(self.this_item.clone().map(|item| one(item)).unwrap_or_else(|| Outcome { items: focus.to_vec(), ordered })),
-            Expr::IndexVar => Ok(self.index.map(|index| one(Value::Integer(index))).unwrap_or(Outcome { items: vec![], ordered: true })),
-            Expr::Total => Ok(self.total.clone().map(one).unwrap_or(Outcome { items: vec![], ordered: true })),
+            Expr::This => Ok(self
+                .this_item
+                .clone()
+                .map(|item| one(item))
+                .unwrap_or_else(|| Outcome {
+                    items: focus.to_vec(),
+                    ordered,
+                })),
+            Expr::IndexVar => Ok(self
+                .index
+                .map(|index| one(Value::Integer(index)))
+                .unwrap_or(Outcome {
+                    items: vec![],
+                    ordered: true,
+                })),
+            Expr::Total => Ok(self.total.clone().map(one).unwrap_or(Outcome {
+                items: vec![],
+                ordered: true,
+            })),
             Expr::Variable(name) => Ok(one(self.variable(name)?)),
             Expr::TypeName(name) => Ok(one(Value::String(simple_name(name).to_string()))),
             Expr::Ident(name) => self.eval_ident(name, focus, ordered),
@@ -146,8 +187,19 @@ impl Ctx<'_> {
                 self.require_ordered(&target)?;
                 let index = self.singleton_int(&self.eval(index, focus, ordered)?.items)?;
                 Ok(match index {
-                    Some(index) if index >= 0 => target.items.get(index as usize).cloned().map(one).unwrap_or(Outcome { items: vec![], ordered: true }),
-                    _ => Outcome { items: vec![], ordered: true },
+                    Some(index) if index >= 0 => target
+                        .items
+                        .get(index as usize)
+                        .cloned()
+                        .map(one)
+                        .unwrap_or(Outcome {
+                            items: vec![],
+                            ordered: true,
+                        }),
+                    _ => Outcome {
+                        items: vec![],
+                        ordered: true,
+                    },
                 })
             }
             Expr::Unary(op, inner) => self.eval_unary(*op, inner, focus, ordered),
@@ -158,13 +210,23 @@ impl Ctx<'_> {
             }
             Expr::As(inner, name) => {
                 let items = self.eval(inner, focus, ordered)?.items;
-                Ok(Outcome { items: self.cast(&items, name)?, ordered: true })
+                Ok(Outcome {
+                    items: self.cast(&items, name)?,
+                    ordered: true,
+                })
             }
-            Expr::Call { focus: call_focus, name, args } => {
+            Expr::Call {
+                focus: call_focus,
+                name,
+                args,
+            } => {
                 let input = if let Some(call_focus) = call_focus {
                     self.eval(call_focus, focus, ordered)?
                 } else {
-                    Outcome { items: focus.to_vec(), ordered }
+                    Outcome {
+                        items: focus.to_vec(),
+                        ordered,
+                    }
                 };
                 self.call(name, &input, args, focus)
             }
@@ -190,13 +252,20 @@ impl Ctx<'_> {
         if self.host.strict() && self.model_loaded(focus) {
             return Err(Error::eval(format!("unknown element {name}")));
         }
-        Ok(Outcome { items: vec![], ordered: true })
+        Ok(Outcome {
+            items: vec![],
+            ordered: true,
+        })
     }
 
     fn members(&self, focus: &[Value], name: &str, ordered: bool) -> Result<Outcome, Error> {
         let mut items = Vec::new();
         for item in focus {
-            if let Value::TypeInfo { namespace, name: type_name } = item {
+            if let Value::TypeInfo {
+                namespace,
+                name: type_name,
+            } = item
+            {
                 let text = match name {
                     "namespace" => namespace.clone(),
                     "name" => type_name.clone(),
@@ -217,7 +286,11 @@ impl Ctx<'_> {
         if let Some(choice) = self.model.choice_path(path, name) {
             return Ok(choice_values(json, &choice, path, name));
         }
-        if self.model_loaded_path(path) && !self.model.known_child(path, name) && name != "id" && name != "resourceType" {
+        if self.model_loaded_path(path)
+            && !self.model.known_child(path, name)
+            && name != "id"
+            && name != "resourceType"
+        {
             if self.host.strict() {
                 return Err(Error::eval(format!("unknown element {name}")));
             }
@@ -227,14 +300,31 @@ impl Ctx<'_> {
             return Ok(vec![]);
         };
         let extensions = extension_siblings(json, name);
-        let element_path = self.model.canonical(&if path.is_empty() { name.to_string() } else { format!("{path}.{name}") }).to_string();
+        let element_path = self
+            .model
+            .canonical(&if path.is_empty() {
+                name.to_string()
+            } else {
+                format!("{path}.{name}")
+            })
+            .to_string();
         let types = self.model.element_types(&element_path);
         let fhir_type = types.first().cloned();
         let child_path = match fhir_type.as_deref() {
-            Some(fhir_type) if !self.model.has_descendants(&element_path) && self.model.has_descendants(fhir_type) => fhir_type.to_string(),
+            Some(fhir_type)
+                if !self.model.has_descendants(&element_path)
+                    && self.model.has_descendants(fhir_type) =>
+            {
+                fhir_type.to_string()
+            }
             _ => element_path,
         };
-        Ok(materialize_list(value, &extensions, fhir_type.as_deref(), &child_path))
+        Ok(materialize_list(
+            value,
+            &extensions,
+            fhir_type.as_deref(),
+            &child_path,
+        ))
     }
 
     fn model_has_child(&self, item: &Value, name: &str) -> bool {
@@ -263,14 +353,19 @@ impl Ctx<'_> {
                 return false;
             }
         }
-        if self.model.is_a(name, want_name) && (namespace == "FHIR" || want_namespace.is_some() || want_name == name) {
+        if self.model.is_a(name, want_name)
+            && (namespace == "FHIR" || want_namespace.is_some() || want_name == name)
+        {
             return true;
         }
         let target = want_name;
         if namespace == "System" && system_name(target) == Some(name) {
             return true;
         }
-        if let Value::Node { json, fhir_type, .. } = item {
+        if let Value::Node {
+            json, fhir_type, ..
+        } = item
+        {
             if json.get("resourceType").and_then(|value| value.as_str()) == Some(target) {
                 return true;
             }
@@ -302,32 +397,59 @@ impl Ctx<'_> {
         Ok(cast_one(item, target))
     }
 
-    fn eval_unary(&self, op: UnaryOp, inner: &Expr, focus: &[Value], ordered: bool) -> Result<Outcome, Error> {
+    fn eval_unary(
+        &self,
+        op: UnaryOp,
+        inner: &Expr,
+        focus: &[Value],
+        ordered: bool,
+    ) -> Result<Outcome, Error> {
         let items = self.eval(inner, focus, ordered)?.items;
         if items.is_empty() {
-            return Ok(Outcome { items, ordered: true });
+            return Ok(Outcome {
+                items,
+                ordered: true,
+            });
         }
-        let item = singleton(&items)?.ok_or_else(|| Error::eval("unary operator expected one item"))?;
+        let item =
+            singleton(&items)?.ok_or_else(|| Error::eval("unary operator expected one item"))?;
         if let Value::Quantity { value, scale, unit } = item {
             let value = match op {
                 UnaryOp::Plus => *value,
                 UnaryOp::Minus => -*value,
             };
-            return Ok(one(Value::Quantity { value, scale: *scale, unit: unit.clone() }));
+            return Ok(one(Value::Quantity {
+                value,
+                scale: *scale,
+                unit: unit.clone(),
+            }));
         }
-        let number = number_of(item).ok_or_else(|| Error::eval("unary operator expected a number"))?;
+        let number =
+            number_of(item).ok_or_else(|| Error::eval("unary operator expected a number"))?;
         let value = match op {
             UnaryOp::Plus => number.0,
             UnaryOp::Minus => -number.0,
         };
-        Ok(one(if matches!(item, Value::Integer(_)) && matches!(op, UnaryOp::Minus | UnaryOp::Plus) {
-            Value::Integer(value.try_into().unwrap_or(0))
-        } else {
-            Value::Decimal { value, scale: number.1 }
-        }))
+        Ok(one(
+            if matches!(item, Value::Integer(_)) && matches!(op, UnaryOp::Minus | UnaryOp::Plus) {
+                Value::Integer(value.try_into().unwrap_or(0))
+            } else {
+                Value::Decimal {
+                    value,
+                    scale: number.1,
+                }
+            },
+        ))
     }
 
-    fn eval_binary(&self, op: BinOp, left: &Expr, right: &Expr, focus: &[Value], ordered: bool) -> Result<Outcome, Error> {
+    fn eval_binary(
+        &self,
+        op: BinOp,
+        left: &Expr,
+        right: &Expr,
+        focus: &[Value],
+        ordered: bool,
+    ) -> Result<Outcome, Error> {
         if matches!(op, BinOp::And | BinOp::Or | BinOp::Xor | BinOp::Implies) {
             return self.eval_logic(op, left, right, focus, ordered);
         }
@@ -335,14 +457,20 @@ impl Ctx<'_> {
         let right_out = self.eval(right, focus, ordered)?;
         if matches!(op, BinOp::Concat) {
             if left_out.items.len() > 1 || right_out.items.len() > 1 {
-                return Ok(Outcome { items: vec![], ordered: true });
+                return Ok(Outcome {
+                    items: vec![],
+                    ordered: true,
+                });
             }
             let left = singleton_string(&left_out.items)?.unwrap_or_default();
             let right = singleton_string(&right_out.items)?.unwrap_or_default();
             return Ok(one(Value::String(format!("{left}{right}"))));
         }
         if matches!(op, BinOp::Union) {
-            return Ok(Outcome { items: union(&left_out.items, &right_out.items), ordered: true });
+            return Ok(Outcome {
+                items: union(&left_out.items, &right_out.items),
+                ordered: true,
+            });
         }
         if matches!(op, BinOp::In | BinOp::Contains) {
             let (needle, haystack) = match op {
@@ -350,7 +478,10 @@ impl Ctx<'_> {
                 _ => (&right_out.items, &left_out.items),
             };
             if needle.is_empty() {
-                return Ok(Outcome { items: vec![], ordered: true });
+                return Ok(Outcome {
+                    items: vec![],
+                    ordered: true,
+                });
             }
             if haystack.is_empty() {
                 return Ok(one(Value::system_bool(false)));
@@ -360,32 +491,70 @@ impl Ctx<'_> {
         if left_out.items.is_empty() || right_out.items.is_empty() {
             return match op {
                 BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                    Ok(Outcome { items: vec![], ordered: true })
+                    Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    })
                 }
-                BinOp::Equiv => Ok(one(Value::system_bool(left_out.items.is_empty() && right_out.items.is_empty()))),
-                BinOp::NotEquiv => Ok(one(Value::system_bool(!(left_out.items.is_empty() && right_out.items.is_empty())))),
-                _ => Ok(Outcome { items: vec![], ordered: true }),
+                BinOp::Equiv => Ok(one(Value::system_bool(
+                    left_out.items.is_empty() && right_out.items.is_empty(),
+                ))),
+                BinOp::NotEquiv => Ok(one(Value::system_bool(
+                    !(left_out.items.is_empty() && right_out.items.is_empty()),
+                ))),
+                _ => Ok(Outcome {
+                    items: vec![],
+                    ordered: true,
+                }),
             };
         }
         match op {
-            BinOp::Eq => Ok(bool_outcome(collections_equal(&left_out.items, &right_out.items))),
-            BinOp::NotEq => Ok(bool_outcome(collections_equal(&left_out.items, &right_out.items).map(|value| !value))),
-            BinOp::Equiv => Ok(one(Value::system_bool(collections_equivalent(&left_out.items, &right_out.items)))),
-            BinOp::NotEquiv => Ok(one(Value::system_bool(!collections_equivalent(&left_out.items, &right_out.items)))),
+            BinOp::Eq => Ok(bool_outcome(collections_equal(
+                &left_out.items,
+                &right_out.items,
+            ))),
+            BinOp::NotEq => Ok(bool_outcome(
+                collections_equal(&left_out.items, &right_out.items).map(|value| !value),
+            )),
+            BinOp::Equiv => Ok(one(Value::system_bool(collections_equivalent(
+                &left_out.items,
+                &right_out.items,
+            )))),
+            BinOp::NotEquiv => Ok(one(Value::system_bool(!collections_equivalent(
+                &left_out.items,
+                &right_out.items,
+            )))),
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                let left = singleton(&left_out.items)?.ok_or_else(|| Error::eval("comparison expected one item"))?;
-                let right = singleton(&right_out.items)?.ok_or_else(|| Error::eval("comparison expected one item"))?;
+                let left = singleton(&left_out.items)?
+                    .ok_or_else(|| Error::eval("comparison expected one item"))?;
+                let right = singleton(&right_out.items)?
+                    .ok_or_else(|| Error::eval("comparison expected one item"))?;
                 Ok(bool_outcome(compare(left, right, op)))
             }
             _ => {
-                let left = singleton(&left_out.items)?.ok_or_else(|| Error::eval("operator expected one item"))?;
-                let right = singleton(&right_out.items)?.ok_or_else(|| Error::eval("operator expected one item"))?;
-                Ok(self.arithmetic(op, left, right)?.map(one).unwrap_or(Outcome { items: vec![], ordered: true }))
+                let left = singleton(&left_out.items)?
+                    .ok_or_else(|| Error::eval("operator expected one item"))?;
+                let right = singleton(&right_out.items)?
+                    .ok_or_else(|| Error::eval("operator expected one item"))?;
+                Ok(self
+                    .arithmetic(op, left, right)?
+                    .map(one)
+                    .unwrap_or(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    }))
             }
         }
     }
 
-    fn eval_logic(&self, op: BinOp, left: &Expr, right: &Expr, focus: &[Value], ordered: bool) -> Result<Outcome, Error> {
+    fn eval_logic(
+        &self,
+        op: BinOp,
+        left: &Expr,
+        right: &Expr,
+        focus: &[Value],
+        ordered: bool,
+    ) -> Result<Outcome, Error> {
         let left = bool_operand(&self.eval(left, focus, ordered)?.items)?;
         let right = bool_operand(&self.eval(right, focus, ordered)?.items)?;
         let value = match op {
@@ -412,7 +581,12 @@ impl Ctx<'_> {
             },
             _ => None,
         };
-        Ok(value.map(|value| one(Value::system_bool(value))).unwrap_or(Outcome { items: vec![], ordered: true }))
+        Ok(value
+            .map(|value| one(Value::system_bool(value)))
+            .unwrap_or(Outcome {
+                items: vec![],
+                ordered: true,
+            }))
     }
 
     fn arithmetic(&self, op: BinOp, left: &Value, right: &Value) -> Result<Option<Value>, Error> {
@@ -425,7 +599,13 @@ impl Ctx<'_> {
             }
         }
         if let (Some(left_q), Some(right_q)) = (measured(left), measured(right)) {
-            return Ok(quantity_math(op, &left_q, &right_q, quantity_scale(left), quantity_scale(right)));
+            return Ok(quantity_math(
+                op,
+                &left_q,
+                &right_q,
+                quantity_scale(left),
+                quantity_scale(right),
+            ));
         }
         let Some((left_n, left_scale)) = number_of(left) else {
             return Ok(None);
@@ -435,9 +615,21 @@ impl Ctx<'_> {
         };
         let both_int = matches!(left, Value::Integer(_)) && matches!(right, Value::Integer(_));
         match op {
-            BinOp::Add => Ok(Some(number_value(left_n + right_n, left_scale.max(right_scale), both_int))),
-            BinOp::Sub => Ok(Some(number_value(left_n - right_n, left_scale.max(right_scale), both_int))),
-            BinOp::Mul => Ok(Some(number_value(left_n * right_n, left_scale.saturating_add(right_scale), both_int))),
+            BinOp::Add => Ok(Some(number_value(
+                left_n + right_n,
+                left_scale.max(right_scale),
+                both_int,
+            ))),
+            BinOp::Sub => Ok(Some(number_value(
+                left_n - right_n,
+                left_scale.max(right_scale),
+                both_int,
+            ))),
+            BinOp::Mul => Ok(Some(number_value(
+                left_n * right_n,
+                left_scale.saturating_add(right_scale),
+                both_int,
+            ))),
             BinOp::Div => {
                 if right_n.is_zero() {
                     return Ok(None);
@@ -454,23 +646,34 @@ impl Ctx<'_> {
                 if right_n.is_zero() {
                     return Ok(None);
                 }
-                Ok(Some(Value::Integer((left_n / right_n).trunc().try_into().unwrap_or(0))))
+                Ok(Some(Value::Integer(
+                    (left_n / right_n).trunc().try_into().unwrap_or(0),
+                )))
             }
             BinOp::Mod => {
                 if right_n.is_zero() {
                     return Ok(None);
                 }
-                Ok(Some(number_value(left_n % right_n, left_scale.max(right_scale), both_int)))
+                Ok(Some(number_value(
+                    left_n % right_n,
+                    left_scale.max(right_scale),
+                    both_int,
+                )))
             }
             _ => Ok(None),
         }
     }
 
-    fn call(&self, name: &str, input: &Outcome, args: &[Expr], outer: &[Value]) -> Result<Outcome, Error> {
+    fn call(
+        &self,
+        name: &str,
+        input: &Outcome,
+        args: &[Expr],
+        outer: &[Value],
+    ) -> Result<Outcome, Error> {
         match name {
-            "where" | "select" | "repeat" | "all" | "exists" | "aggregate" | "iif" | "trace" | "sort" | "is" | "as" => {
-                self.call_expr(name, input, args, outer)
-            }
+            "where" | "select" | "repeat" | "all" | "exists" | "aggregate" | "iif" | "trace"
+            | "sort" | "is" | "as" => self.call_expr(name, input, args, outer),
             _ => {
                 let mut values = Vec::new();
                 for arg in args {
@@ -481,29 +684,52 @@ impl Ctx<'_> {
         }
     }
 
-    fn call_expr(&self, name: &str, input: &Outcome, args: &[Expr], outer: &[Value]) -> Result<Outcome, Error> {
+    fn call_expr(
+        &self,
+        name: &str,
+        input: &Outcome,
+        args: &[Expr],
+        outer: &[Value],
+    ) -> Result<Outcome, Error> {
         match name {
             "where" => {
-                let criteria = args.first().ok_or_else(|| Error::eval("where() criteria required"))?;
+                let criteria = args
+                    .first()
+                    .ok_or_else(|| Error::eval("where() criteria required"))?;
                 let mut kept = Vec::new();
                 for (index, item) in input.items.iter().enumerate() {
                     if self.criteria(criteria, item, index as i64, outer)? {
                         kept.push(item.clone());
                     }
                 }
-                Ok(Outcome { items: kept, ordered: input.ordered })
+                Ok(Outcome {
+                    items: kept,
+                    ordered: input.ordered,
+                })
             }
             "select" => {
-                let projection = args.first().ok_or_else(|| Error::eval("select() projection required"))?;
+                let projection = args
+                    .first()
+                    .ok_or_else(|| Error::eval("select() projection required"))?;
                 let mut items = Vec::new();
                 for (index, item) in input.items.iter().enumerate() {
-                    let child = self.scoped(Some(item.clone()), Some(index as i64), self.total.clone());
-                    items.extend(child.eval(projection, std::slice::from_ref(item), input.ordered)?.items);
+                    let child =
+                        self.scoped(Some(item.clone()), Some(index as i64), self.total.clone());
+                    items.extend(
+                        child
+                            .eval(projection, std::slice::from_ref(item), input.ordered)?
+                            .items,
+                    );
                 }
-                Ok(Outcome { items, ordered: input.ordered })
+                Ok(Outcome {
+                    items,
+                    ordered: input.ordered,
+                })
             }
             "all" => {
-                let criteria = args.first().ok_or_else(|| Error::eval("all() criteria required"))?;
+                let criteria = args
+                    .first()
+                    .ok_or_else(|| Error::eval("all() criteria required"))?;
                 for (index, item) in input.items.iter().enumerate() {
                     if !self.criteria(criteria, item, index as i64, outer)? {
                         return Ok(one(Value::system_bool(false)));
@@ -513,7 +739,9 @@ impl Ctx<'_> {
             }
             "exists" => {
                 if args.is_empty() {
-                    return Ok(one(Value::system_bool(input.items.iter().any(|item| !is_null_node(item)))));
+                    return Ok(one(Value::system_bool(
+                        input.items.iter().any(|item| !is_null_node(item)),
+                    )));
                 }
                 let criteria = &args[0];
                 for (index, item) in input.items.iter().enumerate() {
@@ -524,7 +752,9 @@ impl Ctx<'_> {
                 Ok(one(Value::system_bool(false)))
             }
             "repeat" => {
-                let projection = args.first().ok_or_else(|| Error::eval("repeat() projection required"))?;
+                let projection = args
+                    .first()
+                    .ok_or_else(|| Error::eval("repeat() projection required"))?;
                 let mut pending = input.items.clone();
                 let mut items = Vec::new();
                 let mut seen = BTreeMap::new();
@@ -534,7 +764,10 @@ impl Ctx<'_> {
                     let mut next = Vec::new();
                     for item in &pending {
                         let child = self.scoped(Some(item.clone()), None, None);
-                        for value in child.eval(projection, std::slice::from_ref(item), true)?.items {
+                        for value in child
+                            .eval(projection, std::slice::from_ref(item), true)?
+                            .items
+                        {
                             let key = value.render();
                             if seen.insert(key, ()).is_none() {
                                 next.push(value.clone());
@@ -544,10 +777,15 @@ impl Ctx<'_> {
                     }
                     pending = next;
                 }
-                Ok(Outcome { items, ordered: true })
+                Ok(Outcome {
+                    items,
+                    ordered: true,
+                })
             }
             "aggregate" => {
-                let projection = args.first().ok_or_else(|| Error::eval("aggregate() expression required"))?;
+                let projection = args
+                    .first()
+                    .ok_or_else(|| Error::eval("aggregate() expression required"))?;
                 let mut total = if args.len() > 1 {
                     self.eval(&args[1], outer, true)?.items.into_iter().next()
                 } else {
@@ -555,9 +793,16 @@ impl Ctx<'_> {
                 };
                 for (index, item) in input.items.iter().enumerate() {
                     let child = self.scoped(Some(item.clone()), Some(index as i64), total.clone());
-                    total = child.eval(projection, std::slice::from_ref(item), true)?.items.into_iter().next();
+                    total = child
+                        .eval(projection, std::slice::from_ref(item), true)?
+                        .items
+                        .into_iter()
+                        .next();
                 }
-                Ok(total.map(one).unwrap_or(Outcome { items: vec![], ordered: true }))
+                Ok(total.map(one).unwrap_or(Outcome {
+                    items: vec![],
+                    ordered: true,
+                }))
             }
             "iif" => {
                 if input.items.len() > 1 {
@@ -565,14 +810,40 @@ impl Ctx<'_> {
                 }
                 let focus = input.items.as_slice();
                 let scoped = self.scoped(focus.first().cloned(), self.index, self.total.clone());
-                let criterion = iif_criterion(&scoped.eval(args.first().ok_or_else(|| Error::eval("iif() criterion required"))?, focus, true)?.items);
+                let criterion = iif_criterion(
+                    &scoped
+                        .eval(
+                            args.first()
+                                .ok_or_else(|| Error::eval("iif() criterion required"))?,
+                            focus,
+                            true,
+                        )?
+                        .items,
+                );
                 match criterion {
-                    Some(true) => scoped.eval(args.get(1).ok_or_else(|| Error::eval("iif() true result required"))?, focus, true),
-                    Some(false) => args.get(2).map(|expr| scoped.eval(expr, focus, true)).unwrap_or(Ok(Outcome { items: vec![], ordered: true })),
-                    None => Ok(Outcome { items: vec![], ordered: true }),
+                    Some(true) => scoped.eval(
+                        args.get(1)
+                            .ok_or_else(|| Error::eval("iif() true result required"))?,
+                        focus,
+                        true,
+                    ),
+                    Some(false) => args
+                        .get(2)
+                        .map(|expr| scoped.eval(expr, focus, true))
+                        .unwrap_or(Ok(Outcome {
+                            items: vec![],
+                            ordered: true,
+                        })),
+                    None => Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    }),
                 }
             }
-            "trace" => Ok(Outcome { items: input.items.clone(), ordered: input.ordered }),
+            "trace" => Ok(Outcome {
+                items: input.items.clone(),
+                ordered: input.ordered,
+            }),
             "sort" => self.sort(input, args),
             "is" => {
                 let target = type_arg(args.first());
@@ -580,7 +851,10 @@ impl Ctx<'_> {
             }
             "as" => {
                 let target = type_arg(args.first());
-                Ok(Outcome { items: self.cast(&input.items, &target)?, ordered: true })
+                Ok(Outcome {
+                    items: self.cast(&input.items, &target)?,
+                    ordered: true,
+                })
             }
             _ => Err(Error::eval(format!("unknown function {name}"))),
         }
@@ -622,18 +896,38 @@ impl Ctx<'_> {
             }
             std::cmp::Ordering::Equal
         });
-        let sorted = order.into_iter().map(|index| items[index].clone()).collect();
+        let sorted = order
+            .into_iter()
+            .map(|index| items[index].clone())
+            .collect();
         let _ = &mut items;
-        Ok(Outcome { items: sorted, ordered: true })
+        Ok(Outcome {
+            items: sorted,
+            ordered: true,
+        })
     }
 
-    fn criteria(&self, expr: &Expr, item: &Value, index: i64, outer: &[Value]) -> Result<bool, Error> {
+    fn criteria(
+        &self,
+        expr: &Expr,
+        item: &Value,
+        index: i64,
+        outer: &[Value],
+    ) -> Result<bool, Error> {
         let child = self.scoped(Some(item.clone()), Some(index), self.total.clone());
         let _ = outer;
-        Ok(bool_operand(&child.eval(expr, std::slice::from_ref(item), true)?.items)?.unwrap_or(false))
+        Ok(
+            bool_operand(&child.eval(expr, std::slice::from_ref(item), true)?.items)?
+                .unwrap_or(false),
+        )
     }
 
-    fn scoped(&self, this_item: Option<Value>, index: Option<i64>, total: Option<Value>) -> Ctx<'_> {
+    fn scoped(
+        &self,
+        this_item: Option<Value>,
+        index: Option<i64>,
+        total: Option<Value>,
+    ) -> Ctx<'_> {
         Ctx {
             resource: self.resource,
             root_resource: self.root_resource,
@@ -647,7 +941,12 @@ impl Ctx<'_> {
         }
     }
 
-    fn call_values(&self, name: &str, input: &Outcome, args: &[Vec<Value>]) -> Result<Outcome, Error> {
+    fn call_values(
+        &self,
+        name: &str,
+        input: &Outcome,
+        args: &[Vec<Value>],
+    ) -> Result<Outcome, Error> {
         if matches!(name, "skip" | "take" | "first" | "last" | "tail" | "single") {
             self.require_ordered(input)?;
         }
@@ -655,65 +954,144 @@ impl Ctx<'_> {
             "empty" => Ok(one(Value::system_bool(input.items.is_empty()))),
             "count" => Ok(one(Value::Integer(input.items.len() as i64))),
             "not" => Ok(bool_outcome(not_of(&input.items))),
-            "first" => Ok(input.items.first().cloned().map(one).unwrap_or(Outcome { items: vec![], ordered: true })),
-            "last" => Ok(input.items.last().cloned().map(one).unwrap_or(Outcome { items: vec![], ordered: true })),
-            "tail" => Ok(Outcome { items: input.items.iter().skip(1).cloned().collect(), ordered: true }),
+            "first" => Ok(input.items.first().cloned().map(one).unwrap_or(Outcome {
+                items: vec![],
+                ordered: true,
+            })),
+            "last" => Ok(input.items.last().cloned().map(one).unwrap_or(Outcome {
+                items: vec![],
+                ordered: true,
+            })),
+            "tail" => Ok(Outcome {
+                items: input.items.iter().skip(1).cloned().collect(),
+                ordered: true,
+            }),
             "single" => {
                 if input.items.len() > 1 {
                     return Err(Error::eval("single() expected one item"));
                 }
-                Ok(Outcome { items: input.items.clone(), ordered: true })
+                Ok(Outcome {
+                    items: input.items.clone(),
+                    ordered: true,
+                })
             }
             "skip" => {
-                let count = self.singleton_int(args.first().unwrap_or(&vec![]))?.unwrap_or(0).max(0) as usize;
-                Ok(Outcome { items: input.items.iter().skip(count).cloned().collect(), ordered: true })
+                let count = self
+                    .singleton_int(args.first().unwrap_or(&vec![]))?
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                Ok(Outcome {
+                    items: input.items.iter().skip(count).cloned().collect(),
+                    ordered: true,
+                })
             }
             "take" => {
-                let count = self.singleton_int(args.first().unwrap_or(&vec![]))?.unwrap_or(0).max(0) as usize;
-                Ok(Outcome { items: input.items.iter().take(count).cloned().collect(), ordered: true })
+                let count = self
+                    .singleton_int(args.first().unwrap_or(&vec![]))?
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                Ok(Outcome {
+                    items: input.items.iter().take(count).cloned().collect(),
+                    ordered: true,
+                })
             }
-            "distinct" => Ok(Outcome { items: union(&input.items, &[]), ordered: true }),
-            "isDistinct" => Ok(one(Value::system_bool(union(&input.items, &[]).len() == input.items.len()))),
+            "distinct" => Ok(Outcome {
+                items: union(&input.items, &[]),
+                ordered: true,
+            }),
+            "isDistinct" => Ok(one(Value::system_bool(
+                union(&input.items, &[]).len() == input.items.len(),
+            ))),
             "combine" => {
                 let mut items = input.items.clone();
                 if let Some(extra) = args.first() {
                     items.extend(extra.clone());
                 }
-                Ok(Outcome { items, ordered: true })
+                Ok(Outcome {
+                    items,
+                    ordered: true,
+                })
             }
             "intersect" => {
                 let right = args.first().map(Vec::as_slice).unwrap_or(&[]);
                 let mut items = Vec::new();
                 for item in &input.items {
-                    let kept = right.iter().any(|other| equal_pair(item, other) == Some(true));
-                    let fresh = !items.iter().any(|existing| equal_pair(item, existing) == Some(true));
+                    let kept = right
+                        .iter()
+                        .any(|other| equal_pair(item, other) == Some(true));
+                    let fresh = !items
+                        .iter()
+                        .any(|existing| equal_pair(item, existing) == Some(true));
                     if kept && fresh {
                         items.push(item.clone());
                     }
                 }
-                Ok(Outcome { items, ordered: true })
+                Ok(Outcome {
+                    items,
+                    ordered: true,
+                })
             }
             "exclude" => {
                 let right = args.first().map(Vec::as_slice).unwrap_or(&[]);
                 Ok(Outcome {
-                    items: input.items.iter().filter(|item| !right.iter().any(|other| equal_pair(item, other) == Some(true))).cloned().collect(),
+                    items: input
+                        .items
+                        .iter()
+                        .filter(|item| {
+                            !right
+                                .iter()
+                                .any(|other| equal_pair(item, other) == Some(true))
+                        })
+                        .cloned()
+                        .collect(),
                     ordered: true,
                 })
             }
             "subsetOf" | "supersetOf" => {
                 let right = args.first().map(Vec::as_slice).unwrap_or(&[]);
-                let (left, right) = if name == "subsetOf" { (input.items.as_slice(), right) } else { (right, input.items.as_slice()) };
-                let value = left.iter().all(|item| right.iter().any(|other| equivalent_pair(item, other)));
+                let (left, right) = if name == "subsetOf" {
+                    (input.items.as_slice(), right)
+                } else {
+                    (right, input.items.as_slice())
+                };
+                let value = left
+                    .iter()
+                    .all(|item| right.iter().any(|other| equivalent_pair(item, other)));
                 Ok(one(Value::system_bool(value)))
             }
-            "allTrue" => Ok(one(Value::system_bool(input.items.iter().all(|item| item.as_singleton_bool() == Some(true))))),
-            "anyTrue" => Ok(one(Value::system_bool(input.items.iter().any(|item| item.as_singleton_bool() == Some(true))))),
-            "allFalse" => Ok(one(Value::system_bool(input.items.iter().all(|item| item.as_singleton_bool() == Some(false))))),
-            "anyFalse" => Ok(one(Value::system_bool(input.items.iter().any(|item| item.as_singleton_bool() == Some(false))))),
+            "allTrue" => Ok(one(Value::system_bool(
+                input
+                    .items
+                    .iter()
+                    .all(|item| item.as_singleton_bool() == Some(true)),
+            ))),
+            "anyTrue" => Ok(one(Value::system_bool(
+                input
+                    .items
+                    .iter()
+                    .any(|item| item.as_singleton_bool() == Some(true)),
+            ))),
+            "allFalse" => Ok(one(Value::system_bool(
+                input
+                    .items
+                    .iter()
+                    .all(|item| item.as_singleton_bool() == Some(false)),
+            ))),
+            "anyFalse" => Ok(one(Value::system_bool(
+                input
+                    .items
+                    .iter()
+                    .any(|item| item.as_singleton_bool() == Some(false)),
+            ))),
             "ofType" => {
                 let target = arg_type(args.first().unwrap_or(&vec![]));
                 Ok(Outcome {
-                    items: input.items.iter().filter(|item| self.exact_type(item, &target)).cloned().collect(),
+                    items: input
+                        .items
+                        .iter()
+                        .filter(|item| self.exact_type(item, &target))
+                        .cloned()
+                        .collect(),
                     ordered: input.ordered,
                 })
             }
@@ -723,18 +1101,33 @@ impl Ctx<'_> {
                 for item in &input.items {
                     items.extend(extensions_of(item, &url));
                 }
-                Ok(Outcome { items, ordered: true })
+                Ok(Outcome {
+                    items,
+                    ordered: true,
+                })
             }
-            "hasValue" => Ok(one(Value::system_bool(input.items.iter().any(|item| item.has_primitive_value())))),
+            "hasValue" => Ok(one(Value::system_bool(
+                input.items.iter().any(|item| item.has_primitive_value()),
+            ))),
             "resolve" => self.resolve(input),
             "memberOf" => self.member_of(input, args),
             "type" => {
-                let item = singleton(&input.items)?.ok_or_else(|| Error::eval("type() expected one item"))?;
+                let item = singleton(&input.items)?
+                    .ok_or_else(|| Error::eval("type() expected one item"))?;
                 let (namespace, name) = item.type_name();
-                Ok(one(Value::TypeInfo { namespace: namespace.into(), name: name.into() }))
+                Ok(one(Value::TypeInfo {
+                    namespace: namespace.into(),
+                    name: name.into(),
+                }))
             }
-            "children" => Ok(Outcome { items: self.children_of(&input.items), ordered: false }),
-            "descendants" => Ok(Outcome { items: self.descendants_of(&input.items), ordered: false }),
+            "children" => Ok(Outcome {
+                items: self.children_of(&input.items),
+                ordered: false,
+            }),
+            "descendants" => Ok(Outcome {
+                items: self.descendants_of(&input.items),
+                ordered: false,
+            }),
             "today" => {
                 let mut now = self.host.now();
                 now.hour = None;
@@ -747,19 +1140,33 @@ impl Ctx<'_> {
             "now" => Ok(one(Value::DateTime(self.host.now()))),
             "timeOfDay" => {
                 let now = self.host.now();
-                Ok(one(Value::Time(Temporal { year: None, month: None, day: None, ..now })))
+                Ok(one(Value::Time(Temporal {
+                    year: None,
+                    month: None,
+                    day: None,
+                    ..now
+                })))
             }
-            "toString" | "toInteger" | "toDecimal" | "toBoolean" | "toDate" | "toDateTime" | "toTime" | "toQuantity"
-            | "convertsToString" | "convertsToInteger" | "convertsToDecimal" | "convertsToBoolean" | "convertsToDate" | "convertsToDateTime"
-            | "convertsToTime" | "convertsToQuantity" => self.convert(name, input),
+            "toString" | "toInteger" | "toDecimal" | "toBoolean" | "toDate" | "toDateTime"
+            | "toTime" | "toQuantity" | "convertsToString" | "convertsToInteger"
+            | "convertsToDecimal" | "convertsToBoolean" | "convertsToDate"
+            | "convertsToDateTime" | "convertsToTime" | "convertsToQuantity" => {
+                self.convert(name, input)
+            }
             "union" => {
                 let right = args.first().cloned().unwrap_or_default();
-                Ok(Outcome { items: union(&input.items, &right), ordered: true })
+                Ok(Outcome {
+                    items: union(&input.items, &right),
+                    ordered: true,
+                })
             }
             "conformsTo" => {
                 let url = arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default();
                 if !url.contains("StructureDefinition") {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 }
                 let expected = url.rsplit('/').next().unwrap_or("");
                 let actual = input
@@ -773,10 +1180,14 @@ impl Ctx<'_> {
                     .unwrap_or_default();
                 Ok(one(Value::system_bool(actual == expected)))
             }
-            "length" | "upper" | "lower" | "toChars" | "indexOf" | "substring" | "startsWith" | "endsWith" | "contains"
-            | "replace" | "matches" | "matchesFull" | "replaceMatches" => self.strings(name, input, args),
-            "abs" | "ceiling" | "floor" | "truncate" | "round" | "sqrt" | "exp" | "ln" | "log" | "power" => self.math(name, input, args),
-            "lowBoundary" | "highBoundary" | "precision" | "comparable" => self.boundaries(name, input, args),
+            "length" | "upper" | "lower" | "toChars" | "indexOf" | "substring" | "startsWith"
+            | "endsWith" | "contains" | "replace" | "matches" | "matchesFull"
+            | "replaceMatches" => self.strings(name, input, args),
+            "abs" | "ceiling" | "floor" | "truncate" | "round" | "sqrt" | "exp" | "ln" | "log"
+            | "power" => self.math(name, input, args),
+            "lowBoundary" | "highBoundary" | "precision" | "comparable" => {
+                self.boundaries(name, input, args)
+            }
             other => Err(Error::eval(format!("unsupported function {other}"))),
         }
     }
@@ -808,10 +1219,15 @@ impl Ctx<'_> {
                 continue;
             };
             if let Some(id) = reference.strip_prefix('#') {
-                if let Some(resource) = contained(self.root_resource, id)
-                    .or_else(|| contained(self.resource, id))
+                if let Some(resource) =
+                    contained(self.root_resource, id).or_else(|| contained(self.resource, id))
                 {
-                    items.push(node_from_json(&resource, resource_type(&resource), String::new(), Vec::new()));
+                    items.push(node_from_json(
+                        &resource,
+                        resource_type(&resource),
+                        String::new(),
+                        Vec::new(),
+                    ));
                 }
                 continue;
             }
@@ -819,21 +1235,34 @@ impl Ctx<'_> {
                 continue;
             }
             if let Some(resource) = self.host.resolve(&reference)? {
-                items.push(node_from_json(&resource, resource_type(&resource), String::new(), Vec::new()));
+                items.push(node_from_json(
+                    &resource,
+                    resource_type(&resource),
+                    String::new(),
+                    Vec::new(),
+                ));
             }
         }
-        Ok(Outcome { items, ordered: true })
+        Ok(Outcome {
+            items,
+            ordered: true,
+        })
     }
 
     fn member_of(&self, input: &Outcome, args: &[Vec<Value>]) -> Result<Outcome, Error> {
         let value_set = arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default();
         let Some(item) = singleton(&input.items)? else {
-            return Ok(Outcome { items: vec![], ordered: true });
+            return Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            });
         };
         let (system, code) = code_of(item);
         match self.host.member_of(system.as_deref(), &code, &value_set)? {
             Some(value) => Ok(one(Value::system_bool(value))),
-            None => Err(Error::unsupported("memberOf() requires a terminology service")),
+            None => Err(Error::unsupported(
+                "memberOf() requires a terminology service",
+            )),
         }
     }
 
@@ -842,63 +1271,114 @@ impl Ctx<'_> {
             return Ok(if name.starts_with("convertsTo") {
                 one(Value::system_bool(false))
             } else {
-                Outcome { items: vec![], ordered: true }
+                Outcome {
+                    items: vec![],
+                    ordered: true,
+                }
             });
         };
-        let converted = convert_one(name.trim_start_matches("convertsTo").trim_start_matches("to"), item);
+        let converted = convert_one(
+            name.trim_start_matches("convertsTo")
+                .trim_start_matches("to"),
+            item,
+        );
         if name.starts_with("convertsTo") {
             return Ok(one(Value::system_bool(converted.is_some())));
         }
-        Ok(converted.map(one).unwrap_or(Outcome { items: vec![], ordered: true }))
+        Ok(converted.map(one).unwrap_or(Outcome {
+            items: vec![],
+            ordered: true,
+        }))
     }
 
     fn strings(&self, name: &str, input: &Outcome, args: &[Vec<Value>]) -> Result<Outcome, Error> {
         let Some(item) = singleton(&input.items)? else {
-            return Ok(Outcome { items: vec![], ordered: true });
+            return Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            });
         };
         let Some(text) = as_text(item) else {
-            return Ok(Outcome { items: vec![], ordered: true });
+            return Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            });
         };
         match name {
             "length" => Ok(one(Value::Integer(text.chars().count() as i64))),
             "upper" => Ok(one(Value::String(text.to_uppercase()))),
             "lower" => Ok(one(Value::String(text.to_lowercase()))),
-            "toChars" => Ok(Outcome { items: text.chars().map(|ch| Value::String(ch.to_string())).collect(), ordered: true }),
-            "startsWith" => Ok(one(Value::system_bool(text.starts_with(&arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default())))),
-            "endsWith" => Ok(one(Value::system_bool(text.ends_with(&arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default())))),
-            "contains" => Ok(one(Value::system_bool(text.contains(&arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default())))),
+            "toChars" => Ok(Outcome {
+                items: text
+                    .chars()
+                    .map(|ch| Value::String(ch.to_string()))
+                    .collect(),
+                ordered: true,
+            }),
+            "startsWith" => Ok(one(Value::system_bool(text.starts_with(
+                &arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default(),
+            )))),
+            "endsWith" => Ok(one(Value::system_bool(text.ends_with(
+                &arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default(),
+            )))),
+            "contains" => Ok(one(Value::system_bool(text.contains(
+                &arg_string(args.first().unwrap_or(&vec![])).unwrap_or_default(),
+            )))),
             "indexOf" => {
                 let Some(needle) = arg_string(args.first().unwrap_or(&vec![])) else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
-                let index = text.find(&needle).map(|index| text[..index].chars().count() as i64).unwrap_or(-1);
+                let index = text
+                    .find(&needle)
+                    .map(|index| text[..index].chars().count() as i64)
+                    .unwrap_or(-1);
                 Ok(one(Value::Integer(index)))
             }
             "substring" => {
                 let Some(start) = self.singleton_int(args.first().unwrap_or(&vec![]))? else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
                 if start < 0 {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 }
                 let start = start as usize;
                 let chars: Vec<char> = text.chars().collect();
                 if start > chars.len() {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 }
                 let end = if let Some(len) = args.get(1) {
                     start + self.singleton_int(len)?.unwrap_or(0).max(0) as usize
                 } else {
                     chars.len()
                 };
-                Ok(one(Value::String(chars[start..end.min(chars.len())].iter().collect())))
+                Ok(one(Value::String(
+                    chars[start..end.min(chars.len())].iter().collect(),
+                )))
             }
             "replace" => {
                 let Some(pattern) = arg_string(args.first().unwrap_or(&vec![])) else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
                 let Some(substitution) = arg_string(args.get(1).unwrap_or(&vec![])) else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
                 if pattern.is_empty() {
                     let mut replaced = substitution.clone();
@@ -912,28 +1392,41 @@ impl Ctx<'_> {
             }
             "matches" | "matchesFull" => {
                 let Some(pattern) = arg_string(args.first().unwrap_or(&vec![])) else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
                 let pattern = if name == "matchesFull" {
                     format!("^(?:{pattern})$")
                 } else {
                     pattern
                 };
-                let regex = Regex::new(&format!("(?s){pattern}")).map_err(|err| Error::eval(err.to_string()))?;
+                let regex = Regex::new(&format!("(?s){pattern}"))
+                    .map_err(|err| Error::eval(err.to_string()))?;
                 Ok(one(Value::system_bool(regex.is_match(&text))))
             }
             "replaceMatches" => {
                 let Some(pattern) = arg_string(args.first().unwrap_or(&vec![])) else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
                 let Some(substitution) = arg_string(args.get(1).unwrap_or(&vec![])) else {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 };
                 if pattern.is_empty() {
                     return Ok(one(Value::String(text)));
                 }
-                let regex = Regex::new(&format!("(?s){pattern}")).map_err(|err| Error::eval(err.to_string()))?;
-                Ok(one(Value::String(regex.replace_all(&text, substitution.as_str()).into_owned())))
+                let regex = Regex::new(&format!("(?s){pattern}"))
+                    .map_err(|err| Error::eval(err.to_string()))?;
+                Ok(one(Value::String(
+                    regex.replace_all(&text, substitution.as_str()).into_owned(),
+                )))
             }
             _ => Err(Error::eval(name)),
         }
@@ -941,15 +1434,25 @@ impl Ctx<'_> {
 
     fn math(&self, name: &str, input: &Outcome, args: &[Vec<Value>]) -> Result<Outcome, Error> {
         let Some(item) = singleton(&input.items)? else {
-            return Ok(Outcome { items: vec![], ordered: true });
+            return Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            });
         };
         if let Value::Quantity { value, scale, unit } = item {
             if name == "abs" {
-                return Ok(one(Value::Quantity { value: value.abs(), scale: *scale, unit: unit.clone() }));
+                return Ok(one(Value::Quantity {
+                    value: value.abs(),
+                    scale: *scale,
+                    unit: unit.clone(),
+                }));
             }
         }
         let Some((value, scale)) = number_of(item) else {
-            return Ok(Outcome { items: vec![], ordered: true });
+            return Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            });
         };
         let result = match name {
             "abs" => value.abs(),
@@ -957,25 +1460,48 @@ impl Ctx<'_> {
             "floor" => value.floor(),
             "truncate" => value.trunc(),
             "round" => {
-                let places = args.first().and_then(|arg| singleton_int_pure(arg)).unwrap_or(0).max(0) as u32;
-                return Ok(one(Value::Decimal { value: value.round_dp(places), scale: places }));
+                let places = args
+                    .first()
+                    .and_then(|arg| singleton_int_pure(arg))
+                    .unwrap_or(0)
+                    .max(0) as u32;
+                return Ok(one(Value::Decimal {
+                    value: value.round_dp(places),
+                    scale: places,
+                }));
             }
             "sqrt" => {
                 if value.is_sign_negative() {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 }
                 Decimal::from_f64_retain(f64_of(value).sqrt()).unwrap_or(Decimal::ZERO)
             }
             "exp" => Decimal::from_f64_retain(f64_of(value).exp()).unwrap_or(Decimal::ZERO),
             "ln" => Decimal::from_f64_retain(f64_of(value).ln()).unwrap_or(Decimal::ZERO),
             "log" => {
-                let base = args.first().and_then(|arg| arg.first()).and_then(number_of).map(|number| f64_of(number.0)).unwrap_or(10.0);
+                let base = args
+                    .first()
+                    .and_then(|arg| arg.first())
+                    .and_then(number_of)
+                    .map(|number| f64_of(number.0))
+                    .unwrap_or(10.0);
                 Decimal::from_f64_retain(f64_of(value).log(base)).unwrap_or(Decimal::ZERO)
             }
             "power" => {
-                let exp = args.first().and_then(|arg| arg.first()).and_then(number_of).map(|number| f64_of(number.0)).unwrap_or(1.0);
+                let exp = args
+                    .first()
+                    .and_then(|arg| arg.first())
+                    .and_then(number_of)
+                    .map(|number| f64_of(number.0))
+                    .unwrap_or(1.0);
                 if value.is_sign_negative() && exp.fract() != 0.0 {
-                    return Ok(Outcome { items: vec![], ordered: true });
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
                 }
                 Decimal::from_f64_retain(f64_of(value).powf(exp)).unwrap_or(Decimal::ZERO)
             }
@@ -985,15 +1511,31 @@ impl Ctx<'_> {
         if matches!(name, "ceiling" | "floor" | "truncate") && matches!(item, Value::Integer(_)) {
             return Ok(one(Value::Integer(result.try_into().unwrap_or(0))));
         }
-        Ok(one(Value::Decimal { value: result, scale: 8 }))
+        Ok(one(Value::Decimal {
+            value: result,
+            scale: 8,
+        }))
     }
 
-    fn boundaries(&self, name: &str, input: &Outcome, args: &[Vec<Value>]) -> Result<Outcome, Error> {
+    fn boundaries(
+        &self,
+        name: &str,
+        input: &Outcome,
+        args: &[Vec<Value>],
+    ) -> Result<Outcome, Error> {
         let Some(item) = singleton(&input.items)? else {
-            return Ok(Outcome { items: vec![], ordered: true });
+            return Ok(Outcome {
+                items: vec![],
+                ordered: true,
+            });
         };
         if name == "precision" {
-            return Ok(precision_of(item).map(|value| one(Value::Integer(value))).unwrap_or(Outcome { items: vec![], ordered: true }));
+            return Ok(precision_of(item)
+                .map(|value| one(Value::Integer(value)))
+                .unwrap_or(Outcome {
+                    items: vec![],
+                    ordered: true,
+                }));
         }
         if name == "comparable" {
             let other = args.first().and_then(|arg| arg.first());
@@ -1031,10 +1573,14 @@ impl Ctx<'_> {
             }
             other => {
                 if let Some(name) = other.strip_prefix("vs-") {
-                    return Ok(Value::String(format!("http://hl7.org/fhir/ValueSet/{name}")));
+                    return Ok(Value::String(format!(
+                        "http://hl7.org/fhir/ValueSet/{name}"
+                    )));
                 }
                 if let Some(name) = other.strip_prefix("ext-") {
-                    return Ok(Value::String(format!("http://hl7.org/fhir/StructureDefinition/{name}")));
+                    return Ok(Value::String(format!(
+                        "http://hl7.org/fhir/StructureDefinition/{name}"
+                    )));
                 }
                 return Err(Error::eval(format!("unknown variable %{other}")));
             }
@@ -1048,11 +1594,19 @@ impl Ctx<'_> {
 }
 
 fn one(value: Value) -> Outcome {
-    Outcome { items: vec![value], ordered: true }
+    Outcome {
+        items: vec![value],
+        ordered: true,
+    }
 }
 
 fn bool_outcome(value: Option<bool>) -> Outcome {
-    value.map(|value| one(Value::system_bool(value))).unwrap_or(Outcome { items: vec![], ordered: true })
+    value
+        .map(|value| one(Value::system_bool(value)))
+        .unwrap_or(Outcome {
+            items: vec![],
+            ordered: true,
+        })
 }
 
 fn cast_one(item: &Value, target: &str) -> Vec<Value> {
@@ -1066,7 +1620,11 @@ fn cast_one(item: &Value, target: &str) -> Vec<Value> {
     if name == target {
         return vec![item.clone()];
     }
-    if let Value::Node { fhir_type: Some(fhir_type), .. } = item {
+    if let Value::Node {
+        fhir_type: Some(fhir_type),
+        ..
+    } = item
+    {
         if fhir_type == target {
             return vec![item.clone()];
         }
@@ -1133,8 +1691,12 @@ fn type_arg(expr: Option<&Expr>) -> String {
 
 fn split_type(name: &str) -> (Option<&str>, &str) {
     match name.rsplit_once('.') {
-        Some((namespace, rest)) if namespace == "System" || namespace.ends_with("System") => (Some("System"), rest),
-        Some((namespace, rest)) if namespace == "FHIR" || namespace.ends_with("FHIR") => (Some("FHIR"), rest),
+        Some((namespace, rest)) if namespace == "System" || namespace.ends_with("System") => {
+            (Some("System"), rest)
+        }
+        Some((namespace, rest)) if namespace == "FHIR" || namespace.ends_with("FHIR") => {
+            (Some("FHIR"), rest)
+        }
         _ => (None, simple_name(name)),
     }
 }
@@ -1150,8 +1712,15 @@ fn arg_type(items: &[Value]) -> String {
 fn concat_text(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
-        Value::Node { json: Json::String(value), fhir_type, .. } => match fhir_type.as_deref() {
-            Some("date" | "dateTime" | "instant" | "time" | "boolean" | "integer" | "decimal" | "unsignedInt" | "positiveInt") => None,
+        Value::Node {
+            json: Json::String(value),
+            fhir_type,
+            ..
+        } => match fhir_type.as_deref() {
+            Some(
+                "date" | "dateTime" | "instant" | "time" | "boolean" | "integer" | "decimal"
+                | "unsignedInt" | "positiveInt",
+            ) => None,
             _ => Some(value.clone()),
         },
         _ => None,
@@ -1161,10 +1730,28 @@ fn concat_text(value: &Value) -> Option<String> {
 fn as_text(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
-        Value::Node { json: Json::String(value), .. } => Some(value.clone()),
-        Value::Date(value) => Some(crate::value::Value::Date(value.clone()).render().trim_start_matches('@').to_string()),
-        Value::DateTime(value) => Some(crate::value::Value::DateTime(value.clone()).render().trim_start_matches('@').to_string()),
-        Value::Time(value) => Some(crate::value::Value::Time(value.clone()).render().trim_start_matches("@T").to_string()),
+        Value::Node {
+            json: Json::String(value),
+            ..
+        } => Some(value.clone()),
+        Value::Date(value) => Some(
+            crate::value::Value::Date(value.clone())
+                .render()
+                .trim_start_matches('@')
+                .to_string(),
+        ),
+        Value::DateTime(value) => Some(
+            crate::value::Value::DateTime(value.clone())
+                .render()
+                .trim_start_matches('@')
+                .to_string(),
+        ),
+        Value::Time(value) => Some(
+            crate::value::Value::Time(value.clone())
+                .render()
+                .trim_start_matches("@T")
+                .to_string(),
+        ),
         Value::Integer(value) => Some(value.to_string()),
         Value::Boolean { value, .. } => Some(value.to_string()),
         Value::Decimal { value, scale } => Some(format_decimal(*value, *scale)),
@@ -1183,7 +1770,19 @@ fn as_text(value: &Value) -> Option<String> {
 fn is_calendar_word(unit: &str) -> bool {
     matches!(
         unit,
-        "year" | "years" | "month" | "months" | "week" | "weeks" | "day" | "days" | "hour" | "hours" | "minute" | "minutes" | "second"
+        "year"
+            | "years"
+            | "month"
+            | "months"
+            | "week"
+            | "weeks"
+            | "day"
+            | "days"
+            | "hour"
+            | "hours"
+            | "minute"
+            | "minutes"
+            | "second"
             | "seconds"
             | "millisecond"
             | "milliseconds"
@@ -1229,7 +1828,9 @@ fn f64_of(value: Decimal) -> f64 {
 fn union(left: &[Value], right: &[Value]) -> Vec<Value> {
     let mut items = Vec::new();
     for item in left.iter().chain(right) {
-        if !items.iter().any(|existing| equal_pair(existing, item) == Some(true) || equivalent_pair(existing, item)) {
+        if !items.iter().any(|existing| {
+            equal_pair(existing, item) == Some(true) || equivalent_pair(existing, item)
+        }) {
             items.push(item.clone());
         }
     }
@@ -1243,7 +1844,9 @@ fn membership(needle: &[Value], haystack: &[Value]) -> bool {
     if needle_is_collection(needle) {
         return false;
     }
-    haystack.iter().any(|item| equal_pair(needle, item) == Some(true))
+    haystack
+        .iter()
+        .any(|item| equal_pair(needle, item) == Some(true))
 }
 
 fn needle_is_collection(_value: &Value) -> bool {
@@ -1288,12 +1891,19 @@ fn temporal_of(value: &Value) -> Option<(Temporal, crate::value::TimeKind)> {
         Value::Date(value) => Some((value.clone(), crate::value::TimeKind::Date)),
         Value::DateTime(value) => Some((value.clone(), crate::value::TimeKind::DateTime)),
         Value::Time(value) => Some((value.clone(), crate::value::TimeKind::Time)),
-        Value::Node { json: Json::String(text), fhir_type, .. } => parse_temporal_text(text, fhir_type.as_deref()),
+        Value::Node {
+            json: Json::String(text),
+            fhir_type,
+            ..
+        } => parse_temporal_text(text, fhir_type.as_deref()),
         _ => None,
     }
 }
 
-fn parse_temporal_text(text: &str, fhir_type: Option<&str>) -> Option<(Temporal, crate::value::TimeKind)> {
+fn parse_temporal_text(
+    text: &str,
+    fhir_type: Option<&str>,
+) -> Option<(Temporal, crate::value::TimeKind)> {
     let kind = match fhir_type {
         Some("date") => crate::value::TimeKind::Date,
         Some("time") => crate::value::TimeKind::Time,
@@ -1318,10 +1928,21 @@ fn parse_temporal_text(text: &str, fhir_type: Option<&str>) -> Option<(Temporal,
     Some((value, kind))
 }
 
-fn temporal_cmp_values(left: &Temporal, right: &Temporal, left_kind: crate::value::TimeKind, right_kind: crate::value::TimeKind) -> Option<std::cmp::Ordering> {
+fn temporal_cmp_values(
+    left: &Temporal,
+    right: &Temporal,
+    left_kind: crate::value::TimeKind,
+    right_kind: crate::value::TimeKind,
+) -> Option<std::cmp::Ordering> {
     let mixed = matches!(
         (left_kind, right_kind),
-        (crate::value::TimeKind::Date, crate::value::TimeKind::DateTime) | (crate::value::TimeKind::DateTime, crate::value::TimeKind::Date)
+        (
+            crate::value::TimeKind::Date,
+            crate::value::TimeKind::DateTime
+        ) | (
+            crate::value::TimeKind::DateTime,
+            crate::value::TimeKind::Date
+        )
     );
     if left_kind != right_kind && !mixed {
         return None;
@@ -1343,7 +1964,9 @@ fn temporal_cmp_values(left: &Temporal, right: &Temporal, left_kind: crate::valu
     }
     let left = clear_zero_millis(left);
     let right = clear_zero_millis(right);
-    if crate::value::precision_rank(&left, left_kind) != crate::value::precision_rank(&right, right_kind) {
+    if crate::value::precision_rank(&left, left_kind)
+        != crate::value::precision_rank(&right, right_kind)
+    {
         return None;
     }
     Some(std::cmp::Ordering::Equal)
@@ -1365,7 +1988,11 @@ fn instant_millis(value: &Temporal) -> Option<i64> {
     let minute = value.minute.unwrap_or(0) as i64;
     let second = value.second.unwrap_or(0) as i64;
     let millis = value.millis.unwrap_or(0) as i64;
-    let local = days_from_civil(year, month, day) * 86_400_000 + hour * 3_600_000 + minute * 60_000 + second * 1000 + millis;
+    let local = days_from_civil(year, month, day) * 86_400_000
+        + hour * 3_600_000
+        + minute * 60_000
+        + second * 1000
+        + millis;
     Some(local - offset as i64 * 60_000)
 }
 
@@ -1417,8 +2044,14 @@ fn temporal_kind_of(value: &Value) -> crate::value::TimeKind {
     match value {
         Value::Time(_) => crate::value::TimeKind::Time,
         Value::DateTime(_) => crate::value::TimeKind::DateTime,
-        Value::Node { fhir_type: Some(name), .. } if name == "dateTime" || name == "instant" => crate::value::TimeKind::DateTime,
-        Value::Node { json: Json::String(text), .. } if text.contains('T') => crate::value::TimeKind::DateTime,
+        Value::Node {
+            fhir_type: Some(name),
+            ..
+        } if name == "dateTime" || name == "instant" => crate::value::TimeKind::DateTime,
+        Value::Node {
+            json: Json::String(text),
+            ..
+        } if text.contains('T') => crate::value::TimeKind::DateTime,
         _ => crate::value::TimeKind::Date,
     }
 }
@@ -1499,7 +2132,10 @@ fn add_seconds(temporal: &mut Temporal, seconds: i64) -> bool {
     let Some(hour) = temporal.hour else {
         return false;
     };
-    let current = hour as i64 * 3600 + temporal.minute.unwrap_or(0) as i64 * 60 + temporal.second.unwrap_or(0) as i64 + seconds;
+    let current = hour as i64 * 3600
+        + temporal.minute.unwrap_or(0) as i64 * 60
+        + temporal.second.unwrap_or(0) as i64
+        + seconds;
     let day_delta = current.div_euclid(86_400);
     let within = current.rem_euclid(86_400);
     if day_delta != 0 && !add_days(temporal, day_delta) && temporal.year.is_some() {
@@ -1527,10 +2163,18 @@ fn add_millis(temporal: &mut Temporal, millis: i64) -> bool {
 
 fn measured(value: &Value) -> Option<Measured> {
     match value {
-        Value::Quantity { value, unit, .. } => ucum::parse(unit).map(|unit| Measured { value: *value, unit }),
-        Value::Node { json, fhir_type, .. } if matches!(fhir_type.as_deref(), Some("Quantity" | "Age" | "Duration")) => {
+        Value::Quantity { value, unit, .. } => ucum::parse(unit).map(|unit| Measured {
+            value: *value,
+            unit,
+        }),
+        Value::Node {
+            json, fhir_type, ..
+        } if matches!(fhir_type.as_deref(), Some("Quantity" | "Age" | "Duration")) => {
             let text = json_number_text(json.get("value")?)?;
-            let unit = json.get("code").and_then(|item| item.as_str()).unwrap_or("1");
+            let unit = json
+                .get("code")
+                .and_then(|item| item.as_str())
+                .unwrap_or("1");
             let Ok(magnitude) = text.parse() else {
                 return None;
             };
@@ -1558,7 +2202,13 @@ fn quantity_scale(value: &Value) -> u32 {
     }
 }
 
-fn quantity_math(op: BinOp, left: &Measured, right: &Measured, left_scale: u32, right_scale: u32) -> Option<Value> {
+fn quantity_math(
+    op: BinOp,
+    left: &Measured,
+    right: &Measured,
+    left_scale: u32,
+    right_scale: u32,
+) -> Option<Value> {
     match op {
         BinOp::Mul => {
             let mut dim = left.unit.dim.clone();
@@ -1568,7 +2218,11 @@ fn quantity_math(op: BinOp, left: &Measured, right: &Measured, left_scale: u32, 
             dim.retain(|_, exp| *exp != 0);
             let value = left.value * left.unit.factor * right.value * right.unit.factor;
             let scale = left_scale.saturating_add(right_scale).saturating_add(2);
-            Some(Value::Quantity { value, scale, unit: ucum::format_dim(&dim) })
+            Some(Value::Quantity {
+                value,
+                scale,
+                unit: ucum::format_dim(&dim),
+            })
         }
         BinOp::Div => {
             if right.value.is_zero() {
@@ -1588,8 +2242,16 @@ fn quantity_math(op: BinOp, left: &Measured, right: &Measured, left_scale: u32, 
         }
         BinOp::Add | BinOp::Sub if left.unit.dim == right.unit.dim => {
             let right_value = right.value * right.unit.factor / left.unit.factor;
-            let value = if matches!(op, BinOp::Add) { left.value + right_value } else { left.value - right_value };
-            Some(Value::Quantity { value, scale: left_scale.max(right_scale), unit: left.unit.label.clone() })
+            let value = if matches!(op, BinOp::Add) {
+                left.value + right_value
+            } else {
+                left.value - right_value
+            };
+            Some(Value::Quantity {
+                value,
+                scale: left_scale.max(right_scale),
+                unit: left.unit.label.clone(),
+            })
         }
         _ => None,
     }
@@ -1606,23 +2268,37 @@ fn convert_one(kind: &str, value: &Value) -> Option<Value> {
         },
         "Decimal" | "decimal" => {
             if let Value::Boolean { value, .. } = value {
-                return Some(Value::Decimal { value: Decimal::from(if *value { 1 } else { 0 }), scale: 0 });
+                return Some(Value::Decimal {
+                    value: Decimal::from(if *value { 1 } else { 0 }),
+                    scale: 0,
+                });
             }
-            let scale = text.split_once('.').map(|(_, fraction)| fraction.len() as u32).unwrap_or(0);
-            Decimal::from_str_exact(&text).ok().map(|value| Value::Decimal { value, scale })
+            let scale = text
+                .split_once('.')
+                .map(|(_, fraction)| fraction.len() as u32)
+                .unwrap_or(0);
+            Decimal::from_str_exact(&text)
+                .ok()
+                .map(|value| Value::Decimal { value, scale })
         }
         "Boolean" | "boolean" => match value {
             Value::Integer(1) => Some(Value::system_bool(true)),
             Value::Integer(0) => Some(Value::system_bool(false)),
-            Value::Decimal { value, .. } if *value == Decimal::ONE || *value == Decimal::ZERO => Some(Value::system_bool(*value == Decimal::ONE)),
+            Value::Decimal { value, .. } if *value == Decimal::ONE || *value == Decimal::ZERO => {
+                Some(Value::system_bool(*value == Decimal::ONE))
+            }
             _ => match text.to_ascii_lowercase().as_str() {
                 "true" | "t" | "yes" | "y" | "1" | "1.0" => Some(Value::system_bool(true)),
                 "false" | "f" | "no" | "n" | "0" | "0.0" => Some(Value::system_bool(false)),
                 _ => None,
             },
         },
-        "Date" | "date" => parse_temporal_text(&text, Some("date")).map(|(value, _)| Value::Date(value)),
-        "DateTime" | "dateTime" => parse_temporal_text(&text, Some("dateTime")).map(|(value, _)| Value::DateTime(value)),
+        "Date" | "date" => {
+            parse_temporal_text(&text, Some("date")).map(|(value, _)| Value::Date(value))
+        }
+        "DateTime" | "dateTime" => {
+            parse_temporal_text(&text, Some("dateTime")).map(|(value, _)| Value::DateTime(value))
+        }
         "Time" | "time" => {
             let literal = if text.starts_with("@T") {
                 text
@@ -1631,31 +2307,55 @@ fn convert_one(kind: &str, value: &Value) -> Option<Value> {
             } else {
                 format!("@T{text}")
             };
-            parse_temporal_text(literal.trim_start_matches('@'), Some("time")).map(|(value, _)| Value::Time(value))
+            parse_temporal_text(literal.trim_start_matches('@'), Some("time"))
+                .map(|(value, _)| Value::Time(value))
         }
         "Quantity" | "quantity" => {
             match value {
                 Value::Integer(number) => {
-                    return Some(Value::Quantity { value: Decimal::from(*number), scale: 0, unit: "1".into() });
+                    return Some(Value::Quantity {
+                        value: Decimal::from(*number),
+                        scale: 0,
+                        unit: "1".into(),
+                    });
                 }
                 Value::Decimal { value, scale } => {
-                    return Some(Value::Quantity { value: *value, scale: *scale, unit: "1".into() });
+                    return Some(Value::Quantity {
+                        value: *value,
+                        scale: *scale,
+                        unit: "1".into(),
+                    });
                 }
                 Value::Boolean { value, .. } => {
-                    return Some(Value::Quantity { value: Decimal::from(if *value { 1 } else { 0 }), scale: 0, unit: "1".into() });
+                    return Some(Value::Quantity {
+                        value: Decimal::from(if *value { 1 } else { 0 }),
+                        scale: 0,
+                        unit: "1".into(),
+                    });
                 }
                 Value::Quantity { .. } => return Some(value.clone()),
                 _ => {}
             }
             if let Ok(number) = Decimal::from_str_exact(text.trim()) {
-                let scale = text.trim().split_once('.').map(|(_, fraction)| fraction.len() as u32).unwrap_or(0);
-                return Some(Value::Quantity { value: number, scale, unit: "1".into() });
+                let scale = text
+                    .trim()
+                    .split_once('.')
+                    .map(|(_, fraction)| fraction.len() as u32)
+                    .unwrap_or(0);
+                return Some(Value::Quantity {
+                    value: number,
+                    scale,
+                    unit: "1".into(),
+                });
             }
             let (number, unit) = text.split_once(' ')?;
             if !unit.contains('\'') && !is_calendar_word(unit.trim_matches('\'')) {
                 return None;
             }
-            let scale = number.split_once('.').map(|(_, fraction)| fraction.len() as u32).unwrap_or(0);
+            let scale = number
+                .split_once('.')
+                .map(|(_, fraction)| fraction.len() as u32)
+                .unwrap_or(0);
             Some(Value::Quantity {
                 value: Decimal::from_str_exact(number).ok()?,
                 scale,
@@ -1681,15 +2381,32 @@ fn system_name(target: &str) -> Option<&'static str> {
 }
 
 fn is_null_node(value: &Value) -> bool {
-    matches!(value, Value::Node { json: Json::Null, .. })
+    matches!(
+        value,
+        Value::Node {
+            json: Json::Null,
+            ..
+        }
+    )
 }
 
 fn resource_type(json: &Json) -> Option<String> {
-    json.get("resourceType").and_then(|value| value.as_str()).map(|value| value.to_string())
+    json.get("resourceType")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string())
 }
 
-fn node_from_json(json: &Json, fhir_type: Option<String>, path: String, extensions: Vec<Json>) -> Value {
-    let path = if path.is_empty() { fhir_type.clone().unwrap_or_default() } else { path };
+fn node_from_json(
+    json: &Json,
+    fhir_type: Option<String>,
+    path: String,
+    extensions: Vec<Json>,
+) -> Value {
+    let path = if path.is_empty() {
+        fhir_type.clone().unwrap_or_default()
+    } else {
+        path
+    };
     Value::Node {
         json: json.clone(),
         fhir_type: fhir_type.or_else(|| resource_type(json)),
@@ -1707,7 +2424,12 @@ fn extension_siblings(json: &Json, name: &str) -> Vec<Json> {
     }
 }
 
-fn materialize_list(value: &Json, extensions: &[Json], fhir_type: Option<&str>, path: &str) -> Vec<Value> {
+fn materialize_list(
+    value: &Json,
+    extensions: &[Json],
+    fhir_type: Option<&str>,
+    path: &str,
+) -> Vec<Value> {
     match value {
         Json::Array(items) => items
             .iter()
@@ -1718,7 +2440,12 @@ fn materialize_list(value: &Json, extensions: &[Json], fhir_type: Option<&str>, 
     }
 }
 
-fn materialize_one(value: &Json, extension: Option<&Json>, fhir_type: Option<&str>, path: &str) -> Value {
+fn materialize_one(
+    value: &Json,
+    extension: Option<&Json>,
+    fhir_type: Option<&str>,
+    path: &str,
+) -> Value {
     let extensions = extension
         .and_then(|value| value.get("extension"))
         .and_then(|value| value.as_array())
@@ -1742,7 +2469,10 @@ fn coerce_primitive(value: &Json, fhir_type: &str) -> Json {
     };
     match fhir_type {
         "boolean" => Json::Bool(text == "true"),
-        "integer" | "unsignedInt" | "positiveInt" => text.parse::<i64>().map(|number| Json::Number(number.into())).unwrap_or_else(|_| value.clone()),
+        "integer" | "unsignedInt" | "positiveInt" => text
+            .parse::<i64>()
+            .map(|number| Json::Number(number.into()))
+            .unwrap_or_else(|_| value.clone()),
         "decimal" => serde_json::Number::from_f64(text.parse().unwrap_or(0.0))
             .map(Json::Number)
             .unwrap_or_else(|| value.clone()),
@@ -1781,7 +2511,9 @@ fn choice_type_name(suffix: &str) -> String {
         Some(first) => {
             let rest: String = chars.collect();
             let lowered = format!("{}{rest}", first.to_lowercase());
-            if lowered.chars().next().is_some_and(|ch| ch.is_lowercase()) && suffix_is_primitive(&lowered) {
+            if lowered.chars().next().is_some_and(|ch| ch.is_lowercase())
+                && suffix_is_primitive(&lowered)
+            {
                 lowered
             } else {
                 suffix.to_string()
@@ -1819,7 +2551,9 @@ fn suffix_is_primitive(name: &str) -> bool {
 
 fn extensions_of(value: &Value, url: &str) -> Vec<Value> {
     let extensions = match value {
-        Value::Node { extensions, json, .. } => {
+        Value::Node {
+            extensions, json, ..
+        } => {
             let mut all = extensions.clone();
             if let Some(extra) = json.get("extension").and_then(|value| value.as_array()) {
                 all.extend(extra.clone());
@@ -1856,15 +2590,29 @@ impl Ctx<'_> {
                 }
                 let element_path = self
                     .model
-                    .canonical(&if path.is_empty() { key.clone() } else { format!("{path}.{key}") })
+                    .canonical(&if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    })
                     .to_string();
                 let types = self.model.element_types(&element_path);
                 let fhir_type = types.first().cloned();
                 let child_path = match fhir_type.as_deref() {
-                    Some(fhir_type) if !self.model.has_descendants(&element_path) && self.model.has_descendants(fhir_type) => fhir_type.to_string(),
+                    Some(fhir_type)
+                        if !self.model.has_descendants(&element_path)
+                            && self.model.has_descendants(fhir_type) =>
+                    {
+                        fhir_type.to_string()
+                    }
                     _ => element_path,
                 };
-                children.extend(materialize_list(value, &extension_siblings(json, key), fhir_type.as_deref(), &child_path));
+                children.extend(materialize_list(
+                    value,
+                    &extension_siblings(json, key),
+                    fhir_type.as_deref(),
+                    &child_path,
+                ));
             }
         }
         children
@@ -1897,14 +2645,23 @@ fn reference_text(value: &Value) -> Option<String> {
 }
 
 fn contained(root: &Json, id: &str) -> Option<Json> {
-    root.get("contained")?.as_array()?.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)).cloned()
+    root.get("contained")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+        .cloned()
 }
 
 fn code_of(value: &Value) -> (Option<String>, String) {
     match value {
         Value::Node { json, .. } => {
             if let Some(code) = json.get("code").and_then(|item| item.as_str()) {
-                return (json.get("system").and_then(|item| item.as_str()).map(|value| value.to_string()), code.to_string());
+                return (
+                    json.get("system")
+                        .and_then(|item| item.as_str())
+                        .map(|value| value.to_string()),
+                    code.to_string(),
+                );
             }
             (None, json.as_str().unwrap_or("").to_string())
         }
@@ -1920,7 +2677,9 @@ fn precision_of(value: &Value) -> Option<i64> {
         Value::Decimal { scale, .. } => Some(*scale as i64),
         Value::Integer(_) => Some(0),
         Value::Date(value) => Some(value.precision_digits(crate::value::TimeKind::Date) as i64),
-        Value::DateTime(value) => Some(value.precision_digits(crate::value::TimeKind::DateTime) as i64),
+        Value::DateTime(value) => {
+            Some(value.precision_digits(crate::value::TimeKind::DateTime) as i64)
+        }
         Value::Time(value) => Some(value.precision_digits(crate::value::TimeKind::Time) as i64),
         _ => None,
     }
@@ -1929,7 +2688,11 @@ fn precision_of(value: &Value) -> Option<i64> {
 fn temporal_value(value: &Value) -> Option<Value> {
     match value {
         Value::Date(_) | Value::DateTime(_) | Value::Time(_) => Some(value.clone()),
-        Value::Node { json: Json::String(text), fhir_type, .. } => {
+        Value::Node {
+            json: Json::String(text),
+            fhir_type,
+            ..
+        } => {
             let (temporal, kind) = parse_temporal_text(text, fhir_type.as_deref())?;
             Some(match kind {
                 crate::value::TimeKind::Date => Value::Date(temporal),
@@ -1954,38 +2717,61 @@ fn boundary(value: &Value, low: bool, precision: Option<i64>) -> Result<Outcome,
         Value::Time(_) => 9,
         _ => 8,
     });
-    let empty = Outcome { items: vec![], ordered: true };
+    let empty = Outcome {
+        items: vec![],
+        ordered: true,
+    };
     match value {
         Value::Integer(number) => {
             if !(0..=31).contains(&precision) {
                 return Ok(empty);
             }
-            Ok(one(decimal_from_boundary(&boundary_decimal(&number.to_string(), precision, low))))
+            Ok(one(decimal_from_boundary(&boundary_decimal(
+                &number.to_string(),
+                precision,
+                low,
+            ))))
         }
         Value::Decimal { value, scale } => {
             if !(0..=31).contains(&precision) {
                 return Ok(empty);
             }
-            Ok(one(decimal_from_boundary(&boundary_decimal(&format_decimal(*value, *scale), precision, low))))
+            Ok(one(decimal_from_boundary(&boundary_decimal(
+                &format_decimal(*value, *scale),
+                precision,
+                low,
+            ))))
         }
         Value::Quantity { value, scale, unit } => {
             if !(0..=31).contains(&precision) {
                 return Ok(empty);
             }
-            match decimal_from_boundary(&boundary_decimal(&format_decimal(*value, *scale), precision, low)) {
-                Value::Decimal { value, scale } => Ok(one(Value::Quantity { value, scale, unit: unit.clone() })),
+            match decimal_from_boundary(&boundary_decimal(
+                &format_decimal(*value, *scale),
+                precision,
+                low,
+            )) {
+                Value::Decimal { value, scale } => Ok(one(Value::Quantity {
+                    value,
+                    scale,
+                    unit: unit.clone(),
+                })),
                 other => Ok(one(other)),
             }
         }
-        Value::Date(temporal) | Value::DateTime(temporal) | Value::Time(temporal) => {
-            Ok(temporal_boundary(temporal, temporal_kind_of(value), low, precision as u32).unwrap_or(empty))
-        }
+        Value::Date(temporal) | Value::DateTime(temporal) | Value::Time(temporal) => Ok(
+            temporal_boundary(temporal, temporal_kind_of(value), low, precision as u32)
+                .unwrap_or(empty),
+        ),
         _ => Ok(empty),
     }
 }
 
 fn decimal_from_boundary(text: &str) -> Value {
-    let scale = text.split_once('.').map(|(_, fraction)| fraction.len() as u32).unwrap_or(0);
+    let scale = text
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len() as u32)
+        .unwrap_or(0);
     let numeric: String = text.chars().filter(|ch| *ch != '-').collect();
     let zero = numeric.chars().all(|ch| ch == '0' || ch == '.');
     if text.starts_with('-') && zero {
@@ -2009,14 +2795,22 @@ fn low_boundary_decimal(value: &str, precision: i64) -> String {
         return apply_precision("-0.5000000000000000000000000", precision, true);
     }
     if let Some(rest) = number.strip_prefix('-') {
-        return format!("-{}{}", high_boundary_decimal(rest, precision), exponent.unwrap_or(""));
+        return format!(
+            "-{}{}",
+            high_boundary_decimal(rest, precision),
+            exponent.unwrap_or("")
+        );
     }
     let expanded = if number.contains('.') {
         format!("{}50000000000000000000000000000", minus_one(number))
     } else {
         format!("{}.50000000000000000000000000000", minus_one(number))
     };
-    format!("{}{}", apply_precision(&expanded, precision, true), exponent.unwrap_or(""))
+    format!(
+        "{}{}",
+        apply_precision(&expanded, precision, true),
+        exponent.unwrap_or("")
+    )
 }
 
 fn high_boundary_decimal(value: &str, precision: i64) -> String {
@@ -2025,14 +2819,22 @@ fn high_boundary_decimal(value: &str, precision: i64) -> String {
         return apply_precision("0.50000000000000000000000000000", precision, false);
     }
     if let Some(rest) = number.strip_prefix('-') {
-        return format!("-{}{}", low_boundary_decimal(rest, precision), exponent.unwrap_or(""));
+        return format!(
+            "-{}{}",
+            low_boundary_decimal(rest, precision),
+            exponent.unwrap_or("")
+        );
     }
     let expanded = if number.contains('.') {
         format!("{number}50000000000000000000000000000")
     } else {
         format!("{number}.50000000000000000000000000000")
     };
-    format!("{}{}", apply_precision(&expanded, precision, false), exponent.unwrap_or(""))
+    format!(
+        "{}{}",
+        apply_precision(&expanded, precision, false),
+        exponent.unwrap_or("")
+    )
 }
 
 fn split_exponent(value: &str) -> (&str, Option<&str>) {
@@ -2082,7 +2884,10 @@ fn apply_precision(value: &str, precision: i64, down: bool) -> String {
 
 fn decimal_places(value: &str) -> usize {
     let value = value.split(['e', 'E']).next().unwrap_or(value);
-    value.split_once('.').map(|(_, fraction)| fraction.len()).unwrap_or(0)
+    value
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0)
 }
 
 fn minus_one(value: &str) -> String {
@@ -2098,10 +2903,17 @@ fn minus_one(value: &str) -> String {
     chars.into_iter().collect()
 }
 
-fn temporal_boundary(temporal: &Temporal, kind: crate::value::TimeKind, low: bool, precision: u32) -> Option<Outcome> {
+fn temporal_boundary(
+    temporal: &Temporal,
+    kind: crate::value::TimeKind,
+    low: bool,
+    precision: u32,
+) -> Option<Outcome> {
     let allowed: &[u32] = match kind {
         crate::value::TimeKind::Time => &[2, 4, 6, 9],
-        crate::value::TimeKind::Date | crate::value::TimeKind::DateTime => &[4, 6, 8, 10, 12, 14, 17],
+        crate::value::TimeKind::Date | crate::value::TimeKind::DateTime => {
+            &[4, 6, 8, 10, 12, 14, 17]
+        }
     };
     if !allowed.contains(&precision) {
         return None;
