@@ -3,15 +3,15 @@
 
 use std::sync::{Arc, RwLock};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::Message;
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use futures_util::{SinkExt, StreamExt};
+use axum::extract::{Extension, Path, Query, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::{SinkExt, StreamExt};
 use refhir_database::{CommitError, Database};
 use refhir_fhir::{outcome_code, Catalog, ConformanceStore, FhirError, RunError, RunResult};
 use serde_json::{json, Value};
@@ -103,6 +103,7 @@ pub fn app_with(
         config: config.clone(),
     };
     let router = router
+        .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(state.clone(), smart_guard))
         .with_state(state);
     crate::jobs::attach(db, catalog, store, &config);
@@ -157,26 +158,175 @@ async fn metadata(State(app): State<AppState>) -> Response {
     fhir_json(StatusCode::OK, statement)
 }
 
+async fn request_log(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let uri = request.uri().clone();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    let status = response.status();
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    log_http_request(&method, uri.path(), uri.query(), status, elapsed_ms);
+    response
+}
+
+fn log_http_request(
+    method: &axum::http::Method,
+    path: &str,
+    query: Option<&str>,
+    status: StatusCode,
+    elapsed_ms: f64,
+) {
+    let redacted = redact_query(query);
+    let query = redacted.as_deref();
+    if status.is_server_error() {
+        tracing::error!(
+            method = %method,
+            path,
+            query,
+            status = status.as_u16(),
+            elapsed_ms,
+            "http request"
+        );
+    } else if status.is_client_error() {
+        tracing::warn!(
+            method = %method,
+            path,
+            query,
+            status = status.as_u16(),
+            elapsed_ms,
+            "http request"
+        );
+    } else {
+        tracing::info!(
+            method = %method,
+            path,
+            query,
+            status = status.as_u16(),
+            elapsed_ms,
+            "http request"
+        );
+    }
+}
+
+fn redact_query(query: Option<&str>) -> Option<String> {
+    let query = query?;
+    if !query.contains("access_token") {
+        return Some(query.to_string());
+    }
+    Some(
+        query
+            .split('&')
+            .map(|pair| {
+                let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+                if key == "access_token" {
+                    "access_token=REDACTED"
+                } else {
+                    pair
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&"),
+    )
+}
+
 async fn smart_guard(
     State(app): State<AppState>,
-    request: Request<axum::body::Body>,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
     if app.config.auth {
-        let path = request.uri().path();
-        let open = path == "/metadata"
-            || path.starts_with("/.well-known")
-            || path.starts_with("/oauth/");
+        let path = request.uri().path().to_string();
+        let open =
+            path == "/metadata" || path.starts_with("/.well-known") || path.starts_with("/oauth/");
         if !open {
             let method = request.method().as_str().to_string();
-            let resource = fhir_type_from_path(path);
-            if let Some(response) = crate::auth::check(&app, request.headers(), &method, &resource, None)
-            {
-                return response;
+            let query = request.uri().query().map(str::to_string);
+            if path == "/sync" {
+                match crate::auth::open_sync_session(&app, request.headers(), query.as_deref()) {
+                    Ok(session) => {
+                        request.extensions_mut().insert(session);
+                    }
+                    Err(response) => return response,
+                }
+            } else {
+                let resource = fhir_type_from_path(&path);
+                if let Some(response) = crate::auth::check(
+                    &app,
+                    request.headers(),
+                    query.as_deref(),
+                    &method,
+                    &resource,
+                    None,
+                ) {
+                    return response;
+                }
+                let patient =
+                    crate::auth::patient_compartment(&app, request.headers(), query.as_deref());
+                if let Some(patient) = patient {
+                    if let Some(response) =
+                        reject_patient_http(&app, &patient, &method, &path, &mut request).await
+                    {
+                        return response;
+                    }
+                }
             }
         }
     }
     next.run(request).await
+}
+
+async fn reject_patient_http(
+    app: &AppState,
+    patient: &str,
+    method: &str,
+    path: &str,
+    request: &mut Request<Body>,
+) -> Option<Response> {
+    let body = match buffered_body(request).await {
+        Ok(body) => body,
+        Err(response) => return Some(response),
+    };
+    let operation = match crate::auth::patient_http_operation(method, path, body.as_ref()) {
+        Ok(operation) => operation,
+        Err(message) => return Some(forbidden_response(&message)),
+    };
+    let Some((operation, args)) = operation else {
+        return None;
+    };
+    let catalog = app.catalog.read().expect("catalog");
+    if let Err(message) =
+        crate::auth::guard_patient_operation(&app.db, &catalog, patient, &operation, &args)
+    {
+        return Some(forbidden_response(&message));
+    }
+    None
+}
+
+async fn buffered_body(request: &mut Request<Body>) -> Result<Option<Value>, Response> {
+    if request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD {
+        return Ok(None);
+    }
+    let bytes = axum::body::to_bytes(
+        std::mem::replace(request.body_mut(), Body::empty()),
+        32 * 1024 * 1024,
+    )
+    .await
+    .map_err(|_| {
+        outcome(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too-costly",
+            "request body is too large",
+        )
+    })?;
+    *request.body_mut() = Body::from(bytes.clone());
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    parse_body(&bytes).map(Some)
+}
+
+fn forbidden_response(message: &str) -> Response {
+    outcome(StatusCode::FORBIDDEN, "forbidden", message)
 }
 
 fn fhir_type_from_path(path: &str) -> String {
@@ -192,8 +342,19 @@ fn fhir_type_from_path(path: &str) -> String {
     }
 }
 
-async fn sync_ws(ws: WebSocketUpgrade, State(app): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| sync::handle_socket(socket, app.db, app.catalog, app.store))
+async fn sync_ws(
+    ws: WebSocketUpgrade,
+    State(app): State<AppState>,
+    session: Option<Extension<crate::auth::SyncSession>>,
+) -> Response {
+    if app.config.auth && session.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let session = session.map(|Extension(session)| session);
+    ws.on_upgrade(move |socket| {
+        sync::handle_socket(socket, app.db, app.catalog, app.store, session)
+    })
+    .into_response()
 }
 
 async fn bundle_post(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -253,7 +414,12 @@ async fn create(
             } else {
                 StatusCode::CREATED
             };
-            resource_response(status, result.value, Some(location), prefer_xml(&headers, &[]))
+            resource_response(
+                status,
+                result.value,
+                Some(location),
+                prefer_xml(&headers, &[]),
+            )
         }
         Err(err) => error_response(err),
     }
@@ -348,7 +514,12 @@ async fn read(
     )
     .await
     {
-        Ok(result) => resource_response(StatusCode::OK, result.value, None, prefer_xml(&headers, &params)),
+        Ok(result) => resource_response(
+            StatusCode::OK,
+            result.value,
+            None,
+            prefer_xml(&headers, &params),
+        ),
         Err(err) => error_response(err),
     }
 }
@@ -414,14 +585,16 @@ async fn search(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    if let Some(response) = authorize(&app, &headers, "GET", &resource_type, None) {
+    if let Some(response) = authorize(&app, &headers, uri.query(), "GET", &resource_type, None) {
         return response;
     }
     let xml = prefer_xml(&headers, &params);
     let mut args = query_object(params);
-    if let Some(compartment) = crate::auth::patient_compartment(&app, &headers) {
+    args.remove("access_token");
+    if let Some(compartment) = crate::auth::patient_compartment(&app, &headers, uri.query()) {
         args.entry("_compartment".to_string())
             .or_insert(Value::String(compartment));
     }
@@ -597,9 +770,12 @@ async fn patch_op(
     )
     .await
     {
-        Ok(result) => {
-            resource_response(StatusCode::OK, result.value, None, prefer_xml(&headers, &[]))
-        }
+        Ok(result) => resource_response(
+            StatusCode::OK,
+            result.value,
+            None,
+            prefer_xml(&headers, &[]),
+        ),
         Err(err) => error_response(err),
     }
 }
@@ -651,12 +827,7 @@ async fn meta_get(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
 ) -> Response {
-    run_read(
-        &app,
-        &format!("{resource_type}/$meta"),
-        json!({"id": id}),
-    )
-    .await
+    run_read(&app, &format!("{resource_type}/$meta"), json!({"id": id})).await
 }
 
 async fn meta_post(
@@ -791,11 +962,12 @@ async fn run_read(app: &AppState, path: &str, args: Value) -> Response {
 fn authorize(
     app: &AppState,
     headers: &HeaderMap,
+    query: Option<&str>,
     method: &str,
     resource_type: &str,
     patient: Option<&str>,
 ) -> Option<Response> {
-    crate::auth::check(app, headers, method, resource_type, patient)
+    crate::auth::check(app, headers, query, method, resource_type, patient)
 }
 
 fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
@@ -808,7 +980,8 @@ fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
     }
     if bytes.first() == Some(&b'<') {
         let text = std::str::from_utf8(bytes).unwrap_or("");
-        return crate::xml::to_json(text).map_err(|err| outcome(StatusCode::BAD_REQUEST, "invalid", &err));
+        return crate::xml::to_json(text)
+            .map_err(|err| outcome(StatusCode::BAD_REQUEST, "invalid", &err));
     }
     serde_json::from_slice(bytes).map_err(|err| {
         outcome(
@@ -821,7 +994,8 @@ fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
 
 fn prefer_xml(headers: &HeaderMap, params: &[(String, String)]) -> bool {
     if params.iter().any(|(key, value)| {
-        key == "_format" && (value == "xml" || value.contains("fhir+xml") || value == "application/xml")
+        key == "_format"
+            && (value == "xml" || value.contains("fhir+xml") || value == "application/xml")
     }) {
         return true;
     }
@@ -830,7 +1004,9 @@ fn prefer_xml(headers: &HeaderMap, params: &[(String, String)]) -> bool {
         .and_then(|value| value.to_str().ok())
         .is_some_and(|accept| {
             let accept = accept.to_ascii_lowercase();
-            (accept.contains("fhir+xml") || accept.contains("application/xml") || accept.contains("text/xml"))
+            (accept.contains("fhir+xml")
+                || accept.contains("application/xml")
+                || accept.contains("text/xml"))
                 && !accept.contains("json")
         })
 }
@@ -884,6 +1060,7 @@ fn fhir_json(status: StatusCode, value: Value) -> Response {
 
 pub(crate) fn error_response(err: RunError) -> Response {
     if let RunError::Fhir(FhirError::Outcome(value)) = &err {
+        tracing::warn!(diagnostics = %value, "fhir operation failed");
         return fhir_json(StatusCode::BAD_REQUEST, value.clone());
     }
     let (status, code, diagnostics) = match &err {
@@ -899,6 +1076,12 @@ pub(crate) fn error_response(err: RunError) -> Response {
             other.to_string(),
         ),
     };
+    tracing::warn!(
+        status = status.as_u16(),
+        code,
+        diagnostics = %diagnostics,
+        "fhir operation failed"
+    );
     outcome(status, code, &diagnostics)
 }
 
@@ -933,6 +1116,24 @@ fn outcome(status: StatusCode, code: &str, diagnostics: &str) -> Response {
             }]
         }),
     )
+}
+
+#[cfg(test)]
+mod query_redaction {
+    use super::redact_query;
+
+    #[test]
+    fn access_token_is_not_logged() {
+        assert_eq!(
+            redact_query(Some("active=true&access_token=secret")).as_deref(),
+            Some("active=true&access_token=REDACTED")
+        );
+        assert_eq!(
+            redact_query(Some("active=true")).as_deref(),
+            Some("active=true")
+        );
+        assert_eq!(redact_query(None), None);
+    }
 }
 
 fn fhir_status(err: &FhirError) -> StatusCode {

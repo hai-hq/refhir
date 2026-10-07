@@ -1,0 +1,65 @@
+{
+  "name": "@hai-hq/refhir",
+  "version": "0.1.0",
+  "description": "TypeScript client for ReFHIR /sync and FHIR REST",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hai-hq/haifhir.git",
+    "directory": "clients/ts"
+  },
+  "browser": "./dist/index-browser.js",
+  "exports": {
+    ".": {
+      "browser": {
+        "types": "./dist/index-browser.d.ts",
+        "default": "./dist/index-browser.js"
+      },
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./react": {
+      "browser": {
+        "types": "./dist/react/index-browser.d.ts",
+        "default": "./dist/react/index-browser.js"
+      },
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "seed": "tsx scripts/seed.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.18",
+    "@types/react-test-renderer": "^18.3.1",
+    "@types/ws": "^8.5.13",
+    "react": "^18.3.1",
+    "react-test-renderer": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

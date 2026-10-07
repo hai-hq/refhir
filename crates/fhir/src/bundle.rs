@@ -315,7 +315,11 @@ fn conditional_entry(
     match method {
         "POST" | "PUT" => {
             let (updated, status) = ops::conditional_update(tx, catalog, model, resource, query)?;
-            let code = if status == 201 { "201 Created" } else { "200 OK" };
+            let code = if status == 201 {
+                "201 Created"
+            } else {
+                "200 OK"
+            };
             let id = updated["id"].as_str().unwrap_or("");
             Ok(json!({
                 "response": {
@@ -331,7 +335,8 @@ fn conditional_entry(
             Ok(json!({"response": {"status": "204 No Content"}}))
         }
         "GET" => {
-            let bundle = crate::search::search(tx, catalog, model, &crate::patch::parse_query(query))?;
+            let bundle =
+                crate::search::search(tx, catalog, model, &crate::patch::parse_query(query))?;
             Ok(json!({
                 "response": {"status": "200 OK"},
                 "resource": bundle

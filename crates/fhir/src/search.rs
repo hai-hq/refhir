@@ -14,12 +14,30 @@ use crate::ops::decorate;
 use crate::resolve::TxHost;
 
 const MODIFIERS: &[&str] = &[
-    "exact", "contains", "missing", "text", "not", "above", "below", "in", "not-in", "of-type",
+    "exact",
+    "contains",
+    "missing",
+    "text",
+    "not",
+    "above",
+    "below",
+    "in",
+    "not-in",
+    "of-type",
     "identifier",
 ];
 
 const WIDE: &[&str] = &[
-    "contains", "missing", "not", "text", "above", "below", "in", "not-in", "of-type", "identifier",
+    "contains",
+    "missing",
+    "not",
+    "text",
+    "above",
+    "below",
+    "in",
+    "not-in",
+    "of-type",
+    "identifier",
 ];
 
 struct Controls {
@@ -82,19 +100,15 @@ pub fn search(
     let mut matched = Vec::new();
     for row in rows {
         if !row_matches(
-            catalog,
-            model,
-            &row.json,
-            &clauses,
-            &chain_ids,
-            &has_ids,
-            &controls,
-            &host,
+            catalog, model, &row.json, &clauses, &chain_ids, &has_ids, &controls, &host,
         ) {
             continue;
         }
         let id = row.id.id_str().unwrap_or("").to_string();
-        matched.push((id, decorate(row.json, row.id.id_str().unwrap_or(""), row.ts)));
+        matched.push((
+            id,
+            decorate(row.json, row.id.id_str().unwrap_or(""), row.ts),
+        ));
     }
     sort_matches(catalog, model, &mut matched, &controls.sort);
     let total = matched.len();
@@ -134,7 +148,12 @@ pub fn search(
 fn page_len(entries: &[Value]) -> usize {
     entries
         .iter()
-        .filter(|entry| entry.pointer("/search/mode").and_then(|value| value.as_str()) == Some("match"))
+        .filter(|entry| {
+            entry
+                .pointer("/search/mode")
+                .and_then(|value| value.as_str())
+                == Some("match")
+        })
         .count()
 }
 
@@ -221,7 +240,10 @@ fn parse_include(text: &str) -> Option<IncludeSpec> {
     Some(IncludeSpec { param, target })
 }
 
-fn clauses_from(model: &ResourceModel, params: &BTreeMap<String, String>) -> Result<Vec<Clause>, FhirError> {
+fn clauses_from(
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+) -> Result<Vec<Clause>, FhirError> {
     let mut clauses = Vec::new();
     for (name, value) in params {
         if is_control(name) {
@@ -528,33 +550,46 @@ fn row_matches(
             return false;
         }
     }
-    clauses.iter().enumerate().all(|(index, clause)| match clause {
-        Clause::Id(id) => resource.get("id").and_then(|item| item.as_str()) == Some(id),
-        Clause::Filter(value) => eval_filter(value, catalog, model, resource, host),
-        Clause::Param {
-            name,
-            modifier,
-            value,
-        } => param_matches(catalog, model, resource, name, modifier.as_deref(), value, host),
-        Clause::Chain { param, .. } => {
-            let Some(search) = model.ready_param(param) else {
-                return false;
-            };
-            let ids = &chain_ids[index];
-            search
-                .extractor
-                .indexed(resource, catalog.path_model(), host)
-                .iter()
-                .any(|reference| {
-                    ids.contains(reference)
-                        || reference.rsplit_once('/').is_some_and(|(_, id)| ids.contains(id))
-                })
-        }
-        Clause::Has { .. } => resource
-            .get("id")
-            .and_then(|item| item.as_str())
-            .is_some_and(|id| has_ids[index].contains(id)),
-    })
+    clauses
+        .iter()
+        .enumerate()
+        .all(|(index, clause)| match clause {
+            Clause::Id(id) => resource.get("id").and_then(|item| item.as_str()) == Some(id),
+            Clause::Filter(value) => eval_filter(value, catalog, model, resource, host),
+            Clause::Param {
+                name,
+                modifier,
+                value,
+            } => param_matches(
+                catalog,
+                model,
+                resource,
+                name,
+                modifier.as_deref(),
+                value,
+                host,
+            ),
+            Clause::Chain { param, .. } => {
+                let Some(search) = model.ready_param(param) else {
+                    return false;
+                };
+                let ids = &chain_ids[index];
+                search
+                    .extractor
+                    .indexed(resource, catalog.path_model(), host)
+                    .iter()
+                    .any(|reference| {
+                        ids.contains(reference)
+                            || reference
+                                .rsplit_once('/')
+                                .is_some_and(|(_, id)| ids.contains(id))
+                    })
+            }
+            Clause::Has { .. } => resource
+                .get("id")
+                .and_then(|item| item.as_str())
+                .is_some_and(|id| has_ids[index].contains(id)),
+        })
 }
 
 fn param_matches(
@@ -575,13 +610,17 @@ fn param_matches(
             .matches(resource, value, catalog.path_model(), host),
         Some("above" | "below" | "in" | "not-in") => hierarchy_match(
             catalog,
-            &param.extractor.indexed(resource, catalog.path_model(), host),
+            &param
+                .extractor
+                .indexed(resource, catalog.path_model(), host),
             modifier.unwrap_or(""),
             value,
         ),
-        Some(modifier) => param
-            .extractor
-            .matches_modifier(resource, modifier, value, catalog.path_model(), host),
+        Some(modifier) => {
+            param
+                .extractor
+                .matches_modifier(resource, modifier, value, catalog.path_model(), host)
+        }
     }
 }
 
@@ -617,10 +656,7 @@ fn in_set(terms: &refhir_validate::MemoryTerminology, token: &str, value_set: &s
     let Some(code) = code else {
         return false;
     };
-    matches!(
-        terms.contains(value_set, system, code),
-        TermAnswer::Yes
-    )
+    matches!(terms.contains(value_set, system, code), TermAnswer::Yes)
 }
 
 fn token_parts(token: &str) -> (Option<&str>, Option<&str>) {
@@ -631,6 +667,33 @@ fn token_parts(token: &str) -> (Option<&str>, Option<&str>) {
     } else {
         (None, Some(token))
     }
+}
+
+pub fn resource_in_compartment(
+    catalog: &Catalog,
+    tx: &mut Transaction,
+    resource: &Value,
+    compartment_type: &str,
+    compartment_id: &str,
+) -> bool {
+    let Some(type_name) = resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+    else {
+        return false;
+    };
+    let Ok(model) = catalog.get(type_name) else {
+        return false;
+    };
+    let host = TxHost::new(tx, catalog);
+    in_compartment(
+        catalog,
+        model,
+        resource,
+        compartment_type,
+        compartment_id,
+        &host,
+    )
 }
 
 fn in_compartment(
@@ -812,7 +875,11 @@ fn push_forward(
             continue;
         };
         let type_name = type_name.rsplit('/').next().unwrap_or(type_name);
-        if spec.target.as_deref().is_some_and(|target| target != type_name) {
+        if spec
+            .target
+            .as_deref()
+            .is_some_and(|target| target != type_name)
+        {
             continue;
         }
         if !seen.insert(format!("{type_name}/{id}")) {
@@ -847,7 +914,11 @@ fn push_reverse(
         };
         let rows = tx.index_range(&other.search_index(&spec.param), token_interval(&token))?;
         for row in rows {
-            if !param.extractor.indexed(&row.json, catalog.path_model(), &TxHost::new(tx, catalog)).iter().any(|reference| reference == &token)
+            if !param
+                .extractor
+                .indexed(&row.json, catalog.path_model(), &TxHost::new(tx, catalog))
+                .iter()
+                .any(|reference| reference == &token)
             {
                 continue;
             }
@@ -870,7 +941,9 @@ fn page_offset(params: &BTreeMap<String, String>) -> Result<usize, FhirError> {
             return Err(FhirError::Invalid("invalid _cursor".into()));
         };
         if canonical != cursor_canonical(params) {
-            return Err(FhirError::Invalid("cursor does not match this search".into()));
+            return Err(FhirError::Invalid(
+                "cursor does not match this search".into(),
+            ));
         }
         return Ok(offset);
     }

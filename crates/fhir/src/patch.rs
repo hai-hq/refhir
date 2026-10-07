@@ -23,7 +23,10 @@ fn apply_json_patch(resource: &mut Value, patch: &Value) -> Result<(), FhirError
             .get("op")
             .and_then(|value| value.as_str())
             .ok_or_else(|| FhirError::Invalid("patch op is required".into()))?;
-        let path = op.get("path").and_then(|value| value.as_str()).unwrap_or("");
+        let path = op
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         match kind {
             "add" => {
                 let value = op
@@ -140,7 +143,12 @@ fn primitive_or_value(key: &str, value: &Value) -> Value {
     if value.is_object() || value.is_array() {
         return value.clone();
     }
-    if key == "valueString" || key == "valueCode" || key == "valueUri" || key == "valueDate" || key == "valueDateTime" || key == "valueId"
+    if key == "valueString"
+        || key == "valueCode"
+        || key == "valueUri"
+        || key == "valueDate"
+        || key == "valueDateTime"
+        || key == "valueId"
     {
         return value.clone();
     }
@@ -162,7 +170,12 @@ fn fhir_pointer(path: &str) -> String {
             .split_once('[')
             .map(|(name, rest)| (name, rest.trim_end_matches(']')))
             .unwrap_or((segment, ""));
-        if name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) && out.is_empty() {
+        if name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+            && out.is_empty()
+        {
             continue;
         }
         out.push('/');
@@ -175,7 +188,12 @@ fn fhir_pointer(path: &str) -> String {
     out
 }
 
-fn write_child(target: &mut Value, name: &str, value: Value, insert: bool) -> Result<(), FhirError> {
+fn write_child(
+    target: &mut Value,
+    name: &str,
+    value: Value,
+    insert: bool,
+) -> Result<(), FhirError> {
     if name.is_empty() {
         *target = value;
         return Ok(());
@@ -235,7 +253,9 @@ fn pointer_add(resource: &mut Value, pointer: &str, value: Value) -> Result<(), 
                 .parse()
                 .map_err(|_| FhirError::Invalid(format!("bad array index {token}")))?;
             if index > items.len() {
-                return Err(FhirError::Invalid(format!("array index {index} is past the end")));
+                return Err(FhirError::Invalid(format!(
+                    "array index {index} is past the end"
+                )));
             }
             items.insert(index, value);
             Ok(())
@@ -262,7 +282,9 @@ fn pointer_remove(resource: &mut Value, pointer: &str) -> Result<(), FhirError> 
                 .parse()
                 .map_err(|_| FhirError::Invalid(format!("bad array index {token}")))?;
             if index >= items.len() {
-                return Err(FhirError::Invalid(format!("array index {index} is past the end")));
+                return Err(FhirError::Invalid(format!(
+                    "array index {index} is past the end"
+                )));
             }
             items.remove(index);
             Ok(())
@@ -284,9 +306,9 @@ fn parent_value<'a>(
     } else {
         format!("/{parent}")
     };
-    resource.pointer_mut(&parent_pointer).ok_or_else(|| {
-        FhirError::Invalid(format!("patch path {pointer} was not found"))
-    })
+    resource
+        .pointer_mut(&parent_pointer)
+        .ok_or_else(|| FhirError::Invalid(format!("patch path {pointer} was not found")))
 }
 
 fn split_pointer(pointer: &str) -> Result<(&str, &str), FhirError> {

@@ -19,6 +19,22 @@ use refhir_persistence::{ConflictStrategy, PersistError, Persistence, Persistenc
 use refhir_types::{IndexId, Timestamp};
 use tokio::sync::mpsc::UnboundedSender;
 
+const ENGINE: &str = "refhir_engine";
+
+fn write_keys_summary(keys: &[(IndexId, Vec<u8>)], limit: usize) -> String {
+    keys.iter()
+        .take(limit)
+        .map(|(index, key)| {
+            format!(
+                "{}:{}",
+                index.as_str(),
+                String::from_utf8_lossy(key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub use reads::ReadSet;
 pub use subscription::{Invalidation, SubToken};
 pub use transaction::{
@@ -140,6 +156,7 @@ impl Committer {
     ) -> Result<Timestamp, CommitError> {
         if self.occ_faults > 0 {
             self.occ_faults -= 1;
+            tracing::debug!(target: ENGINE, begin_ts = begin_ts.as_u64(), "occ fault injected (test)");
             return Err(CommitError::Occ(OccConflict {
                 index_id: IndexId::new("occ-fault"),
                 key: Vec::new(),
@@ -148,9 +165,27 @@ impl Committer {
         }
         let commit_ts = self.next_commit_ts()?;
         if let Some(conflict) = self.log.is_stale(reads, begin_ts, commit_ts) {
+            tracing::debug!(
+                target: ENGINE,
+                begin_ts = begin_ts.as_u64(),
+                commit_ts = commit_ts.as_u64(),
+                index = conflict.index_id.as_str(),
+                write_ts = conflict.write_ts.as_u64(),
+                reads = reads.summary(),
+                "occ conflict (published write log)"
+            );
             return Err(CommitError::Occ(conflict));
         }
         if let Some(conflict) = self.pending.is_stale(reads) {
+            tracing::debug!(
+                target: ENGINE,
+                begin_ts = begin_ts.as_u64(),
+                commit_ts = commit_ts.as_u64(),
+                index = conflict.index_id.as_str(),
+                write_ts = conflict.write_ts.as_u64(),
+                reads = reads.summary(),
+                "occ conflict (pending commit)"
+            );
             return Err(CommitError::Occ(conflict));
         }
         self.pending.push(commit_ts, keys.to_vec());
@@ -199,7 +234,13 @@ impl Database {
 
     pub fn begin(&self) -> Transaction {
         let state = self.state.lock().expect("committer");
-        Transaction::new(state.snapshot.latest_ts(), self.reader.clone())
+        let snapshot_ts = state.snapshot.latest_ts();
+        tracing::trace!(
+            target: ENGINE,
+            snapshot_ts = snapshot_ts.as_u64(),
+            "transaction opened at snapshot"
+        );
+        Transaction::new(snapshot_ts, self.reader.clone())
     }
 
     pub fn commit(&self, tx: Transaction) -> Result<Timestamp, CommitError> {
@@ -214,13 +255,29 @@ impl Database {
         mut stamp: impl FnMut(&mut String, Timestamp),
     ) -> Result<Timestamp, CommitError> {
         if !tx.has_writes() {
+            tracing::debug!(
+                target: ENGINE,
+                snapshot_ts = tx.begin_timestamp().as_u64(),
+                reads = tx.read_set().summary(),
+                "read-only transaction finished (no publish)"
+            );
             return Ok(tx.begin_timestamp());
         }
         let keys = tx.occ_keys();
+        let begin_ts = tx.begin_timestamp();
         let commit_ts = {
             let mut state = self.state.lock().expect("committer");
-            state.validate_commit(tx.read_set(), tx.begin_timestamp(), &keys)?
+            state.validate_commit(tx.read_set(), begin_ts, &keys)?
         };
+        tracing::debug!(
+            target: ENGINE,
+            begin_ts = begin_ts.as_u64(),
+            commit_ts = commit_ts.as_u64(),
+            write_keys = keys.len(),
+            keys = write_keys_summary(&keys, 12),
+            reads = tx.read_set().summary(),
+            "commit validated, persisting"
+        );
         tx.stamp_new_json(commit_ts, &mut stamp);
         let (documents, indexes) = tx.log_entries(commit_ts);
         match self
@@ -236,6 +293,13 @@ impl Database {
             }
             Err(PersistError::Uncertain(message)) => uncertain_persist(message),
         }
+        tracing::debug!(
+            target: ENGINE,
+            commit_ts = commit_ts.as_u64(),
+            documents = documents.len(),
+            index_rows = indexes.len(),
+            "persisted, publishing"
+        );
         self.publish_commit(commit_ts, keys);
         Ok(commit_ts)
     }
@@ -251,6 +315,13 @@ impl Database {
         state.log.append(ts, &keys);
         state.snapshot.push(ts);
         state.subscriptions.invalidate(&keys, ts);
+        tracing::debug!(
+            target: ENGINE,
+            commit_ts = ts.as_u64(),
+            latest_ts = state.snapshot.latest_ts().as_u64(),
+            write_keys = keys.len(),
+            "commit published, snapshot advanced"
+        );
         self.cv.notify_all();
         drop(state);
         let listeners = self
@@ -280,6 +351,13 @@ impl Database {
     ) -> Result<SubToken, SubscribeError> {
         let mut state = self.state.lock().expect("committer");
         if state.reads_are_stale(&reads, ts) {
+            tracing::debug!(
+                target: ENGINE,
+                query_id,
+                snapshot_ts = ts.as_u64(),
+                latest_ts = state.snapshot.latest_ts().as_u64(),
+                "subscribe rejected: read set stale"
+            );
             return Err(SubscribeError::Stale);
         }
         Ok(state.subscriptions.insert(query_id, reads, ts, tx))
@@ -296,6 +374,13 @@ impl Database {
             return Err(SubscribeError::Gone);
         }
         if state.reads_are_stale(&reads, ts) {
+            tracing::debug!(
+                target: ENGINE,
+                sub_token = token.0,
+                snapshot_ts = ts.as_u64(),
+                latest_ts = state.snapshot.latest_ts().as_u64(),
+                "subscription refresh rejected: read set stale"
+            );
             return Err(SubscribeError::Stale);
         }
         if state.subscriptions.refresh(token, reads, ts) {

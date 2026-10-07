@@ -488,7 +488,8 @@ async fn xml_graphql_smart_export_and_subscription() {
             terminology_urls: Vec::new(),
         },
     );
-    let xml = r#"<Patient xmlns="http://hl7.org/fhir"><id value="x1"/><active value="true"/></Patient>"#;
+    let xml =
+        r#"<Patient xmlns="http://hl7.org/fhir"><id value="x1"/><active value="true"/></Patient>"#;
     let created = send_text(
         &app,
         "POST",
@@ -557,7 +558,11 @@ async fn xml_graphql_smart_export_and_subscription() {
     assert_eq!(status, "completed");
     let file = send_text(&app, "GET", &format!("/export/{job}/file"), "", &[]).await;
     assert_eq!(file.0, StatusCode::OK);
-    assert!(file.1.contains("\"id\":\"x1\"") || file.1.contains("\"id\": \"x1\""), "{}", file.1);
+    assert!(
+        file.1.contains("\"id\":\"x1\"") || file.1.contains("\"id\": \"x1\""),
+        "{}",
+        file.1
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -608,6 +613,27 @@ async fn smart_scopes_gate_http_and_sync() {
     )
     .await;
     assert_eq!(forbidden.0, StatusCode::FORBIDDEN);
+    let history = send_text(
+        &app,
+        "GET",
+        "/_history",
+        "",
+        &[("authorization", &format!("Bearer {access}"))],
+    )
+    .await;
+    assert_eq!(history.0, StatusCode::FORBIDDEN, "{}", history.1);
+    let bundle = send_text(
+        &app,
+        "POST",
+        "/",
+        r#"{"resourceType":"Bundle","type":"transaction","entry":[]}"#,
+        &[
+            ("authorization", &format!("Bearer {access}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(bundle.0, StatusCode::FORBIDDEN, "{}", bundle.1);
 
     let metadata = send(&app, "GET", "/metadata", None, None).await;
     assert!(metadata.body["rest"][0].get("security").is_some());
@@ -620,6 +646,238 @@ async fn smart_scopes_gate_http_and_sync() {
     let url = format!("ws://{addr}/sync");
     let blocked = tokio_tungstenite::connect_async(&url).await;
     assert!(blocked.is_err());
+    let authed = format!("ws://{addr}/sync?access_token={access}");
+    let (mut socket, _) = connect(&authed).await;
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "ModifyQuerySet",
+                "baseVersion": 0,
+                "newVersion": 1,
+                "modifications": [{
+                    "type": "Add",
+                    "queryId": 1,
+                    "udfPath": "Patient/search",
+                    "args": {"active": "true"}
+                }]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let first = next_json(&mut socket).await;
+    assert_eq!(first["type"], "Transition");
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "Mutation",
+                "requestId": 1,
+                "udfPath": "Patient/update",
+                "args": {"id": "p1", "resource": {"resourceType": "Patient", "id": "p1"}}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let denied_write = next_json(&mut socket).await;
+    assert_eq!(denied_write["type"], "MutationResponse");
+    assert_eq!(denied_write["success"], false);
+    assert_eq!(denied_write["result"]["resourceType"], "OperationOutcome");
+}
+
+#[tokio::test]
+async fn access_token_query_is_decoded_and_patient_compartment_holds() {
+    crate::auth::install_token("tok+1/2=", &["user/Patient.read"], None);
+    crate::auth::install_token("patient-tok", &["patient/Patient.read"], Some("p1"));
+    crate::auth::install_token("writer-tok", &["user/Patient.write"], None);
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+        },
+    );
+    let decoded = send(
+        &app,
+        "GET",
+        "/Patient?access_token=tok%2B1%2F2%3D",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(decoded.status, StatusCode::OK, "{}", decoded.body);
+    let other = send(
+        &app,
+        "GET",
+        "/Patient/p2?access_token=patient-tok",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::FORBIDDEN, "{}", other.body);
+    let own = send(
+        &app,
+        "GET",
+        "/Patient/p1?access_token=patient-tok",
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(own.status, StatusCode::FORBIDDEN, "{}", own.body);
+    let untyped = send_text(
+        &app,
+        "POST",
+        "/",
+        &patient("p9").to_string(),
+        &[
+            ("authorization", "Bearer writer-tok"),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(untyped.0, StatusCode::FORBIDDEN, "{}", untyped.1);
+    let graphql = send_text(
+        &app,
+        "POST",
+        "/graphql",
+        "{}",
+        &[
+            ("authorization", "Bearer writer-tok"),
+            ("content-type", "application/json"),
+        ],
+    )
+    .await;
+    assert_eq!(graphql.0, StatusCode::FORBIDDEN, "{}", graphql.1);
+    let created = send_text(
+        &app,
+        "POST",
+        "/Patient",
+        &patient("p9").to_string(),
+        &[
+            ("authorization", "Bearer writer-tok"),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+}
+
+#[tokio::test]
+async fn patient_scope_cannot_leave_its_compartment() {
+    let (db, catalog, store) = memory();
+    {
+        let loaded = catalog.read().expect("catalog");
+        for (id, subject) in [("o1", "p1"), ("o2", "p2")] {
+            refhir_fhir::run(
+                &db,
+                &loaded,
+                "Patient/create",
+                &json!({"resource": patient(subject)}),
+            )
+            .unwrap();
+            refhir_fhir::run(
+                &db,
+                &loaded,
+                "Observation/create",
+                &json!({"resource": {
+                    "resourceType": "Observation",
+                    "id": id,
+                    "subject": {"reference": format!("Patient/{subject}")},
+                    "code": {"coding": [{"code": "8480-6"}]}
+                }}),
+            )
+            .unwrap();
+        }
+        assert!(crate::auth::guard_patient_operation(
+            &db,
+            &loaded,
+            "Patient/p1",
+            "Observation/read",
+            &json!({"id": "o2"}),
+        )
+        .is_err());
+        assert!(crate::auth::guard_patient_operation(
+            &db,
+            &loaded,
+            "Patient/p1",
+            "Observation/read",
+            &json!({"id": "o1"}),
+        )
+        .is_ok());
+        assert!(crate::auth::guard_patient_operation(
+            &db,
+            &loaded,
+            "Patient/p1",
+            "Bundle/transaction",
+            &json!({"resource": {"entry": [{
+                "resource": {
+                    "resourceType": "Observation",
+                    "id": "o3",
+                    "subject": {"reference": "Patient/p2"},
+                    "code": {"coding": [{"code": "8480-6"}]}
+                },
+                "request": {"method": "POST", "url": "Observation"}
+            }]}}),
+        )
+        .is_err());
+        assert!(crate::auth::guard_patient_operation(
+            &db,
+            &loaded,
+            "Patient/p1",
+            "Patient/create",
+            &json!({"resource": patient("p2")}),
+        )
+        .is_err());
+    }
+    crate::auth::install_token(
+        "compartment-writer",
+        &["patient/*.write", "patient/*.read"],
+        Some("p1"),
+    );
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+        },
+    );
+    let other = send_text(
+        &app,
+        "GET",
+        "/Observation/o2",
+        "",
+        &[("authorization", "Bearer compartment-writer")],
+    )
+    .await;
+    assert_eq!(other.0, StatusCode::FORBIDDEN, "{}", other.1);
+    let own = send_text(
+        &app,
+        "GET",
+        "/Observation/o1",
+        "",
+        &[("authorization", "Bearer compartment-writer")],
+    )
+    .await;
+    assert_eq!(own.0, StatusCode::OK, "{}", own.1);
+    let create_other = send_text(
+        &app,
+        "POST",
+        "/Patient",
+        &patient("p3").to_string(),
+        &[
+            ("authorization", "Bearer compartment-writer"),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(create_other.0, StatusCode::FORBIDDEN, "{}", create_other.1);
 }
 
 #[tokio::test]
@@ -627,7 +885,13 @@ async fn include_search_invalidates_when_the_included_patient_changes() {
     let (db, catalog, store) = memory();
     {
         let loaded = catalog.read().expect("catalog");
-        refhir_fhir::run(&db, &loaded, "Patient/create", &json!({"resource": patient("p1")})).unwrap();
+        refhir_fhir::run(
+            &db,
+            &loaded,
+            "Patient/create",
+            &json!({"resource": patient("p1")}),
+        )
+        .unwrap();
         refhir_fhir::run(
             &db,
             &loaded,
@@ -850,7 +1114,11 @@ async fn patient_export_keeps_the_compartment() {
     .await;
     let started = send(&app, "POST", "/Patient/p1/$export", Some(json!({})), None).await;
     assert_eq!(started.status, StatusCode::ACCEPTED);
-    let job = started.location.unwrap().trim_start_matches("/export/").to_string();
+    let job = started
+        .location
+        .unwrap()
+        .trim_start_matches("/export/")
+        .to_string();
     let mut status = String::new();
     for _ in 0..40 {
         let polled = send(&app, "GET", &format!("/export/{job}"), None, None).await;
@@ -862,10 +1130,26 @@ async fn patient_export_keeps_the_compartment() {
     }
     assert_eq!(status, "completed");
     let file = send_text(&app, "GET", &format!("/export/{job}/file"), "", &[]).await;
-    assert!(file.1.contains("\"id\":\"p1\"") || file.1.contains("\"id\": \"p1\""), "{}", file.1);
-    assert!(file.1.contains("\"id\":\"o1\"") || file.1.contains("\"id\": \"o1\""), "{}", file.1);
-    assert!(!file.1.contains("\"id\":\"p2\"") && !file.1.contains("\"id\": \"p2\""), "{}", file.1);
-    assert!(!file.1.contains("\"id\":\"o2\"") && !file.1.contains("\"id\": \"o2\""), "{}", file.1);
+    assert!(
+        file.1.contains("\"id\":\"p1\"") || file.1.contains("\"id\": \"p1\""),
+        "{}",
+        file.1
+    );
+    assert!(
+        file.1.contains("\"id\":\"o1\"") || file.1.contains("\"id\": \"o1\""),
+        "{}",
+        file.1
+    );
+    assert!(
+        !file.1.contains("\"id\":\"p2\"") && !file.1.contains("\"id\": \"p2\""),
+        "{}",
+        file.1
+    );
+    assert!(
+        !file.1.contains("\"id\":\"o2\"") && !file.1.contains("\"id\": \"o2\""),
+        "{}",
+        file.1
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

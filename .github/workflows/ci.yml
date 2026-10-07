@@ -44,6 +44,20 @@ jobs:
           REFHIR_BIN: ../../target/debug/refhir
         run: go test ./...
 
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Test TypeScript client
+        working-directory: clients/ts
+        env:
+          REFHIR_BIN: ../../target/debug/refhir
+        run: |
+          npm ci
+          npm run build
+          npm test
+
   release-binary:
     name: Build release binary
     runs-on: ubuntu-latest

@@ -12,6 +12,7 @@ refhir-persistence = { path = "../persistence" }
 refhir-types = { path = "../types" }
 serde_json = { workspace = true }
 uuid = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 refhir-sqlite = { path = "../sqlite" }

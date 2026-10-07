@@ -1,0 +1,9 @@
+{
+  "resourceType": "Patient",
+  "id": "demo-patient-2",
+  "active": true,
+  "name": [{ "family": "Patel", "given": ["Isha"] }],
+  "gender": "female",
+  "birthDate": "1985-11-20",
+  "managingOrganization": { "reference": "Organization/demo-org" }
+}

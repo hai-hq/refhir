@@ -18,13 +18,15 @@ pub fn operation(
             let filter = optional(args, &["filter"]);
             let offset = optional_usize(args, &["offset"]).unwrap_or(0);
             let count = optional_usize(args, &["count"]);
-            Ok(terms.expand_page(url, filter, offset, count).unwrap_or_else(|| {
-                outcome(
-                    "warning",
-                    "not-supported",
-                    &format!("value set {url} expansion is not supported"),
-                )
-            }))
+            Ok(terms
+                .expand_page(url, filter, offset, count)
+                .unwrap_or_else(|| {
+                    outcome(
+                        "warning",
+                        "not-supported",
+                        &format!("value set {url} expansion is not supported"),
+                    )
+                }))
         }
         ("ValueSet", "$validate-code") => {
             let url = required(args, &["url"])?;
@@ -60,7 +62,8 @@ pub fn operation(
                 .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
             let code_a = required(args, &["codeA", "code"])?;
             let code_b = required(args, &["codeB"])?;
-            let outcome = if terms.subsumes(system, code_a, code_b) && terms.subsumes(system, code_b, code_a)
+            let outcome = if terms.subsumes(system, code_a, code_b)
+                && terms.subsumes(system, code_b, code_a)
             {
                 "equivalent"
             } else if terms.subsumes(system, code_a, code_b) {

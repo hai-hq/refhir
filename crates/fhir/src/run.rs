@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use refhir_database::{CommitError, Database, DocumentWrite, ReadSet};
 use refhir_types::Timestamp;
-use serde_json::Value;
 use refhir_validate::validate;
+use serde_json::Value;
 
 use crate::bundle;
 use crate::catalog::Catalog;
@@ -21,6 +21,8 @@ use crate::search;
 
 /// Retries after an OCC conflict. The first attempt is not counted.
 pub const MAX_OCC_FAILURES: usize = 4;
+
+const ENGINE: &str = "refhir_engine";
 
 #[derive(Debug)]
 pub enum RunError {
@@ -74,6 +76,14 @@ pub fn run(
     }
     for attempt in 0..=MAX_OCC_FAILURES {
         let mut tx = db.begin();
+        let snapshot_ts = tx.begin_timestamp();
+        tracing::debug!(
+            target: ENGINE,
+            operation = path,
+            attempt,
+            snapshot_ts = snapshot_ts.as_u64(),
+            "operation started"
+        );
         set_status(0);
         let mut value = match dispatch(&mut tx, catalog, path, args) {
             Ok(value) => value,
@@ -84,11 +94,29 @@ pub fn run(
         let written = tx.written_ids();
         let wrote = tx.has_writes();
         let writes = tx.document_writes();
+        tracing::debug!(
+            target: ENGINE,
+            operation = path,
+            attempt,
+            wrote,
+            reads = reads.summary(),
+            documents_written = writes.len(),
+            "operation dispatched, committing"
+        );
         match db.commit_with(tx, stamp_stored_json) {
             Ok(ts) => {
                 if wrote {
                     bundle::finalize(&mut value, &written, ts);
                 }
+                tracing::debug!(
+                    target: ENGINE,
+                    operation = path,
+                    attempt,
+                    commit_ts = ts.as_u64(),
+                    wrote,
+                    reads = reads.summary(),
+                    "operation committed"
+                );
                 return Ok(RunResult {
                     value,
                     ts,
@@ -98,7 +126,18 @@ pub fn run(
                     status,
                 });
             }
-            Err(CommitError::Occ(_)) if wrote && attempt < MAX_OCC_FAILURES => continue,
+            Err(CommitError::Occ(conflict)) if wrote && attempt < MAX_OCC_FAILURES => {
+                tracing::debug!(
+                    target: ENGINE,
+                    operation = path,
+                    attempt,
+                    next_attempt = attempt + 1,
+                    index = conflict.index_id.as_str(),
+                    write_ts = conflict.write_ts.as_u64(),
+                    "occ conflict, retrying operation"
+                );
+                continue;
+            }
             Err(err) => return Err(RunError::Commit(err)),
         }
     }

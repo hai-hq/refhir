@@ -1,0 +1,11 @@
+---
+# Apply with Synthea Flexporter on export or against existing FHIR bundles.
+# https://github.com/synthetichealth/synthea/wiki/Flexporter
+name: Rename hospitals
+actions:
+  - name: Hospital name
+    set_values:
+      - applicability: Organization.where(type.coding.code = 'hospital')
+        fields:
+          - location: Organization.name
+            value: "Riverside Community Health"

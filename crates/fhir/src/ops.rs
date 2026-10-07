@@ -162,11 +162,6 @@ fn check_instance(
     Ok(())
 }
 
-pub fn validation_report(tx: &mut Transaction, catalog: &Catalog, resource: &Value) -> Value {
-    let host = TxHost::new(tx, catalog);
-    validate(resource, &[], catalog.schema(), catalog.terms(), &host).operation_outcome()
-}
-
 fn expect_type(model: &ResourceModel, resource: &Value) -> Result<(), FhirError> {
     match resource
         .get("resourceType")
@@ -449,10 +444,17 @@ fn search_ids(
         .into_iter()
         .flatten()
     {
-        if entry.pointer("/search/mode").and_then(|value| value.as_str()) == Some("include") {
+        if entry
+            .pointer("/search/mode")
+            .and_then(|value| value.as_str())
+            == Some("include")
+        {
             continue;
         }
-        if let Some(id) = entry.pointer("/resource/id").and_then(|value| value.as_str()) {
+        if let Some(id) = entry
+            .pointer("/resource/id")
+            .and_then(|value| value.as_str())
+        {
             ids.push(id.to_string());
         }
     }

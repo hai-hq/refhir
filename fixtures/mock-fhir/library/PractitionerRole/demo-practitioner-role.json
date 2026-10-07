@@ -1,0 +1,8 @@
+{
+  "resourceType": "PractitionerRole",
+  "id": "demo-practitioner-role",
+  "active": true,
+  "practitioner": { "reference": "Practitioner/demo-practitioner" },
+  "organization": { "reference": "Organization/demo-org" },
+  "healthcareService": [{ "reference": "HealthcareService/demo-service" }]
+}

@@ -1,0 +1,8 @@
+{
+  "resourceType": "HealthcareService",
+  "id": "demo-service",
+  "active": true,
+  "name": "Family Medicine",
+  "providedBy": { "reference": "Organization/demo-org" },
+  "location": [{ "reference": "Location/demo-location" }]
+}

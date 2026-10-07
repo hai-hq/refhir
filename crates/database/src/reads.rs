@@ -34,4 +34,11 @@ impl ReadSet {
         }
         None
     }
+
+    /// Short summary for reactive-engine tracing.
+    pub fn summary(&self) -> String {
+        let indexes = self.indexed.len();
+        let intervals = self.indexed.values().map(|v| v.len()).sum::<usize>();
+        format!("{indexes} index(es), {intervals} interval(s)")
+    }
 }

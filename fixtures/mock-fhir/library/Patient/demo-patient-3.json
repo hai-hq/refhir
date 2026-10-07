@@ -1,0 +1,9 @@
+{
+  "resourceType": "Patient",
+  "id": "demo-patient-3",
+  "active": true,
+  "name": [{ "family": "Kim", "given": ["Jordan"] }],
+  "gender": "other",
+  "birthDate": "2001-03-14",
+  "managingOrganization": { "reference": "Organization/demo-org" }
+}

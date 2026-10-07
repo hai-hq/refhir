@@ -134,17 +134,14 @@ impl Extractor {
         let values = self.indexed_values(resource, path_model, host);
         match self.probe("") {
             Probe::Token(_) => token_rows(index, id, &values),
-            Probe::Prefix(_) | Probe::AtLeast(_) | Probe::AtMost(_) => string_rows(index, id, &values),
+            Probe::Prefix(_) | Probe::AtLeast(_) | Probe::AtMost(_) => {
+                string_rows(index, id, &values)
+            }
             Probe::Range(_) | Probe::Scan => Vec::new(),
         }
     }
 
-    pub fn indexed(
-        &self,
-        resource: &Value,
-        path_model: &Model,
-        host: &dyn Host,
-    ) -> Vec<String> {
+    pub fn indexed(&self, resource: &Value, path_model: &Model, host: &dyn Host) -> Vec<String> {
         self.indexed_values(resource, path_model, host)
     }
 
@@ -509,7 +506,10 @@ fn bound_probe(op: &str, span: &Span, code: &str) -> Probe<'static> {
         "eq" => (Some(span.start), Some(span.end)),
         "ap" => {
             let width = (span.exact.abs() * 0.1).max(span.end - span.start);
-            (Some(span.exact - width), Some((span.exact + width).next_up()))
+            (
+                Some(span.exact - width),
+                Some((span.exact + width).next_up()),
+            )
         }
         _ => return Probe::Scan,
     };
@@ -1514,7 +1514,13 @@ mod tests {
             "valueQuantity": {"value": 5.4, "system": "http://unitsofmeasure.org", "code": "mg"}
         });
         assert!(quantity.matches(&resource, "5.4||mg", &model, &host));
-        let keys = quantity.keys(&resource, "o1", &IndexId::new("Observation/value-quantity"), &model, &host);
+        let keys = quantity.keys(
+            &resource,
+            "o1",
+            &IndexId::new("Observation/value-quantity"),
+            &model,
+            &host,
+        );
         assert_eq!(keys.len(), 1, "quantity was not indexed");
         let key = &keys[0].1;
         let Probe::Range(interval) = quantity.probe("gt5||mg") else {

@@ -46,7 +46,9 @@ fn write_child(out: &mut String, name: &str, value: &Value) {
         }
         Value::Object(map) => {
             if let Some(div) = map.get("div").and_then(|item| item.as_str()) {
-                out.push_str(&format!("<{name}><div xmlns=\"http://www.w3.org/1999/xhtml\">{div}</div></{name}>"));
+                out.push_str(&format!(
+                    "<{name}><div xmlns=\"http://www.w3.org/1999/xhtml\">{div}</div></{name}>"
+                ));
                 return;
             }
             out.push('<');
@@ -142,12 +144,21 @@ fn element_value(
             "false" => Value::Bool(false),
             other => Value::String(other.to_string()),
         };
-        if name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) && children.is_empty() {
+        if name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+            && children.is_empty()
+        {
             return json!({"resourceType": name, "value": parsed});
         }
         return json!({"resourceType": name, "value": parsed});
     }
-    if name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) {
+    if name
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase())
+    {
         let mut object = Map::new();
         object.insert("resourceType".into(), Value::String(name.to_string()));
         for (key, value) in children {
@@ -200,7 +211,9 @@ fn take_attrs(input: &str) -> Result<(BTreeMap<String, String>, &str), String> {
         }
         let (name, rest) = take_name(input)?;
         let rest = rest.trim_start();
-        let rest = rest.strip_prefix('=').ok_or_else(|| "expected =".to_string())?;
+        let rest = rest
+            .strip_prefix('=')
+            .ok_or_else(|| "expected =".to_string())?;
         let rest = rest.trim_start();
         let quote = rest
             .chars()

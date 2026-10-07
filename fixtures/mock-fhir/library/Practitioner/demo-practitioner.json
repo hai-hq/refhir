@@ -1,0 +1,6 @@
+{
+  "resourceType": "Practitioner",
+  "id": "demo-practitioner",
+  "active": true,
+  "name": [{ "family": "Nguyen", "given": ["An"], "prefix": ["Dr."] }]
+}

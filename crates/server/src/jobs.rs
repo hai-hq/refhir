@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::{header, StatusCode};
-use axum::Json;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use refhir_database::Database;
 use refhir_fhir::{Catalog, ConformanceStore};
 use refhir_persistence::TimestampRange;
@@ -30,7 +30,8 @@ struct ExportJob {
 }
 
 fn jobs() -> &'static Mutex<BTreeMap<String, ExportJob>> {
-    static JOBS: std::sync::OnceLock<Mutex<BTreeMap<String, ExportJob>>> = std::sync::OnceLock::new();
+    static JOBS: std::sync::OnceLock<Mutex<BTreeMap<String, ExportJob>>> =
+        std::sync::OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
@@ -130,7 +131,9 @@ pub async fn accept_export(
         }),
     );
     if let Ok(location) = format!("/export/{job_id}").parse() {
-        response.headers_mut().insert(header::CONTENT_LOCATION, location);
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LOCATION, location);
     }
     response
 }
@@ -176,7 +179,9 @@ fn write_export(
     path: &PathBuf,
 ) -> Result<(), String> {
     let snapshot = db.latest_ts();
-    let end = snapshot.succ().map_err(|_| "timestamp overflow".to_string())?;
+    let end = snapshot
+        .succ()
+        .map_err(|_| "timestamp overflow".to_string())?;
     let rows = db
         .reader()
         .load_documents(
@@ -203,7 +208,15 @@ fn write_export(
         let Some(text) = value.as_deref() else {
             continue;
         };
-        if !export_keeps(&catalog, tablet, doc_id.id_str().unwrap_or(""), text, type_name, id, &members) {
+        if !export_keeps(
+            &catalog,
+            tablet,
+            doc_id.id_str().unwrap_or(""),
+            text,
+            type_name,
+            id,
+            &members,
+        ) {
             continue;
         }
         writeln!(file, "{text}").map_err(|err| err.to_string())?;
@@ -239,7 +252,10 @@ fn group_members(
         return patients;
     };
     for member in members {
-        let Some(reference) = member.pointer("/entity/reference").and_then(|value| value.as_str()) else {
+        let Some(reference) = member
+            .pointer("/entity/reference")
+            .and_then(|value| value.as_str())
+        else {
             continue;
         };
         if let Some(patient) = reference
@@ -272,7 +288,9 @@ fn export_keeps(
         if tablet == "Group" && Some(id) == focus {
             return true;
         }
-        return group_patients.iter().any(|patient| patient_export(catalog, tablet, id, text, patient));
+        return group_patients
+            .iter()
+            .any(|patient| patient_export(catalog, tablet, id, text, patient));
     }
     if type_name == "Patient" {
         let Some(patient) = focus else {
@@ -299,7 +317,9 @@ fn patient_export(catalog: &Catalog, tablet: &str, id: &str, text: &str, patient
     let Some(params) = compartment.params_for(tablet) else {
         return false;
     };
-    params.iter().any(|name| field_references(resource.get(name), patient))
+    params
+        .iter()
+        .any(|name| field_references(resource.get(name), patient))
 }
 
 fn in_patient_compartment(catalog: &Catalog, tablet: &str) -> bool {
@@ -310,7 +330,9 @@ fn in_patient_compartment(catalog: &Catalog, tablet: &str) -> bool {
 
 fn field_references(value: Option<&Value>, patient: &str) -> bool {
     match value {
-        Some(Value::Array(items)) => items.iter().any(|item| field_references(Some(item), patient)),
+        Some(Value::Array(items)) => items
+            .iter()
+            .any(|item| field_references(Some(item), patient)),
         Some(Value::Object(map)) => map
             .get("reference")
             .and_then(|item| item.as_str())
@@ -333,12 +355,8 @@ fn deliver_subscriptions(
         return;
     };
     let mut tx = db.begin();
-    let Ok(bundle) = refhir_fhir::dispatch(
-        &mut tx,
-        &catalog,
-        "Subscription/search",
-        &json!({}),
-    ) else {
+    let Ok(bundle) = refhir_fhir::dispatch(&mut tx, &catalog, "Subscription/search", &json!({}))
+    else {
         return;
     };
     let entries = bundle
@@ -389,7 +407,13 @@ fn deliver_subscriptions(
             let Ok(_resource) = serde_json::from_str::<Value>(text) else {
                 continue;
             };
-            if !criteria_matches(&catalog, db, type_name, query, row.id.id_str().unwrap_or("")) {
+            if !criteria_matches(
+                &catalog,
+                db,
+                type_name,
+                query,
+                row.id.id_str().unwrap_or(""),
+            ) {
                 continue;
             }
             if channel == "rest-hook" && !endpoint.is_empty() {
@@ -437,7 +461,10 @@ fn criteria_matches(
         .and_then(|value| value.as_array())
         .is_some_and(|entries| {
             entries.iter().any(|entry| {
-                entry.pointer("/resource/id").and_then(|value| value.as_str()) == Some(id)
+                entry
+                    .pointer("/resource/id")
+                    .and_then(|value| value.as_str())
+                    == Some(id)
             })
         })
 }

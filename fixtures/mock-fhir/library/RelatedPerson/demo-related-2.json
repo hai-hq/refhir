@@ -1,0 +1,8 @@
+{
+  "resourceType": "RelatedPerson",
+  "id": "demo-related-2",
+  "active": true,
+  "patient": { "reference": "Patient/demo-patient-2" },
+  "name": [{ "family": "Patel", "given": ["Ravi"] }],
+  "relationship": [{ "text": "spouse" }]
+}

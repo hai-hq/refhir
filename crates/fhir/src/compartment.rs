@@ -29,7 +29,9 @@ impl Compartment {
 pub fn load(resources: &[Value]) -> BTreeMap<String, Compartment> {
     let mut compartments = builtin();
     for resource in resources {
-        if resource.get("resourceType").and_then(|value| value.as_str())
+        if resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
             != Some("CompartmentDefinition")
         {
             continue;

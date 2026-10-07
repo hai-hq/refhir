@@ -79,7 +79,7 @@ ReFHIR aims to provide:
 - real-time synchronization of query results;
 - consistent results across transactions;
 - reconnect and recovery semantics;
-- an ergonomic developer SDK (Go first: `github.com/hai-hq/haifhir/clients/go`; TypeScript later);
+- an ergonomic developer SDK (Go: `github.com/hai-hq/haifhir/clients/go`; TypeScript: `@hai-hq/refhir` in `clients/ts`);
 - standard FHIR REST for existing clients;
 - primitives for AI-agent context synchronization;
 - ways to detect when state an agent depends on has changed.
@@ -181,14 +181,14 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 | Transaction `Bundle` | Yes (atomic commit) |
 | FHIR REST | Yes (`application/fhir+json`) |
 | Reactive sync | Yes (`/sync`, invalidation + query rerun) |
-| Go SDK | Yes (`clients/go`, `github.com/hai-hq/haifhir/clients/go`) |
-| TypeScript SDK | **Not yet** |
+| Go SDK | Yes ([clients/go](clients/go/README.md), module `github.com/hai-hq/haifhir/clients/go`) |
+| TypeScript SDK | Yes (`clients/ts`, npm `@hai-hq/refhir`) |
 | SMART / auth | **Not yet** |
 | Full spec, `_include`, `$everything`, all search params | **Deferred** |
 | FHIR Subscription delivery | **Deferred** (vs live query sync) |
 | Commit-time agent revalidation | **Deferred** (architecture direction) |
 
-**Persistence:** SQLite (`refhir.sqlite`); optional Postgres.
+**Persistence:** SQLite (`refhir.sqlite`), in-memory SQLite (`--memory`), or Postgres.
 
 **This build:**
 
@@ -216,6 +216,12 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 cargo run -p refhir -- --sqlite refhir.sqlite
 ```
 
+For a throwaway local server with no database file:
+
+```bash
+cargo run -p refhir -- --memory
+```
+
 That command installs the bundled `hl7.fhir.r4.core` 4.0.1 package, so the concrete R4 resource types are available on a fresh database. Pass `--package dir` to install a package directory instead. Repeat the flag for more than one package on the same FHIR version.
 
 Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It downloads the published core package and writes StructureDefinitions and SearchParameters into `crates/fhir/fixtures/r4`.
@@ -226,11 +232,20 @@ Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It dow
 | Flag | Purpose |
 |------|---------|
 | `--sqlite path` | SQLite file (default `refhir.sqlite`) |
-| `--postgres url` | Postgres (not with `--sqlite`) |
+| `--memory` | SQLite in RAM; no file (not with `--sqlite` or `--postgres`) |
+| `--postgres url` | Postgres (not with `--sqlite` or `--memory`) |
 | `--bind host:port` | Default `127.0.0.1:8080` |
 | `--package dir` | FHIR package directory. Repeatable. Replaces the bundled R4 core default. |
 
 Optional: `just run` ([justfile](justfile)) if you use [just](https://github.com/casey/just).
+
+Load mock FHIR JSON after startup (from `fixtures/mock-fhir/`, or Synthea `output/fhir`):
+
+```bash
+cd clients/go && go run ./cmd/seed -url http://127.0.0.1:8080
+```
+
+See [fixtures/mock-fhir/README.md](fixtures/mock-fhir/README.md) and [clients/go/README.md](clients/go/README.md#demo-data-seed-script).
 
 ### HTTP examples
 

@@ -16,6 +16,7 @@ uuid = { workspace = true }
 ureq = { workspace = true }
 refhir-persistence = { path = "../persistence" }
 refhir-types = { path = "../types" }
+tracing = { workspace = true }
 
 [dev-dependencies]
 refhir-database = { path = "../database", features = ["test-util"] }

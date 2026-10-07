@@ -33,10 +33,7 @@ async fn execute_document(app: &AppState, document: &str) -> Result<Value, Strin
         .find('{')
         .map(|index| &document[index + 1..])
         .ok_or_else(|| "query needs a selection".to_string())?;
-    let body = body
-        .rsplit_once('}')
-        .map(|(head, _)| head)
-        .unwrap_or(body);
+    let body = body.rsplit_once('}').map(|(head, _)| head).unwrap_or(body);
     let field = parse_field(body).ok_or_else(|| "empty selection".to_string())?;
     let (type_name, list, action) = split_field(&field.name);
     if mutation || action.is_some() {

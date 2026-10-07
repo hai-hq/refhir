@@ -1081,7 +1081,11 @@ fn fhir_reference_policy_allows_absolute_and_missing_targets() {
         .write()
         .expect("catalog")
         .set_reference_policy(ReferencePolicy::Fhir);
-    apply(&harness, "Patient/create", json!({"resource": patient("p1", true, "Ann")}));
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
     let absolute = apply(
         &harness,
         "Observation/create",
@@ -1133,10 +1137,26 @@ fn observation(id: &str, patient: &str, date: &str, code: &str) -> Value {
 #[test]
 fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
     let harness = ready();
-    apply(&harness, "Patient/create", json!({"resource": patient("p1", true, "Ann")}));
-    apply(&harness, "Patient/create", json!({"resource": patient("p2", false, "Bee")}));
-    apply(&harness, "Observation/create", json!({"resource": observation("o1", "p1", "2020-01-02", "8480-6")}));
-    apply(&harness, "Observation/create", json!({"resource": observation("o2", "p2", "2018-01-02", "8480-6")}));
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p2", false, "Bee")}),
+    );
+    apply(
+        &harness,
+        "Observation/create",
+        json!({"resource": observation("o1", "p1", "2020-01-02", "8480-6")}),
+    );
+    apply(
+        &harness,
+        "Observation/create",
+        json!({"resource": observation("o2", "p2", "2018-01-02", "8480-6")}),
+    );
 
     let exact = apply(&harness, "Patient/search", json!({"name:exact": "Bee"}));
     assert_eq!(exact["total"], 1);
@@ -1144,7 +1164,11 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
     assert_eq!(loose["total"], 0);
     let contains = apply(&harness, "Patient/search", json!({"name:contains": "ee"}));
     assert_eq!(contains["total"], 1);
-    let missing = apply(&harness, "Patient/search", json!({"active:missing": "false"}));
+    let missing = apply(
+        &harness,
+        "Patient/search",
+        json!({"active:missing": "false"}),
+    );
     assert_eq!(missing["total"], 2);
     let negated = apply(&harness, "Patient/search", json!({"active:not": "true"}));
     assert_eq!(negated["total"], 1);
@@ -1156,7 +1180,11 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
     let earlier = apply(&harness, "Observation/search", json!({"date": "lt2019"}));
     assert_eq!(earlier["total"], 1);
 
-    let page = apply(&harness, "Patient/search", json!({"_count": "1", "_sort": "name"}));
+    let page = apply(
+        &harness,
+        "Patient/search",
+        json!({"_count": "1", "_sort": "name"}),
+    );
     assert_eq!(page["total"], 2);
     assert_eq!(page["entry"].as_array().unwrap().len(), 1);
     let next_link = page["link"]
@@ -1188,7 +1216,11 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
         "{}",
         followed["link"]
     );
-    let full_page = apply(&harness, "Patient/search", json!({"_count": "2", "_sort": "name"}));
+    let full_page = apply(
+        &harness,
+        "Patient/search",
+        json!({"_count": "2", "_sort": "name"}),
+    );
     assert_eq!(full_page["entry"].as_array().unwrap().len(), 2);
     assert!(
         full_page["link"]
@@ -1218,7 +1250,11 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
     assert!(modes.contains(&"match".to_string()));
     assert!(modes.contains(&"include".to_string()));
 
-    let chained = apply(&harness, "Observation/search", json!({"subject:Patient.name": "Bee"}));
+    let chained = apply(
+        &harness,
+        "Observation/search",
+        json!({"subject:Patient.name": "Bee"}),
+    );
     assert_eq!(chained["total"], 1);
     assert_eq!(chained["entry"][0]["resource"]["id"], "o2");
 
@@ -1241,7 +1277,11 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
 #[test]
 fn patch_conditional_history_batch_and_urn_references() {
     let harness = ready();
-    apply(&harness, "Patient/create", json!({"resource": patient("p1", true, "Ann")}));
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
     let patched = apply(
         &harness,
         "Patient/patch",
@@ -1261,7 +1301,11 @@ fn patch_conditional_history_batch_and_urn_references() {
     assert_eq!(again.status, 200);
     assert_eq!(again.value["id"], "p1");
 
-    apply(&harness, "Patient/create", json!({"resource": patient("p2", true, "Ann")}));
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p2", true, "Ann")}),
+    );
     let many = run_op(
         &harness,
         "Patient/conditional-delete",
@@ -1306,11 +1350,23 @@ fn patch_conditional_history_batch_and_urn_references() {
         }}),
     );
     assert_eq!(failed["entry"][0]["response"]["status"], "404 Not Found");
-    assert_eq!(failed["entry"][0]["response"]["outcome"]["issue"][0]["code"], "not-found");
+    assert_eq!(
+        failed["entry"][0]["response"]["outcome"]["issue"][0]["code"],
+        "not-found"
+    );
     assert_eq!(failed["entry"][1]["response"]["status"], "409 Conflict");
-    assert_eq!(failed["entry"][1]["response"]["outcome"]["issue"][0]["code"], "conflict");
-    assert_eq!(failed["entry"][2]["response"]["status"], "412 Precondition Failed");
-    assert_eq!(failed["entry"][2]["response"]["outcome"]["issue"][0]["code"], "conflict");
+    assert_eq!(
+        failed["entry"][1]["response"]["outcome"]["issue"][0]["code"],
+        "conflict"
+    );
+    assert_eq!(
+        failed["entry"][2]["response"]["status"],
+        "412 Precondition Failed"
+    );
+    assert_eq!(
+        failed["entry"][2]["response"]["outcome"]["issue"][0]["code"],
+        "conflict"
+    );
     let stored = apply(&harness, "Patient/read", json!({"id": "b1"}));
     assert_eq!(stored["name"][0]["family"], "Batch");
 
@@ -1339,14 +1395,25 @@ fn patch_conditional_history_batch_and_urn_references() {
     );
     assert_eq!(urn["type"], "transaction-response");
     let obs = apply(&harness, "Observation/read", json!({"id": "urn-obs"}));
-    assert!(obs["subject"]["reference"].as_str().unwrap().starts_with("Patient/"));
+    assert!(obs["subject"]["reference"]
+        .as_str()
+        .unwrap()
+        .starts_with("Patient/"));
 }
 
 #[test]
 fn meta_everything_and_instance_validate() {
     let harness = ready();
-    apply(&harness, "Patient/create", json!({"resource": patient("p1", true, "Ann")}));
-    apply(&harness, "Observation/create", json!({"resource": observation("o1", "p1", "2020-01-02", "8480-6")}));
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
+    apply(
+        &harness,
+        "Observation/create",
+        json!({"resource": observation("o1", "p1", "2020-01-02", "8480-6")}),
+    );
     let added = apply(
         &harness,
         "Patient/$meta-add",
@@ -1354,7 +1421,10 @@ fn meta_everything_and_instance_validate() {
     );
     assert_eq!(added["parameter"][0]["valueMeta"]["tag"][0]["code"], "vip");
     let current = apply(&harness, "Patient/$meta", json!({"id": "p1"}));
-    assert_eq!(current["parameter"][0]["valueMeta"]["tag"][0]["code"], "vip");
+    assert_eq!(
+        current["parameter"][0]["valueMeta"]["tag"][0]["code"],
+        "vip"
+    );
     let removed = apply(
         &harness,
         "Patient/$meta-delete",
@@ -1373,5 +1443,8 @@ fn meta_everything_and_instance_validate() {
     assert_eq!(validated["resourceType"], "OperationOutcome");
 
     let document = run_op(&harness, "Observation/$document", &json!({"id": "o1"})).unwrap_err();
-    assert!(matches!(document, RunError::Fhir(FhirError::Unsupported(_))));
+    assert!(matches!(
+        document,
+        RunError::Fhir(FhirError::Unsupported(_))
+    ));
 }

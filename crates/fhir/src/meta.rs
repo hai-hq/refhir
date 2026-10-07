@@ -170,9 +170,9 @@ fn meta_of(body: &Value) -> Value {
             .get("parameter")
             .and_then(|value| value.as_array())
             .and_then(|items| {
-                items.iter().find(|item| {
-                    item.get("name").and_then(|value| value.as_str()) == Some("meta")
-                })
+                items
+                    .iter()
+                    .find(|item| item.get("name").and_then(|value| value.as_str()) == Some("meta"))
             })
             .and_then(|item| item.get("valueMeta"))
             .cloned()
@@ -208,7 +208,8 @@ fn meta_same(left: &Value, right: &Value) -> bool {
         )
     };
     let left_code = code(left);
-    left_code.0.is_some() && left_code == code(right) || left.as_str().is_some() && left.as_str() == right.as_str()
+    left_code.0.is_some() && left_code == code(right)
+        || left.as_str().is_some() && left.as_str() == right.as_str()
 }
 
 fn collect_refs(value: &Value, refs: &mut Vec<String>) {

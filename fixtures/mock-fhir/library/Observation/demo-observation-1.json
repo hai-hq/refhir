@@ -1,0 +1,22 @@
+{
+  "resourceType": "Observation",
+  "id": "demo-observation-1",
+  "status": "final",
+  "code": {
+    "coding": [
+      {
+        "system": "http://loinc.org",
+        "code": "8480-6",
+        "display": "Systolic blood pressure"
+      }
+    ]
+  },
+  "subject": { "reference": "Patient/demo-patient-1" },
+  "effectiveDateTime": "2026-01-15",
+  "valueQuantity": {
+    "value": 118,
+    "unit": "mmHg",
+    "system": "http://unitsofmeasure.org",
+    "code": "mm[Hg]"
+  }
+}

@@ -1,0 +1,49 @@
+import WebSocket from "ws";
+
+import type { SocketConnection } from "./socket.js";
+
+export async function openNodeSocket(
+  wsURL: string,
+  token?: string,
+): Promise<SocketConnection> {
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const socket = new WebSocket(wsURL, { headers });
+  await new Promise<void>((resolve, reject) => {
+    socket.once("open", () => resolve());
+    socket.once("error", (err) => reject(err));
+  });
+  return wrapNode(socket);
+}
+
+function wrapNode(socket: WebSocket): SocketConnection {
+  let onMessage: ((text: string) => void) | null = null;
+  let onClose: (() => void) | null = null;
+  socket.on("message", (data) => onMessage?.(data.toString()));
+  socket.on("close", () => onClose?.());
+  return {
+    get readyState() {
+      return socket.readyState;
+    },
+    send(text: string) {
+      socket.send(text);
+    },
+    close() {
+      socket.close();
+    },
+    terminate() {
+      socket.terminate();
+    },
+    onMessage(handler) {
+      onMessage = handler;
+    },
+    onClose(handler) {
+      onClose = handler;
+    },
+    removeListeners() {
+      socket.removeAllListeners();
+      onMessage = null;
+      onClose = null;
+    },
+  };
+}

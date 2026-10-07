@@ -1,0 +1,7 @@
+{
+  "resourceType": "Location",
+  "id": "demo-location",
+  "status": "active",
+  "name": "Riverside Main Campus",
+  "managingOrganization": { "reference": "Organization/demo-org" }
+}

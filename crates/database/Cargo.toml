@@ -9,6 +9,7 @@ refhir-persistence = { path = "../persistence" }
 refhir-types = { path = "../types" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 test-util = []
