@@ -1,7 +1,7 @@
 use serde_json::Value as Json;
 
 use crate::error::Error;
-use crate::value::Temporal;
+use crate::value::{Temporal, Value};
 
 pub trait Host {
     fn resolve(&self, reference: &str) -> Result<Option<Json>, Error> {
@@ -35,6 +35,13 @@ pub trait Host {
 
     /// `Some` when this host can check a profile. `None` leaves the type-name fallback.
     fn conforms_to(&self, _resource: &Json, _url: &str) -> Result<Option<bool>, Error> {
+        Ok(None)
+    }
+
+    /// Extra `%name` bindings. `None` falls through to the built-in variables.
+    /// `Some` is the collection, including an empty one.
+    fn lookup_variable(&self, name: &str) -> Result<Option<Vec<Value>>, Error> {
+        let _ = name;
         Ok(None)
     }
 }

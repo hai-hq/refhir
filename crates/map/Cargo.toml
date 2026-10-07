@@ -1,0 +1,10 @@
+[package]
+name = "refhir-map"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+refhir-fhirpath = { path = "../fhirpath" }
+serde_json = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Library-type", "version": "4.0.1", "name": "type", "status": "active", "description": "Search Library by type", "code": "type", "base": ["Library"], "type": "token", "expression": "Library.type"}

@@ -241,7 +241,16 @@ impl Schema {
                     .entry(structure.type_name.clone())
                     .or_insert_with(|| structure.url.clone());
             }
-            by_url.insert(structure.url.clone(), structure);
+            // A later package may repeat a core URL with a root-only snapshot.
+            // Keep the definition that actually describes the type.
+            let keep_existing = by_url
+                .get(&structure.url)
+                .is_some_and(|existing: &Structure| {
+                    existing.elements.len() >= structure.elements.len()
+                });
+            if !keep_existing {
+                by_url.insert(structure.url.clone(), structure);
+            }
         }
         Self {
             by_url,

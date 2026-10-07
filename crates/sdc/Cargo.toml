@@ -1,0 +1,13 @@
+[package]
+name = "refhir-sdc"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+refhir-cql = { path = "../cql" }
+refhir-fhirpath = { path = "../fhirpath" }
+refhir-map = { path = "../map" }
+regex = "1"
+serde_json = { workspace = true }
+uuid = { workspace = true }

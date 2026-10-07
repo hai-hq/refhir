@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/StructureDefinition-type", "version": "4.0.1", "name": "type", "status": "active", "description": "Search StructureDefinition by type", "code": "type", "base": ["StructureDefinition"], "type": "uri", "expression": "StructureDefinition.type"}

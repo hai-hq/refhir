@@ -12,6 +12,8 @@ pub enum FhirError {
     UnknownResource(String),
     Unsupported(String),
     Storage(String),
+    /// The caller is not allowed to perform the interaction.
+    Forbidden(String),
 }
 
 impl std::fmt::Display for FhirError {
@@ -24,7 +26,8 @@ impl std::fmt::Display for FhirError {
             | FhirError::Invalid(message)
             | FhirError::UnknownResource(message)
             | FhirError::Unsupported(message)
-            | FhirError::Storage(message) => write!(f, "{message}"),
+            | FhirError::Storage(message)
+            | FhirError::Forbidden(message) => write!(f, "{message}"),
             FhirError::Outcome(value) => {
                 let diagnostics = value
                     .pointer("/issue/0/diagnostics")
@@ -51,5 +54,6 @@ pub fn outcome_code(err: &FhirError) -> &'static str {
         FhirError::Conflict(_) | FhirError::Precondition(_) => "conflict",
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => "invalid",
         FhirError::Storage(_) => "exception",
+        FhirError::Forbidden(_) => "forbidden",
     }
 }

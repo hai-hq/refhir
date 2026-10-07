@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
-use refhir_fhir::{install_package_dir, minir4_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES};
+use refhir_fhir::{install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES};
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -486,6 +486,7 @@ async fn xml_graphql_smart_export_and_subscription() {
             auth: false,
             export_dir: dir.display().to_string(),
             terminology_urls: Vec::new(),
+            sdc_archiver: false,
         },
     );
     let xml =
@@ -577,6 +578,7 @@ async fn smart_scopes_gate_http_and_sync() {
             auth: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
+            sdc_archiver: false,
         },
     );
     let denied = send(&app, "GET", "/Patient", None, None).await;
@@ -699,6 +701,7 @@ async fn access_token_query_is_decoded_and_patient_compartment_holds() {
             auth: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
+            sdc_archiver: false,
         },
     );
     let decoded = send(
@@ -846,6 +849,7 @@ async fn patient_scope_cannot_leave_its_compartment() {
             auth: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
+            sdc_archiver: false,
         },
     );
     let other = send_text(
@@ -1082,6 +1086,7 @@ async fn patient_export_keeps_the_compartment() {
             auth: false,
             export_dir: dir.display().to_string(),
             terminology_urls: Vec::new(),
+            sdc_archiver: false,
         },
     );
     send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
@@ -1269,4 +1274,476 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         }
     }
     String::from_utf8_lossy(&buffer).into_owned()
+}
+
+#[tokio::test]
+async fn sdc_archiver_hides_responses_and_receiver_reads_them() {
+    let (db, catalog, store) = memory();
+    install_package_dir(store.as_ref(), &db, &catalog, sdc_dir()).unwrap();
+    let receiver = crate::app_with(
+        db.clone(),
+        catalog.clone(),
+        store.clone(),
+        crate::ServerConfig {
+            auth: false,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+        },
+    );
+    let created = send(
+        &receiver,
+        "POST",
+        "/QuestionnaireResponse",
+        Some(json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "in-progress",
+            "item": [{"linkId": "q1", "answer": [{"valueString": "yes"}]}]
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let id = created.body["id"].as_str().unwrap();
+    let read = send(&receiver, "GET", &format!("/QuestionnaireResponse/{id}"), None, None).await;
+    assert_eq!(read.status, StatusCode::OK);
+    let patient = send(
+        &receiver,
+        "POST",
+        "/Patient",
+        Some(json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "active": true,
+            "name": [{"family": "Ada"}]
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(patient.status, StatusCode::CREATED);
+    let answered = send(
+        &receiver,
+        "POST",
+        "/QuestionnaireResponse",
+        Some(json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "in-progress",
+            "subject": {"reference": "Patient/p1"},
+            "item": [{"linkId": "q1", "answer": [{"valueString": "secret"}]}]
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(answered.status, StatusCode::CREATED);
+
+    let archiver_db = db.clone();
+    let archiver_catalog = catalog.clone();
+    let archiver_store = store.clone();
+    let archiver = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: false,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: true,
+        },
+    );
+    let hidden = send(&archiver, "GET", &format!("/QuestionnaireResponse/{id}"), None, None).await;
+    assert_eq!(hidden.status, StatusCode::FORBIDDEN);
+    let stored = send(
+        &archiver,
+        "POST",
+        "/QuestionnaireResponse",
+        Some(json!({
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "questionnaire": "http://example.org/Questionnaire/missing"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(stored.status, StatusCode::CREATED);
+    let compartment = send(
+        &archiver,
+        "GET",
+        "/Patient/p1/QuestionnaireResponse",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(compartment.status, StatusCode::FORBIDDEN);
+    let bundled = send(
+        &archiver,
+        "POST",
+        "/",
+        Some(json!({
+            "resourceType": "Bundle",
+            "type": "batch",
+            "entry": [{"request": {"method": "GET", "url": format!("QuestionnaireResponse/{id}")}}]
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(bundled.status, StatusCode::OK);
+    assert!(
+        bundled.body["entry"][0]["response"]["status"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("403"),
+        "{}",
+        bundled.body
+    );
+    let everything = send(
+        &archiver,
+        "GET",
+        &format!("/QuestionnaireResponse/{id}/$everything"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(everything.status, StatusCode::FORBIDDEN);
+    let meta = send(
+        &archiver,
+        "GET",
+        &format!("/QuestionnaireResponse/{id}/$meta"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(meta.status, StatusCode::FORBIDDEN);
+    let patched = send(
+        &archiver,
+        "PATCH",
+        &format!("/QuestionnaireResponse/{id}"),
+        Some(json!([{"op": "replace", "path": "/status", "value": "in-progress"}])),
+        None,
+    )
+    .await;
+    assert_eq!(patched.status, StatusCode::FORBIDDEN, "{}", patched.body);
+    let validated = send(
+        &archiver,
+        "POST",
+        &format!("/QuestionnaireResponse/{id}/$validate"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(validated.status, StatusCode::FORBIDDEN);
+    let revinclude = send(
+        &archiver,
+        "GET",
+        "/Patient?_revinclude=QuestionnaireResponse:subject",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(revinclude.status, StatusCode::OK, "{}", revinclude.body);
+    let leaked = revinclude.body["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["resource"]["resourceType"] == "QuestionnaireResponse");
+    assert!(!leaked, "{}", revinclude.body);
+    let synced = crate::http::execute(
+        &archiver_db,
+        &archiver_catalog,
+        &archiver_store,
+        "QuestionnaireResponse/read",
+        json!({"id": id, "_sdcArchiver": false}),
+    )
+    .await;
+    assert!(synced.is_err());
+}
+
+#[tokio::test]
+async fn populate_respects_observation_scopes() {
+    let (db, catalog, store) = memory();
+    install_package_dir(store.as_ref(), &db, &catalog, sdc_dir()).unwrap();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+        },
+    );
+    let admin = token(&app, "user/*.*").await;
+    send_text(
+        &app,
+        "POST",
+        "/Patient",
+        &json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "active": true,
+            "name": [{"family": "Ada"}]
+        })
+        .to_string(),
+        &[
+            ("authorization", &format!("Bearer {admin}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    send_text(
+        &app,
+        "POST",
+        "/Observation",
+        &json!({
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "29463-7"}]},
+            "subject": {"reference": "Patient/p1"},
+            "effectiveDateTime": "2099-01-01T00:00:00Z",
+            "valueString": "70"
+        })
+        .to_string(),
+        &[
+            ("authorization", &format!("Bearer {admin}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    let form = json!({
+        "resourceType": "Questionnaire",
+        "url": "http://example.org/Questionnaire/weight",
+        "status": "active",
+        "item": [{
+            "linkId": "weight",
+            "type": "string",
+            "code": [{"system": "http://loinc.org", "code": "29463-7"}],
+            "extension": [{
+                "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-observationLinkPeriod",
+                "valueDuration": {"value": 1, "code": "a"}
+            }]
+        }]
+    });
+    let limited = token(&app, "user/Questionnaire.*").await;
+    let hidden = send_text(
+        &app,
+        "POST",
+        "/Questionnaire/$populate",
+        &json!({"resourceType": "Parameters", "parameter": [
+            {"name": "questionnaire", "resource": form.clone()},
+            {"name": "subject", "valueString": "Patient/p1"}
+        ]})
+        .to_string(),
+        &[
+            ("authorization", &format!("Bearer {limited}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(hidden.0, StatusCode::OK, "{}", hidden.1);
+    let hidden_body: Value = serde_json::from_str(&hidden.1).unwrap();
+    assert!(hidden_body["item"].as_array().map(|items| items.is_empty()).unwrap_or(true));
+
+    let read_only = token(&app, "user/Questionnaire.read").await;
+    let read_populate = send_text(
+        &app,
+        "POST",
+        "/Questionnaire/$populate",
+        &json!({"resourceType": "Parameters", "parameter": [
+            {"name": "questionnaire", "resource": form.clone()},
+            {"name": "subject", "valueString": "Patient/p1"}
+        ]})
+        .to_string(),
+        &[
+            ("authorization", &format!("Bearer {read_only}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(read_populate.0, StatusCode::OK, "{}", read_populate.1);
+
+    let reader = token(&app, "user/Questionnaire.* user/Observation.read").await;
+    let shown = send_text(
+        &app,
+        "POST",
+        "/Questionnaire/$populate",
+        &json!({"resourceType": "Parameters", "parameter": [
+            {"name": "questionnaire", "resource": form},
+            {"name": "subject", "valueString": "Patient/p1"}
+        ]})
+        .to_string(),
+        &[
+            ("authorization", &format!("Bearer {reader}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(shown.0, StatusCode::OK, "{}", shown.1);
+    let shown_body: Value = serde_json::from_str(&shown.1).unwrap();
+    assert_eq!(shown_body["item"][0]["answer"][0]["valueString"], "70");
+}
+
+#[tokio::test]
+async fn bundle_and_graphql_keep_read_scopes() {
+    let (db, catalog, store) = memory();
+    install_package_dir(store.as_ref(), &db, &catalog, sdc_dir()).unwrap();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+        },
+    );
+    let admin = token(&app, "user/*.*").await;
+    let created = send_text(
+        &app,
+        "POST",
+        "/Patient",
+        &json!({
+            "resourceType": "Patient",
+            "id": "p1",
+            "active": true,
+            "name": [{"family": "Ada"}]
+        })
+        .to_string(),
+        &[
+            ("authorization", &format!("Bearer {admin}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+
+    let writer = token(&app, "user/*.write").await;
+    let bundle = launch_bundle().to_string();
+    let denied = send_text(
+        &app,
+        "POST",
+        "/",
+        &bundle,
+        &[
+            ("authorization", &format!("Bearer {writer}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(denied.0, StatusCode::BAD_REQUEST, "{}", denied.1);
+    assert!(
+        denied.1.contains("unknown variable"),
+        "bundle write must not read Patient: {}",
+        denied.1
+    );
+
+    let allowed = send_text(
+        &app,
+        "POST",
+        "/",
+        &bundle,
+        &[
+            ("authorization", &format!("Bearer {admin}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(allowed.0, StatusCode::OK, "{}", allowed.1);
+    let allowed_body: Value = serde_json::from_str(&allowed.1).unwrap();
+    assert_eq!(
+        allowed_body["entry"][0]["resource"]["item"][0]["answer"][0]["valueString"],
+        "secret"
+    );
+
+    let resource = launch_bundle()["entry"][0]["resource"].to_string();
+    let query = format!("mutation {{ QuestionnaireResponseCreate(resource: '{resource}') }}");
+    let gql_denied = send_text(
+        &app,
+        "POST",
+        "/graphql",
+        &json!({"query": query}).to_string(),
+        &[
+            ("authorization", &format!("Bearer {writer}")),
+            ("content-type", "application/json"),
+        ],
+    )
+    .await;
+    assert_eq!(gql_denied.0, StatusCode::BAD_REQUEST, "{}", gql_denied.1);
+    assert!(
+        gql_denied.1.contains("unknown variable"),
+        "graphql write must not read Patient: {}",
+        gql_denied.1
+    );
+
+    let gql_allowed = send_text(
+        &app,
+        "POST",
+        "/graphql",
+        &json!({"query": query}).to_string(),
+        &[
+            ("authorization", &format!("Bearer {admin}")),
+            ("content-type", "application/json"),
+        ],
+    )
+    .await;
+    assert_eq!(gql_allowed.0, StatusCode::OK, "{}", gql_allowed.1);
+    let gql_body: Value = serde_json::from_str(&gql_allowed.1).unwrap();
+    assert_eq!(
+        gql_body["data"]["QuestionnaireResponseCreate"]["item"][0]["answer"][0]["valueString"],
+        "secret"
+    );
+}
+
+fn launch_bundle() -> Value {
+    json!({
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": [{
+            "resource": {
+                "resourceType": "QuestionnaireResponse",
+                "status": "completed",
+                "questionnaire": "#q",
+                "subject": {"reference": "Patient/p1"},
+                "contained": [{
+                    "resourceType": "Questionnaire",
+                    "id": "q",
+                    "status": "active",
+                    "extension": [{
+                        "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-launchContext",
+                        "extension": [
+                            {"url": "name", "valueCoding": {"code": "patient"}},
+                            {"url": "type", "valueCode": "Patient"}
+                        ]
+                    }],
+                    "item": [{
+                        "linkId": "note",
+                        "type": "string",
+                        "extension": [{
+                            "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-enableWhenExpression",
+                            "valueExpression": {
+                                "language": "text/fhirpath",
+                                "expression": "%patient.active"
+                            }
+                        }]
+                    }]
+                }],
+                "item": [{"linkId": "note", "answer": [{"valueString": "secret"}]}]
+            },
+            "request": {"method": "POST", "url": "QuestionnaireResponse"}
+        }]
+    })
+}
+
+async fn token(app: &axum::Router, scope: &str) -> String {
+    let issued = send_text(
+        app,
+        "POST",
+        "/oauth/token",
+        &format!("scope={scope}"),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::OK, "{}", issued.1);
+    let body: Value = serde_json::from_str(&issued.1).unwrap();
+    body["access_token"].as_str().unwrap().to_string()
 }

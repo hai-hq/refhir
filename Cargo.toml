@@ -9,6 +9,10 @@ members = [
     "crates/fhirpath",
     "crates/validate",
     "crates/fhir",
+    "crates/cql",
+    "crates/map",
+    "crates/sdc",
+    "crates/sdc-wasm",
     "crates/server",
     "crates/refhir",
 ]

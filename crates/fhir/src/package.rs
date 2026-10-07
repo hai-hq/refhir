@@ -48,6 +48,10 @@ pub fn expression_clash_dir() -> &'static Path {
     ))
 }
 
+pub fn sdc_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sdc"))
+}
+
 pub fn install_package_dir(
     store: &dyn ConformanceStore,
     db: &Database,
@@ -146,9 +150,13 @@ pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let policy = catalog.read().expect("catalog").reference_policy();
+    let (policy, archiver) = {
+        let current = catalog.read().expect("catalog");
+        (current.reference_policy(), current.sdc_archiver())
+    };
     let mut loaded = Catalog::open(store)?;
     loaded.set_reference_policy(policy);
+    loaded.set_sdc_archiver(archiver);
     *catalog.write().expect("catalog") = loaded;
     Ok(())
 }

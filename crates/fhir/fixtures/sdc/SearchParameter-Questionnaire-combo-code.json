@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/uv/sdc/SearchParameter/Questionnaire-combo-code", "version": "4.0.0", "name": "combo-code", "status": "active", "description": "combo-code", "code": "combo-code", "base": ["Questionnaire"], "type": "token", "expression": "Questionnaire.item.code"}

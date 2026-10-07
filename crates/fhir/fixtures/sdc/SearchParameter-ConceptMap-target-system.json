@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/ConceptMap-target-system", "version": "4.0.1", "name": "targetsystem", "status": "active", "description": "Search ConceptMap by target-system", "code": "target-system", "base": ["ConceptMap"], "type": "uri", "expression": "ConceptMap.group.target"}

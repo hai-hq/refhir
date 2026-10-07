@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/QuestionnaireResponse-author", "version": "4.0.1", "name": "author", "status": "active", "description": "Search QuestionnaireResponse by author", "code": "author", "base": ["QuestionnaireResponse"], "type": "reference", "expression": "QuestionnaireResponse.author"}

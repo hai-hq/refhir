@@ -262,7 +262,9 @@ fn authorize(
     subscribe: bool,
 ) -> Result<Value, String> {
     let Some(session) = session else {
-        return Ok(args.clone());
+        let mut args = args.clone();
+        crate::auth::strip_sdc_controls(&mut args);
+        return Ok(args);
     };
     let args = session.prepare(path, args, subscribe)?;
     if let Some(patient) = session.patient() {
@@ -502,4 +504,36 @@ enum QueryModification {
         #[serde(rename = "queryId")]
         query_id: u64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, RwLock};
+
+    use refhir_database::Database;
+    use refhir_fhir::Catalog;
+    use refhir_sqlite::SqlitePersistence;
+    use serde_json::json;
+
+    use super::authorize;
+
+    #[test]
+    fn unauthenticated_sync_drops_client_controls() {
+        let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+        let db = Database::open(store).unwrap();
+        let catalog = Arc::new(RwLock::new(Catalog::empty()));
+        let args = json!({"_readScopes": ["user/*.*"], "_sdcArchiver": true, "id": "qr1"});
+        let got = authorize(
+            None,
+            &db,
+            &catalog,
+            "QuestionnaireResponse/read",
+            &args,
+            false,
+        )
+        .unwrap();
+        assert!(got.get("_readScopes").is_none());
+        assert!(got.get("_sdcArchiver").is_none());
+        assert_eq!(got["id"], "qr1");
+    }
 }

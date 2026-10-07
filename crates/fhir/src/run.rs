@@ -168,7 +168,7 @@ pub fn dispatch(
             .get("resource")
             .cloned()
             .unwrap_or_else(|| args.clone());
-        return bundle::transaction(tx, catalog, &bundle);
+        return bundle::transaction(tx, catalog, &bundle, args);
     }
     let (type_name, op) = path
         .split_once('/')
@@ -191,36 +191,53 @@ pub fn dispatch(
     let model = catalog.get(type_name)?;
     match op {
         "create" => {
-            let value = ops::create(tx, catalog, model, resource_arg(args)?)?;
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource_arg(args)?)?;
+            let value = ops::create(tx, catalog, model, resource)?;
             set_status(201);
             Ok(value)
         }
-        "read" => ops::read(tx, model, &id_arg(args)?),
-        "update" => ops::update(
-            tx,
-            catalog,
-            model,
-            &id_arg(args)?,
-            resource_arg(args)?,
-            args.get("ifMatch").and_then(|value| value.as_str()),
-        ),
+        "read" => {
+            catalog.deny_response_read(type_name)?;
+            ops::read(tx, model, &id_arg(args)?)
+        }
+        "update" => {
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource_arg(args)?)?;
+            ops::update(
+                tx,
+                catalog,
+                model,
+                &id_arg(args)?,
+                resource,
+                args.get("ifMatch").and_then(|value| value.as_str()),
+            )
+        }
         "delete" => ops::delete(tx, catalog, model, &id_arg(args)?),
-        "patch" => ops::patch(
-            tx,
-            catalog,
-            model,
-            &id_arg(args)?,
-            args.get("patch")
+        "patch" => {
+            catalog.deny_response_read(type_name)?;
+            let id = id_arg(args)?;
+            let patch = args
+                .get("patch")
                 .cloned()
-                .ok_or_else(|| FhirError::Invalid("patch is required".into()))?,
-            args.get("ifMatch").and_then(|value| value.as_str()),
-        ),
+                .ok_or_else(|| FhirError::Invalid("patch is required".into()))?;
+            let mut resource = ops::read(tx, model, &id)?;
+            crate::patch::apply(&mut resource, &patch)?;
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
+            ops::update(
+                tx,
+                catalog,
+                model,
+                &id,
+                resource,
+                args.get("ifMatch").and_then(|value| value.as_str()),
+            )
+        }
         "conditional-create" => {
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource_arg(args)?)?;
             let (value, status) = ops::conditional_create(
                 tx,
                 catalog,
                 model,
-                resource_arg(args)?,
+                resource,
                 args.get("ifNoneExist")
                     .and_then(|value| value.as_str())
                     .unwrap_or(""),
@@ -229,11 +246,12 @@ pub fn dispatch(
             Ok(value)
         }
         "conditional-update" => {
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource_arg(args)?)?;
             let (value, status) = ops::conditional_update(
                 tx,
                 catalog,
                 model,
-                resource_arg(args)?,
+                resource,
                 args.get("query")
                     .and_then(|value| value.as_str())
                     .unwrap_or(""),
@@ -250,6 +268,7 @@ pub fn dispatch(
                 .unwrap_or(""),
         ),
         "vread" => {
+            catalog.deny_response_read(type_name)?;
             let version = args
                 .get("versionId")
                 .and_then(|value| value.as_str())
@@ -257,6 +276,7 @@ pub fn dispatch(
             history::vread(tx, model, &id_arg(args)?, version)
         }
         "history" => {
+            catalog.deny_response_read(type_name)?;
             if let Some(id) = args.get("id").and_then(|value| value.as_str()) {
                 if !id.is_empty() {
                     return history::history(tx, model, id);
@@ -274,21 +294,35 @@ pub fn dispatch(
             let params = search_args(args)?;
             search::search(tx, catalog, model, &params)
         }
+        "$populate" | "$assemble" | "$next-question" | "$behavior" | "$extract" => {
+            crate::sdc::operation(tx, catalog, type_name, op, args)
+        }
         "$validate" => {
             let resource = if args.get("resource").is_some() {
                 resource_arg(args)?
             } else {
+                catalog.deny_response_read(type_name)?;
                 ops::read(tx, model, &id_arg(args)?)?
             };
             let profiles = profile_arg(args);
             Ok(validation_with_profile(tx, catalog, &resource, &profiles))
         }
-        "$meta" => crate::meta::get(tx, model, &id_arg(args)?),
-        "$meta-add" => crate::meta::add(tx, catalog, model, &id_arg(args)?, &resource_arg(args)?),
+        "$meta" => {
+            catalog.deny_response_read(type_name)?;
+            crate::meta::get(tx, model, &id_arg(args)?)
+        }
+        "$meta-add" => {
+            catalog.deny_response_read(type_name)?;
+            crate::meta::add(tx, catalog, model, &id_arg(args)?, &resource_arg(args)?)
+        }
         "$meta-delete" => {
+            catalog.deny_response_read(type_name)?;
             crate::meta::delete(tx, catalog, model, &id_arg(args)?, &resource_arg(args)?)
         }
-        "$everything" => crate::meta::everything(tx, catalog, model, &id_arg(args)?),
+        "$everything" => {
+            catalog.deny_response_read(type_name)?;
+            crate::meta::everything(tx, catalog, model, &id_arg(args)?)
+        }
         "$document" => crate::meta::document(tx, catalog, model, &id_arg(args)?),
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"

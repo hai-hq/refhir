@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/QuestionnaireResponse-subject", "version": "4.0.1", "name": "subject", "status": "active", "description": "Search QuestionnaireResponse by subject", "code": "subject", "base": ["QuestionnaireResponse"], "type": "reference", "expression": "QuestionnaireResponse.subject"}

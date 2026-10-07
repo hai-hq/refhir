@@ -23,6 +23,8 @@ pub struct ServerConfig {
     pub auth: bool,
     pub export_dir: String,
     pub terminology_urls: Vec<String>,
+    /// Form Archiver: QuestionnaireResponse may be created, not read.
+    pub sdc_archiver: bool,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +33,7 @@ impl Default for ServerConfig {
             auth: false,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
+            sdc_archiver: false,
         }
     }
 }
@@ -57,6 +60,10 @@ pub fn app_with(
     store: Arc<dyn ConformanceStore>,
     config: ServerConfig,
 ) -> Router {
+    catalog
+        .write()
+        .expect("catalog")
+        .set_sdc_archiver(config.sdc_archiver);
     let router = Router::new()
         .route("/metadata", get(metadata))
         .route("/.well-known/smart-configuration", get(smart_config))
@@ -77,6 +84,11 @@ pub fn app_with(
         )
         .route("/:resource_type/_history", get(type_history))
         .route("/:resource_type/$validate", post(validate_op))
+        .route("/:resource_type/$populate", post(populate_type))
+        .route("/:resource_type/$assemble", post(assemble_type))
+        .route("/:resource_type/$next-question", post(next_question_type))
+        .route("/:resource_type/$behavior", post(behavior_type))
+        .route("/:resource_type/$extract", post(extract_type))
         .route("/:resource_type/$expand", post(expand_op))
         .route("/:resource_type/$validate-code", post(validate_code_op))
         .route("/:resource_type/$lookup", post(lookup_op))
@@ -87,6 +99,11 @@ pub fn app_with(
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id/$meta", get(meta_get).post(meta_post))
         .route("/:resource_type/:id/$validate", post(validate_instance))
+        .route("/:resource_type/:id/$populate", post(populate_instance))
+        .route("/:resource_type/:id/$assemble", post(assemble_instance))
+        .route("/:resource_type/:id/$next-question", post(next_question_instance))
+        .route("/:resource_type/:id/$behavior", post(behavior_instance))
+        .route("/:resource_type/:id/$extract", post(extract_instance))
         .route("/:resource_type/:id/$everything", get(everything))
         .route("/:resource_type/:id/$document", get(document_op))
         .route("/:resource_type/:id/$websocket", get(subscription_socket))
@@ -256,6 +273,7 @@ async fn smart_guard(
                     query.as_deref(),
                     &method,
                     &resource,
+                    &path,
                     None,
                 ) {
                     return response;
@@ -367,13 +385,9 @@ async fn bundle_post(State(app): State<AppState>, headers: HeaderMap, body: Byte
     } else {
         "Bundle/transaction"
     };
-    match execute(
-        &app.db,
-        &app.catalog,
-        &app.store,
-        path,
-        json!({"resource": resource}),
-    )
+    let mut args = json!({"resource": resource});
+    stamp_sdc(&app, &headers, &mut args);
+    match execute(&app.db, &app.catalog, &app.store, path, args)
     .await
     {
         Ok(result) => render(StatusCode::OK, result.value, prefer_xml(&headers, &[])),
@@ -394,7 +408,7 @@ async fn create(
     let if_none_exist = headers
         .get("if-none-exist")
         .and_then(|value| value.to_str().ok());
-    let (path, args) = if let Some(query) = if_none_exist {
+    let (path, mut args) = if let Some(query) = if_none_exist {
         (
             format!("{resource_type}/conditional-create"),
             json!({"resource": resource, "ifNoneExist": query}),
@@ -405,6 +419,7 @@ async fn create(
             json!({"resource": resource}),
         )
     };
+    stamp_sdc(&app, &headers, &mut args);
     match execute(&app.db, &app.catalog, &app.store, &path, args).await {
         Ok(result) => {
             let id = result.value["id"].as_str().unwrap_or("");
@@ -440,6 +455,131 @@ async fn validate_op(
         &app.store,
         &format!("{resource_type}/$validate"),
         json!({"resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Err(err) => error_response(err),
+    }
+}
+
+async fn populate_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, None, "$populate", headers, body).await
+}
+
+async fn assemble_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, None, "$assemble", headers, body).await
+}
+
+async fn next_question_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, None, "$next-question", headers, body).await
+}
+
+async fn behavior_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, None, "$behavior", headers, body).await
+}
+
+async fn extract_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, None, "$extract", headers, body).await
+}
+
+async fn populate_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, Some(id), "$populate", headers, body).await
+}
+
+async fn assemble_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, Some(id), "$assemble", headers, body).await
+}
+
+async fn next_question_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, Some(id), "$next-question", headers, body).await
+}
+
+async fn behavior_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, Some(id), "$behavior", headers, body).await
+}
+
+async fn extract_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    sdc_call(app, resource_type, Some(id), "$extract", headers, body).await
+}
+
+async fn sdc_call(
+    app: AppState,
+    resource_type: String,
+    id: Option<String>,
+    op: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resource = if body.is_empty() {
+        json!({})
+    } else {
+        match parse_body(&body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        }
+    };
+    let mut args = json!({"resource": resource});
+    if let Some(id) = id {
+        args["id"] = json!(id);
+    }
+    stamp_sdc(&app, &headers, &mut args);
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/{op}"),
+        args,
     )
     .await
     {
@@ -505,6 +645,9 @@ async fn read(
     headers: HeaderMap,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    if let Some(response) = archiver_read(&app, &resource_type) {
+        return response;
+    }
     match execute(
         &app.db,
         &app.catalog,
@@ -541,6 +684,7 @@ async fn update(
     {
         args["ifMatch"] = json!(tag);
     }
+    stamp_sdc(&app, &headers, &mut args);
     match execute(
         &app.db,
         &app.catalog,
@@ -588,6 +732,9 @@ async fn search(
     uri: axum::http::Uri,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    if let Some(response) = archiver_read(&app, &resource_type) {
+        return response;
+    }
     if let Some(response) = authorize(&app, &headers, uri.query(), "GET", &resource_type, None) {
         return response;
     }
@@ -618,6 +765,9 @@ async fn instance_history(
     Path((resource_type, id)): Path<(String, String)>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    if let Some(response) = archiver_read(&app, &resource_type) {
+        return response;
+    }
     let mut args = query_object(params);
     args.insert("id".into(), Value::String(id));
     match execute(
@@ -638,6 +788,9 @@ async fn vread(
     State(app): State<AppState>,
     Path((resource_type, id, vid)): Path<(String, String, String)>,
 ) -> Response {
+    if let Some(response) = archiver_read(&app, &resource_type) {
+        return response;
+    }
     match execute(
         &app.db,
         &app.catalog,
@@ -669,6 +822,9 @@ async fn type_history(
     Path(resource_type): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
+    if let Some(response) = archiver_read(&app, &resource_type) {
+        return response;
+    }
     run_read(
         &app,
         &format!("{resource_type}/history"),
@@ -920,8 +1076,8 @@ async fn oauth_token(State(app): State<AppState>, body: Bytes) -> Response {
     crate::auth::issue(&app, &body)
 }
 
-async fn graphql_route(State(app): State<AppState>, body: Bytes) -> Response {
-    crate::graphql::handle(&app, &body).await
+async fn graphql_route(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    crate::graphql::handle(&app, &headers, &body).await
 }
 
 async fn export_system(State(app): State<AppState>, body: Bytes) -> Response {
@@ -959,6 +1115,27 @@ async fn run_read(app: &AppState, path: &str, args: Value) -> Response {
     }
 }
 
+pub(crate) fn stamp_sdc(app: &AppState, headers: &HeaderMap, args: &mut Value) {
+    if app.config.sdc_archiver {
+        args["_sdcArchiver"] = json!(true);
+    }
+    if app.config.auth {
+        args["_readScopes"] = json!(crate::auth::token_scopes(headers, None).unwrap_or_default());
+    }
+}
+
+fn archiver_read(app: &AppState, resource_type: &str) -> Option<Response> {
+    if app.config.sdc_archiver && resource_type == "QuestionnaireResponse" {
+        Some(outcome(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "form archiver does not read QuestionnaireResponse",
+        ))
+    } else {
+        None
+    }
+}
+
 fn authorize(
     app: &AppState,
     headers: &HeaderMap,
@@ -967,7 +1144,7 @@ fn authorize(
     resource_type: &str,
     patient: Option<&str>,
 ) -> Option<Response> {
-    crate::auth::check(app, headers, query, method, resource_type, patient)
+    crate::auth::check(app, headers, query, method, resource_type, "", patient)
 }
 
 fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
@@ -1143,6 +1320,7 @@ fn fhir_status(err: &FhirError) -> StatusCode {
         FhirError::Conflict(_) => StatusCode::CONFLICT,
         FhirError::Precondition(_) => StatusCode::PRECONDITION_FAILED,
         FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        FhirError::Forbidden(_) => StatusCode::FORBIDDEN,
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
             StatusCode::BAD_REQUEST
         }

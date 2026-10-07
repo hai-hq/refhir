@@ -102,6 +102,8 @@ pub struct Catalog {
     terms: MemoryTerminology,
     reference_policy: ReferencePolicy,
     compartments: BTreeMap<String, Compartment>,
+    /// Form Archiver: store QuestionnaireResponse, never return one.
+    sdc_archiver: bool,
 }
 
 impl Catalog {
@@ -114,6 +116,7 @@ impl Catalog {
             terms: MemoryTerminology::default(),
             reference_policy: ReferencePolicy::Strict,
             compartments: compartment::load(&[]),
+            sdc_archiver: false,
         }
     }
 
@@ -235,6 +238,7 @@ impl Catalog {
             terms,
             reference_policy: ReferencePolicy::Strict,
             compartments: compartment::load(&term_json),
+            sdc_archiver: false,
         })
     }
 
@@ -244,6 +248,25 @@ impl Catalog {
 
     pub fn set_reference_policy(&mut self, policy: ReferencePolicy) {
         self.reference_policy = policy;
+    }
+
+    pub fn sdc_archiver(&self) -> bool {
+        self.sdc_archiver
+    }
+
+    pub fn set_sdc_archiver(&mut self, enabled: bool) {
+        self.sdc_archiver = enabled;
+    }
+
+    /// Form Archiver may store a QuestionnaireResponse and must not return one.
+    pub fn deny_response_read(&self, type_name: &str) -> Result<(), FhirError> {
+        if self.sdc_archiver && type_name == "QuestionnaireResponse" {
+            Err(FhirError::Forbidden(
+                "form archiver does not read QuestionnaireResponse".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn compartment(&self, code: &str) -> Option<&Compartment> {
@@ -311,7 +334,7 @@ impl Catalog {
                 })
             })
             .collect();
-        json!({
+        let mut statement = json!({
             "resourceType": "CapabilityStatement",
             "status": "active",
             "kind": "instance",
@@ -327,7 +350,9 @@ impl Catalog {
                     {"code": "search-system"}
                 ]
             }]
-        })
+        });
+        refhir_sdc::annotate_capability(&mut statement);
+        statement
     }
 }
 

@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/StructureDefinition-derivation", "version": "4.0.1", "name": "derivation", "status": "active", "description": "Search StructureDefinition by derivation", "code": "derivation", "base": ["StructureDefinition"], "type": "token", "expression": "StructureDefinition.derivation"}

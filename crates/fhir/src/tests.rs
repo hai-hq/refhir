@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use refhir_database::Database;
+use refhir_database::{Database, Put};
 use refhir_persistence::ConformanceStore;
 use refhir_sqlite::SqlitePersistence;
-use refhir_types::{token_interval, IndexId, Order};
+use refhir_types::{exact_key, token_interval, IndexId, Order, TabletId};
 use serde_json::{json, Value};
 
 use refhir_validate::{TermAnswer, Terminology};
@@ -13,7 +13,7 @@ use crate::conform::{commit_operation, repair_conformance};
 use crate::error::FhirError;
 use crate::package::{
     expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
-    stage_package_dir, version_clash_dir,
+    sdc_dir, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
 
@@ -1447,4 +1447,509 @@ fn meta_everything_and_instance_validate() {
         document,
         RunError::Fhir(FhirError::Unsupported(_))
     ));
+}
+
+#[test]
+fn sdc_capability_populate_and_completed_response() {
+    let harness = ready();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, sdc_dir()).unwrap();
+    let statement = harness.catalog.read().unwrap().capability_statement();
+    let instantiates = statement["instantiates"].to_string();
+    assert!(instantiates.contains("sdc-form-fill-manager"));
+    let questionnaire = statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Questionnaire")
+        .unwrap();
+    let names: Vec<_> = questionnaire["operation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| operation["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"populate"));
+    assert!(names.contains(&"assemble"));
+    assert!(questionnaire.to_string().contains("text/fhirpath"));
+    assert!(questionnaire.to_string().contains("text/cql-expression"));
+
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ada")}),
+    );
+    apply(
+        &harness,
+        "Observation/create",
+        json!({"resource": {
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "29463-7"}]},
+            "subject": {"reference": "Patient/p1"},
+            "effectiveDateTime": "2099-01-01T00:00:00Z",
+            "valueString": "70"
+        }}),
+    );
+    let form = json!({
+        "resourceType": "Questionnaire",
+        "url": "http://example.org/Questionnaire/weight",
+        "status": "active",
+        "item": [{
+            "linkId": "weight",
+            "type": "string",
+            "code": [{"system": "http://loinc.org", "code": "29463-7"}],
+            "extension": [{
+                "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-observationLinkPeriod",
+                "valueDuration": {"value": 1, "unit": "a", "system": "http://unitsofmeasure.org", "code": "a"}
+            }]
+        }]
+    });
+    let populated = apply(
+        &harness,
+        "Questionnaire/$populate",
+        json!({"resource": form.clone(), "subject": "Patient/p1"}),
+    );
+    assert_eq!(populated["item"][0]["answer"][0]["valueString"], "70");
+    let view = apply(
+        &harness,
+        "Questionnaire/$behavior",
+        json!({"resource": {
+            "questionnaire": form,
+            "response": {"resourceType": "QuestionnaireResponse", "status": "in-progress", "item": [{
+                "linkId": "weight",
+                "answer": [{"valueString": "70"}]
+            }]}
+        }}),
+    );
+    assert_eq!(view["enabled"]["weight"], true);
+
+    apply(&harness, "Questionnaire/create", json!({"resource": {
+        "resourceType": "Questionnaire",
+        "url": "http://example.org/Questionnaire/required",
+        "status": "active",
+        "item": [{"linkId": "name", "type": "string", "required": true}]
+    }}));
+    let rejected = run_op(
+        &harness,
+        "QuestionnaireResponse/create",
+        &json!({"resource": {
+            "resourceType": "QuestionnaireResponse",
+            "status": "completed",
+            "questionnaire": "http://example.org/Questionnaire/required"
+        }}),
+    )
+    .unwrap_err();
+    assert!(matches!(rejected, RunError::Fhir(FhirError::Outcome(_))));
+}
+
+#[test]
+fn bundle_store_uses_caller_read_scopes() {
+    let harness = ready();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, sdc_dir()).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ada")}),
+    );
+    let denied = run_op(
+        &harness,
+        "Bundle/transaction",
+        &json!({
+            "_readScopes": ["user/QuestionnaireResponse.write"],
+            "resource": launch_bundle()
+        }),
+    )
+    .unwrap_err();
+    let message = denied.to_string();
+    assert!(
+        message.contains("unknown variable"),
+        "write scopes must not read Patient during store: {message}"
+    );
+
+    let allowed = apply(
+        &harness,
+        "Bundle/transaction",
+        json!({
+            "_readScopes": ["user/Patient.read"],
+            "resource": launch_bundle()
+        }),
+    );
+    assert_eq!(
+        allowed["entry"][0]["resource"]["item"][0]["answer"][0]["valueString"],
+        "secret"
+    );
+}
+
+#[test]
+fn patch_checks_completed_responses_and_archiver_rejects_it() {
+    let harness = ready();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, sdc_dir()).unwrap();
+    apply(
+        &harness,
+        "Questionnaire/create",
+        json!({"resource": {
+            "resourceType": "Questionnaire",
+            "url": "http://example.org/Questionnaire/required",
+            "status": "active",
+            "item": [{"linkId": "name", "type": "string", "required": true}]
+        }}),
+    );
+    let created = apply(
+        &harness,
+        "QuestionnaireResponse/create",
+        json!({"resource": {
+            "resourceType": "QuestionnaireResponse",
+            "status": "in-progress",
+            "questionnaire": "http://example.org/Questionnaire/required"
+        }}),
+    );
+    let id = created["id"].as_str().unwrap();
+    let patch = json!({"id": id, "patch": [{"op": "replace", "path": "/status", "value": "completed"}]});
+    let rejected = run_op(&harness, "QuestionnaireResponse/patch", &patch).unwrap_err();
+    assert!(
+        matches!(rejected, RunError::Fhir(FhirError::Outcome(_))),
+        "{rejected}"
+    );
+    harness.catalog.write().unwrap().set_sdc_archiver(true);
+    let hidden = run_op(&harness, "QuestionnaireResponse/patch", &patch).unwrap_err();
+    assert!(
+        matches!(hidden, RunError::Fhir(FhirError::Forbidden(_))),
+        "{hidden}"
+    );
+}
+
+fn launch_bundle() -> Value {
+    json!({
+        "resourceType": "Bundle",
+        "type": "transaction",
+        "entry": [{
+            "resource": {
+                "resourceType": "QuestionnaireResponse",
+                "status": "completed",
+                "questionnaire": "#q",
+                "subject": {"reference": "Patient/p1"},
+                "contained": [{
+                    "resourceType": "Questionnaire",
+                    "id": "q",
+                    "status": "active",
+                    "extension": [{
+                        "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-launchContext",
+                        "extension": [
+                            {"url": "name", "valueCoding": {"code": "patient"}},
+                            {"url": "type", "valueCode": "Patient"}
+                        ]
+                    }],
+                    "item": [{
+                        "linkId": "note",
+                        "type": "string",
+                        "extension": [{
+                            "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-enableWhenExpression",
+                            "valueExpression": {
+                                "language": "text/fhirpath",
+                                "expression": "%patient.active"
+                            }
+                        }]
+                    }]
+                }],
+                "item": [{"linkId": "note", "answer": [{"valueString": "secret"}]}]
+            },
+            "request": {"method": "POST", "url": "QuestionnaireResponse"}
+        }]
+    })
+}
+
+#[test]
+fn sdc_package_installs_on_r4() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, sdc_dir()).unwrap();
+    let statement = harness.catalog.read().unwrap().capability_statement();
+    let questionnaire = statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Questionnaire")
+        .unwrap();
+    let names: Vec<_> = questionnaire["operation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|operation| operation["name"].as_str())
+        .collect();
+    assert!(names.contains(&"populate"));
+    assert!(!names.contains(&"extract"));
+    let response = statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "QuestionnaireResponse")
+        .unwrap();
+    assert!(response["operation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|operation| operation["name"] == "extract"));
+    let rejected = commit(
+        &harness,
+        "Questionnaire/create",
+        json!({"resource": {
+            "resourceType": "Questionnaire",
+            "status": "active",
+            "notAField": true
+        }}),
+    );
+    let RunError::Fhir(FhirError::Outcome(outcome)) = rejected.unwrap_err() else {
+        panic!("expected a validation outcome");
+    };
+    let message = outcome.to_string();
+    assert!(
+        message.contains("unknown element"),
+        "sdc package must not wipe the R4 snapshot: {message}"
+    );
+
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ada")}),
+    );
+    let response = apply(
+        &harness,
+        "QuestionnaireResponse/create",
+        json!({"resource": {
+            "resourceType": "QuestionnaireResponse",
+            "status": "in-progress",
+            "author": {"reference": "Patient/p1"},
+            "item": [{"linkId": "q1", "answer": [{"valueString": "secret"}]}]
+        }}),
+    );
+    let response_id = response["id"].as_str().unwrap();
+    apply(
+        &harness,
+        "Observation/create",
+        json!({"resource": {
+            "resourceType": "Observation",
+            "status": "final",
+            "code": {"text": "from the form"},
+            "derivedFrom": [{"reference": format!("QuestionnaireResponse/{response_id}")}]
+        }}),
+    );
+    let included = apply(
+        &harness,
+        "Patient/search",
+        json!({"_id": "p1", "_revinclude": "QuestionnaireResponse:author"}),
+    );
+    assert!(bundle_has_type(&included, "QuestionnaireResponse"));
+    let forward = apply(
+        &harness,
+        "Observation/search",
+        json!({"derived-from": format!("QuestionnaireResponse/{response_id}"), "_include": "Observation:derived-from"}),
+    );
+    assert!(bundle_has_type(&forward, "QuestionnaireResponse"));
+    // section.entry's targetProfile is Resource, so validation rejects a
+    // QuestionnaireResponse reference. Persist the composition on the document
+    // log so $document still has a response to walk.
+    let composition_id = "comp1";
+    store_composition(&harness, composition_id, response_id);
+    let document = apply(
+        &harness,
+        "Composition/$document",
+        json!({"id": composition_id}),
+    );
+    assert!(bundle_has_type(&document, "QuestionnaireResponse"));
+
+    harness.catalog.write().unwrap().set_sdc_archiver(true);
+    let hidden = commit(
+        &harness,
+        "QuestionnaireResponse/$everything",
+        json!({"id": response_id}),
+    );
+    assert!(matches!(
+        hidden.unwrap_err(),
+        RunError::Fhir(FhirError::Forbidden(_))
+    ));
+    let meta = commit(
+        &harness,
+        "QuestionnaireResponse/$meta",
+        json!({"id": response_id}),
+    );
+    assert!(matches!(
+        meta.unwrap_err(),
+        RunError::Fhir(FhirError::Forbidden(_))
+    ));
+    let validated = commit(
+        &harness,
+        "QuestionnaireResponse/$validate",
+        json!({"id": response_id}),
+    );
+    assert!(matches!(
+        validated.unwrap_err(),
+        RunError::Fhir(FhirError::Forbidden(_))
+    ));
+    let document = apply(
+        &harness,
+        "Composition/$document",
+        json!({"id": composition_id}),
+    );
+    assert!(!bundle_has_type(&document, "QuestionnaireResponse"));
+    assert!(bundle_has_type(&document, "Composition"));
+    assert!(bundle_has_type(&document, "Patient"));
+    let revinclude = apply(
+        &harness,
+        "Patient/search",
+        json!({"_id": "p1", "_revinclude": "QuestionnaireResponse:author"}),
+    );
+    assert!(!bundle_has_type(&revinclude, "QuestionnaireResponse"));
+    let include = apply(
+        &harness,
+        "Observation/search",
+        json!({"derived-from": format!("QuestionnaireResponse/{response_id}"), "_include": "Observation:derived-from"}),
+    );
+    assert!(!bundle_has_type(&include, "QuestionnaireResponse"));
+    assert!(bundle_has_type(&include, "Observation"));
+}
+
+fn store_composition(harness: &Harness, id: &str, response_id: &str) {
+    let mut tx = harness.db.begin();
+    tx.stage_put(Put {
+        tablet: TabletId::new("Composition"),
+        id: id.to_string(),
+        json: json!({
+            "resourceType": "Composition",
+            "id": id,
+            "status": "final",
+            "type": {"text": "form"},
+            "date": "2020-01-01",
+            "author": [{"reference": "Patient/p1"}],
+            "title": "answers",
+            "section": [{
+                "entry": [{"reference": format!("QuestionnaireResponse/{response_id}")}]
+            }]
+        }),
+        new_keys: vec![(IndexId::new("Composition/by_id"), exact_key(id))],
+        old_keys: Vec::new(),
+        prev_ts: None,
+    })
+    .unwrap();
+    harness.db.commit(tx).unwrap();
+}
+
+fn bundle_has_type(bundle: &Value, type_name: &str) -> bool {
+    bundle["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["resource"]["resourceType"] == type_name)
+}
+
+#[test]
+fn unindexed_populate_query_does_not_return_every_patient() {
+    let harness = ready();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, sdc_dir()).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ada")}),
+    );
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p2", true, "Grace")}),
+    );
+    let expression =
+        "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-initialExpression";
+    let form = json!({
+        "resourceType": "Questionnaire",
+        "status": "active",
+        "item": [
+            {
+                "linkId": "named",
+                "type": "reference",
+                "extension": [{
+                    "url": expression,
+                    "valueExpression": {"language": "text/fhirpath", "expression": "Patient?identifier=http://hospital.example|mrn-p1"}
+                }]
+            },
+            {
+                "linkId": "born",
+                "type": "reference",
+                "extension": [{
+                    "url": expression,
+                    "valueExpression": {"language": "text/fhirpath", "expression": "Patient?birthdate=1980"}
+                }]
+            }
+        ]
+    });
+    let populated = apply(
+        &harness,
+        "Questionnaire/$populate",
+        json!({"resource": form}),
+    );
+    assert_eq!(
+        populated["item"][0]["answer"][0]["valueReference"]["reference"],
+        "Patient/p1"
+    );
+    let born = &populated["item"][1];
+    assert!(
+        born.get("answer").is_none()
+            || born["answer"].as_array().is_some_and(|items| items.is_empty()),
+        "birthdate is not an indexed parameter: {born}"
+    );
+}
+
+#[test]
+fn structure_map_translate_uses_the_installed_concept_map() {
+    let harness = ready();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, sdc_dir()).unwrap();
+    let map = json!({
+        "resourceType": "StructureMap",
+        "id": "gender",
+        "status": "active",
+        "group": [{
+            "name": "main",
+            "input": [
+                {"name": "src", "mode": "source"},
+                {"name": "out", "type": "QuestionnaireResponse", "mode": "target"}
+            ],
+            "rule": [{
+                "name": "gender",
+                "source": [{"context": "src", "element": "entry.resource.gender", "variable": "g"}],
+                "target": [{
+                    "context": "out",
+                    "element": "status",
+                    "transform": "translate",
+                    "parameter": [
+                        {"valueId": "g"},
+                        {"valueString": "http://example.org/ConceptMap/gender"}
+                    ]
+                }]
+            }]
+        }]
+    });
+    let form = json!({
+        "resourceType": "Questionnaire",
+        "status": "active",
+        "contained": [map],
+        "extension": [{
+            "url": "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-sourceStructureMap",
+            "valueCanonical": "#gender"
+        }]
+    });
+    let ambiguous = apply(
+        &harness,
+        "Questionnaire/$populate",
+        json!({"resource": form.clone(), "content": [{"resourceType": "Patient", "gender": "M"}]}),
+    );
+    assert_eq!(ambiguous["status"], "M");
+    let translated = apply(
+        &harness,
+        "Questionnaire/$populate",
+        json!({
+            "resource": form,
+            "content": [{
+                "resourceType": "Patient",
+                "gender": {"system": "http://example.org/gender-a", "code": "M"}
+            }]
+        }),
+    );
+    assert_eq!(translated["status"], "male");
 }

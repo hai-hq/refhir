@@ -58,7 +58,7 @@ pub fn type_history(
     offset: usize,
 ) -> Result<Value, FhirError> {
     tx.record_span(model.by_id(), Interval::all());
-    log_bundle(tx, Some(model), since, count, offset)
+    log_bundle(tx, Some(model), since, count, offset, None)
 }
 
 pub fn system_history(
@@ -71,7 +71,10 @@ pub fn system_history(
     for model in catalog.resource_models() {
         tx.record_span(model.by_id(), Interval::all());
     }
-    log_bundle(tx, None, since, count, offset)
+    let hide = catalog
+        .sdc_archiver()
+        .then_some("QuestionnaireResponse");
+    log_bundle(tx, None, since, count, offset, hide)
 }
 
 fn log_bundle(
@@ -80,13 +83,14 @@ fn log_bundle(
     since: Option<Timestamp>,
     count: Option<usize>,
     offset: usize,
+    hide: Option<&str>,
 ) -> Result<Value, FhirError> {
     let start = since.unwrap_or(Timestamp::ZERO);
     let rows = tx.log_since(start)?;
     let mut entries = Vec::new();
     for row in rows {
         let type_name = row.id.tablet.as_str();
-        if model.is_some_and(|item| item.name != type_name) {
+        if model.is_some_and(|item| item.name != type_name) || hide == Some(type_name) {
             continue;
         }
         let Some(id) = row.id.id_str() else {

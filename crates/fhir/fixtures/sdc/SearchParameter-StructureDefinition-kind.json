@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/StructureDefinition-kind", "version": "4.0.1", "name": "kind", "status": "active", "description": "Search StructureDefinition by kind", "code": "kind", "base": ["StructureDefinition"], "type": "token", "expression": "StructureDefinition.kind"}

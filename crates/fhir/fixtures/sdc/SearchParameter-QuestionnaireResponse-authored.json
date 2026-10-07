@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/QuestionnaireResponse-authored", "version": "4.0.1", "name": "authored", "status": "active", "description": "Search QuestionnaireResponse by authored", "code": "authored", "base": ["QuestionnaireResponse"], "type": "date", "expression": "QuestionnaireResponse.authored"}

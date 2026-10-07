@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Task-owner", "version": "4.0.1", "name": "owner", "status": "active", "description": "Search Task by owner", "code": "owner", "base": ["Task"], "type": "reference", "expression": "Task.owner"}

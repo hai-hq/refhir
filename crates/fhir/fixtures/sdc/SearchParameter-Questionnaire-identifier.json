@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Questionnaire-identifier", "version": "4.0.1", "name": "identifier", "status": "active", "description": "Search Questionnaire by identifier", "code": "identifier", "base": ["Questionnaire"], "type": "token", "expression": "Questionnaire.identifier"}

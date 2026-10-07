@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Task-code", "version": "4.0.1", "name": "code", "status": "active", "description": "Search Task by code", "code": "code", "base": ["Task"], "type": "token", "expression": "Task.code"}

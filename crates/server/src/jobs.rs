@@ -278,6 +278,9 @@ fn export_keeps(
     focus: Option<&str>,
     group_patients: &[String],
 ) -> bool {
+    if catalog.sdc_archiver() && tablet == "QuestionnaireResponse" {
+        return false;
+    }
     let Some(type_name) = type_name else {
         return true;
     };

@@ -1,0 +1,6 @@
+{
+  "name": "hl7.fhir.uv.sdc",
+  "version": "4.0.0",
+  "fhirVersion": "4.0.1",
+  "description": "Structured Data Capture 4.0.0 conformance slice for ReFHIR"
+}

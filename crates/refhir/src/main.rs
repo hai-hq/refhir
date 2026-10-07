@@ -34,6 +34,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut export_dir = "export".to_string();
     let mut terminology_urls = Vec::new();
     let mut trace_engine = false;
+    let mut sdc_archiver = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -41,11 +42,12 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "refhir [--sqlite path] [--memory] [--postgres url] [--bind 127.0.0.1:8080]\n\
                      [--package dir] [--references strict|fhir] [--smart]\n\
-                     [--export-dir path] [--terminology url] [--trace-engine]\n\
+                     [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
                      Default database is refhir.sqlite. --memory uses SQLite in RAM and\n\
                      leaves no file. With no --package, the bundled\n\
-                     hl7.fhir.r4.core 4.0.1 package is installed. --package may be repeated and\n\
-                     replaces that default. --references defaults to strict."
+                     hl7.fhir.r4.core 4.0.1 package and the SDC 4.0.0 slice are installed.\n\
+                     --package may be repeated and replaces that default. --references defaults to strict.\n\
+                     --sdc-archiver stores QuestionnaireResponse without allowing a later read."
                 );
                 return Ok(());
             }
@@ -71,6 +73,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 references = required(&args, index, "--references")?;
             }
             "--smart" => auth = true,
+            "--sdc-archiver" => sdc_archiver = true,
             "--export-dir" => {
                 index += 1;
                 export_dir = required(&args, index, "--export-dir")?;
@@ -121,6 +124,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = Arc::new(RwLock::new(Catalog::open(store.as_ref())?));
     if packages.is_empty() {
         refhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, refhir_fhir::r4_dir())?;
+        refhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, refhir_fhir::sdc_dir())?;
     } else {
         for path in &packages {
             refhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, Path::new(path))?;
@@ -147,6 +151,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             auth,
             export_dir,
             terminology_urls,
+            sdc_archiver,
         },
     )
     .await?;

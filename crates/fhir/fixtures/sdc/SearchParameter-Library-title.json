@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Library-title", "version": "4.0.1", "name": "title", "status": "active", "description": "Search Library by title", "code": "title", "base": ["Library"], "type": "string", "expression": "Library.title"}

@@ -1,0 +1,27 @@
+{
+  "resourceType": "ConceptMap",
+  "url": "http://example.org/ConceptMap/gender",
+  "status": "active",
+  "group": [
+    {
+      "source": "http://example.org/gender-a",
+      "target": "http://example.org/gender-out",
+      "element": [
+        {
+          "code": "M",
+          "target": [{ "code": "male", "equivalence": "equivalent" }]
+        }
+      ]
+    },
+    {
+      "source": "http://example.org/gender-b",
+      "target": "http://example.org/gender-out",
+      "element": [
+        {
+          "code": "M",
+          "target": [{ "code": "other", "equivalence": "equivalent" }]
+        }
+      ]
+    }
+  ]
+}

@@ -53,6 +53,8 @@ struct Controls {
 }
 
 struct IncludeSpec {
+    /// Resource type named before the parameter, when the token has one.
+    source: Option<String>,
     param: String,
     target: Option<String>,
 }
@@ -87,6 +89,7 @@ pub fn search(
     model: &ResourceModel,
     params: &BTreeMap<String, String>,
 ) -> Result<Value, FhirError> {
+    catalog.deny_response_read(&model.name)?;
     if let Some(query) = params.get("_query") {
         return Err(FhirError::Invalid(format!("unknown query {query}")));
     }
@@ -226,18 +229,35 @@ fn parse_include(text: &str) -> Option<IncludeSpec> {
     let text = text.trim().trim_end_matches(":iterate");
     if text == "*" {
         return Some(IncludeSpec {
+            source: None,
             param: "*".into(),
             target: None,
         });
     }
     let mut parts = text.split(':');
-    let _source = parts.next()?;
-    let param = parts.next().unwrap_or(text).to_string();
+    let first = parts.next()?.to_string();
+    if first.is_empty() {
+        return None;
+    }
+    let Some(param) = parts.next() else {
+        return Some(IncludeSpec {
+            source: None,
+            param: first,
+            target: None,
+        });
+    };
     if param.is_empty() {
         return None;
     }
-    let target = parts.next().map(|item| item.to_string());
-    Some(IncludeSpec { param, target })
+    let target = parts
+        .next()
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_string());
+    Some(IncludeSpec {
+        source: Some(first),
+        param: param.to_string(),
+        target,
+    })
 }
 
 fn clauses_from(
@@ -847,6 +867,13 @@ fn push_forward(
     entries: &mut Vec<Value>,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), FhirError> {
+    if spec
+        .source
+        .as_deref()
+        .is_some_and(|source| source != "*" && source != model.name)
+    {
+        return Ok(());
+    }
     let params: Vec<&crate::catalog::SearchParam> = if spec.param == "*" {
         model
             .params
@@ -882,6 +909,9 @@ fn push_forward(
         {
             continue;
         }
+        if catalog.deny_response_read(type_name).is_err() {
+            continue;
+        }
         if !seen.insert(format!("{type_name}/{id}")) {
             continue;
         }
@@ -909,6 +939,16 @@ fn push_reverse(
 ) -> Result<(), FhirError> {
     let token = format!("{}/{}", model.name, id);
     for other in catalog.resource_models() {
+        if spec
+            .source
+            .as_deref()
+            .is_some_and(|source| source != "*" && source != other.name)
+        {
+            continue;
+        }
+        if catalog.deny_response_read(&other.name).is_err() {
+            continue;
+        }
         let Some(param) = other.ready_param(&spec.param) else {
             continue;
         };

@@ -353,20 +353,6 @@ fn check_version(
     Ok(())
 }
 
-pub fn patch(
-    tx: &mut Transaction,
-    catalog: &Catalog,
-    model: &ResourceModel,
-    id: &str,
-    patch_body: Value,
-    if_match: Option<&str>,
-) -> Result<Value, FhirError> {
-    let current = read(tx, model, id)?;
-    let mut resource = current;
-    crate::patch::apply(&mut resource, &patch_body)?;
-    update(tx, catalog, model, id, resource, if_match)
-}
-
 pub fn conditional_create(
     tx: &mut Transaction,
     catalog: &Catalog,

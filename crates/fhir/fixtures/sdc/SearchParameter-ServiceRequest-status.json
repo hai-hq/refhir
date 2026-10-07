@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/ServiceRequest-status", "version": "4.0.1", "name": "status", "status": "active", "description": "Search ServiceRequest by status", "code": "status", "base": ["ServiceRequest"], "type": "token", "expression": "ServiceRequest.status"}

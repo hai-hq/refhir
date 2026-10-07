@@ -1,14 +1,34 @@
 //! A small FHIR GraphQL surface. Queries and mutations lower to `dispatch`.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use std::collections::BTreeMap;
 
+use refhir_fhir::{FhirError, RunError};
 use serde_json::{json, Map, Value};
 
 use crate::http::{execute, fhir_json_public, AppState};
 
-pub async fn handle(app: &AppState, body: &[u8]) -> Response {
+enum GqlErr {
+    Bad(String),
+    Forbidden(String),
+}
+
+impl From<String> for GqlErr {
+    fn from(message: String) -> Self {
+        GqlErr::Bad(message)
+    }
+}
+
+fn from_run(err: RunError) -> GqlErr {
+    if let RunError::Fhir(FhirError::Forbidden(message)) = err {
+        GqlErr::Forbidden(message)
+    } else {
+        GqlErr::Bad(err.to_string())
+    }
+}
+
+pub async fn handle(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
     let document = match serde_json::from_slice::<Value>(body) {
         Ok(value) => value
             .get("query")
@@ -17,16 +37,24 @@ pub async fn handle(app: &AppState, body: &[u8]) -> Response {
             .to_string(),
         Err(_) => String::from_utf8_lossy(body).to_string(),
     };
-    match execute_document(app, &document).await {
+    match execute_document(app, headers, &document).await {
         Ok(data) => fhir_json_public(StatusCode::OK, json!({"data": data})),
-        Err(message) => fhir_json_public(
+        Err(GqlErr::Forbidden(message)) => fhir_json_public(
+            StatusCode::FORBIDDEN,
+            json!({"errors": [{"message": message}]}),
+        ),
+        Err(GqlErr::Bad(message)) => fhir_json_public(
             StatusCode::BAD_REQUEST,
             json!({"errors": [{"message": message}]}),
         ),
     }
 }
 
-async fn execute_document(app: &AppState, document: &str) -> Result<Value, String> {
+async fn execute_document(
+    app: &AppState,
+    headers: &HeaderMap,
+    document: &str,
+) -> Result<Value, GqlErr> {
     let document = document.trim();
     let mutation = document.starts_with("mutation");
     let body = document
@@ -37,7 +65,7 @@ async fn execute_document(app: &AppState, document: &str) -> Result<Value, Strin
     let field = parse_field(body).ok_or_else(|| "empty selection".to_string())?;
     let (type_name, list, action) = split_field(&field.name);
     if mutation || action.is_some() {
-        return mutate(app, &type_name, action.unwrap_or("Create"), &field).await;
+        return mutate(app, headers, &type_name, action.unwrap_or("Create"), &field).await;
     }
     if list {
         let mut args = Map::new();
@@ -56,7 +84,7 @@ async fn execute_document(app: &AppState, document: &str) -> Result<Value, Strin
             Value::Object(args),
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(from_run)?;
         Ok(json!({ field.name.clone(): project_list(&result.value, &field) }))
     } else {
         let id = field
@@ -72,18 +100,19 @@ async fn execute_document(app: &AppState, document: &str) -> Result<Value, Strin
             json!({"id": id}),
         )
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(from_run)?;
         Ok(json!({ field.name.clone(): project(&result.value, &field) }))
     }
 }
 
 async fn mutate(
     app: &AppState,
+    headers: &HeaderMap,
     type_name: &str,
     action: &str,
     field: &Field,
-) -> Result<Value, String> {
-    let (path, args) = match action {
+) -> Result<Value, GqlErr> {
+    let (path, mut args) = match action {
         "Delete" => (
             format!("{type_name}/delete"),
             json!({"id": field.args.get("id").cloned().unwrap_or_default()}),
@@ -107,9 +136,10 @@ async fn mutate(
             json!({"resource": parse_resource(field.args.get("resource"))?}),
         ),
     };
+    crate::http::stamp_sdc(app, headers, &mut args);
     let result = execute(&app.db, &app.catalog, &app.store, &path, args)
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(from_run)?;
     let value = if result.value.is_null() {
         json!({"id": field.args.get("id").cloned().unwrap_or_default()})
     } else {

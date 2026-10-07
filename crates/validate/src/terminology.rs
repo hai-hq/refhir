@@ -307,6 +307,41 @@ impl MemoryTerminology {
         parameter.extend(matches);
         json!({"resourceType": "Parameters", "parameter": parameter})
     }
+
+    /// Target code for a StructureMap `translate` transform.
+    ///
+    /// The mapping language writes this value onto the target element, so the
+    /// result is the code itself. A source system selects one ConceptMap group.
+    /// When the system is absent and the groups disagree, there is no translation.
+    pub fn translate_coding(
+        &self,
+        map_url: &str,
+        system: Option<&str>,
+        code: &str,
+    ) -> Option<Json> {
+        let map_url = canonical(map_url);
+        let mut codes = Vec::new();
+        for ((source_system, stored), targets) in &self.maps {
+            if stored != code {
+                continue;
+            }
+            if system.is_some_and(|item| canonical(item) != source_system) {
+                continue;
+            }
+            for target in targets {
+                if target.map_url != map_url || !usable_equivalence(&target.equivalence) {
+                    continue;
+                }
+                if !codes.iter().any(|found| found == &target.code) {
+                    codes.push(target.code.clone());
+                }
+            }
+        }
+        match codes.as_slice() {
+            [only] => Some(Json::String(only.clone())),
+            _ => None,
+        }
+    }
 }
 
 impl Terminology for MemoryTerminology {
@@ -935,6 +970,10 @@ pub fn canonical(url: &str) -> &str {
     url.split('|').next().unwrap_or(url)
 }
 
+fn usable_equivalence(equivalence: &str) -> bool {
+    !matches!(equivalence, "disjoint" | "unmatched" | "unrelated")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -1059,6 +1098,17 @@ mod tests {
             }]
         });
         let terms = MemoryTerminology::from_resources(&[map]);
+        assert_eq!(
+            terms.translate_coding("http://example.org/map", Some("http://example.org/src"), "a"),
+            Some(json!("b"))
+        );
+        assert!(terms
+            .translate_coding(
+                "http://example.org/other",
+                Some("http://example.org/src"),
+                "a"
+            )
+            .is_none());
         let translated = terms.translate(
             Some("http://example.org/map"),
             "http://example.org/src",
@@ -1079,6 +1129,34 @@ mod tests {
             .find(|item| item["name"] == "match")
             .unwrap();
         assert_eq!(concept["part"][1]["valueCoding"]["code"], "b");
+        let ambiguous = json!({
+            "resourceType": "ConceptMap",
+            "url": "http://example.org/map",
+            "group": [
+                {
+                    "source": "http://example.org/src-a",
+                    "target": "http://example.org/dst",
+                    "element": [{"code": "M", "target": [{"code": "male", "equivalence": "equivalent"}]}]
+                },
+                {
+                    "source": "http://example.org/src-b",
+                    "target": "http://example.org/dst",
+                    "element": [{"code": "M", "target": [{"code": "other", "equivalence": "equivalent"}]}]
+                }
+            ]
+        });
+        let terms = MemoryTerminology::from_resources(&[ambiguous]);
+        assert!(terms
+            .translate_coding("http://example.org/map", None, "M")
+            .is_none());
+        assert_eq!(
+            terms.translate_coding(
+                "http://example.org/map",
+                Some("http://example.org/src-a"),
+                "M"
+            ),
+            Some(json!("male"))
+        );
     }
 
     #[test]

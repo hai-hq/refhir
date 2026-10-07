@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Provenance-agent", "version": "4.0.1", "name": "agent", "status": "active", "description": "Search Provenance by agent", "code": "agent", "base": ["Provenance"], "type": "reference", "expression": "Provenance.agent.who"}

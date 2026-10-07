@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/Provenance-target", "version": "4.0.1", "name": "target", "status": "active", "description": "Search Provenance by target", "code": "target", "base": ["Provenance"], "type": "reference", "expression": "Provenance.target"}

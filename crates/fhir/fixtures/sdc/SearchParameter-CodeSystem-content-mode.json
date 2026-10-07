@@ -1,0 +1,1 @@
+{"resourceType": "SearchParameter", "url": "http://hl7.org/fhir/SearchParameter/CodeSystem-content-mode", "version": "4.0.1", "name": "contentmode", "status": "active", "description": "Search CodeSystem by content-mode", "code": "content-mode", "base": ["CodeSystem"], "type": "token", "expression": "CodeSystem.content"}

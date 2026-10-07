@@ -37,6 +37,7 @@ pub fn check(
     query: Option<&str>,
     method: &str,
     resource_type: &str,
+    path: &str,
     _patient: Option<&str>,
 ) -> Option<Response> {
     if !app.config.auth {
@@ -49,11 +50,7 @@ pub fn check(
     let Some(record) = table.get(&token) else {
         return Some(unauthorized("unknown token"));
     };
-    let interaction = if method == "GET" || method == "HEAD" {
-        "read"
-    } else {
-        "write"
-    };
+    let interaction = http_interaction(method, path);
     if !record
         .scopes
         .iter()
@@ -144,7 +141,9 @@ impl SyncSession {
                 return Err("bundle cannot be subscribed".into());
             }
             self.authorize_bundle(args)?;
-            return Ok(args.clone());
+            let mut args = args.clone();
+            self.stamp_controls(&mut args);
+            return Ok(args);
         }
         let (resource, op) = path
             .split_once('/')
@@ -160,6 +159,7 @@ impl SyncSession {
             }
         }
         let mut args = args.clone();
+        self.stamp_controls(&mut args);
         if op == "search" {
             if let Some(patient) = &self.patient {
                 if let Some(object) = args.as_object_mut() {
@@ -170,6 +170,15 @@ impl SyncSession {
             }
         }
         Ok(args)
+    }
+
+    fn stamp_controls(&self, args: &mut Value) {
+        let Some(object) = args.as_object_mut() else {
+            return;
+        };
+        object.remove("_readScopes");
+        object.remove("_sdcArchiver");
+        object.insert("_readScopes".into(), json!(self.scopes));
     }
 
     fn allows(&self, resource_type: &str, interaction: &str) -> bool {
@@ -190,11 +199,11 @@ impl SyncSession {
                 .pointer("/request/method")
                 .and_then(|value| value.as_str())
                 .unwrap_or("POST");
-            let interaction = if method == "GET" || method == "HEAD" {
-                "read"
-            } else {
-                "write"
-            };
+            let url = entry
+                .pointer("/request/url")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let interaction = http_interaction(method, url);
             if !self.allows(resource_type, interaction) {
                 return Err(format!(
                     "scope does not allow {method} {resource_type} in bundle"
@@ -488,6 +497,30 @@ fn entry_resource_type(entry: &Value) -> Option<&str> {
     }
 }
 
+pub(crate) fn strip_sdc_controls(args: &mut Value) {
+    if let Some(object) = args.as_object_mut() {
+        object.remove("_readScopes");
+        object.remove("_sdcArchiver");
+    }
+}
+
+/// `$populate` and the other SDC reads stay reads when the HTTP method is POST.
+pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
+    if let Some(op) = path.split('/').find(|segment| segment.starts_with('$')) {
+        if matches!(
+            op,
+            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
+        ) {
+            return "read";
+        }
+    }
+    if method == "GET" || method == "HEAD" {
+        "read"
+    } else {
+        "write"
+    }
+}
+
 fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str, String> {
     const READ_OPS: &[&str] = &[
         "read",
@@ -503,6 +536,11 @@ fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str, String> {
         "$validate-code",
         "$translate",
         "$subsumes",
+        "$populate",
+        "$assemble",
+        "$next-question",
+        "$behavior",
+        "$extract",
     ];
     const WRITE_OPS: &[&str] = &[
         "create",
@@ -590,6 +628,15 @@ pub fn resolve_token(headers: &HeaderMap, query: Option<&str>) -> Option<String>
         return Some(value.to_string());
     }
     query_token(query)
+}
+
+pub fn token_scopes(headers: &HeaderMap, query: Option<&str>) -> Option<Vec<String>> {
+    let token = resolve_token(headers, query)?;
+    tokens()
+        .lock()
+        .ok()?
+        .get(&token)
+        .map(|record| record.scopes.clone())
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -730,6 +777,23 @@ mod tests {
         assert!(patient
             .prepare("Patient/read", &json!({"id": "p1"}), true)
             .is_ok());
+
+        let reader = SyncSession {
+            scopes: vec!["user/Questionnaire.read".into()],
+            patient: None,
+        };
+        let prepared = reader
+            .prepare(
+                "Questionnaire/$populate",
+                &json!({"_readScopes": ["user/*.*"], "_sdcArchiver": true, "subject": "Patient/p1"}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(prepared["_readScopes"], json!(["user/Questionnaire.read"]));
+        assert!(prepared.get("_sdcArchiver").is_none());
+        assert_eq!(prepared["subject"], "Patient/p1");
+        assert_eq!(http_interaction("POST", "/Questionnaire/$populate"), "read");
+        assert_eq!(http_interaction("POST", "/Patient"), "write");
     }
 }
 

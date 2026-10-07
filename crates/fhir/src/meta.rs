@@ -90,6 +90,7 @@ pub fn everything(
     model: &ResourceModel,
     id: &str,
 ) -> Result<Value, FhirError> {
+    catalog.deny_response_read(&model.name)?;
     let focus = ops::read(tx, model, id)?;
     let mut entries = vec![json!({"resource": focus, "search": {"mode": "match"}})];
     let Some(compartment) = catalog.compartment(&model.name) else {
@@ -99,7 +100,7 @@ pub fn everything(
         let Ok(other) = catalog.get(&link.code) else {
             continue;
         };
-        if link.params.is_empty() {
+        if link.params.is_empty() || catalog.deny_response_read(&link.code).is_err() {
             continue;
         }
         let mut params = BTreeMap::new();
@@ -132,6 +133,9 @@ pub fn document(
             continue;
         };
         let type_name = type_name.rsplit('/').next().unwrap_or(type_name);
+        if catalog.deny_response_read(type_name).is_err() {
+            continue;
+        }
         let Ok(target) = catalog.get(type_name) else {
             continue;
         };

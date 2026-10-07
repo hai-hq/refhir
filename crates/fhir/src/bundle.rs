@@ -16,6 +16,7 @@ pub fn transaction(
     tx: &mut Transaction,
     catalog: &Catalog,
     bundle: &Value,
+    args: &Value,
 ) -> Result<Value, FhirError> {
     if bundle.get("resourceType").and_then(|value| value.as_str()) != Some("Bundle") {
         return Err(FhirError::Invalid("resourceType Bundle is required".into()));
@@ -32,7 +33,7 @@ pub fn transaction(
     let mut response_entries = vec![Value::Null; entries.len()];
     for index in apply_order(catalog, &entries) {
         response_entries[index] =
-            apply_entry(tx, catalog, &entries[index]).map_err(|err| annotate(index, err))?;
+            apply_entry(tx, catalog, args, &entries[index]).map_err(|err| annotate(index, err))?;
     }
     Ok(json!({
         "resourceType": "Bundle",
@@ -166,7 +167,12 @@ fn request_url(entry: &Value) -> Option<&str> {
         .and_then(|value| value.as_str())
 }
 
-fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result<Value, FhirError> {
+fn apply_entry(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    args: &Value,
+    entry: &Value,
+) -> Result<Value, FhirError> {
     let request = entry
         .get("request")
         .ok_or_else(|| FhirError::Invalid("entry.request is required".into()))?;
@@ -179,7 +185,7 @@ fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result
         .and_then(|value| value.as_str())
         .ok_or_else(|| FhirError::Invalid("entry.request.url is required".into()))?;
     if let Some((path, query)) = url.split_once('?') {
-        return conditional_entry(tx, catalog, entry, method, path, query);
+        return conditional_entry(tx, catalog, args, entry, method, path, query);
     }
     let (type_name, id) = parse_url(url)?;
     let model = catalog.get(&type_name)?;
@@ -187,6 +193,7 @@ fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result
         "POST" => {
             if let Some(query) = request.get("ifNoneExist").and_then(|value| value.as_str()) {
                 let resource = entry.get("resource").cloned().unwrap_or(Value::Null);
+                let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
                 let (created, status) =
                     ops::conditional_create(tx, catalog, model, resource, query)?;
                 let code = if status == 201 {
@@ -218,6 +225,7 @@ fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result
                 }
                 resource["id"] = json!(id);
             }
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
             let created = ops::create(tx, catalog, model, resource)?;
             let id = created["id"].as_str().unwrap_or("").to_string();
             Ok(json!({
@@ -235,6 +243,7 @@ fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result
                 .get("resource")
                 .cloned()
                 .ok_or_else(|| FhirError::Invalid("PUT entry requires a resource".into()))?;
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
             let updated = ops::update(tx, catalog, model, &id, resource, None)?;
             Ok(json!({
                 "response": {
@@ -254,6 +263,7 @@ fn apply_entry(tx: &mut Transaction, catalog: &Catalog, entry: &Value) -> Result
         }
         "GET" => {
             let id = id.ok_or_else(|| FhirError::Invalid("GET url requires an id".into()))?;
+            catalog.deny_response_read(&model.name)?;
             let resource = ops::read(tx, model, &id)?;
             let version = resource
                 .pointer("/meta/versionId")
@@ -304,6 +314,7 @@ fn parse_url(url: &str) -> Result<(String, Option<String>), FhirError> {
 fn conditional_entry(
     tx: &mut Transaction,
     catalog: &Catalog,
+    args: &Value,
     entry: &Value,
     method: &str,
     path: &str,
@@ -314,6 +325,7 @@ fn conditional_entry(
     let resource = entry.get("resource").cloned().unwrap_or(Value::Null);
     match method {
         "POST" | "PUT" => {
+            let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
             let (updated, status) = ops::conditional_update(tx, catalog, model, resource, query)?;
             let code = if status == 201 {
                 "201 Created"
@@ -441,7 +453,7 @@ pub fn batch(
     let mut wrote = false;
     let mut writes = Vec::new();
     for entry in entries {
-        match batch_entry(db, catalog, &entry) {
+        match batch_entry(db, catalog, args, &entry) {
             Ok(result) => {
                 wrote |= result.wrote;
                 last = result.ts;
@@ -468,11 +480,17 @@ pub fn batch(
 fn batch_entry(
     db: &refhir_database::Database,
     catalog: &Catalog,
+    controls: &Value,
     entry: &Value,
 ) -> Result<crate::run::RunResult, crate::run::RunError> {
     let method = request_method(entry).unwrap_or("");
     let url = request_url(entry).unwrap_or("");
-    let (path, args) = batch_call(method, url, entry).map_err(crate::run::RunError::Fhir)?;
+    let (path, mut args) = batch_call(method, url, entry).map_err(crate::run::RunError::Fhir)?;
+    if let Some(scopes) = controls.get("_readScopes") {
+        if let Some(object) = args.as_object_mut() {
+            object.insert("_readScopes".into(), scopes.clone());
+        }
+    }
     let result = crate::run::run(db, catalog, &path, &args)?;
     let value = bundle_response(&result);
     Ok(crate::run::RunResult { value, ..result })
@@ -509,6 +527,7 @@ fn entry_status(err: &FhirError) -> &'static str {
         FhirError::Conflict(_) => "409 Conflict",
         FhirError::Precondition(_) => "412 Precondition Failed",
         FhirError::Storage(_) => "500 Internal Server Error",
+        FhirError::Forbidden(_) => "403 Forbidden",
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
             "400 Bad Request"
         }
@@ -700,6 +719,7 @@ fn annotate(index: usize, err: FhirError) -> FhirError {
         FhirError::Outcome(value) => FhirError::Outcome(prefix_outcome(index, value)),
         FhirError::UnknownResource(_) => FhirError::UnknownResource(message),
         FhirError::Unsupported(_) => FhirError::Unsupported(message),
+        FhirError::Forbidden(_) => FhirError::Forbidden(message),
         FhirError::Storage(_) => FhirError::Storage(message),
     }
 }

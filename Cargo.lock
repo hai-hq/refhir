@@ -1108,6 +1108,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "refhir-cql"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "refhir-database"
 version = "0.1.0"
 dependencies = [
@@ -1126,6 +1133,7 @@ dependencies = [
  "refhir-database",
  "refhir-fhirpath",
  "refhir-persistence",
+ "refhir-sdc",
  "refhir-sqlite",
  "refhir-types",
  "refhir-validate",
@@ -1145,6 +1153,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "refhir-map"
+version = "0.1.0"
+dependencies = [
+ "refhir-fhirpath",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "refhir-persistence"
 version = "0.1.0"
 dependencies = [
@@ -1160,6 +1177,27 @@ dependencies = [
  "refhir-persistence",
  "refhir-types",
  "serde_json",
+]
+
+[[package]]
+name = "refhir-sdc"
+version = "0.1.0"
+dependencies = [
+ "refhir-cql",
+ "refhir-fhirpath",
+ "refhir-map",
+ "regex",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "refhir-sdc-wasm"
+version = "0.1.0"
+dependencies = [
+ "refhir-sdc",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -175,7 +175,15 @@ impl Ctx<'_> {
                 items: vec![],
                 ordered: true,
             })),
-            Expr::Variable(name) => Ok(one(self.variable(name)?)),
+            Expr::Variable(name) => {
+                if let Some(items) = self.host.lookup_variable(name)? {
+                    return Ok(Outcome {
+                        items,
+                        ordered: true,
+                    });
+                }
+                Ok(one(self.variable(name)?))
+            }
             Expr::TypeName(name) => Ok(one(Value::String(simple_name(name).to_string()))),
             Expr::Ident(name) => self.eval_ident(name, focus, ordered),
             Expr::Member(target, name) => {
