@@ -242,7 +242,7 @@ There is no resume token; after reconnect the first watch result is the current 
 
 ## Auth (SMART)
 
-When the server runs with `--smart`, obtain a token from `POST /oauth/token` (form body, see server tests), then:
+When the server runs with `--smart`, complete the SMART App Launch code+PKCE flow (or `POST /oauth/register` with `--smart-dcr-token`, then `client_credentials`), then:
 
 ```go
 client, err := refhir.Dial(ctx, baseURL, refhir.Bearer(token))

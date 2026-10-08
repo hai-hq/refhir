@@ -20,7 +20,9 @@ impl Host for ChartHost<'_> {
         let Some((type_name, id)) = reference.rsplit_once('/') else {
             return Ok(None);
         };
-        if type_name.is_empty() || id.is_empty() || !type_name.chars().next().unwrap().is_ascii_uppercase()
+        if type_name.is_empty()
+            || id.is_empty()
+            || !type_name.chars().next().unwrap().is_ascii_uppercase()
         {
             return Ok(None);
         }
@@ -72,7 +74,10 @@ pub fn value_json(value: &Value) -> Json {
         Value::Decimal { value, .. } => json!(value.to_string().parse::<f64>().unwrap_or(0.0)),
         Value::String(value) => json!(value),
         Value::Date(_) | Value::DateTime(_) | Value::Time(_) => {
-            json!(value.render().trim_start_matches('@').trim_start_matches('T'))
+            json!(value
+                .render()
+                .trim_start_matches('@')
+                .trim_start_matches('T'))
         }
         Value::Quantity { value, unit, .. } => json!({
             "value": value.to_string().parse::<f64>().unwrap_or(0.0),
@@ -191,12 +196,21 @@ pub fn library_expression(
     Ok(None)
 }
 
-pub fn find_canonical(chart: &mut dyn Chart, type_name: &str, canonical: &str) -> Result<Option<Json>, String> {
+pub fn find_canonical(
+    chart: &mut dyn Chart,
+    type_name: &str,
+    canonical: &str,
+) -> Result<Option<Json>, String> {
     if let Some(_id) = canonical.strip_prefix('#') {
         return Ok(None);
     }
     if let Some((type_name, id)) = canonical.split_once('/') {
-        if !canonical.contains(':') && type_name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase()) {
+        if !canonical.contains(':')
+            && type_name
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        {
             return chart.read_type(type_name, id);
         }
     }
@@ -226,7 +240,12 @@ fn substitute(
         let expr = parse(inner).map_err(|err| err.to_string())?;
         let values = evaluate(&expr, root, &model, &host).unwrap_or_default();
         if let Some(first) = values.first() {
-            out.push_str(&value_json(first).as_str().unwrap_or(&first.render()).replace('"', ""));
+            out.push_str(
+                &value_json(first)
+                    .as_str()
+                    .unwrap_or(&first.render())
+                    .replace('"', ""),
+            );
         }
         rest = &rest[start + 2 + end + 2..];
     }
@@ -241,7 +260,10 @@ fn is_query(expression: &str) -> bool {
     };
     !type_name.is_empty()
         && !type_name.contains(' ')
-        && type_name.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+        && type_name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
         && !rest.contains('\n')
 }
 
@@ -257,7 +279,10 @@ fn run_query(chart: &mut dyn Chart, expression: &str) -> Result<Vec<Json>, Strin
             params.push((name, value.to_string()));
         }
     }
-    let owned: Vec<(&str, String)> = params.iter().map(|(name, value)| (*name, value.clone())).collect();
+    let owned: Vec<(&str, String)> = params
+        .iter()
+        .map(|(name, value)| (*name, value.clone()))
+        .collect();
     chart.search_type(type_name, &owned)
 }
 

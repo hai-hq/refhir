@@ -1,7 +1,10 @@
 //! SMART scope checks in front of dispatch. Handlers do not see tokens.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+mod oauth;
+mod scopes;
+mod store;
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -11,11 +14,32 @@ use serde_json::{json, Value};
 use refhir_database::Database;
 use refhir_fhir::{resource_in_compartment, Catalog, FhirError};
 
-use crate::http::{fhir_json_public, AppState};
+use crate::http::AppState;
 
-struct Token {
-    scopes: Vec<String>,
-    patient: Option<String>,
+use scopes::{interaction_for, scope_allows};
+use store::normalize_patient_id;
+
+pub use store::SmartStore;
+
+pub(crate) use oauth::{
+    authorize, configuration, ehr_launch, introspect, issue, jwks, manage, register, revoke,
+    security_extension, style,
+};
+pub(crate) use scopes::http_interaction;
+pub(crate) use store::origin_allowed;
+
+#[derive(Clone)]
+pub(crate) struct Token {
+    pub scopes: Vec<String>,
+    pub patient: Option<String>,
+    pub encounter: Option<String>,
+    pub fhir_user: Option<String>,
+    pub client_id: String,
+    pub exp: u64,
+    pub sub: Option<String>,
+    pub iss: Option<String>,
+    pub need_patient_banner: Option<bool>,
+    pub smart_style_url: Option<String>,
 }
 
 /// Identity for an authenticated `/sync` socket. Resource scopes are checked per message.
@@ -26,9 +50,11 @@ pub struct SyncSession {
     patient: Option<String>,
 }
 
-fn tokens() -> &'static Mutex<HashMap<String, Token>> {
-    static TOKENS: std::sync::OnceLock<Mutex<HashMap<String, Token>>> = std::sync::OnceLock::new();
-    TOKENS.get_or_init(|| Mutex::new(HashMap::new()))
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 pub fn check(
@@ -46,10 +72,12 @@ pub fn check(
     let Some(token) = resolve_token(headers, query) else {
         return Some(unauthorized("a bearer token is required"));
     };
-    let table = tokens().lock().expect("tokens");
-    let Some(record) = table.get(&token) else {
+    let Some(record) = app.smart.token(&token) else {
         return Some(unauthorized("unknown token"));
     };
+    if record.exp <= now() {
+        return Some(unauthorized("token expired"));
+    }
     let interaction = http_interaction(method, path);
     if !record
         .scopes
@@ -79,8 +107,10 @@ pub fn patient_compartment(
         return None;
     }
     let token = resolve_token(headers, query)?;
-    let table = tokens().lock().expect("tokens");
-    let record = table.get(&token)?;
+    let record = app.smart.token(&token)?;
+    if record.exp <= now() {
+        return None;
+    }
     let patient_scope = record
         .scopes
         .iter()
@@ -88,7 +118,10 @@ pub fn patient_compartment(
     if !patient_scope {
         return None;
     }
-    record.patient.as_ref().map(|id| format!("Patient/{id}"))
+    record
+        .patient
+        .as_ref()
+        .map(|id| format!("Patient/{}", normalize_patient_id(id)))
 }
 
 /// A known token may open `/sync`. Each later operation is checked with [`SyncSession::prepare`].
@@ -106,10 +139,12 @@ pub fn open_sync_session(
     let Some(token) = resolve_token(headers, query) else {
         return Err(unauthorized("a bearer token is required"));
     };
-    let table = tokens().lock().expect("tokens");
-    let Some(record) = table.get(&token) else {
+    let Some(record) = app.smart.token(&token) else {
         return Err(unauthorized("unknown token"));
     };
+    if record.exp <= now() {
+        return Err(unauthorized("token expired"));
+    }
     if record.scopes.is_empty() {
         return Err(unauthorized("token has no scopes"));
     }
@@ -124,7 +159,7 @@ pub fn open_sync_session(
                     .iter()
                     .any(|scope| scope.starts_with("patient/"))
             })
-            .map(|id| format!("Patient/{id}")),
+            .map(|id| format!("Patient/{}", normalize_patient_id(id))),
     })
 }
 
@@ -504,125 +539,6 @@ pub(crate) fn strip_sdc_controls(args: &mut Value) {
     }
 }
 
-/// `$populate` and the other SDC reads stay reads when the HTTP method is POST.
-pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
-    if let Some(op) = path.split('/').find(|segment| segment.starts_with('$')) {
-        if matches!(
-            op,
-            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
-        ) {
-            return "read";
-        }
-    }
-    if method == "GET" || method == "HEAD" {
-        "read"
-    } else {
-        "write"
-    }
-}
-
-fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str, String> {
-    const READ_OPS: &[&str] = &[
-        "read",
-        "vread",
-        "search",
-        "history",
-        "$validate",
-        "$meta",
-        "$everything",
-        "$document",
-        "$expand",
-        "$lookup",
-        "$validate-code",
-        "$translate",
-        "$subsumes",
-        "$populate",
-        "$assemble",
-        "$next-question",
-        "$behavior",
-        "$extract",
-    ];
-    const WRITE_OPS: &[&str] = &[
-        "create",
-        "update",
-        "delete",
-        "patch",
-        "conditional-create",
-        "conditional-update",
-        "conditional-delete",
-        "$meta-add",
-        "$meta-delete",
-    ];
-    let interaction = if READ_OPS.contains(&op) {
-        "read"
-    } else if WRITE_OPS.contains(&op) {
-        "write"
-    } else {
-        return Err(format!("unsupported operation {op}"));
-    };
-    if subscribe && interaction != "read" {
-        return Err(format!("{op} writes and cannot be subscribed"));
-    }
-    Ok(interaction)
-}
-
-pub fn configuration(app: &AppState) -> Response {
-    fhir_json_public(
-        StatusCode::OK,
-        json!({
-            "authorization_endpoint": "/oauth/authorize",
-            "token_endpoint": "/oauth/token",
-            "capabilities": ["launch-standalone", "client-confidential-symmetric", "permission-patient", "permission-user"],
-            "scopes_supported": ["patient/*.read", "user/*.read", "user/*.write", "system/*.read"],
-            "enabled": app.config.auth
-        }),
-    )
-}
-
-pub fn issue(app: &AppState, body: &[u8]) -> Response {
-    if !app.config.auth {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "smart is not enabled"})),
-        )
-            .into_response();
-    }
-    let text = String::from_utf8_lossy(body);
-    let mut scope = String::new();
-    let mut patient = None;
-    for pair in text.split('&') {
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        if key == "scope" {
-            scope = value.replace('+', " ");
-        }
-        if key == "patient" {
-            patient = Some(value.to_string());
-        }
-    }
-    let token = format!("tok-{}", tokens().lock().expect("tokens").len() + 1);
-    let scopes = scope
-        .split_whitespace()
-        .filter(|item| !item.is_empty())
-        .map(|item| item.to_string())
-        .collect::<Vec<_>>();
-    tokens().lock().expect("tokens").insert(
-        token.clone(),
-        Token {
-            scopes: scopes.clone(),
-            patient: patient.clone(),
-        },
-    );
-    fhir_json_public(
-        StatusCode::OK,
-        json!({
-            "access_token": token,
-            "token_type": "bearer",
-            "scope": scopes.join(" "),
-            "patient": patient
-        }),
-    )
-}
-
 pub fn resolve_token(headers: &HeaderMap, query: Option<&str>) -> Option<String> {
     if let Some(value) = bearer(headers) {
         return Some(value.to_string());
@@ -630,13 +546,13 @@ pub fn resolve_token(headers: &HeaderMap, query: Option<&str>) -> Option<String>
     query_token(query)
 }
 
-pub fn token_scopes(headers: &HeaderMap, query: Option<&str>) -> Option<Vec<String>> {
+pub fn token_scopes(
+    app: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<Vec<String>> {
     let token = resolve_token(headers, query)?;
-    tokens()
-        .lock()
-        .ok()?
-        .get(&token)
-        .map(|record| record.scopes.clone())
+    app.smart.token(&token).map(|record| record.scopes)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -657,7 +573,7 @@ fn query_token(query: Option<&str>) -> Option<String> {
     None
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -684,17 +600,6 @@ fn percent_decode(input: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
-}
-
-#[cfg(test)]
-pub fn install_token(token: &str, scopes: &[&str], patient: Option<&str>) {
-    tokens().lock().expect("tokens").insert(
-        token.to_string(),
-        Token {
-            scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
-            patient: patient.map(str::to_string),
-        },
-    );
 }
 
 #[cfg(test)]
@@ -793,29 +698,17 @@ mod tests {
         assert!(prepared.get("_sdcArchiver").is_none());
         assert_eq!(prepared["subject"], "Patient/p1");
         assert_eq!(http_interaction("POST", "/Questionnaire/$populate"), "read");
-        assert_eq!(http_interaction("POST", "/Patient"), "write");
+        assert_eq!(http_interaction("POST", "/Patient"), "create");
     }
-}
-
-fn scope_allows(scope: &str, resource_type: &str, interaction: &str) -> bool {
-    let mut parts = scope.split('/');
-    let _context = parts.next().unwrap_or("");
-    let Some(rest) = parts.next() else {
-        return false;
-    };
-    let (type_name, permission) = rest.split_once('.').unwrap_or((rest, "*"));
-    if type_name != "*" && type_name != resource_type {
-        return false;
-    }
-    permission == "*"
-        || permission == interaction
-        || (permission == "read" && interaction == "read")
-        || (permission == "*")
 }
 
 fn unauthorized(message: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Bearer realm=\"refhir\", error=\"invalid_token\"",
+        )],
         Json(json!({
             "resourceType": "OperationOutcome",
             "issue": [{"severity": "error", "code": "login", "diagnostics": message}]

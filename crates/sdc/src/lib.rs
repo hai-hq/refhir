@@ -22,17 +22,14 @@ pub use assemble::assemble;
 pub use behavior::apply_behavior;
 pub use chart::{scope_allows, Chart, MemoryChart, NullChart};
 pub use evalexpr::find_canonical;
+pub use ext::client_extensions;
 pub use extract::extract;
 pub use populate::populate;
-pub use ext::client_extensions;
 pub use validate::{has_errors, validate_response};
 
 /// Drop disabled answers and validate a completed response.
 /// `Ok` is the response to store. `Err` is an OperationOutcome.
-pub fn prepare_completed(
-    chart: &mut dyn Chart,
-    response: &Json,
-) -> Result<Json, Json> {
+pub fn prepare_completed(chart: &mut dyn Chart, response: &Json) -> Result<Json, Json> {
     if response.get("status").and_then(|value| value.as_str()) != Some("completed") {
         return Ok(response.clone());
     }
@@ -40,7 +37,8 @@ pub fn prepare_completed(
         Ok(value) => value,
         Err(message) => return Err(invalid_outcome(&message)),
     };
-    let view = apply_behavior(chart, &questionnaire, response).map_err(|err| invalid_outcome(&err))?;
+    let view =
+        apply_behavior(chart, &questionnaire, response).map_err(|err| invalid_outcome(&err))?;
     let enabled = behavior::enabled_map(&view);
     let mut cleaned = response.clone();
     for (link_id, on) in &enabled {
@@ -48,7 +46,8 @@ pub fn prepare_completed(
             items::strip_link(&mut cleaned, link_id);
         }
     }
-    let outcome = validate_response(chart, &questionnaire, &cleaned).map_err(|err| invalid_outcome(&err))?;
+    let outcome =
+        validate_response(chart, &questionnaire, &cleaned).map_err(|err| invalid_outcome(&err))?;
     if has_errors(&outcome) {
         return Err(outcome);
     }
@@ -73,7 +72,9 @@ fn questionnaire_of(chart: &mut dyn Chart, response: &Json) -> Result<Json, Stri
             .get("contained")
             .and_then(|value| value.as_array())
             .and_then(|items| {
-                items.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
             })
             .cloned()
             .ok_or_else(|| format!("contained questionnaire {canonical} was not found"));
@@ -109,7 +110,10 @@ pub fn annotate_capability(statement: &mut Json) {
         return;
     };
     for resource in resources {
-        let type_name = resource.get("type").and_then(|value| value.as_str()).unwrap_or("");
+        let type_name = resource
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         match type_name {
             "Questionnaire" => {
                 resource["operation"] = json!([
@@ -132,7 +136,11 @@ pub fn annotate_capability(statement: &mut Json) {
 }
 
 fn add_languages(resource: &mut Json) {
-    let languages = ["text/fhirpath", "text/cql-expression", "text/cql-identifier"];
+    let languages = [
+        "text/fhirpath",
+        "text/cql-expression",
+        "text/cql-identifier",
+    ];
     let contexts = [
         "behaviorExpressionLanguage",
         "populationExpressionLanguage",
@@ -315,7 +323,10 @@ mod tests {
         .unwrap();
         assert_eq!(response["item"][0]["answer"][0]["valueDecimal"], 70.0);
         assert_eq!(response["contained"][0]["entity"][0]["role"], "source");
-        assert_eq!(response["contained"][0]["entity"][0]["what"]["reference"], "Observation/w1");
+        assert_eq!(
+            response["contained"][0]["entity"][0]["what"]["reference"],
+            "Observation/w1"
+        );
     }
 
     #[test]
@@ -341,10 +352,25 @@ mod tests {
             "effectiveDateTime": "2099-01-01",
             "valueQuantity": {"value": 70}
         });
-        let mut chart = MemoryChart::new(vec![observation]);
+        let mut chart = MemoryChart::new(vec![observation.clone()]);
         chart.scopes = Some(vec!["user/Patient.read".into()]);
-        let response = populate(&mut chart, &questionnaire, &json!({"subject": "Patient/p1"})).unwrap();
+        let response = populate(
+            &mut chart,
+            &questionnaire,
+            &json!({"subject": "Patient/p1"}),
+        )
+        .unwrap();
         assert!(response.get("item").is_none());
+
+        let mut allowed = MemoryChart::new(vec![observation]);
+        allowed.scopes = Some(vec!["user/Observation.rs".into()]);
+        let shown = populate(
+            &mut allowed,
+            &questionnaire,
+            &json!({"subject": "Patient/p1"}),
+        )
+        .unwrap();
+        assert!(shown.get("item").is_some(), "{shown}");
     }
 
     #[test]

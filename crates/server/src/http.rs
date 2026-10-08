@@ -25,6 +25,20 @@ pub struct ServerConfig {
     pub terminology_urls: Vec<String>,
     /// Form Archiver: QuestionnaireResponse may be created, not read.
     pub sdc_archiver: bool,
+    /// Absolute FHIR base URL used in SMART discovery (issuer, endpoints).
+    pub public_url: Option<String>,
+    /// Patient id established for `launch/patient` when none is supplied.
+    pub smart_patient: Option<String>,
+    /// Encounter id established for `launch/encounter` when none is supplied.
+    pub smart_encounter: Option<String>,
+    /// Relative FHIR identity used as the `fhirUser` claim, e.g. `Patient/smart`.
+    pub smart_fhir_user: Option<String>,
+    /// RFC 7591 initial access token required for `POST /oauth/register`.
+    pub smart_dcr_token: Option<String>,
+    /// Secret for the built-in `confidential` client. Generated when unset.
+    pub smart_confidential_secret: Option<String>,
+    /// Injected SMART tables for tests. A fresh store is created when this is `None`.
+    pub smart: Option<std::sync::Arc<crate::auth::SmartStore>>,
 }
 
 impl Default for ServerConfig {
@@ -34,6 +48,13 @@ impl Default for ServerConfig {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            public_url: None,
+            smart_patient: None,
+            smart_encounter: None,
+            smart_fhir_user: None,
+            smart_dcr_token: None,
+            smart_confidential_secret: None,
+            smart: None,
         }
     }
 }
@@ -44,6 +65,7 @@ pub struct AppState {
     pub catalog: Arc<RwLock<Catalog>>,
     pub store: Arc<dyn ConformanceStore>,
     pub config: ServerConfig,
+    pub smart: Arc<crate::auth::SmartStore>,
 }
 
 pub fn app(
@@ -67,7 +89,18 @@ pub fn app_with(
     let router = Router::new()
         .route("/metadata", get(metadata))
         .route("/.well-known/smart-configuration", get(smart_config))
+        .route("/.well-known/jwks.json", get(jwks))
+        .route(
+            "/oauth/authorize",
+            get(oauth_authorize).post(oauth_authorize_post),
+        )
         .route("/oauth/token", post(oauth_token))
+        .route("/oauth/introspect", post(oauth_introspect))
+        .route("/oauth/revoke", post(oauth_revoke))
+        .route("/oauth/register", post(oauth_register))
+        .route("/oauth/manage", get(oauth_manage))
+        .route("/oauth/ehr-launch", get(oauth_ehr_launch))
+        .route("/oauth/style.json", get(oauth_style))
         .route("/graphql", post(graphql_route))
         .route("/sync", get(sync_ws))
         .route("/_history", get(system_history))
@@ -101,7 +134,10 @@ pub fn app_with(
         .route("/:resource_type/:id/$validate", post(validate_instance))
         .route("/:resource_type/:id/$populate", post(populate_instance))
         .route("/:resource_type/:id/$assemble", post(assemble_instance))
-        .route("/:resource_type/:id/$next-question", post(next_question_instance))
+        .route(
+            "/:resource_type/:id/$next-question",
+            post(next_question_instance),
+        )
         .route("/:resource_type/:id/$behavior", post(behavior_instance))
         .route("/:resource_type/:id/$extract", post(extract_instance))
         .route("/:resource_type/:id/$everything", get(everything))
@@ -113,15 +149,24 @@ pub fn app_with(
             get(read).put(update).delete(remove).patch(patch_op),
         )
         .route("/:resource_type/:id/:compartment", get(compartment_search));
+    let smart = config.smart.clone().unwrap_or_else(|| {
+        let secret = config
+            .smart_confidential_secret
+            .clone()
+            .unwrap_or_else(|| format!("secret-{}", uuid::Uuid::new_v4()));
+        Arc::new(crate::auth::SmartStore::with_confidential_secret(secret))
+    });
     let state = AppState {
         db: db.clone(),
         catalog: catalog.clone(),
         store: store.clone(),
         config: config.clone(),
+        smart,
     };
     let router = router
-        .layer(middleware::from_fn(request_log))
         .layer(middleware::from_fn_with_state(state.clone(), smart_guard))
+        .layer(middleware::from_fn(request_log))
+        .layer(middleware::from_fn_with_state(state.clone(), cors))
         .with_state(state);
     crate::jobs::attach(db, catalog, store, &config);
     router
@@ -150,7 +195,7 @@ pub async fn execute(
     }
 }
 
-async fn metadata(State(app): State<AppState>) -> Response {
+async fn metadata(State(app): State<AppState>, headers: HeaderMap) -> Response {
     let mut statement = app.catalog.read().expect("catalog").capability_statement();
     if app.config.auth {
         if let Some(rest) = statement
@@ -159,20 +204,69 @@ async fn metadata(State(app): State<AppState>) -> Response {
         {
             rest.insert(
                 "security".into(),
-                json!({
-                    "service": [{"coding": [{"system": "http://terminology.hl7.org/CodeSystem/restful-security-service", "code": "SMART-on-FHIR"}]}],
-                    "extension": [{
-                        "url": "http://fhir-registry.smarthealthit.org/StructureDefinition/oauth-uris",
-                        "extension": [
-                            {"url": "authorize", "valueUri": "/oauth/authorize"},
-                            {"url": "token", "valueUri": "/oauth/token"}
-                        ]
-                    }]
-                }),
+                crate::auth::security_extension(&app, &headers),
             );
         }
     }
     fhir_json(StatusCode::OK, statement)
+}
+
+async fn cors(State(app): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let origin = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    if request.method() == axum::http::Method::OPTIONS {
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        apply_cors(response.headers_mut(), &app, &path, origin.as_deref());
+        return response;
+    }
+    let mut response = next.run(request).await;
+    apply_cors(response.headers_mut(), &app, &path, origin.as_deref());
+    response
+}
+
+fn apply_cors(headers: &mut HeaderMap, app: &AppState, path: &str, origin: Option<&str>) {
+    let discovery = path == "/metadata" || path.starts_with("/.well-known");
+    let allow = if discovery {
+        Some("*".to_string())
+    } else if let Some(origin) = origin {
+        if crate::auth::origin_allowed(&app.smart, origin) {
+            Some(origin.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(allow) = allow {
+        if let Ok(value) = allow.parse() {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
+            if allow != "*" {
+                headers.insert(header::VARY, "Origin".parse().unwrap());
+            }
+        }
+    }
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        "GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        "Authorization, Content-Type, Accept, Prefer, If-Match, If-None-Match"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_EXPOSE_HEADERS,
+        "Location, Content-Location, ETag, WWW-Authenticate"
+            .parse()
+            .unwrap(),
+    );
 }
 
 async fn request_log(request: Request<Body>, next: Next) -> Response {
@@ -387,9 +481,7 @@ async fn bundle_post(State(app): State<AppState>, headers: HeaderMap, body: Byte
     };
     let mut args = json!({"resource": resource});
     stamp_sdc(&app, &headers, &mut args);
-    match execute(&app.db, &app.catalog, &app.store, path, args)
-    .await
-    {
+    match execute(&app.db, &app.catalog, &app.store, path, args).await {
         Ok(result) => render(StatusCode::OK, result.value, prefer_xml(&headers, &[])),
         Err(err) => error_response(err),
     }
@@ -532,7 +624,15 @@ async fn next_question_instance(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    sdc_call(app, resource_type, Some(id), "$next-question", headers, body).await
+    sdc_call(
+        app,
+        resource_type,
+        Some(id),
+        "$next-question",
+        headers,
+        body,
+    )
+    .await
 }
 
 async fn behavior_instance(
@@ -1068,12 +1168,65 @@ async fn subsumes_op(
     terminology_op(app, resource_type, "$subsumes", body).await
 }
 
-async fn smart_config(State(app): State<AppState>) -> Response {
-    crate::auth::configuration(&app)
+async fn smart_config(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    crate::auth::configuration(&app, &headers)
 }
 
-async fn oauth_token(State(app): State<AppState>, body: Bytes) -> Response {
-    crate::auth::issue(&app, &body)
+async fn jwks() -> Response {
+    crate::auth::jwks()
+}
+
+async fn oauth_authorize(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    crate::auth::authorize(&app, &headers, uri.query(), &[])
+}
+
+async fn oauth_authorize_post(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> Response {
+    crate::auth::authorize(&app, &headers, uri.query(), &body)
+}
+
+async fn oauth_token(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    crate::auth::issue(&app, &headers, &body)
+}
+
+async fn oauth_introspect(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    crate::auth::introspect(&app, &headers, &body)
+}
+
+async fn oauth_revoke(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    crate::auth::revoke(&app, &headers, &body)
+}
+
+async fn oauth_register(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    crate::auth::register(&app, &headers, &body)
+}
+
+async fn oauth_manage(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    crate::auth::manage(&app, &headers)
+}
+
+async fn oauth_ehr_launch(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    crate::auth::ehr_launch(&app, &headers, uri.query())
+}
+
+async fn oauth_style() -> Response {
+    crate::auth::style()
 }
 
 async fn graphql_route(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1120,7 +1273,8 @@ pub(crate) fn stamp_sdc(app: &AppState, headers: &HeaderMap, args: &mut Value) {
         args["_sdcArchiver"] = json!(true);
     }
     if app.config.auth {
-        args["_readScopes"] = json!(crate::auth::token_scopes(headers, None).unwrap_or_default());
+        args["_readScopes"] =
+            json!(crate::auth::token_scopes(app, headers, None).unwrap_or_default());
     }
 }
 

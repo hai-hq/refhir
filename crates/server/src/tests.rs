@@ -6,7 +6,9 @@ use axum::http::{Request, StatusCode};
 use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
-use refhir_fhir::{install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES};
+use refhir_fhir::{
+    install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES,
+};
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -487,6 +489,7 @@ async fn xml_graphql_smart_export_and_subscription() {
             export_dir: dir.display().to_string(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            ..Default::default()
         },
     );
     let xml =
@@ -579,21 +582,12 @@ async fn smart_scopes_gate_http_and_sync() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            ..Default::default()
         },
     );
     let denied = send(&app, "GET", "/Patient", None, None).await;
     assert_eq!(denied.status, StatusCode::UNAUTHORIZED);
-    let issued = send_text(
-        &app,
-        "POST",
-        "/oauth/token",
-        "scope=user/Patient.read&patient=p1",
-        &[("content-type", "application/x-www-form-urlencoded")],
-    )
-    .await;
-    assert_eq!(issued.0, StatusCode::OK, "{}", issued.1);
-    let token: Value = serde_json::from_str(&issued.1).unwrap();
-    let access = token["access_token"].as_str().unwrap();
+    let access = token(&app, "user/Patient.read").await;
     let allowed = send_text(
         &app,
         "GET",
@@ -688,10 +682,858 @@ async fn smart_scopes_gate_http_and_sync() {
 }
 
 #[tokio::test]
+async fn smart_app_launch_covers_discovery_pkce_oidc_and_backend() {
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            public_url: Some("http://127.0.0.1".into()),
+            smart_patient: Some("p1".into()),
+            smart_dcr_token: Some("dcr-test".into()),
+            ..Default::default()
+        },
+    );
+
+    let preflight = send_text(
+        &app,
+        "OPTIONS",
+        "/.well-known/smart-configuration",
+        "",
+        &[
+            ("origin", "http://app.example"),
+            ("access-control-request-method", "GET"),
+        ],
+    )
+    .await;
+    assert_eq!(preflight.0, StatusCode::NO_CONTENT);
+
+    let discovery = send(&app, "GET", "/.well-known/smart-configuration", None, None).await;
+    assert_eq!(discovery.status, StatusCode::OK);
+    assert_eq!(
+        discovery.body["grant_types_supported"][0],
+        "authorization_code"
+    );
+    assert!(discovery.body["grant_types_supported"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "client_credentials"));
+    assert_eq!(
+        discovery.body["code_challenge_methods_supported"],
+        json!(["S256"])
+    );
+    assert!(discovery.body["authorization_endpoint"]
+        .as_str()
+        .unwrap()
+        .starts_with("http://"));
+    assert_eq!(discovery.body["issuer"], "http://127.0.0.1");
+    assert!(discovery.body["jwks_uri"]
+        .as_str()
+        .unwrap()
+        .ends_with("/.well-known/jwks.json"));
+    let capabilities = discovery.body["capabilities"].as_array().unwrap();
+    for needed in [
+        "launch-ehr",
+        "launch-standalone",
+        "client-public",
+        "client-confidential-symmetric",
+        "client-confidential-asymmetric",
+        "sso-openid-connect",
+        "permission-patient",
+        "permission-user",
+        "permission-v1",
+        "permission-v2",
+        "context-ehr-patient",
+        "context-standalone-patient",
+    ] {
+        assert!(
+            capabilities.iter().any(|value| value == needed),
+            "missing {needed}"
+        );
+    }
+
+    let keys = send(&app, "GET", "/.well-known/jwks.json", None, None).await;
+    assert_eq!(keys.body["keys"][0]["kty"], "RSA");
+
+    let body = smart_token(
+        &app,
+        "launch/patient openid fhirUser offline_access patient/Patient.rs",
+        "http://127.0.0.1/cb",
+    )
+    .await;
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(body["patient"], "p1");
+    assert!(body["refresh_token"].as_str().is_some());
+    let id_token = body["id_token"].as_str().unwrap();
+    let n = keys.body["keys"][0]["n"].as_str().unwrap();
+    let e = keys.body["keys"][0]["e"].as_str().unwrap();
+    let decoding = jsonwebtoken::DecodingKey::from_rsa_components(n, e).unwrap();
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+    validation.set_audience(&["public"]);
+    validation.set_issuer(&["http://127.0.0.1"]);
+    let claims: Value = jsonwebtoken::decode::<Value>(id_token, &decoding, &validation)
+        .unwrap()
+        .claims;
+    assert!(claims["fhirUser"].as_str().unwrap().contains("Patient/"));
+
+    let access = body["access_token"].as_str().unwrap();
+    let read = send_text(
+        &app,
+        "GET",
+        "/Patient",
+        "",
+        &[("authorization", &format!("Bearer {access}"))],
+    )
+    .await;
+    assert_eq!(read.0, StatusCode::OK, "{}", read.1);
+    let create = send_text(
+        &app,
+        "POST",
+        "/Patient",
+        &patient("p9").to_string(),
+        &[
+            ("authorization", &format!("Bearer {access}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(create.0, StatusCode::FORBIDDEN);
+
+    let introspected = send_text(
+        &app,
+        "POST",
+        "/oauth/introspect",
+        &format!("token={access}"),
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("authorization", &format!("Bearer {access}")),
+        ],
+    )
+    .await;
+    assert_eq!(introspected.0, StatusCode::OK, "{}", introspected.1);
+    let intro: Value = serde_json::from_str(&introspected.1).unwrap();
+    assert_eq!(intro["active"], true);
+    assert_eq!(intro["patient"], "p1");
+    assert!(intro["scope"]
+        .as_str()
+        .unwrap()
+        .contains("patient/Patient.rs"));
+
+    let refreshed = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=refresh_token&refresh_token={}&client_id=public",
+            body["refresh_token"].as_str().unwrap()
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(refreshed.0, StatusCode::OK, "{}", refreshed.1);
+
+    let ehr = smart_token(
+        &app,
+        "launch openid fhirUser patient/*.read",
+        "http://127.0.0.1/cb",
+    )
+    .await;
+    assert_eq!(ehr["patient"], "p1");
+    assert_eq!(ehr["need_patient_banner"], true);
+
+    let (encoding, jwks) = backend_client_keys();
+    let registered = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "private_key_jwt",
+            "grant_types": ["client_credentials"],
+            "jwks": jwks,
+            "scope": "system/*.cruds"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(registered.0, StatusCode::CREATED, "{}", registered.1);
+    let client: Value = serde_json::from_str(&registered.1).unwrap();
+    let client_id = client["client_id"].as_str().unwrap();
+    let assertion = backend_assertion(&encoding, client_id, "http://127.0.0.1/oauth/token");
+    let backend = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}&scope=system/*.rs"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(backend.0, StatusCode::OK, "{}", backend.1);
+    let backend_body: Value = serde_json::from_str(&backend.1).unwrap();
+    assert_eq!(backend_body["expires_in"], 300);
+    assert!(backend_body["scope"]
+        .as_str()
+        .unwrap()
+        .contains("system/*.rs"));
+}
+
+fn backend_client_keys() -> (jsonwebtoken::EncodingKey, Value) {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+    use rsa::traits::PublicKeyParts;
+
+    let mut rng = rand::thread_rng();
+    let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let pem = key.to_pkcs8_pem(LineEnding::LF).unwrap();
+    let encoding = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+    let public = rsa::RsaPublicKey::from(&key);
+    (
+        encoding,
+        json!({
+            "keys": [{
+                "kty": "RSA",
+                "alg": "RS256",
+                "use": "sig",
+                "kid": "client-1",
+                "n": URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+                "e": URL_SAFE_NO_PAD.encode(public.e().to_bytes_be())
+            }]
+        }),
+    )
+}
+
+fn backend_assertion(encoding: &jsonwebtoken::EncodingKey, client_id: &str, aud: &str) -> String {
+    backend_assertion_kid(encoding, client_id, aud, "client-1")
+}
+
+fn backend_assertion_kid(
+    encoding: &jsonwebtoken::EncodingKey,
+    client_id: &str,
+    aud: &str,
+    kid: &str,
+) -> String {
+    #[derive(serde::Serialize)]
+    struct Claims<'a> {
+        iss: &'a str,
+        sub: &'a str,
+        aud: &'a str,
+        exp: u64,
+        iat: u64,
+        jti: String,
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(kid.into());
+    jsonwebtoken::encode(
+        &header,
+        &Claims {
+            iss: client_id,
+            sub: client_id,
+            aud,
+            exp: now + 60,
+            iat: now,
+            jti: uuid::Uuid::new_v4().to_string(),
+        },
+        encoding,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn smart_rejects_open_redirects_system_scopes_and_bad_clients() {
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            public_url: Some("https://fhir.example.org".into()),
+            smart_dcr_token: Some("dcr-test".into()),
+            smart_confidential_secret: Some("secret".into()),
+            ..Default::default()
+        },
+    );
+
+    let stolen = send(
+        &app,
+        "GET",
+        "/oauth/authorize?response_type=code&client_id=public&redirect_uri=https://evil.example/cb&scope=user/Patient.read&aud=https://fhir.example.org&code_challenge=abc&code_challenge_method=S256",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(stolen.status, StatusCode::BAD_REQUEST, "{}", stolen.body);
+    assert!(stolen.location.is_none());
+    assert_eq!(stolen.body["error"], "invalid_request");
+
+    let prefix = send(
+        &app,
+        "GET",
+        "/oauth/authorize?response_type=code&client_id=public&redirect_uri=http://localhost.evil.example/cb&scope=user/Patient.read&aud=https://fhir.example.org&code_challenge=abc&code_challenge_method=S256",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(prefix.status, StatusCode::BAD_REQUEST);
+
+    let system_only = send(
+        &app,
+        "GET",
+        "/oauth/authorize?response_type=code&client_id=public&redirect_uri=http://127.0.0.1/cb&scope=system/*.rs&aud=https://fhir.example.org&code_challenge=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&code_challenge_method=S256",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(system_only.status, StatusCode::FOUND);
+    assert!(
+        system_only
+            .location
+            .as_deref()
+            .unwrap_or("")
+            .contains("error=invalid_scope"),
+        "{:?}",
+        system_only.location
+    );
+
+    let mixed = smart_token_for(
+        &app,
+        "user/Patient.read system/*.cruds",
+        "http://127.0.0.1/cb",
+        "https://fhir.example.org",
+    )
+    .await;
+    assert_eq!(mixed["scope"], "user/Patient.read");
+    assert!(!mixed["scope"].as_str().unwrap().contains("system/"));
+
+    let dcr_open = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "private_key_jwt",
+            "grant_types": ["client_credentials"],
+            "jwks": {"keys": []},
+            "scope": "system/*.cruds"
+        })
+        .to_string(),
+        &[("content-type", "application/json")],
+    )
+    .await;
+    assert_eq!(dcr_open.0, StatusCode::UNAUTHORIZED, "{}", dcr_open.1);
+
+    let dcr = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "client_secret_post",
+            "grant_types": ["client_credentials"],
+            "scope": "system/*.cruds"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(dcr.0, StatusCode::BAD_REQUEST, "{}", dcr.1);
+
+    let jwks_only = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "private_key_jwt",
+            "grant_types": ["client_credentials"],
+            "jwks_uri": "https://evil.example/jwks.json",
+            "scope": "system/*.rs"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(jwks_only.0, StatusCode::BAD_REQUEST, "{}", jwks_only.1);
+
+    let (encoding, jwks) = backend_client_keys();
+    let registered = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "private_key_jwt",
+            "grant_types": ["client_credentials"],
+            "jwks": jwks,
+            "scope": "system/*.rs"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(registered.0, StatusCode::CREATED, "{}", registered.1);
+    let client_id = serde_json::from_str::<Value>(&registered.1).unwrap()["client_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let assertion = backend_assertion(
+        &encoding,
+        &client_id,
+        "https://fhir.example.org/oauth/token",
+    );
+    let backend = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}&scope=system/*.rs"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(backend.0, StatusCode::OK, "{}", backend.1);
+
+    let replay_jti = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}&scope=system/*.rs"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(replay_jti.0, StatusCode::UNAUTHORIZED);
+
+    let issuer_aud = backend_assertion(&encoding, &client_id, "https://fhir.example.org");
+    let issuer_as_aud = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={issuer_aud}&scope=system/*.rs"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(issuer_as_aud.0, StatusCode::UNAUTHORIZED);
+
+    let wrong_kid = backend_assertion_kid(
+        &encoding,
+        &client_id,
+        "https://fhir.example.org/oauth/token",
+        "other",
+    );
+    let kid_mismatch = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={wrong_kid}&scope=system/*.rs"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(kid_mismatch.0, StatusCode::UNAUTHORIZED);
+
+    let none_alg = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        "grant_type=client_credentials&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion=eyJhbGciOiJub25lIn0.eyJpc3MiOiJwdWJsaWMifQ.&scope=system/*.rs",
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(none_alg.0, StatusCode::UNAUTHORIZED);
+
+    let wrong_secret = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        "grant_type=authorization_code&code=missing&redirect_uri=http://127.0.0.1/cb&client_id=confidential&client_secret=nope&code_verifier=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(wrong_secret.0, StatusCode::UNAUTHORIZED);
+
+    let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let redirected = send(
+        &app,
+        "GET",
+        &format!(
+            "/oauth/authorize?response_type=code&client_id=public&redirect_uri=http://127.0.0.1/cb&scope=user/Patient.read&aud=https://fhir.example.org&code_challenge={challenge}&code_challenge_method=S256&state=s1"
+        ),
+        None,
+        None,
+    )
+    .await;
+    let code = query_value(redirected.location.as_deref().unwrap_or(""), "code").unwrap();
+    let bad_pkce = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http://127.0.0.1/cb&client_id=public&code_verifier=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(bad_pkce.0, StatusCode::BAD_REQUEST, "{}", bad_pkce.1);
+    let replay = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http://127.0.0.1/cb&client_id=public&code_verifier={verifier}"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(replay.0, StatusCode::BAD_REQUEST);
+
+    let issued = smart_token_for(
+        &app,
+        "openid fhirUser offline_access user/Patient.read",
+        "http://127.0.0.1/cb",
+        "https://fhir.example.org",
+    )
+    .await;
+    let refresh_expand = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=refresh_token&refresh_token={}&client_id=public&scope=user/*.cruds",
+            issued["refresh_token"].as_str().unwrap()
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(refresh_expand.0, StatusCode::BAD_REQUEST);
+
+    let id_token = issued["id_token"].as_str().unwrap();
+    assert!(id_token.split('.').nth(1).is_some());
+
+    let cors_ok = cors_header(
+        &app,
+        "OPTIONS",
+        "/.well-known/smart-configuration",
+        &[("origin", "https://app.example")],
+        "access-control-allow-origin",
+    )
+    .await;
+    assert_eq!(cors_ok.as_deref(), Some("*"));
+    let cors_denied = cors_header(
+        &app,
+        "OPTIONS",
+        "/Patient",
+        &[("origin", "https://evil.example")],
+        "access-control-allow-origin",
+    )
+    .await;
+    assert_ne!(cors_denied.as_deref(), Some("*"));
+    assert_ne!(cors_denied.as_deref(), Some("https://evil.example"));
+    let cors_loopback = cors_header(
+        &app,
+        "OPTIONS",
+        "/oauth/token",
+        &[("origin", "http://127.0.0.1:3000")],
+        "access-control-allow-origin",
+    )
+    .await;
+    assert_eq!(cors_loopback.as_deref(), Some("http://127.0.0.1:3000"));
+
+    let smart = std::sync::Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token_exp("expired", &["user/Patient.read"], None, 1);
+    let (db, catalog, store) = memory();
+    let expired_app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            smart: Some(smart),
+            ..Default::default()
+        },
+    );
+    let expired = send_text(
+        &expired_app,
+        "GET",
+        "/Patient",
+        "",
+        &[("authorization", "Bearer expired")],
+    )
+    .await;
+    assert_eq!(expired.0, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn smart_dcr_launch_issuer_and_code_are_locked_down() {
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            public_url: Some("http://127.0.0.1".into()),
+            smart_patient: Some("p1".into()),
+            smart_dcr_token: Some("dcr-test".into()),
+            smart_confidential_secret: Some("secret".into()),
+            ..Default::default()
+        },
+    );
+
+    let userinfo = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "none",
+            "redirect_uris": ["https://app.example@evil.example/cb"],
+            "scope": "user/*.cruds"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(userinfo.0, StatusCode::BAD_REQUEST, "{}", userinfo.1);
+
+    let remote_http = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "none",
+            "redirect_uris": ["http://evil.example/cb"],
+            "scope": "user/*.cruds"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(remote_http.0, StatusCode::BAD_REQUEST, "{}", remote_http.1);
+
+    let star = send_text(
+        &app,
+        "POST",
+        "/oauth/register",
+        &json!({
+            "token_endpoint_auth_method": "none",
+            "redirect_uris": ["http://127.0.0.1/cb"],
+            "scope": "*"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/json"),
+            ("authorization", "Bearer dcr-test"),
+        ],
+    )
+    .await;
+    assert_eq!(star.0, StatusCode::BAD_REQUEST, "{}", star.1);
+
+    let launched = send(
+        &app,
+        "GET",
+        "/oauth/ehr-launch?client_id=public&launch_uri=http://127.0.0.1/app&patient=victim",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(launched.status, StatusCode::FOUND, "{}", launched.body);
+    let launch = query_value(launched.location.as_deref().unwrap_or(""), "launch").unwrap();
+    let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let redirected = send(
+        &app,
+        "GET",
+        &format!(
+            "/oauth/authorize?response_type=code&client_id=public&redirect_uri=http://127.0.0.1/cb&scope=launch%20patient/*.read&aud=http://127.0.0.1&code_challenge={challenge}&code_challenge_method=S256&launch={launch}"
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(redirected.status, StatusCode::FOUND, "{}", redirected.body);
+    let code = query_value(redirected.location.as_deref().unwrap_or(""), "code").unwrap();
+    let issued = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=authorization_code&code={code}&redirect_uri=http://127.0.0.1/cb&client_id=public&code_verifier={verifier}"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::OK, "{}", issued.1);
+    let body: Value = serde_json::from_str(&issued.1).unwrap();
+    assert_eq!(body["patient"], "p1");
+    assert_ne!(body["patient"], "victim");
+
+    let pinned = send_text(
+        &app,
+        "GET",
+        "/.well-known/smart-configuration",
+        "",
+        &[("host", "evil.example")],
+    )
+    .await;
+    assert_eq!(pinned.0, StatusCode::OK, "{}", pinned.1);
+    let pinned_body: Value = serde_json::from_str(&pinned.1).unwrap();
+    assert_eq!(pinned_body["issuer"], "http://127.0.0.1");
+
+    let (db, catalog, store) = memory();
+    let unpinned = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            ..Default::default()
+        },
+    );
+    let injected = send_text(
+        &unpinned,
+        "GET",
+        "/.well-known/smart-configuration",
+        "",
+        &[("host", "evil.example")],
+    )
+    .await;
+    assert_eq!(injected.0, StatusCode::OK, "{}", injected.1);
+    let discovery: Value = serde_json::from_str(&injected.1).unwrap();
+    assert_eq!(discovery["issuer"], "http://127.0.0.1");
+    assert!(
+        !discovery["issuer"]
+            .as_str()
+            .unwrap_or("")
+            .contains("evil.example"),
+        "{}",
+        discovery
+    );
+
+    let authorize = send(
+        &app,
+        "GET",
+        &format!(
+            "/oauth/authorize?response_type=code&client_id=public&redirect_uri=http://127.0.0.1/cb&scope=user/Patient.read&aud=http://127.0.0.1&code_challenge={challenge}&code_challenge_method=S256"
+        ),
+        None,
+        None,
+    )
+    .await;
+    let stolen = query_value(authorize.location.as_deref().unwrap_or(""), "code").unwrap();
+    let wrong_client = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=authorization_code&code={stolen}&redirect_uri=http://127.0.0.1/cb&client_id=confidential&client_secret=secret&code_verifier={verifier}"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(
+        wrong_client.0,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        wrong_client.1
+    );
+    let right_client = send_text(
+        &app,
+        "POST",
+        "/oauth/token",
+        &format!(
+            "grant_type=authorization_code&code={stolen}&redirect_uri=http://127.0.0.1/cb&client_id=public&code_verifier={verifier}"
+        ),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(right_client.0, StatusCode::OK, "{}", right_client.1);
+    let token_body: Value = serde_json::from_str(&right_client.1).unwrap();
+    let access = token_body["access_token"].as_str().unwrap();
+
+    let revoke = send_text(
+        &app,
+        "POST",
+        "/oauth/revoke",
+        &format!("token={access}&client_id=confidential&client_secret=secret"),
+        &[("content-type", "application/x-www-form-urlencoded")],
+    )
+    .await;
+    assert_eq!(revoke.0, StatusCode::UNAUTHORIZED, "{}", revoke.1);
+    let still = send_text(
+        &app,
+        "GET",
+        "/Patient",
+        "",
+        &[("authorization", &format!("Bearer {access}"))],
+    )
+    .await;
+    assert_eq!(still.0, StatusCode::OK, "{}", still.1);
+}
+
+async fn cors_header(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    name: &str,
+) -> Option<String> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (header_name, value) in headers {
+        builder = builder.header(*header_name, *value);
+    }
+    let response = app
+        .clone()
+        .oneshot(builder.body(Body::from("")).unwrap())
+        .await
+        .unwrap();
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+#[tokio::test]
 async fn access_token_query_is_decoded_and_patient_compartment_holds() {
-    crate::auth::install_token("tok+1/2=", &["user/Patient.read"], None);
-    crate::auth::install_token("patient-tok", &["patient/Patient.read"], Some("p1"));
-    crate::auth::install_token("writer-tok", &["user/Patient.write"], None);
+    let smart = std::sync::Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token("tok+1/2=", &["user/Patient.read"], None);
+    smart.install_token("patient-tok", &["patient/Patient.read"], Some("p1"));
+    smart.install_token("writer-tok", &["user/Patient.write"], None);
     let (db, catalog, store) = memory();
     let app = crate::app_with(
         db,
@@ -702,6 +1544,8 @@ async fn access_token_query_is_decoded_and_patient_compartment_holds() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            smart: Some(smart),
+            ..Default::default()
         },
     );
     let decoded = send(
@@ -836,7 +1680,8 @@ async fn patient_scope_cannot_leave_its_compartment() {
         )
         .is_err());
     }
-    crate::auth::install_token(
+    let smart = std::sync::Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token(
         "compartment-writer",
         &["patient/*.write", "patient/*.read"],
         Some("p1"),
@@ -850,6 +1695,8 @@ async fn patient_scope_cannot_leave_its_compartment() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            smart: Some(smart),
+            ..Default::default()
         },
     );
     let other = send_text(
@@ -1087,6 +1934,7 @@ async fn patient_export_keeps_the_compartment() {
             export_dir: dir.display().to_string(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            ..Default::default()
         },
     );
     send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
@@ -1289,6 +2137,7 @@ async fn sdc_archiver_hides_responses_and_receiver_reads_them() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            ..Default::default()
         },
     );
     let created = send(
@@ -1305,7 +2154,14 @@ async fn sdc_archiver_hides_responses_and_receiver_reads_them() {
     .await;
     assert_eq!(created.status, StatusCode::CREATED);
     let id = created.body["id"].as_str().unwrap();
-    let read = send(&receiver, "GET", &format!("/QuestionnaireResponse/{id}"), None, None).await;
+    let read = send(
+        &receiver,
+        "GET",
+        &format!("/QuestionnaireResponse/{id}"),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(read.status, StatusCode::OK);
     let patient = send(
         &receiver,
@@ -1348,9 +2204,17 @@ async fn sdc_archiver_hides_responses_and_receiver_reads_them() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: true,
+            ..Default::default()
         },
     );
-    let hidden = send(&archiver, "GET", &format!("/QuestionnaireResponse/{id}"), None, None).await;
+    let hidden = send(
+        &archiver,
+        "GET",
+        &format!("/QuestionnaireResponse/{id}"),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(hidden.status, StatusCode::FORBIDDEN);
     let stored = send(
         &archiver,
@@ -1470,6 +2334,7 @@ async fn populate_respects_observation_scopes() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            ..Default::default()
         },
     );
     let admin = token(&app, "user/*.*").await;
@@ -1541,7 +2406,10 @@ async fn populate_respects_observation_scopes() {
     .await;
     assert_eq!(hidden.0, StatusCode::OK, "{}", hidden.1);
     let hidden_body: Value = serde_json::from_str(&hidden.1).unwrap();
-    assert!(hidden_body["item"].as_array().map(|items| items.is_empty()).unwrap_or(true));
+    assert!(hidden_body["item"]
+        .as_array()
+        .map(|items| items.is_empty())
+        .unwrap_or(true));
 
     let read_only = token(&app, "user/Questionnaire.read").await;
     let read_populate = send_text(
@@ -1595,6 +2463,7 @@ async fn bundle_and_graphql_keep_read_scopes() {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            ..Default::default()
         },
     );
     let admin = token(&app, "user/*.*").await;
@@ -1735,15 +2604,88 @@ fn launch_bundle() -> Value {
 }
 
 async fn token(app: &axum::Router, scope: &str) -> String {
+    let body = smart_token(app, scope, "http://127.0.0.1/cb").await;
+    body["access_token"].as_str().unwrap().to_string()
+}
+
+async fn smart_token(app: &axum::Router, scope: &str, redirect: &str) -> Value {
+    smart_token_for(app, scope, redirect, "http://127.0.0.1").await
+}
+
+async fn smart_token_for(app: &axum::Router, scope: &str, redirect: &str, aud: &str) -> Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let mut query = format!(
+        "response_type=code&client_id=public&redirect_uri={}&scope={}&aud={}&code_challenge={}&code_challenge_method=S256&state=s1",
+        encode_query(redirect),
+        encode_query(scope),
+        encode_query(aud),
+        challenge
+    );
+    if scope.split_whitespace().any(|item| item == "launch") {
+        let launched = send(
+            app,
+            "GET",
+            "/oauth/ehr-launch?client_id=public&launch_uri=http://127.0.0.1/app&patient=p1",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(launched.status, StatusCode::FOUND, "{}", launched.body);
+        let launch =
+            query_value(launched.location.as_deref().unwrap_or(""), "launch").expect("launch");
+        query.push_str("&launch=");
+        query.push_str(&encode_query(&launch));
+    }
+    let redirected = send(app, "GET", &format!("/oauth/authorize?{query}"), None, None).await;
+    assert_eq!(redirected.status, StatusCode::FOUND, "{}", redirected.body);
+    let code = query_value(redirected.location.as_deref().unwrap_or(""), "code").expect("code");
     let issued = send_text(
         app,
         "POST",
         "/oauth/token",
-        &format!("scope={scope}"),
+        &format!(
+            "grant_type=authorization_code&code={code}&redirect_uri={}&client_id=public&code_verifier={verifier}",
+            encode_query(redirect)
+        ),
         &[("content-type", "application/x-www-form-urlencoded")],
     )
     .await;
     assert_eq!(issued.0, StatusCode::OK, "{}", issued.1);
-    let body: Value = serde_json::from_str(&issued.1).unwrap();
-    body["access_token"].as_str().unwrap().to_string()
+    serde_json::from_str(&issued.1).unwrap()
+}
+
+fn encode_query(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn query_value(url: &str, name: &str) -> Option<String> {
+    let query = url.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        if key == name {
+            return Some(
+                value
+                    .replace('+', " ")
+                    .replace("%20", " ")
+                    .replace("%2F", "/")
+                    .replace("%3A", ":"),
+            );
+        }
+    }
+    None
 }

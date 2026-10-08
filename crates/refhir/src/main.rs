@@ -1,4 +1,5 @@
 use std::env;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::process::ExitCode;
@@ -31,6 +32,12 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut bind = "127.0.0.1:8080".to_string();
     let mut references = "strict".to_string();
     let mut auth = false;
+    let mut public_url = None;
+    let mut smart_patient = None;
+    let mut smart_encounter = None;
+    let mut smart_fhir_user = None;
+    let mut smart_dcr_token = None;
+    let mut smart_confidential_secret = None;
     let mut export_dir = "export".to_string();
     let mut terminology_urls = Vec::new();
     let mut trace_engine = false;
@@ -42,11 +49,17 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "refhir [--sqlite path] [--memory] [--postgres url] [--bind 127.0.0.1:8080]\n\
                      [--package dir] [--references strict|fhir] [--smart]\n\
+                     [--public-url url] [--smart-patient id] [--smart-encounter id]\n\
+                     [--smart-fhir-user Resource/id] [--smart-dcr-token token]\n\
+                     [--smart-confidential-secret secret]\n\
                      [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
                      Default database is refhir.sqlite. --memory uses SQLite in RAM and\n\
                      leaves no file. With no --package, the bundled\n\
                      hl7.fhir.r4.core 4.0.1 package and the SDC 4.0.0 slice are installed.\n\
                      --package may be repeated and replaces that default. --references defaults to strict.\n\
+                     --smart enables SMART App Launch 2.2. --public-url is required when\n\
+                     --smart is used with a non-loopback --bind. Generated DCR and confidential\n\
+                     secrets print once to stderr in a terminal and are never written to logs.\n\
                      --sdc-archiver stores QuestionnaireResponse without allowing a later read."
                 );
                 return Ok(());
@@ -73,6 +86,31 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 references = required(&args, index, "--references")?;
             }
             "--smart" => auth = true,
+            "--public-url" => {
+                index += 1;
+                public_url = Some(required(&args, index, "--public-url")?);
+            }
+            "--smart-patient" => {
+                index += 1;
+                smart_patient = Some(required(&args, index, "--smart-patient")?);
+            }
+            "--smart-encounter" => {
+                index += 1;
+                smart_encounter = Some(required(&args, index, "--smart-encounter")?);
+            }
+            "--smart-fhir-user" => {
+                index += 1;
+                smart_fhir_user = Some(required(&args, index, "--smart-fhir-user")?);
+            }
+            "--smart-dcr-token" => {
+                index += 1;
+                smart_dcr_token = Some(required(&args, index, "--smart-dcr-token")?);
+            }
+            "--smart-confidential-secret" => {
+                index += 1;
+                smart_confidential_secret =
+                    Some(required(&args, index, "--smart-confidential-secret")?);
+            }
             "--sdc-archiver" => sdc_archiver = true,
             "--export-dir" => {
                 index += 1;
@@ -139,6 +177,12 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         .expect("catalog")
         .set_reference_policy(policy);
     let addr: SocketAddr = bind.parse()?;
+    if auth && public_url.is_none() && !addr.ip().is_loopback() {
+        return Err("--smart on a non-loopback bind requires --public-url".into());
+    }
+    if auth {
+        fill_smart_credentials(&mut smart_dcr_token, &mut smart_confidential_secret)?;
+    }
     let listener = TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     tracing::info!("listening on http://{local}");
@@ -152,9 +196,49 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             export_dir,
             terminology_urls,
             sdc_archiver,
+            public_url,
+            smart_patient,
+            smart_encounter,
+            smart_fhir_user,
+            smart_dcr_token,
+            smart_confidential_secret,
+            smart: None,
         },
     )
     .await?;
+    Ok(())
+}
+
+fn fill_smart_credentials(
+    dcr: &mut Option<String>,
+    confidential: &mut Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let generated_dcr = dcr.as_deref().is_none_or(str::is_empty);
+    let generated_secret = confidential.as_deref().is_none_or(str::is_empty);
+    if generated_dcr {
+        *dcr = Some(uuid::Uuid::new_v4().to_string());
+    }
+    if generated_secret {
+        *confidential = Some(uuid::Uuid::new_v4().to_string());
+    }
+    if !generated_dcr && !generated_secret {
+        return Ok(());
+    }
+    if !std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+    if generated_dcr {
+        eprintln!(
+            "SMART DCR initial access token (Authorization: Bearer on POST /oauth/register): {}",
+            dcr.as_deref().unwrap_or("")
+        );
+    }
+    if generated_secret {
+        eprintln!(
+            "SMART confidential client_id=confidential secret={}",
+            confidential.as_deref().unwrap_or("")
+        );
+    }
     Ok(())
 }
 

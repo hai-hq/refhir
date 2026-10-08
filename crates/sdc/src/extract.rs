@@ -8,8 +8,8 @@ use serde_json::{json, Value as Json};
 use crate::chart::Chart;
 use crate::evalexpr::{eval_text, find_canonical};
 use crate::ext::{
-    value_of, ALLOCATE_ID, DEFINITION_EXTRACT, DEFINITION_VALUE, IS_SUBJECT, OBS_CATEGORY, OBS_ENTRY,
-    OBS_EXTRACT, TARGET_MAP, TEMPLATE_CONTEXT, TEMPLATE_EXTRACT, TEMPLATE_VALUE, UNIT,
+    value_of, ALLOCATE_ID, DEFINITION_EXTRACT, DEFINITION_VALUE, IS_SUBJECT, OBS_CATEGORY,
+    OBS_ENTRY, OBS_EXTRACT, TARGET_MAP, TEMPLATE_CONTEXT, TEMPLATE_EXTRACT, TEMPLATE_VALUE, UNIT,
 };
 use crate::items::{answer_values, answers, each_item};
 use crate::populate::new_id;
@@ -44,7 +44,11 @@ fn questionnaire_for(chart: &mut dyn Chart, response: &Json) -> Result<Json, Str
         return response
             .get("contained")
             .and_then(|value| value.as_array())
-            .and_then(|items| items.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+            })
             .cloned()
             .ok_or_else(|| format!("contained questionnaire {canonical} was not found"));
     }
@@ -52,13 +56,21 @@ fn questionnaire_for(chart: &mut dyn Chart, response: &Json) -> Result<Json, Str
         .ok_or_else(|| format!("questionnaire {canonical} was not found"))
 }
 
-fn extract_map(chart: &mut dyn Chart, questionnaire: &Json, response: &Json) -> Result<Json, String> {
+fn extract_map(
+    chart: &mut dyn Chart,
+    questionnaire: &Json,
+    response: &Json,
+) -> Result<Json, String> {
     let canonical = crate::ext::ext_text(questionnaire, TARGET_MAP).unwrap_or_default();
     let map = if let Some(id) = canonical.strip_prefix('#') {
         questionnaire
             .get("contained")
             .and_then(|value| value.as_array())
-            .and_then(|items| items.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+            })
             .cloned()
             .ok_or_else(|| format!("contained map {canonical} was not found"))?
     } else {
@@ -142,16 +154,24 @@ fn extract_observation(questionnaire: &Json, response: &Json, entries: &mut Vec<
             if let Some(category) = crate::ext::first_ext(&item, OBS_CATEGORY).and_then(value_of) {
                 observation["category"] = json!([category]);
             }
-            let item_type = item.get("type").and_then(|kind| kind.as_str()).unwrap_or("string");
+            let item_type = item
+                .get("type")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or("string");
             observation[value_key(item_type, &item)] = quantity_or(item_type, &item, value);
             let mut entry = json!({"resource": observation, "request": {"method": "POST", "url": "Observation"}});
             if let Some(entry_ext) = crate::ext::first_ext(&item, OBS_ENTRY) {
-                if let Some(full_url) = crate::ext::nested(entry_ext, "fullUrl").and_then(value_of) {
+                if let Some(full_url) = crate::ext::nested(entry_ext, "fullUrl").and_then(value_of)
+                {
                     entry["fullUrl"] = full_url.clone();
                 }
-                if let Some(resource_id) = crate::ext::nested(entry_ext, "resourceId").and_then(value_of).and_then(|v| v.as_str()) {
+                if let Some(resource_id) = crate::ext::nested(entry_ext, "resourceId")
+                    .and_then(value_of)
+                    .and_then(|v| v.as_str())
+                {
                     entry["resource"]["id"] = json!(resource_id);
-                    entry["request"] = json!({"method": "PUT", "url": format!("Observation/{resource_id}")});
+                    entry["request"] =
+                        json!({"method": "PUT", "url": format!("Observation/{resource_id}")});
                 }
             }
             if relationship == "component" {
@@ -180,7 +200,11 @@ fn attach_component(entries: &mut [Json], entry: &Json) -> bool {
             component[key] = value.clone();
         }
     }
-    if !parent.get("component").map(|value| value.is_array()).unwrap_or(false) {
+    if !parent
+        .get("component")
+        .map(|value| value.is_array())
+        .unwrap_or(false)
+    {
         parent["component"] = json!([]);
     }
     parent["component"].as_array_mut().unwrap().push(component);
@@ -206,7 +230,11 @@ fn attach_member(entries: &mut [Json]) {
     };
     let parent = entries.len() - 2;
     let resource = &mut entries[parent]["resource"];
-    if !resource.get("hasMember").map(|value| value.is_array()).unwrap_or(false) {
+    if !resource
+        .get("hasMember")
+        .map(|value| value.is_array())
+        .unwrap_or(false)
+    {
         resource["hasMember"] = json!([]);
     }
     resource["hasMember"]
@@ -271,20 +299,37 @@ fn extract_definition(
                 continue;
             }
             let link_id = item.get("linkId").and_then(|value| value.as_str());
-            if link_id.is_some() && answers(response, link_id.unwrap()).is_empty() && item.get("item").is_none() {
+            if link_id.is_some()
+                && answers(response, link_id.unwrap()).is_empty()
+                && item.get("item").is_none()
+            {
                 continue;
             }
             let type_name = resource_type_from(canonical);
             let mut resource = json!({"resourceType": type_name});
             let profile = canonical.split('#').next().unwrap_or(canonical);
-            if profile.contains("/StructureDefinition/") && !profile.ends_with(&format!("/{type_name}")) {
+            if profile.contains("/StructureDefinition/")
+                && !profile.ends_with(&format!("/{type_name}"))
+            {
                 resource["meta"] = json!({"profile": [profile]});
             }
-            fill_definition(chart, questionnaire, response, &mut resource, canonical, &ids)?;
-            let id = resource.get("id").and_then(|value| value.as_str()).map(|value| value.to_string());
+            fill_definition(
+                chart,
+                questionnaire,
+                response,
+                &mut resource,
+                canonical,
+                &ids,
+            )?;
+            let id = resource
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
             let full_url = crate::ext::nested(ext, "fullUrl")
                 .and_then(|node| crate::ext::expression_of(node))
-                .and_then(|(language, expression)| eval_text(chart, language, expression, response, &Default::default()).ok())
+                .and_then(|(language, expression)| {
+                    eval_text(chart, language, expression, response, &Default::default()).ok()
+                })
                 .and_then(|values| values.first().cloned())
                 .or_else(|| ids.values().next().cloned().map(|value| json!(value)));
             let mut entry = json!({
@@ -319,7 +364,10 @@ fn fill_definition(
                 if !same_profile(definition, canonical) {
                     continue;
                 }
-                let link_id = item.get("linkId").and_then(|value| value.as_str()).unwrap_or("");
+                let link_id = item
+                    .get("linkId")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 let values = answer_values(response, link_id);
                 for value in values {
                     set_fhir_path(resource, path, value);
@@ -342,7 +390,8 @@ fn fill_definition(
             for (name, id) in ids {
                 vars.insert(name.clone(), vec![crate::evalexpr::json_value(&json!(id))]);
             }
-            let values = eval_text(chart, language, expression, response, &vars).unwrap_or_default();
+            let values =
+                eval_text(chart, language, expression, response, &vars).unwrap_or_default();
             for value in values {
                 set_fhir_path(resource, path, value);
             }
@@ -372,7 +421,11 @@ fn extract_template(
             let Some(template) = questionnaire
                 .get("contained")
                 .and_then(|value| value.as_array())
-                .and_then(|items| items.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)))
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+                })
                 .cloned()
             else {
                 continue;
@@ -390,7 +443,10 @@ fn extract_template(
                 .get("resourceType")
                 .and_then(|value| value.as_str())
                 .unwrap_or("Resource");
-            let id = resource.get("id").and_then(|value| value.as_str()).map(|value| value.to_string());
+            let id = resource
+                .get("id")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string());
             entries.push(json!({
                 "resource": resource,
                 "request": {
@@ -430,7 +486,8 @@ fn apply_template(chart: &mut dyn Chart, node: &mut Json, focus: &Json) -> Resul
     }
     for ext in &contexts {
         if let Some((language, expression)) = crate::ext::expression_of(ext) {
-            let result = eval_text(chart, language, expression, focus, &Default::default()).unwrap_or_default();
+            let result = eval_text(chart, language, expression, focus, &Default::default())
+                .unwrap_or_default();
             if result.is_empty() {
                 *node = Json::Null;
                 return Ok(());
@@ -439,7 +496,8 @@ fn apply_template(chart: &mut dyn Chart, node: &mut Json, focus: &Json) -> Resul
     }
     for ext in &values {
         if let Some((language, expression)) = crate::ext::expression_of(ext) {
-            let result = eval_text(chart, language, expression, focus, &Default::default()).unwrap_or_default();
+            let result = eval_text(chart, language, expression, focus, &Default::default())
+                .unwrap_or_default();
             if result.is_empty() {
                 *node = Json::Null;
                 return Ok(());
@@ -485,7 +543,10 @@ fn set_fhir_path(resource: &mut Json, path: &str, value: Json) {
         .and_then(|item| item.as_str())
         .unwrap_or("");
     let relative = path.strip_prefix(&format!("{type_name}.")).unwrap_or(path);
-    let segments: Vec<&str> = relative.split('.').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = relative
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.is_empty() {
         return;
     }

@@ -18,11 +18,13 @@ use crate::items::{answer_for, answers, each_item, set_answers};
 pub fn populate(chart: &mut dyn Chart, questionnaire: &Json, args: &Json) -> Result<Json, String> {
     let subject = subject_of(args);
     let content = content_of(args);
-    let local = args.get("local").and_then(|value| value.as_bool()).unwrap_or(false);
-    let mut response = args
-        .get("response")
-        .cloned()
-        .unwrap_or_else(|| json!({"resourceType": "QuestionnaireResponse", "status": "in-progress"}));
+    let local = args
+        .get("local")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let mut response = args.get("response").cloned().unwrap_or_else(
+        || json!({"resourceType": "QuestionnaireResponse", "status": "in-progress"}),
+    );
     if response.get("resourceType").is_none() {
         response["resourceType"] = json!("QuestionnaireResponse");
     }
@@ -36,7 +38,15 @@ pub fn populate(chart: &mut dyn Chart, questionnaire: &Json, args: &Json) -> Res
         return populate_map(chart, questionnaire, &response, &content, local);
     }
     let mut sources = Vec::new();
-    populate_observation(chart, questionnaire, &mut response, subject.as_deref(), &content, local, &mut sources)?;
+    populate_observation(
+        chart,
+        questionnaire,
+        &mut response,
+        subject.as_deref(),
+        &content,
+        local,
+        &mut sources,
+    )?;
     populate_expressions(chart, questionnaire, &mut response, &content, local)?;
     if !sources.is_empty() {
         attach_provenance(&mut response, &sources);
@@ -83,7 +93,9 @@ fn source_bundle(
     local: bool,
 ) -> Result<Json, String> {
     let Some(reference) = crate::ext::ext_text(questionnaire, SOURCE_QUERIES) else {
-        return Ok(json!({"resourceType": "Bundle", "type": "collection", "entry": content.iter().map(|resource| json!({"resource": resource})).collect::<Vec<_>>() }));
+        return Ok(
+            json!({"resourceType": "Bundle", "type": "collection", "entry": content.iter().map(|resource| json!({"resource": resource})).collect::<Vec<_>>() }),
+        );
     };
     let batch = resolve_ref(chart, questionnaire, "Bundle", &reference)?;
     let mut entries = Vec::new();
@@ -101,13 +113,13 @@ fn source_bundle(
             content.to_vec()
         } else if let Some((type_name, query)) = url.split_once('?') {
             let params = query_params(query);
-            let owned: Vec<(&str, String)> = params.iter().map(|(name, value)| (*name, value.clone())).collect();
+            let owned: Vec<(&str, String)> = params
+                .iter()
+                .map(|(name, value)| (*name, value.clone()))
+                .collect();
             chart.search_type(type_name, &owned)?
         } else if let Some((type_name, id)) = url.split_once('/') {
-            chart
-                .read_type(type_name, id)?
-                .into_iter()
-                .collect()
+            chart.read_type(type_name, id)?.into_iter().collect()
         } else {
             Vec::new()
         };
@@ -131,7 +143,8 @@ fn populate_observation(
     local: bool,
     sources: &mut Vec<String>,
 ) -> Result<(), String> {
-    let inherited = period_seconds(crate::ext::first_ext(questionnaire, LINK_PERIOD).and_then(value_of));
+    let inherited =
+        period_seconds(crate::ext::first_ext(questionnaire, LINK_PERIOD).and_then(value_of));
     walk_observation(
         chart,
         questionnaire,
@@ -165,7 +178,8 @@ fn walk_observation(
             }
         }
     }
-    let period = period_seconds(crate::ext::first_ext(node, LINK_PERIOD).and_then(value_of)).or(inherited);
+    let period =
+        period_seconds(crate::ext::first_ext(node, LINK_PERIOD).and_then(value_of)).or(inherited);
     if let Some(link_id) = node.get("linkId").and_then(|value| value.as_str()) {
         let observes = period.is_some() && !crate::ext::codes_of(node).is_empty();
         if observes && crate::ext::first_ext(node, INITIAL).is_some() {
@@ -176,11 +190,16 @@ fn walk_observation(
         if observes && answers(response, link_id).is_empty() {
             let codes = crate::ext::codes_of(node);
             if !codes.is_empty() {
-                if let Some(observation) = newest_observation(chart, subject.as_deref(), &codes, period, content, local)? {
+                if let Some(observation) =
+                    newest_observation(chart, subject.as_deref(), &codes, period, content, local)?
+                {
                     if let Some(reference) = observation_reference(&observation) {
                         sources.push(reference);
                     }
-                    let item_type = node.get("type").and_then(|value| value.as_str()).unwrap_or("string");
+                    let item_type = node
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("string");
                     if let Some(value) = observation_value(&observation, node, item_type) {
                         set_answers(response, link_id, &[answer_for(item_type, &value)]);
                     }
@@ -190,7 +209,16 @@ fn walk_observation(
     }
     if let Some(items) = node.get("item").and_then(|value| value.as_array()) {
         for item in items {
-            walk_observation(chart, item, response, subject.clone(), content, local, sources, period)?;
+            walk_observation(
+                chart,
+                item,
+                response,
+                subject.clone(),
+                content,
+                local,
+                sources,
+                period,
+            )?;
         }
     }
     Ok(())
@@ -206,7 +234,9 @@ fn newest_observation(
 ) -> Result<Option<Json>, String> {
     let mut rows = content
         .iter()
-        .filter(|row| row.get("resourceType").and_then(|value| value.as_str()) == Some("Observation"))
+        .filter(|row| {
+            row.get("resourceType").and_then(|value| value.as_str()) == Some("Observation")
+        })
         .cloned()
         .collect::<Vec<_>>();
     if !local && chart.allows("Observation") {
@@ -217,7 +247,10 @@ fn newest_observation(
         if let Some((_, code)) = codes.first() {
             params.push(("code", code.clone()));
         }
-        let owned: Vec<(&str, String)> = params.iter().map(|(name, value)| (*name, value.clone())).collect();
+        let owned: Vec<(&str, String)> = params
+            .iter()
+            .map(|(name, value)| (*name, value.clone()))
+            .collect();
         rows.extend(chart.search_type("Observation", &owned)?);
     }
     let now = now_secs();
@@ -241,7 +274,9 @@ fn observation_matches(row: &Json, subject: Option<&str>, codes: &[(String, Stri
         }
     }
     let present = crate::ext::codes_of(row.get("code").unwrap_or(&json!({})));
-    codes.iter().any(|(_, code)| present.iter().any(|(_, item)| item == code))
+    codes
+        .iter()
+        .any(|(_, code)| present.iter().any(|(_, item)| item == code))
 }
 
 fn within_period(row: &Json, period: Option<i64>, now: i64) -> bool {
@@ -298,19 +333,26 @@ fn populate_expressions(
     vars.insert("questionnaire".into(), vec![json_value(questionnaire)]);
     vars.insert("resource".into(), vec![json_value(response)]);
     for resource in content {
-        if let Some(type_name) = resource.get("resourceType").and_then(|value| value.as_str()) {
+        if let Some(type_name) = resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+        {
             vars.entry(type_name.to_ascii_lowercase())
                 .or_insert_with(Vec::new)
                 .push(json_value(resource));
         }
     }
     for ext in crate::ext::extensions(questionnaire, LAUNCH) {
-        let name = crate::ext::nested(ext, "name").and_then(value_of).and_then(|value| {
-            value
-                .as_str()
-                .map(|text| text.to_string())
-                .or_else(|| value.get("code").and_then(|code| code.as_str()).map(|code| code.to_string()))
-        });
+        let name = crate::ext::nested(ext, "name")
+            .and_then(value_of)
+            .and_then(|value| {
+                value.as_str().map(|text| text.to_string()).or_else(|| {
+                    value
+                        .get("code")
+                        .and_then(|code| code.as_str())
+                        .map(|code| code.to_string())
+                })
+            });
         let type_name = crate::ext::nested(ext, "type")
             .and_then(value_of)
             .and_then(|value| value.as_str());
@@ -363,8 +405,14 @@ fn populate_expressions(
             continue;
         };
         let values = eval_text(chart, language, expression, response, &vars).unwrap_or_default();
-        let item_type = item.get("type").and_then(|value| value.as_str()).unwrap_or("string");
-        let stored: Vec<Json> = values.iter().map(|value| answer_for(item_type, value)).collect();
+        let item_type = item
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("string");
+        let stored: Vec<Json> = values
+            .iter()
+            .map(|value| answer_for(item_type, value))
+            .collect();
         set_answers(response, link_id, &stored);
         vars.insert("resource".into(), vec![json_value(response)]);
     }
@@ -389,7 +437,10 @@ fn attach_provenance(response: &mut Json, sources: &[String]) {
         .expect("response")
         .entry("contained")
         .or_insert_with(|| json!([]));
-    contained.as_array_mut().expect("contained").push(provenance);
+    contained
+        .as_array_mut()
+        .expect("contained")
+        .push(provenance);
     crate::ext::push_extension(
         response,
         json!({"url": PROVENANCE, "valueReference": {"reference": format!("#{id}")}}),
@@ -412,7 +463,12 @@ fn content_of(args: &Json) -> Vec<Json> {
     if let Some(items) = args.get("content").and_then(|value| value.as_array()) {
         for item in items {
             if item.get("resourceType").and_then(|value| value.as_str()) == Some("Bundle") {
-                for entry in item.get("entry").and_then(|value| value.as_array()).into_iter().flatten() {
+                for entry in item
+                    .get("entry")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                {
                     if let Some(resource) = entry.get("resource") {
                         rows.push(resource.clone());
                     }
@@ -425,16 +481,26 @@ fn content_of(args: &Json) -> Vec<Json> {
     rows
 }
 
-fn resolve_ref(chart: &mut dyn Chart, owner: &Json, type_name: &str, reference: &str) -> Result<Json, String> {
+fn resolve_ref(
+    chart: &mut dyn Chart,
+    owner: &Json,
+    type_name: &str,
+    reference: &str,
+) -> Result<Json, String> {
     if let Some(id) = reference.strip_prefix('#') {
         return owner
             .get("contained")
             .and_then(|value| value.as_array())
-            .and_then(|items| items.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+            })
             .cloned()
             .ok_or_else(|| format!("contained {reference} was not found"));
     }
-    find_canonical(chart, type_name, reference)?.ok_or_else(|| format!("{type_name} {reference} was not found"))
+    find_canonical(chart, type_name, reference)?
+        .ok_or_else(|| format!("{type_name} {reference} was not found"))
 }
 
 fn query_params(query: &str) -> Vec<(&str, String)> {
@@ -450,8 +516,14 @@ fn query_params(query: &str) -> Vec<(&str, String)> {
 
 fn period_seconds(value: Option<&Json>) -> Option<i64> {
     let value = value?;
-    let amount = value.get("value").and_then(|item| item.as_f64()).unwrap_or(0.0);
-    let code = value.get("code").and_then(|item| item.as_str()).unwrap_or("d");
+    let amount = value
+        .get("value")
+        .and_then(|item| item.as_f64())
+        .unwrap_or(0.0);
+    let code = value
+        .get("code")
+        .and_then(|item| item.as_str())
+        .unwrap_or("d");
     let seconds = match code {
         "a" | "year" | "yr" => amount * 365.0 * 86_400.0,
         "mo" => amount * 30.0 * 86_400.0,
@@ -485,7 +557,11 @@ fn civil_days(year: i32, month: u8, day: u8) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = (year - era * 400) as u64;
-    let mp = if month > 2 { month as u64 - 3 } else { month as u64 + 9 };
+    let mp = if month > 2 {
+        month as u64 - 3
+    } else {
+        month as u64 + 9
+    };
     let doy = (153 * mp + 2) / 5 + day as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era as i64 * 146_097 + doe as i64 - 719_468

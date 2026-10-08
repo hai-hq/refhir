@@ -67,13 +67,13 @@ pub const MAX_VALUE: &str = "http://hl7.org/fhir/StructureDefinition/maxValue";
 pub const REGEX: &str = "http://hl7.org/fhir/StructureDefinition/regex";
 pub const LINK_PREFIX: &str =
     "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-linkIdPrefix";
-pub const ENDPOINT: &str = "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-endpoint";
+pub const ENDPOINT: &str =
+    "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-endpoint";
 pub const ENTRY_MODE: &str =
     "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-entryMode";
 pub const PERFORMER: &str =
     "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaire-performerType";
-pub const CRITICAL: &str =
-    "http://hl7.org/fhir/StructureDefinition/rendering-criticalExtension";
+pub const CRITICAL: &str = "http://hl7.org/fhir/StructureDefinition/rendering-criticalExtension";
 pub const PROVENANCE: &str =
     "http://hl7.org/fhir/uv/sdc/StructureDefinition/sdc-questionnaireresponse-provenance";
 pub const TASK_ENDPOINT: &str =

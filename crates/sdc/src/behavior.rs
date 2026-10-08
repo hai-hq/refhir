@@ -57,8 +57,14 @@ pub fn apply_behavior(
             if let Some(ext) = crate::ext::first_ext(item, INITIAL) {
                 if let Some((language, expression)) = crate::ext::expression_of(ext) {
                     let values = eval_text(chart, language, expression, &response, &vars)?;
-                    let item_type = item.get("type").and_then(|value| value.as_str()).unwrap_or("string");
-                    let answers: Vec<Json> = values.iter().map(|value| answer_for(item_type, value)).collect();
+                    let item_type = item
+                        .get("type")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("string");
+                    let answers: Vec<Json> = values
+                        .iter()
+                        .map(|value| answer_for(item_type, value))
+                        .collect();
                     set_answers(&mut response, &link_id, &answers);
                 }
             }
@@ -66,8 +72,14 @@ pub fn apply_behavior(
         if let Some(ext) = crate::ext::first_ext(item, CALCULATED) {
             if let Some((language, expression)) = crate::ext::expression_of(ext) {
                 let values = eval_text(chart, language, expression, &response, &vars)?;
-                let item_type = item.get("type").and_then(|value| value.as_str()).unwrap_or("string");
-                let answers: Vec<Json> = values.iter().map(|value| answer_for(item_type, value)).collect();
+                let item_type = item
+                    .get("type")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("string");
+                let answers: Vec<Json> = values
+                    .iter()
+                    .map(|value| answer_for(item_type, value))
+                    .collect();
                 if !answers.is_empty() {
                     set_answers(&mut response, &link_id, &answers);
                 }
@@ -128,15 +140,12 @@ fn bind_launch(
         let name = crate::ext::nested(ext, "name")
             .and_then(value_of)
             .and_then(|value| {
-                value
-                    .as_str()
-                    .map(|text| text.to_string())
-                    .or_else(|| {
-                        value
-                            .get("code")
-                            .and_then(|code| code.as_str())
-                            .map(|code| code.to_string())
-                    })
+                value.as_str().map(|text| text.to_string()).or_else(|| {
+                    value
+                        .get("code")
+                        .and_then(|code| code.as_str())
+                        .map(|code| code.to_string())
+                })
             });
         let type_name = crate::ext::nested(ext, "type")
             .and_then(value_of)
@@ -149,7 +158,9 @@ fn bind_launch(
             .and_then(|value| value.get("reference"))
             .and_then(|value| value.as_str())
         {
-            if type_name.is_none() || reference.starts_with(&format!("{}/", type_name.unwrap_or(""))) {
+            if type_name.is_none()
+                || reference.starts_with(&format!("{}/", type_name.unwrap_or("")))
+            {
                 if let Some((type_name, id)) = reference.split_once('/') {
                     if let Some(resource) = chart.read_type(type_name, id)? {
                         vars.insert(name, vec![json_value(&resource)]);
@@ -170,7 +181,10 @@ fn item_enabled(
     if let Some(ext) = crate::ext::first_ext(item, ENABLE_EXPR) {
         if let Some((language, expression)) = crate::ext::expression_of(ext) {
             let values = eval_text(chart, language, expression, response, vars)?;
-            return Ok(values.first().and_then(|value| value.as_bool()).unwrap_or(false));
+            return Ok(values
+                .first()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false));
         }
     }
     let conditions = item
@@ -210,15 +224,15 @@ fn condition_matches(condition: &Json, response: &Json) -> bool {
             .unwrap_or(true);
         return values.is_empty() != wanted;
     }
-    let expected = condition
-        .as_object()
-        .and_then(|object| {
-            object
-                .iter()
-                .find(|(key, _)| key.starts_with("answer"))
-                .map(|(_, value)| value)
-        });
-    values.iter().any(|value| compare(operator, value, expected))
+    let expected = condition.as_object().and_then(|object| {
+        object
+            .iter()
+            .find(|(key, _)| key.starts_with("answer"))
+            .map(|(_, value)| value)
+    });
+    values
+        .iter()
+        .any(|value| compare(operator, value, expected))
 }
 
 fn compare(operator: &str, left: &Json, right: Option<&Json>) -> bool {
@@ -227,7 +241,8 @@ fn compare(operator: &str, left: &Json, right: Option<&Json>) -> bool {
     };
     if left.get("code").is_some() || right.get("code").is_some() {
         let same = left.get("code") == right.get("code")
-            && left.get("system").unwrap_or(&json!("")) == right.get("system").unwrap_or(&json!(""));
+            && left.get("system").unwrap_or(&json!(""))
+                == right.get("system").unwrap_or(&json!(""));
         return match operator {
             "!=" => !same,
             _ => same,
@@ -244,8 +259,14 @@ fn compare(operator: &str, left: &Json, right: Option<&Json>) -> bool {
             _ => false,
         };
     }
-    let left = left.as_str().map(|value| value.to_string()).unwrap_or_else(|| left.to_string());
-    let right = right.as_str().map(|value| value.to_string()).unwrap_or_else(|| right.to_string());
+    let left = left
+        .as_str()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| left.to_string());
+    let right = right
+        .as_str()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| right.to_string());
     match operator {
         "=" => left == right,
         "!=" => left != right,

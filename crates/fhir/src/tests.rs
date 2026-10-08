@@ -1523,12 +1523,16 @@ fn sdc_capability_populate_and_completed_response() {
     );
     assert_eq!(view["enabled"]["weight"], true);
 
-    apply(&harness, "Questionnaire/create", json!({"resource": {
-        "resourceType": "Questionnaire",
-        "url": "http://example.org/Questionnaire/required",
-        "status": "active",
-        "item": [{"linkId": "name", "type": "string", "required": true}]
-    }}));
+    apply(
+        &harness,
+        "Questionnaire/create",
+        json!({"resource": {
+            "resourceType": "Questionnaire",
+            "url": "http://example.org/Questionnaire/required",
+            "status": "active",
+            "item": [{"linkId": "name", "type": "string", "required": true}]
+        }}),
+    );
     let rejected = run_op(
         &harness,
         "QuestionnaireResponse/create",
@@ -1604,7 +1608,8 @@ fn patch_checks_completed_responses_and_archiver_rejects_it() {
         }}),
     );
     let id = created["id"].as_str().unwrap();
-    let patch = json!({"id": id, "patch": [{"op": "replace", "path": "/status", "value": "completed"}]});
+    let patch =
+        json!({"id": id, "patch": [{"op": "replace", "path": "/status", "value": "completed"}]});
     let rejected = run_op(&harness, "QuestionnaireResponse/patch", &patch).unwrap_err();
     assert!(
         matches!(rejected, RunError::Fhir(FhirError::Outcome(_))),
@@ -1891,7 +1896,9 @@ fn unindexed_populate_query_does_not_return_every_patient() {
     let born = &populated["item"][1];
     assert!(
         born.get("answer").is_none()
-            || born["answer"].as_array().is_some_and(|items| items.is_empty()),
+            || born["answer"]
+                .as_array()
+                .is_some_and(|items| items.is_empty()),
         "birthdate is not an indexed parameter: {born}"
     );
 }

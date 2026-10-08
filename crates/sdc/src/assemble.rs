@@ -5,7 +5,7 @@ use serde_json::{json, Value as Json};
 use crate::chart::Chart;
 use crate::evalexpr::find_canonical;
 use crate::ext::{
-    push_extension, ADAPTIVE, ASSEMBLE_EXPECTATION, ASSEMBLED_FROM, CRITICAL, ENDPOINT, ENTRY_MODE,
+    push_extension, ADAPTIVE, ASSEMBLED_FROM, ASSEMBLE_EXPECTATION, CRITICAL, ENDPOINT, ENTRY_MODE,
     LAUNCH, LIBRARY, LINK_PREFIX, PERFORMER, SUB_QUESTIONNAIRE, VARIABLE,
 };
 use crate::items::{item_by_link, prefix_link_ids};
@@ -29,7 +29,11 @@ pub fn assemble(chart: &mut dyn Chart, questionnaire: &Json) -> Result<Json, Str
     Ok(assembled)
 }
 
-fn assemble_in(chart: &mut dyn Chart, questionnaire: &mut Json, seen: &mut Vec<String>) -> Result<(), String> {
+fn assemble_in(
+    chart: &mut dyn Chart,
+    questionnaire: &mut Json,
+    seen: &mut Vec<String>,
+) -> Result<(), String> {
     let url = questionnaire
         .get("url")
         .and_then(|value| value.as_str())
@@ -84,7 +88,9 @@ fn replace_subquestionnaires(
                     .unwrap_or_default();
                 if !prefix.is_empty() {
                     for imported in &mut imported {
-                        if let Some(link_id) = imported.get("linkId").and_then(|value| value.as_str()) {
+                        if let Some(link_id) =
+                            imported.get("linkId").and_then(|value| value.as_str())
+                        {
                             imported["linkId"] = json!(format!("{prefix}{link_id}"));
                         }
                         prefix_link_ids(imported, &prefix);
@@ -110,7 +116,11 @@ fn load_child(chart: &mut dyn Chart, parent: &Json, canonical: &str) -> Result<J
         return parent
             .get("contained")
             .and_then(|value| value.as_array())
-            .and_then(|items| items.iter().find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id)))
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|value| value.as_str()) == Some(id))
+            })
             .cloned()
             .ok_or_else(|| format!("contained questionnaire {canonical} was not found"));
     }
@@ -122,7 +132,9 @@ fn align(parent: &Json, child: &Json) -> Result<(), String> {
     for field in ["language", "implicitRules"] {
         if let Some(child_value) = child.get(field) {
             if parent.get(field).is_some() && parent.get(field) != Some(child_value) {
-                return Err(format!("sub-questionnaire {field} does not match the parent"));
+                return Err(format!(
+                    "sub-questionnaire {field} does not match the parent"
+                ));
             }
         }
     }
@@ -133,7 +145,9 @@ fn align(parent: &Json, child: &Json) -> Result<(), String> {
         }
         let parent_values = crate::ext::extensions(parent, url);
         if parent_values.is_empty() {
-            return Err(format!("sub-questionnaire extension {url} is not declared on the parent"));
+            return Err(format!(
+                "sub-questionnaire extension {url} is not declared on the parent"
+            ));
         }
     }
     Ok(())
@@ -142,14 +156,16 @@ fn align(parent: &Json, child: &Json) -> Result<(), String> {
 fn propagate(parent: &mut Json, display: &Json, child: &Json) -> Result<(), String> {
     for url in ROOT_BLOCKED {
         if crate::ext::first_ext(child, url).is_some() {
-            return Err(format!("sub-questionnaire must not carry {url} at the root"));
+            return Err(format!(
+                "sub-questionnaire must not carry {url} at the root"
+            ));
         }
     }
     for ext in crate::ext::extensions(child, LIBRARY) {
         let canonical = crate::ext::value_of(ext).and_then(|value| value.as_str());
-        let already = crate::ext::extensions(parent, LIBRARY).iter().any(|item| {
-            crate::ext::value_of(item).and_then(|value| value.as_str()) == canonical
-        });
+        let already = crate::ext::extensions(parent, LIBRARY)
+            .iter()
+            .any(|item| crate::ext::value_of(item).and_then(|value| value.as_str()) == canonical);
         if !already {
             push_extension(parent, (*ext).clone());
         }
@@ -171,7 +187,9 @@ fn propagate(parent: &mut Json, display: &Json, child: &Json) -> Result<(), Stri
         let list = list.as_array_mut().expect("contained");
         for resource in contained {
             let id = resource.get("id").and_then(|value| value.as_str());
-            let present = list.iter().any(|item| item.get("id").and_then(|value| value.as_str()) == id);
+            let present = list
+                .iter()
+                .any(|item| item.get("id").and_then(|value| value.as_str()) == id);
             if !present {
                 list.push(resource.clone());
             }
@@ -210,14 +228,22 @@ fn expand_definitions(chart: &mut dyn Chart, questionnaire: &mut Json) -> Result
         let mut item = item;
         if let Some(definition) = item.get("definition").and_then(|value| value.as_str()) {
             if let Some((canonical, link_id)) = definition.split_once('#') {
-                if canonical.contains("Questionnaire") || chart.search_type("Questionnaire", &[("url", canonical.to_string())]).ok().and_then(|rows| rows.into_iter().next()).is_some() {
+                if canonical.contains("Questionnaire")
+                    || chart
+                        .search_type("Questionnaire", &[("url", canonical.to_string())])
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next())
+                        .is_some()
+                {
                     if let Some(source) = find_canonical(chart, "Questionnaire", canonical)? {
                         if let Some(imported) = item_by_link(&source, link_id) {
                             item = imported.clone();
                         }
                     }
                 } else if item.get("text").is_none() {
-                    if let Some(definition_resource) = find_canonical(chart, "StructureDefinition", canonical)? {
+                    if let Some(definition_resource) =
+                        find_canonical(chart, "StructureDefinition", canonical)?
+                    {
                         if let Some(text) = element_text(&definition_resource, link_id) {
                             item["text"] = json!(text);
                         }

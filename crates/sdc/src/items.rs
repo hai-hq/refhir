@@ -112,9 +112,15 @@ pub fn answer_for(item_type: &str, value: &Json) -> Json {
     let stored = if key == "valueString" && !value.is_string() {
         json!(value.to_string())
     } else if key == "valueInteger" {
-        json!(value.as_i64().or_else(|| value.as_f64().map(|number| number as i64)).unwrap_or(0))
+        json!(value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|number| number as i64))
+            .unwrap_or(0))
     } else if key == "valueDecimal" {
-        json!(value.as_f64().or_else(|| value.as_i64().map(|number| number as f64)).unwrap_or(0.0))
+        json!(value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|number| number as f64))
+            .unwrap_or(0.0))
     } else if key == "valueBoolean" {
         json!(value.as_bool().unwrap_or(false))
     } else {

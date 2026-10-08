@@ -51,7 +51,11 @@ pub fn validate_response(
                 return;
             }
             if answers(response, link_id).is_empty() {
-                issues.push(issue("error", "required item is missing an answer", link_id));
+                issues.push(issue(
+                    "error",
+                    "required item is missing an answer",
+                    link_id,
+                ));
             }
         });
     }
@@ -67,8 +71,17 @@ pub fn validate_response(
         let Some(expression) = expression else {
             continue;
         };
-        let values = eval_text(chart, "text/fhirpath", expression, response, &Default::default())?;
-        let ok = values.first().and_then(|value| value.as_bool()).unwrap_or(false);
+        let values = eval_text(
+            chart,
+            "text/fhirpath",
+            expression,
+            response,
+            &Default::default(),
+        )?;
+        let ok = values
+            .first()
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
         if !ok {
             let text = crate::ext::nested(ext, "human")
                 .and_then(value_of)
@@ -89,15 +102,24 @@ pub fn has_errors(outcome: &Json) -> bool {
         .get("issue")
         .and_then(|value| value.as_array())
         .map(|items| {
-            items.iter().any(|item| {
-                item.get("severity").and_then(|value| value.as_str()) == Some("error")
-            })
+            items
+                .iter()
+                .any(|item| item.get("severity").and_then(|value| value.as_str()) == Some("error"))
         })
         .unwrap_or(false)
 }
 
-fn check_item(chart: &mut dyn Chart, definition: &Json, item: &Json, response: &Json, issues: &mut Vec<Json>) {
-    let link_id = item.get("linkId").and_then(|value| value.as_str()).unwrap_or("");
+fn check_item(
+    chart: &mut dyn Chart,
+    definition: &Json,
+    item: &Json,
+    response: &Json,
+    issues: &mut Vec<Json>,
+) {
+    let link_id = item
+        .get("linkId")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     let item_type = definition
         .get("type")
         .and_then(|value| value.as_str())
@@ -107,7 +129,9 @@ fn check_item(chart: &mut dyn Chart, definition: &Json, item: &Json, response: &
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    if definition.get("repeats").and_then(|value| value.as_bool()) != Some(true) && answer_list.len() > 1 {
+    if definition.get("repeats").and_then(|value| value.as_bool()) != Some(true)
+        && answer_list.len() > 1
+    {
         issues.push(issue("error", "item does not repeat", link_id));
     }
     if let Some(max) = definition.get("maxLength").and_then(|value| value.as_u64()) {
@@ -120,10 +144,20 @@ fn check_item(chart: &mut dyn Chart, definition: &Json, item: &Json, response: &
     for answer in &answer_list {
         if let Some(value) = value_of(answer) {
             if !type_matches(item_type, answer) {
-                issues.push(issue("error", "answer type does not match the item", link_id));
+                issues.push(issue(
+                    "error",
+                    "answer type does not match the item",
+                    link_id,
+                ));
             }
-            if let Some(options) = definition.get("answerOption").and_then(|item| item.as_array()) {
-                if !options.is_empty() && !options.iter().any(|option| value_of(option) == Some(value) || option == answer)
+            if let Some(options) = definition
+                .get("answerOption")
+                .and_then(|item| item.as_array())
+            {
+                if !options.is_empty()
+                    && !options
+                        .iter()
+                        .any(|option| value_of(option) == Some(value) || option == answer)
                 {
                     issues.push(issue("error", "answer is not an allowed option", link_id));
                 }
@@ -131,7 +165,11 @@ fn check_item(chart: &mut dyn Chart, definition: &Json, item: &Json, response: &
             if let Some(pattern) = crate::ext::ext_text(definition, REGEX) {
                 if let Ok(regex) = regex::Regex::new(&pattern) {
                     if value.as_str().is_some_and(|text| !regex.is_match(text)) {
-                        issues.push(issue("error", "answer does not match the required pattern", link_id));
+                        issues.push(issue(
+                            "error",
+                            "answer does not match the required pattern",
+                            link_id,
+                        ));
                     }
                 }
             }
@@ -198,7 +236,8 @@ fn type_matches(item_type: &str, answer: &Json) -> bool {
         _ => return true,
     };
     keys.contains(&expected)
-        || (item_type == "choice" && (keys.contains(&"valueString") || keys.contains(&"valueCoding")))
+        || (item_type == "choice"
+            && (keys.contains(&"valueString") || keys.contains(&"valueCoding")))
         || (item_type == "url" && keys.contains(&"valueUrl"))
 }
 

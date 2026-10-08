@@ -31,7 +31,9 @@ pub fn next_question(chart: &mut dyn Chart, response: &Json) -> Result<Json, Str
         .unwrap_or_default();
     let next = next_link(chart, &bank, &response)?;
     if let Some(link_id) = next {
-        if shown.iter().all(|item| item.get("linkId").and_then(|value| value.as_str()) != Some(link_id.as_str())) {
+        if shown.iter().all(|item| {
+            item.get("linkId").and_then(|value| value.as_str()) != Some(link_id.as_str())
+        }) {
             if let Some(item) = item_by_link(&bank, &link_id) {
                 shown.push(item.clone());
             }
@@ -40,25 +42,33 @@ pub fn next_question(chart: &mut dyn Chart, response: &Json) -> Result<Json, Str
     } else {
         response["status"] = json!("completed");
     }
-    let mut form = contained.unwrap_or_else(|| json!({
-        "resourceType": "Questionnaire",
-        "id": "adaptive",
-        "status": "active"
-    }));
+    let mut form = contained.unwrap_or_else(|| {
+        json!({
+            "resourceType": "Questionnaire",
+            "id": "adaptive",
+            "status": "active"
+        })
+    });
     form["item"] = json!(shown);
     if form.get("derivedFrom").is_none() {
         if let Some(url) = bank.get("url") {
             form["derivedFrom"] = json!([url]);
         }
     }
-    let id = form.get("id").and_then(|value| value.as_str()).unwrap_or("adaptive").to_string();
+    let id = form
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("adaptive")
+        .to_string();
     response["contained"] = json!([form]);
     response["questionnaire"] = json!(format!("#{id}"));
     Ok(response)
 }
 
 fn contained_questionnaire(response: &Json) -> Option<Json> {
-    let canonical = response.get("questionnaire").and_then(|value| value.as_str())?;
+    let canonical = response
+        .get("questionnaire")
+        .and_then(|value| value.as_str())?;
     let id = canonical.strip_prefix('#')?;
     response
         .get("contained")
@@ -71,7 +81,11 @@ fn contained_questionnaire(response: &Json) -> Option<Json> {
         .cloned()
 }
 
-fn bank_for(chart: &mut dyn Chart, response: &Json, contained: Option<&Json>) -> Result<Json, String> {
+fn bank_for(
+    chart: &mut dyn Chart,
+    response: &Json,
+    contained: Option<&Json>,
+) -> Result<Json, String> {
     if let Some(contained) = contained {
         if let Some(url) = contained
             .get("derivedFrom")
@@ -84,7 +98,10 @@ fn bank_for(chart: &mut dyn Chart, response: &Json, contained: Option<&Json>) ->
             }
         }
     }
-    if let Some(url) = response.get("questionnaire").and_then(|value| value.as_str()) {
+    if let Some(url) = response
+        .get("questionnaire")
+        .and_then(|value| value.as_str())
+    {
         if !url.starts_with('#') {
             if let Some(bank) = crate::evalexpr::find_canonical(chart, "Questionnaire", url)? {
                 return Ok(bank);
@@ -96,8 +113,14 @@ fn bank_for(chart: &mut dyn Chart, response: &Json, contained: Option<&Json>) ->
         .ok_or_else(|| "adaptive questionnaire was not found".to_string())
 }
 
-fn next_link(chart: &mut dyn Chart, bank: &Json, response: &Json) -> Result<Option<String>, String> {
-    if let Some(values) = library_expression(chart, bank, "NextQuestion", response, &Default::default())? {
+fn next_link(
+    chart: &mut dyn Chart,
+    bank: &Json,
+    response: &Json,
+) -> Result<Option<String>, String> {
+    if let Some(values) =
+        library_expression(chart, bank, "NextQuestion", response, &Default::default())?
+    {
         if let Some(link_id) = values.first().and_then(|value| value.as_str()) {
             return Ok(Some(link_id.to_string()));
         }

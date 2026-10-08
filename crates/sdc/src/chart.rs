@@ -8,7 +8,11 @@ use serde_json::Value as Json;
 
 pub trait Chart {
     fn read_type(&mut self, type_name: &str, id: &str) -> Result<Option<Json>, String>;
-    fn search_type(&mut self, type_name: &str, params: &[(&str, String)]) -> Result<Vec<Json>, String>;
+    fn search_type(
+        &mut self,
+        type_name: &str,
+        params: &[(&str, String)],
+    ) -> Result<Vec<Json>, String>;
     fn allows(&self, type_name: &str) -> bool;
     fn path_model(&self) -> Model;
     fn in_valueset(&mut self, system: Option<&str>, code: &str, value_set: &str) -> Option<bool> {
@@ -91,15 +95,25 @@ impl Chart for MemoryChart {
             .cloned())
     }
 
-    fn search_type(&mut self, type_name: &str, params: &[(&str, String)]) -> Result<Vec<Json>, String> {
+    fn search_type(
+        &mut self,
+        type_name: &str,
+        params: &[(&str, String)],
+    ) -> Result<Vec<Json>, String> {
         if !self.allows(type_name) {
             return Ok(Vec::new());
         }
         Ok(self
             .rows
             .iter()
-            .filter(|row| row.get("resourceType").and_then(|value| value.as_str()) == Some(type_name))
-            .filter(|row| params.iter().all(|(name, value)| row_matches(row, name, value)))
+            .filter(|row| {
+                row.get("resourceType").and_then(|value| value.as_str()) == Some(type_name)
+            })
+            .filter(|row| {
+                params
+                    .iter()
+                    .all(|(name, value)| row_matches(row, name, value))
+            })
             .cloned()
             .collect())
     }
@@ -130,11 +144,57 @@ impl Chart for MemoryChart {
 }
 
 pub fn scope_allows(scopes: &[String], type_name: &str) -> bool {
-    scopes.iter().any(|scope| {
-        let rest = scope.split('/').nth(1).unwrap_or(scope.as_str());
-        let (name, permission) = rest.split_once('.').unwrap_or((rest, "*"));
-        (name == "*" || name == type_name) && (permission == "*" || permission == "read")
-    })
+    scopes
+        .iter()
+        .any(|scope| scope_allows_type(scope, type_name))
+}
+
+fn scope_allows_type(scope: &str, type_name: &str) -> bool {
+    let scope = scope.split_once('?').map(|(head, _)| head).unwrap_or(scope);
+    let mut parts = scope.split('/');
+    let context = parts.next().unwrap_or("");
+    if !matches!(context, "patient" | "user" | "system") {
+        return false;
+    }
+    let Some(rest) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let (name, permission) = rest.split_once('.').unwrap_or((rest, "*"));
+    if name != "*" && name != type_name {
+        return false;
+    }
+    let letters = v2_letters(permission);
+    letters.contains('r') || letters.contains('s')
+}
+
+fn v2_letters(permission: &str) -> String {
+    match permission {
+        "read" => "rs".into(),
+        "write" => "cud".into(),
+        "*" => "cruds".into(),
+        letters if is_cruds(letters) => letters.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn is_cruds(letters: &str) -> bool {
+    if letters.is_empty() {
+        return false;
+    }
+    let mut last = 0usize;
+    for ch in letters.chars() {
+        let Some(index) = "cruds".find(ch) else {
+            return false;
+        };
+        if index < last {
+            return false;
+        }
+        last = index + 1;
+    }
+    true
 }
 
 fn row_matches(row: &Json, name: &str, value: &str) -> bool {
@@ -147,7 +207,9 @@ fn row_matches(row: &Json, name: &str, value: &str) -> bool {
                 && (version.is_empty()
                     || row.get("version").and_then(|item| item.as_str()) == Some(version))
         }
-        "status" | "title" | "gender" => row.get(name).and_then(|item| item.as_str()) == Some(value),
+        "status" | "title" | "gender" => {
+            row.get(name).and_then(|item| item.as_str()) == Some(value)
+        }
         "subject" | "patient" | "questionnaire" => {
             let reference = row
                 .get(if name == "patient" { "subject" } else { name })
@@ -191,4 +253,36 @@ fn identifier_matches(row: &Json, value: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v2_read_search_letters_count_as_read_access() {
+        assert!(scope_allows(
+            &["patient/Observation.rs".into()],
+            "Observation"
+        ));
+        assert!(scope_allows(
+            &["patient/Observation.rs?category=vital-signs".into()],
+            "Observation"
+        ));
+        assert!(scope_allows(&["user/*.cruds".into()], "Observation"));
+        assert!(scope_allows(
+            &["user/Observation.read".into()],
+            "Observation"
+        ));
+        assert!(!scope_allows(&["user/Patient.read".into()], "Observation"));
+        assert!(!scope_allows(
+            &["user/Observation.write".into()],
+            "Observation"
+        ));
+        assert!(!scope_allows(
+            &["user/Observation.cud".into()],
+            "Observation"
+        ));
+        assert!(!scope_allows(&["launch/patient".into()], "Observation"));
+    }
 }

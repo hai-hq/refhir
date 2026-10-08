@@ -38,3 +38,8 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 http-body-util = "0.1"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+base64 = "0.22"
+jsonwebtoken = "9.3"
+rand = "0.8"
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"

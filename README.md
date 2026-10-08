@@ -183,7 +183,7 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 | Reactive sync | Yes (`/sync`, invalidation + query rerun) |
 | Go SDK | Yes ([clients/go](clients/go/README.md), module `github.com/hai-hq/haifhir/clients/go`) |
 | TypeScript SDK | Yes (`clients/ts`, npm `@hai-hq/refhir`) |
-| SMART / auth | **Not yet** |
+| SMART / auth | Yes (App Launch 2.2, Backend Services, PKCE, OIDC) |
 | Full spec, `_include`, `$everything`, all search params | **Deferred** |
 | FHIR Subscription delivery | **Deferred** (vs live query sync) |
 | Commit-time agent revalidation | **Deferred** (architecture direction) |
@@ -200,7 +200,7 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 
 ### Roadmap vs defer
 
-**Toward initial release:** R4 subset, CRUD, selected search, transactions, reactive search, WebSocket sync, dependency tracking, invalidation, reconnect, version identifiers, TS SDK, basic auth, benchmarks.
+**Toward initial release:** R4 subset, CRUD, selected search, transactions, reactive search, WebSocket sync, dependency tracking, invalidation, reconnect, version identifiers, TS SDK, SMART App Launch 2.2, benchmarks.
 
 **Defer:** full spec, terminology, bulk export, analytics, workflow orchestration, agent framework, inference, autonomous clinical actions, full certification.
 
@@ -236,6 +236,11 @@ Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It dow
 | `--postgres url` | Postgres (not with `--sqlite` or `--memory`) |
 | `--bind host:port` | Default `127.0.0.1:8080` |
 | `--package dir` | FHIR package directory. Repeatable. Replaces the bundled R4 core default. |
+| `--smart` | SMART App Launch 2.2 authorization (`/.well-known/smart-configuration`, `/oauth/*`) |
+| `--public-url url` | Absolute FHIR base URL advertised as the SMART `issuer` (required behind TLS) |
+| `--smart-patient id` | Patient id granted for `launch/patient` |
+| `--smart-encounter id` | Encounter id granted for `launch/encounter` |
+| `--smart-fhir-user Resource/id` | FHIR identity placed in the `fhirUser` claim |
 
 Optional: `just run` ([justfile](justfile)) if you use [just](https://github.com/casey/just).
 
@@ -271,6 +276,20 @@ curl -s -X POST http://127.0.0.1:8080/Observation \
 | * | `/{type}`, `/{type}/{id}`, search, `_history` | FHIR-style routes |
 
 Errors: `OperationOutcome` (4xx/5xx).
+
+### SMART on FHIR
+
+`--smart` turns the server into a SMART App Launch 2.2 authorization server and resource server:
+
+- Discovery at `/.well-known/smart-configuration` and JWKS at `/.well-known/jwks.json`
+- Authorization code + PKCE (`S256`), EHR launch (`/oauth/ehr-launch`), standalone `launch/patient`
+- Token endpoint: `authorization_code`, `refresh_token`, and `client_credentials` (asymmetric JWT)
+- OpenID Connect `id_token`, token introspection, revocation, and dynamic client registration
+- SMART v1 (`patient/*.read`) and v2 (`patient/*.rs`) scopes, plus patient-compartment enforcement
+
+Default clients: `public` (no secret) and `confidential` (`--smart-confidential-secret`), with loopback redirect URIs `/cb` and `/app`. App-launch tokens cannot include `system/` scopes.
+
+`POST /oauth/register` requires `--smart-dcr-token`. If either flag is omitted, a value is generated and printed once to stderr when the process has a terminal; secrets are never written to logs. Redirect URIs must be `https` or loopback `http`. Backend clients register with `private_key_jwt`, inline `jwks`, and `system/` scopes. EHR launch context comes from `--smart-patient` / `--smart-encounter`, not from query parameters. `--public-url` is required when `--smart` is combined with a non-loopback `--bind`.
 
 ### Live sync
 

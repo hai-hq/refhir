@@ -49,9 +49,13 @@ impl Chart for Bridge<'_> {
             return Ok(Vec::new());
         };
         let (indexed, rest) = split_params(model, params);
-        let bundle = search::search(self.tx, self.catalog, model, &indexed).map_err(|err| err.to_string())?;
+        let bundle = search::search(self.tx, self.catalog, model, &indexed)
+            .map_err(|err| err.to_string())?;
         let mut rows = bundle_resources(&bundle);
-        rows.retain(|row| rest.iter().all(|(name, value)| field_matches(row, name, value)));
+        rows.retain(|row| {
+            rest.iter()
+                .all(|(name, value)| field_matches(row, name, value))
+        });
         Ok(rows)
     }
 
@@ -67,9 +71,7 @@ impl Chart for Bridge<'_> {
     }
 
     fn translate(&mut self, map_url: &str, system: Option<&str>, code: &str) -> Option<Value> {
-        self.catalog
-            .terms()
-            .translate_coding(map_url, system, code)
+        self.catalog.terms().translate_coding(map_url, system, code)
     }
 
     fn in_valueset(&mut self, system: Option<&str>, code: &str, value_set: &str) -> Option<bool> {
@@ -86,7 +88,9 @@ impl Chart for Bridge<'_> {
             .and_then(|items| {
                 items.iter().find_map(|parameter| {
                     if parameter.get("name").and_then(|value| value.as_str()) == Some("result") {
-                        parameter.get("valueBoolean").and_then(|value| value.as_bool())
+                        parameter
+                            .get("valueBoolean")
+                            .and_then(|value| value.as_bool())
                     } else {
                         None
                     }
@@ -126,7 +130,8 @@ pub fn operation(
         }
         "$behavior" => {
             expect(type_name, "Questionnaire")?;
-            let (questionnaire, response) = load_behavior(&mut chart, args).map_err(FhirError::Invalid)?;
+            let (questionnaire, response) =
+                load_behavior(&mut chart, args).map_err(FhirError::Invalid)?;
             behavior_document(&mut chart, &questionnaire, &response)
         }
         "$extract" => {
@@ -147,7 +152,10 @@ pub fn prepare_store(
     args: &Value,
     resource: Value,
 ) -> Result<Value, FhirError> {
-    if resource.get("resourceType").and_then(|value| value.as_str()) != Some("QuestionnaireResponse")
+    if resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        != Some("QuestionnaireResponse")
     {
         return Ok(resource);
     }
@@ -176,12 +184,14 @@ fn expect(actual: &str, wanted: &str) -> Result<(), FhirError> {
 }
 
 fn scopes_of(args: &Value) -> Option<Vec<String>> {
-    args.get("_readScopes").and_then(|value| value.as_array()).map(|items| {
-        items
-            .iter()
-            .filter_map(|value| value.as_str().map(|item| item.to_string()))
-            .collect()
-    })
+    args.get("_readScopes")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str().map(|item| item.to_string()))
+                .collect()
+        })
 }
 
 fn load_questionnaire(chart: &mut Bridge<'_>, args: &Value) -> Result<Value, String> {
@@ -189,7 +199,11 @@ fn load_questionnaire(chart: &mut Bridge<'_>, args: &Value) -> Result<Value, Str
         return Ok(resource);
     }
     if let Some(resource) = args.get("resource") {
-        if resource.get("resourceType").and_then(|value| value.as_str()) == Some("Questionnaire") {
+        if resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+            == Some("Questionnaire")
+        {
             return Ok(resource.clone());
         }
     }
@@ -200,7 +214,11 @@ fn load_questionnaire(chart: &mut Bridge<'_>, args: &Value) -> Result<Value, Str
     }
     let canonical = parameter_canonical(args, "questionnaire")
         .or_else(|| parameter_reference(args, "questionnaireRef"))
-        .or_else(|| args.get("questionnaire").and_then(|value| value.as_str()).map(|value| value.to_string()));
+        .or_else(|| {
+            args.get("questionnaire")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string())
+        });
     if let Some(canonical) = canonical {
         if let Some(id) = canonical.strip_prefix("Questionnaire/") {
             if let Some(found) = chart.read_type("Questionnaire", id)? {
@@ -231,7 +249,11 @@ fn load_response(args: &Value) -> Result<Value, String> {
         .cloned()
         .or_else(|| args.get("response").cloned())
         .ok_or_else(|| "QuestionnaireResponse is required".to_string())?;
-    if resource.get("resourceType").and_then(|value| value.as_str()) == Some("Parameters") {
+    if resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        == Some("Parameters")
+    {
         return Err("QuestionnaireResponse is required".into());
     }
     Ok(resource)
@@ -240,45 +262,62 @@ fn load_response(args: &Value) -> Result<Value, String> {
 fn load_behavior(chart: &mut Bridge<'_>, args: &Value) -> Result<(Value, Value), String> {
     if let Some(resource) = args.get("resource") {
         if let (Some(questionnaire), Some(response)) = (
-            resource.get("questionnaire").filter(|value| value.is_object()),
+            resource
+                .get("questionnaire")
+                .filter(|value| value.is_object()),
             resource.get("response").filter(|value| value.is_object()),
         ) {
             return Ok((questionnaire.clone(), response.clone()));
         }
     }
     if let (Some(questionnaire), Some(response)) = (
-        args.get("questionnaire").filter(|value| value.is_object()).cloned(),
-        args.get("response").filter(|value| value.is_object()).cloned(),
+        args.get("questionnaire")
+            .filter(|value| value.is_object())
+            .cloned(),
+        args.get("response")
+            .filter(|value| value.is_object())
+            .cloned(),
     ) {
         return Ok((questionnaire, response));
     }
     if let Some(questionnaire) = parameter_resource(args, "questionnaire") {
-        let response = parameter_resource(args, "response").unwrap_or_else(|| {
-            json!({"resourceType": "QuestionnaireResponse", "status": "in-progress"})
-        });
+        let response = parameter_resource(args, "response").unwrap_or_else(
+            || json!({"resourceType": "QuestionnaireResponse", "status": "in-progress"}),
+        );
         return Ok((questionnaire, response));
     }
     let response = load_response(args)?;
-    if response.get("resourceType").and_then(|value| value.as_str()) == Some("Questionnaire") {
+    if response
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        == Some("Questionnaire")
+    {
         return Ok((
             response,
             json!({"resourceType": "QuestionnaireResponse", "status": "in-progress"}),
         ));
     }
-    let questionnaire = load_questionnaire(chart, &json!({
-        "questionnaire": response.get("questionnaire").cloned().unwrap_or(Value::Null),
-        "resource": response.get("contained").and_then(|items| items.as_array()).and_then(|items| {
-            items.iter().find(|item| item.get("resourceType").and_then(|value| value.as_str()) == Some("Questionnaire")).cloned()
-        }).unwrap_or(Value::Null)
-    }))?;
+    let questionnaire = load_questionnaire(
+        chart,
+        &json!({
+            "questionnaire": response.get("questionnaire").cloned().unwrap_or(Value::Null),
+            "resource": response.get("contained").and_then(|items| items.as_array()).and_then(|items| {
+                items.iter().find(|item| item.get("resourceType").and_then(|value| value.as_str()) == Some("Questionnaire")).cloned()
+            }).unwrap_or(Value::Null)
+        }),
+    )?;
     Ok((questionnaire, response))
 }
 
 fn normalize_populate(args: &Value) -> Value {
     let mut out = args.clone();
-    if out.get("subject").and_then(|value| value.as_str()).is_none() {
-        if let Some(subject) = parameter_reference(args, "subject")
-            .or_else(|| parameter_canonical(args, "subject"))
+    if out
+        .get("subject")
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
+        if let Some(subject) =
+            parameter_reference(args, "subject").or_else(|| parameter_canonical(args, "subject"))
         {
             out["subject"] = json!(subject);
         }
@@ -297,7 +336,11 @@ fn normalize_populate(args: &Value) -> Value {
 
 fn parameters(args: &Value) -> Option<&Vec<Value>> {
     let resource = args.get("resource")?;
-    if resource.get("resourceType").and_then(|value| value.as_str()) != Some("Parameters") {
+    if resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        != Some("Parameters")
+    {
         return None;
     }
     resource.get("parameter")?.as_array()
@@ -328,7 +371,10 @@ fn parameter_resources(args: &Value, name: &str) -> Vec<Value> {
 }
 
 fn part_resource(parts: &Value) -> Option<Value> {
-    parts.as_array()?.iter().find_map(|part| part.get("resource").cloned())
+    parts
+        .as_array()?
+        .iter()
+        .find_map(|part| part.get("resource").cloned())
 }
 
 fn parameter_canonical(args: &Value, name: &str) -> Option<String> {
@@ -352,9 +398,11 @@ fn parameter_reference(args: &Value, name: &str) -> Option<String> {
 }
 
 fn parameter_bool(args: &Value, name: &str) -> Option<bool> {
-    named(args, name)
-        .into_iter()
-        .find_map(|parameter| parameter.get("valueBoolean").and_then(|value| value.as_bool()))
+    named(args, name).into_iter().find_map(|parameter| {
+        parameter
+            .get("valueBoolean")
+            .and_then(|value| value.as_bool())
+    })
 }
 
 fn split_params(
@@ -419,7 +467,8 @@ fn reference_matches(node: Option<&Value>, value: &str) -> bool {
     let Some(node) = node else {
         return false;
     };
-    node.get("reference").and_then(|item| item.as_str()) == Some(value) || node.as_str() == Some(value)
+    node.get("reference").and_then(|item| item.as_str()) == Some(value)
+        || node.as_str() == Some(value)
 }
 
 fn identifier_matches(node: Option<&Value>, value: &str) -> bool {
@@ -432,7 +481,10 @@ fn identifier_matches(node: Option<&Value>, value: &str) -> bool {
         vec![node.clone()]
     };
     items.iter().any(|item| {
-        let found = item.get("value").and_then(|part| part.as_str()).unwrap_or("");
+        let found = item
+            .get("value")
+            .and_then(|part| part.as_str())
+            .unwrap_or("");
         if let Some((system, code)) = value.split_once('|') {
             found == code && item.get("system").and_then(|part| part.as_str()) == Some(system)
         } else {

@@ -17,6 +17,11 @@ ureq = { workspace = true }
 refhir-persistence = { path = "../persistence" }
 refhir-types = { path = "../types" }
 tracing = { workspace = true }
+base64 = { workspace = true }
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+rsa = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 refhir-database = { path = "../database", features = ["test-util"] }
