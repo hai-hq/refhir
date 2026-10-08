@@ -28,6 +28,9 @@ pub fn commit_operation(
     path: &str,
     args: &Value,
 ) -> Result<RunResult, RunError> {
+    if path == "ImplementationGuide/$install" {
+        return crate::npm::install_operation(store, db, catalog, args).map_err(RunError::Fhir);
+    }
     preflight(store, catalog, path, args).map_err(RunError::Fhir)?;
     let result = {
         let guard = catalog.read().expect("catalog");

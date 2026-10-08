@@ -352,7 +352,25 @@ impl Catalog {
             }]
         });
         refhir_sdc::annotate_capability(&mut statement);
+        annotate_install(&mut statement);
         statement
+    }
+}
+
+fn annotate_install(statement: &mut Value) {
+    let Some(resources) = statement
+        .pointer_mut("/rest/0/resource")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    for resource in resources {
+        if resource.get("type").and_then(|value| value.as_str()) == Some("ImplementationGuide") {
+            resource["operation"] = json!([{
+                "name": "install",
+                "definition": "https://refhir.dev/OperationDefinition/ImplementationGuide-install"
+            }]);
+        }
     }
 }
 

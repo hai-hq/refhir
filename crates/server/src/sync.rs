@@ -261,6 +261,9 @@ fn authorize(
     args: &Value,
     subscribe: bool,
 ) -> Result<Value, String> {
+    if path == "ImplementationGuide/$install" && session.is_none() {
+        return Err("ImplementationGuide/$install requires authentication".into());
+    }
     let Some(session) = session else {
         let mut args = args.clone();
         crate::auth::strip_sdc_controls(&mut args);

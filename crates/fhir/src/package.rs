@@ -287,14 +287,14 @@ fn backfill_id(
     Err(FhirError::Conflict("backfill OCC retries exhausted".into()))
 }
 
-fn read_manifest(root: &Path) -> Result<Value, FhirError> {
+pub(crate) fn read_manifest(root: &Path) -> Result<Value, FhirError> {
     let manifest_text = fs::read_to_string(root.join("package.json"))
         .map_err(|err| FhirError::Invalid(format!("package.json: {err}")))?;
     serde_json::from_str(&manifest_text)
         .map_err(|err| FhirError::Invalid(format!("package.json: {err}")))
 }
 
-fn package_identity(path: &Path) -> Result<(String, String), FhirError> {
+pub(crate) fn package_identity(path: &Path) -> Result<(String, String), FhirError> {
     let root = package_root(path)?;
     let manifest = read_manifest(&root)?;
     let name = manifest
@@ -384,7 +384,7 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     })
 }
 
-fn package_root(path: &Path) -> Result<PathBuf, FhirError> {
+pub(crate) fn package_root(path: &Path) -> Result<PathBuf, FhirError> {
     let nested = path.join("package").join("package.json");
     if nested.is_file() {
         return Ok(path.join("package"));

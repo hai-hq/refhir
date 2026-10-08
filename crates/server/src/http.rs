@@ -122,6 +122,7 @@ pub fn app_with(
         .route("/:resource_type/$next-question", post(next_question_type))
         .route("/:resource_type/$behavior", post(behavior_type))
         .route("/:resource_type/$extract", post(extract_type))
+        .route("/:resource_type/$install", post(install_op))
         .route("/:resource_type/$expand", post(expand_op))
         .route("/:resource_type/$validate-code", post(validate_code_op))
         .route("/:resource_type/$lookup", post(lookup_op))
@@ -686,6 +687,24 @@ async fn sdc_call(
         Ok(result) => fhir_json(StatusCode::OK, result.value),
         Err(err) => error_response(err),
     }
+}
+
+async fn install_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    if resource_type != "ImplementationGuide" {
+        return outcome(
+            StatusCode::BAD_REQUEST,
+            "not-supported",
+            "$install is an ImplementationGuide operation",
+        );
+    }
+    if !app.config.auth {
+        return crate::auth::unauthorized("ImplementationGuide/$install requires authentication");
+    }
+    terminology_op(app, resource_type, "$install", body).await
 }
 
 async fn expand_op(

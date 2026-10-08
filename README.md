@@ -222,7 +222,9 @@ For a throwaway local server with no database file:
 cargo run -p refhir -- --memory
 ```
 
-That command installs the bundled `hl7.fhir.r4.core` 4.0.1 package, so the concrete R4 resource types are available on a fresh database. Pass `--package dir` to install a package directory instead. Repeat the flag for more than one package on the same FHIR version.
+That command installs the bundled `hl7.fhir.r4.core` 4.0.1 package, so the concrete R4 resource types are available on a fresh database. Pass `--package` for more packages on the same FHIR version: a local directory, a `.tgz`, or `name@version` from [packages.fhir.org](https://packages.fhir.org) (for example `hl7.fhir.us.core@6.1.0`). Repeat the flag. Dependencies listed in `package.json` are installed first.
+
+After startup, `POST /ImplementationGuide/$install` installs `name@version` from the same registry. It requires SMART (`--smart`) and a `system` write scope (`system/*.write` or `system/ImplementationGuide.write`). It does not take a filesystem path or a caller-supplied registry. Override the registry with `REFHIR_PACKAGE_REGISTRY`.
 
 Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It downloads the published core package and writes StructureDefinitions and SearchParameters into `crates/fhir/fixtures/r4`.
 
@@ -235,7 +237,7 @@ Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It dow
 | `--memory` | SQLite in RAM; no file (not with `--sqlite` or `--postgres`) |
 | `--postgres url` | Postgres (not with `--sqlite` or `--memory`) |
 | `--bind host:port` | Default `127.0.0.1:8080` |
-| `--package dir` | FHIR package directory. Repeatable. Replaces the bundled R4 core default. |
+| `--package spec` | FHIR package. Repeatable. Replaces the bundled R4 core default. Directory, `.tgz`, or `name@version` from packages.fhir.org. |
 | `--smart` | SMART App Launch 2.2 authorization (`/.well-known/smart-configuration`, `/oauth/*`) |
 | `--public-url url` | Absolute FHIR base URL advertised as the SMART `issuer` (required behind TLS) |
 | `--smart-patient id` | Patient id granted for `launch/patient` |

@@ -699,10 +699,14 @@ mod tests {
         assert_eq!(prepared["subject"], "Patient/p1");
         assert_eq!(http_interaction("POST", "/Questionnaire/$populate"), "read");
         assert_eq!(http_interaction("POST", "/Patient"), "create");
+        assert_eq!(
+            http_interaction("POST", "/ImplementationGuide/$install"),
+            "install"
+        );
     }
 }
 
-fn unauthorized(message: &str) -> Response {
+pub(crate) fn unauthorized(message: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(

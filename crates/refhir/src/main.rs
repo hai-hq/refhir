@@ -48,7 +48,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "--help" | "-h" => {
                 println!(
                     "refhir [--sqlite path] [--memory] [--postgres url] [--bind 127.0.0.1:8080]\n\
-                     [--package dir] [--references strict|fhir] [--smart]\n\
+                     [--package dir|name@version] [--references strict|fhir] [--smart]\n\
                      [--public-url url] [--smart-patient id] [--smart-encounter id]\n\
                      [--smart-fhir-user Resource/id] [--smart-dcr-token token]\n\
                      [--smart-confidential-secret secret]\n\
@@ -56,7 +56,8 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                      Default database is refhir.sqlite. --memory uses SQLite in RAM and\n\
                      leaves no file. With no --package, the bundled\n\
                      hl7.fhir.r4.core 4.0.1 package and the SDC 4.0.0 slice are installed.\n\
-                     --package may be repeated and replaces that default. --references defaults to strict.\n\
+                     --package may be repeated and replaces that default. A value is a local\n\
+                     directory, a .tgz, or name@version from packages.fhir.org. --references defaults to strict.\n\
                      --smart enables SMART App Launch 2.2. --public-url is required when\n\
                      --smart is used with a non-loopback --bind. Generated DCR and confidential\n\
                      secrets print once to stderr in a terminal and are never written to logs.\n\
@@ -164,8 +165,8 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         refhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, refhir_fhir::r4_dir())?;
         refhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, refhir_fhir::sdc_dir())?;
     } else {
-        for path in &packages {
-            refhir_fhir::install_package_dir(store.as_ref(), &db, &catalog, Path::new(path))?;
+        for spec in &packages {
+            refhir_fhir::install_package(store.as_ref(), &db, &catalog, spec)?;
         }
     }
     refhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;

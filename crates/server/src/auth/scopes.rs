@@ -2,6 +2,9 @@
 
 pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
     if let Some(op) = path.split('/').find(|segment| segment.starts_with('$')) {
+        if op == "$install" {
+            return "install";
+        }
         if matches!(
             op,
             "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
@@ -69,6 +72,7 @@ pub(crate) fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str,
     ];
     const SEARCH_OPS: &[&str] = &["search"];
     const CREATE_OPS: &[&str] = &["create", "conditional-create"];
+    const INSTALL_OPS: &[&str] = &["$install"];
     const UPDATE_OPS: &[&str] = &[
         "update",
         "patch",
@@ -87,6 +91,8 @@ pub(crate) fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str,
         "update"
     } else if DELETE_OPS.contains(&op) {
         "delete"
+    } else if INSTALL_OPS.contains(&op) {
+        "install"
     } else {
         return Err(format!("unsupported operation {op}"));
     };
@@ -97,6 +103,9 @@ pub(crate) fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str,
 }
 
 pub(crate) fn scope_allows(scope: &str, resource_type: &str, interaction: &str) -> bool {
+    if interaction == "install" {
+        return install_scope_allows(scope, resource_type);
+    }
     let scope = scope.split_once('?').map(|(head, _)| head).unwrap_or(scope);
     let mut parts = scope.split('/');
     let context = parts.next().unwrap_or("");
@@ -114,6 +123,29 @@ pub(crate) fn scope_allows(scope: &str, resource_type: &str, interaction: &str) 
         return false;
     }
     letters_allow(&v2_letters(permission), interaction)
+}
+
+fn install_scope_allows(scope: &str, resource_type: &str) -> bool {
+    if resource_type != "ImplementationGuide" {
+        return false;
+    }
+    let scope = scope.split_once('?').map(|(head, _)| head).unwrap_or(scope);
+    let mut parts = scope.split('/');
+    let context = parts.next().unwrap_or("");
+    if context != "system" {
+        return false;
+    }
+    let Some(rest) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let (type_name, permission) = rest.split_once('.').unwrap_or((rest, "*"));
+    if type_name != "*" && type_name != "ImplementationGuide" {
+        return false;
+    }
+    letters_allow(&v2_letters(permission), "create")
 }
 
 fn v2_letters(permission: &str) -> String {
@@ -198,5 +230,49 @@ mod tests {
         ));
         assert!(!scope_allows("launch/patient", "Patient", "read"));
         assert!(!scope_allows("openid", "Patient", "read"));
+    }
+
+    #[test]
+    fn install_requires_system_write_on_implementation_guide() {
+        assert!(scope_allows(
+            "system/*.write",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert!(scope_allows(
+            "system/ImplementationGuide.write",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert!(scope_allows(
+            "system/*.cruds",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert!(!scope_allows(
+            "user/*.cruds",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert!(!scope_allows(
+            "patient/*.write",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert!(!scope_allows("system/*.write", "Patient", "install"));
+        assert!(!scope_allows(
+            "system/Patient.write",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert!(!scope_allows(
+            "system/*.read",
+            "ImplementationGuide",
+            "install"
+        ));
+        assert_eq!(
+            http_interaction("POST", "/ImplementationGuide/$install"),
+            "install"
+        );
     }
 }

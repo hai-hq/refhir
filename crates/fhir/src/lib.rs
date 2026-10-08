@@ -11,13 +11,14 @@ mod error;
 mod extract;
 mod history;
 mod meta;
+mod npm;
 mod ops;
 mod package;
 mod patch;
 mod resolve;
 mod run;
-mod search;
 mod sdc;
+mod search;
 mod terms;
 
 #[cfg(test)]
@@ -27,6 +28,9 @@ pub use bundle::transaction;
 pub use catalog::{Catalog, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
+pub use npm::{
+    install_package, install_with, parse_package_spec, NpmRegistry, PackageFetcher, PackageSpec,
+};
 pub use package::{
     expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
     sdc_dir, stage_package_dir, version_clash_dir,

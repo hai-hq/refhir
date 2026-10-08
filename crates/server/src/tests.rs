@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
 use refhir_fhir::{
-    install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES,
+    extra_dir, install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES,
 };
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
@@ -468,6 +468,89 @@ async fn terminology_operations_are_http_routes() {
     .await;
     assert_eq!(subsumed.status, StatusCode::OK);
     assert_eq!(subsumed.body["parameter"][0]["valueCode"], "subsumes");
+}
+
+#[tokio::test]
+async fn implementation_guide_install_is_an_http_route() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    let unauth = send(
+        &app,
+        "POST",
+        "/ImplementationGuide/$install",
+        Some(json!({"name": "hl7.fhir.us.core", "version": "6.1.0"})),
+        None,
+    )
+    .await;
+    assert_eq!(unauth.status, StatusCode::UNAUTHORIZED);
+
+    let wrong = send(
+        &app,
+        "POST",
+        "/Patient/$install",
+        Some(json!({"name": "hl7.fhir.us.core", "version": "6.1.0"})),
+        None,
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
+
+    let smart = std::sync::Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token("user-tok", &["user/*.cruds"], None);
+    smart.install_token("system-tok", &["system/*.write"], None);
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            smart: Some(smart),
+            ..Default::default()
+        },
+    );
+    let user = send_text(
+        &app,
+        "POST",
+        "/ImplementationGuide/$install",
+        &json!({"name": "hl7.fhir.us.core", "version": "6.1.0"}).to_string(),
+        &[
+            ("content-type", "application/fhir+json"),
+            ("authorization", "Bearer user-tok"),
+        ],
+    )
+    .await;
+    assert_eq!(user.0, StatusCode::FORBIDDEN, "{}", user.1);
+
+    let path = send_text(
+        &app,
+        "POST",
+        "/ImplementationGuide/$install",
+        &json!({"package": extra_dir().to_str().unwrap()}).to_string(),
+        &[
+            ("content-type", "application/fhir+json"),
+            ("authorization", "Bearer system-tok"),
+        ],
+    )
+    .await;
+    assert_eq!(path.0, StatusCode::BAD_REQUEST, "{}", path.1);
+
+    let registry = send_text(
+        &app,
+        "POST",
+        "/ImplementationGuide/$install",
+        &json!({
+            "name": "hl7.fhir.us.core",
+            "version": "6.1.0",
+            "registry": "http://127.0.0.1"
+        })
+        .to_string(),
+        &[
+            ("content-type", "application/fhir+json"),
+            ("authorization", "Bearer system-tok"),
+        ],
+    )
+    .await;
+    assert_eq!(registry.0, StatusCode::BAD_REQUEST, "{}", registry.1);
 }
 
 #[tokio::test]

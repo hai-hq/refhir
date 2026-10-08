@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use refhir_database::{Database, Put};
@@ -11,6 +13,7 @@ use refhir_validate::{TermAnswer, Terminology};
 use crate::catalog::{Catalog, ReferencePolicy};
 use crate::conform::{commit_operation, repair_conformance};
 use crate::error::FhirError;
+use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
     expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
     sdc_dir, stage_package_dir, version_clash_dir,
@@ -472,6 +475,201 @@ fn second_package_backfills_birthdate_without_a_new_version() {
         .collect();
     assert!(names.contains(&"birthdate"));
     assert!(names.contains(&"phonetic"));
+}
+
+struct MapFetcher {
+    packages: BTreeMap<(String, String), PathBuf>,
+}
+
+impl PackageFetcher for MapFetcher {
+    fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError> {
+        let src = self.packages.get(&(name.to_string(), version.to_string())).ok_or_else(|| {
+            FhirError::NotFound(format!("{name}@{version} is not in the test registry"))
+        })?;
+        copy_tree(src, dest)
+    }
+}
+
+fn copy_tree(src: &Path, dest: &Path) -> Result<(), FhirError> {
+    std::fs::create_dir_all(dest).map_err(|err| FhirError::Storage(err.to_string()))?;
+    for entry in std::fs::read_dir(src).map_err(|err| FhirError::Storage(err.to_string()))? {
+        let entry = entry.map_err(|err| FhirError::Storage(err.to_string()))?;
+        let to = dest.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), to).map_err(|err| FhirError::Storage(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn temp_dir(tag: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "refhir-{tag}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn write_tgz(src: &Path, dest: &Path) {
+    let file = std::fs::File::create(dest).unwrap();
+    let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    archive.append_dir_all("package", src).unwrap();
+    archive.finish().unwrap();
+}
+
+#[test]
+fn install_package_accepts_a_directory_and_a_tarball() {
+    let db = ready();
+    install_package(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        extra_dir().to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(db.catalog.read().expect("catalog").contains("Encounter"));
+
+    let db = ready();
+    let scratch = temp_dir("tgz");
+    let tarball = scratch.join("extra.tgz");
+    write_tgz(extra_dir(), &tarball);
+    install_package(&db.store, &db.db, &db.catalog, tarball.to_str().unwrap()).unwrap();
+    assert!(db.catalog.read().expect("catalog").contains("Encounter"));
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn npm_install_fetches_dependencies_then_the_package() {
+    let db = ready();
+    let depends = temp_dir("depends");
+    std::fs::write(
+        depends.join("package.json"),
+        r#"{"name":"example.depends","version":"1.0.0","fhirVersion":"4.0.1","dependencies":{"example.extra":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let cache = temp_dir("pkg-cache");
+    let fetcher = MapFetcher {
+        packages: BTreeMap::from([(
+            ("example.extra".into(), "1.0.0".into()),
+            extra_dir().to_path_buf(),
+        )]),
+    };
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        depends.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert!(db.catalog.read().expect("catalog").contains("Encounter"));
+    let _ = std::fs::remove_dir_all(&depends);
+    let _ = std::fs::remove_dir_all(&cache);
+}
+
+#[test]
+fn implementation_guide_install_rejects_paths_and_registry() {
+    let db = ready();
+    let path = commit_operation(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "ImplementationGuide/$install",
+        &json!({"package": extra_dir().to_str().unwrap()}),
+    )
+    .unwrap_err();
+    assert!(matches!(path, RunError::Fhir(FhirError::Invalid(_))));
+    let registry = commit_operation(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "ImplementationGuide/$install",
+        &json!({
+            "name": "hl7.fhir.us.core",
+            "version": "6.1.0",
+            "registry": "http://127.0.0.1"
+        }),
+    )
+    .unwrap_err();
+    assert!(matches!(registry, RunError::Fhir(FhirError::Invalid(_))));
+    let missing = commit_operation(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "ImplementationGuide/$install",
+        &json!({"name": "hl7.fhir.us.core"}),
+    )
+    .unwrap_err();
+    assert!(matches!(missing, RunError::Fhir(FhirError::Invalid(_))));
+}
+
+#[test]
+fn npm_install_rejects_dependency_cycles_and_version_ranges() {
+    let db = ready();
+    let cycle_a = temp_dir("cycle-a");
+    let cycle_b = temp_dir("cycle-b");
+    std::fs::write(
+        cycle_a.join("package.json"),
+        r#"{"name":"example.cycle.a","version":"1.0.0","fhirVersion":"4.0.1","dependencies":{"example.cycle.b":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cycle_b.join("package.json"),
+        r#"{"name":"example.cycle.b","version":"1.0.0","fhirVersion":"4.0.1","dependencies":{"example.cycle.a":"1.0.0"}}"#,
+    )
+    .unwrap();
+    let cache = temp_dir("cycle-cache");
+    let fetcher = MapFetcher {
+        packages: BTreeMap::from([
+            (
+                ("example.cycle.a".into(), "1.0.0".into()),
+                cycle_a.clone(),
+            ),
+            (
+                ("example.cycle.b".into(), "1.0.0".into()),
+                cycle_b.clone(),
+            ),
+        ]),
+    };
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        cycle_a.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap_err();
+    assert!(matches!(err, FhirError::Invalid(_)), "{err}");
+
+    let ranged = temp_dir("ranged");
+    std::fs::write(
+        ranged.join("package.json"),
+        r#"{"name":"example.ranged","version":"1.0.0","fhirVersion":"4.0.1","dependencies":{"example.extra":"^1.0.0"}}"#,
+    )
+    .unwrap();
+    let ranged_err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        ranged.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap_err();
+    assert!(matches!(ranged_err, FhirError::Invalid(_)));
+    let _ = std::fs::remove_dir_all(&cycle_a);
+    let _ = std::fs::remove_dir_all(&cycle_b);
+    let _ = std::fs::remove_dir_all(&cache);
+    let _ = std::fs::remove_dir_all(&ranged);
 }
 
 #[test]
