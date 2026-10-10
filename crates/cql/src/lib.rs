@@ -76,7 +76,10 @@ mod tests {
 
     fn codes(row: &Json) -> Vec<String> {
         let mut found = Vec::new();
-        if let Some(items) = row.pointer("/code/coding").and_then(|value| value.as_array()) {
+        if let Some(items) = row
+            .pointer("/code/coding")
+            .and_then(|value| value.as_array())
+        {
             for item in items {
                 if let Some(code) = item.get("code").and_then(|value| value.as_str()) {
                     found.push(code.to_string());

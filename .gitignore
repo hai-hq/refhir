@@ -6,3 +6,7 @@
 
 docs/architecture.md
 .cursor/plans/haifhir_build_roadmap.plan.md
+
+# Default package download cache and the output of scripts/package-bundle.py
+.refhir/
+/dist/

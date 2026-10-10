@@ -1,7 +1,10 @@
 //! SMART scope checks in front of dispatch. Handlers do not see tokens.
 
+mod interact;
 mod oauth;
+mod oidc;
 mod scopes;
+mod signing;
 mod store;
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,16 +22,18 @@ use crate::http::AppState;
 use scopes::{interaction_for, scope_allows};
 use store::normalize_patient_id;
 
+pub use oidc::{Oidc, OidcConfig};
 pub use store::SmartStore;
 
+pub(crate) use interact::{interact_get, interact_post, oidc_callback};
 pub(crate) use oauth::{
-    authorize, configuration, ehr_launch, introspect, issue, jwks, manage, register, revoke,
-    security_extension, style,
+    authorize, configuration, ehr_launch, introspect, issue, jwks, manage, parse_authorize_form,
+    register, revoke, security_extension, style,
 };
 pub(crate) use scopes::http_interaction;
 pub(crate) use store::origin_allowed;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Token {
     pub scopes: Vec<String>,
     pub patient: Option<String>,
@@ -544,6 +549,12 @@ pub fn resolve_token(headers: &HeaderMap, query: Option<&str>) -> Option<String>
         return Some(value.to_string());
     }
     query_token(query)
+}
+
+/// True when checking this request needs no database read: there is no token to look up, or
+/// it is cached.
+pub fn lookup_is_cheap(app: &AppState, headers: &HeaderMap, query: Option<&str>) -> bool {
+    resolve_token(headers, query).is_none_or(|token| app.smart.token_is_cached(&token))
 }
 
 pub fn token_scopes(

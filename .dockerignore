@@ -1,0 +1,7 @@
+target
+.git
+refhir.sqlite
+export
+clients/ts/node_modules
+**/*.md
+!deploy/**

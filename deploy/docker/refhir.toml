@@ -1,0 +1,20 @@
+[fhir]
+version = "r4"
+
+[server]
+bind = "0.0.0.0:8080"
+
+[database]
+kind = "sqlite"
+sqlite_path = "/data/refhir.sqlite"
+
+[conformance]
+reference_policy = "strict"
+package_cache = "/data/package-cache"
+
+[export]
+dir = "/data/export"
+
+[features]
+trace_engine = false
+sdc_archiver = false

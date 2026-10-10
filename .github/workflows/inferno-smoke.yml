@@ -1,0 +1,45 @@
+name: SMART Inferno smoke
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/server/src/auth/**"
+      - "crates/server/src/http.rs"
+      - "crates/server/src/tests.rs"
+      - "deploy/inferno/**"
+      - "Dockerfile"
+      - ".github/workflows/inferno-smoke.yml"
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start ReFHIR (SMART)
+        run: docker compose -f deploy/inferno/docker-compose.yml up --build -d
+
+      - name: Wait and seed
+        run: |
+          chmod +x deploy/inferno/*.sh
+          deploy/inferno/wait-ready.sh
+          deploy/inferno/seed.sh
+        env:
+          REFHIR_PUBLIC_URL: http://localhost:8080
+          SEED_CLIENT_SECRET: inferno-confidential
+
+      - name: Discovery smoke
+        run: deploy/inferno/smoke-discovery.sh
+        env:
+          REFHIR_PUBLIC_URL: http://localhost:8080
+
+      - name: OAuth standalone smoke
+        run: deploy/inferno/smoke-oauth.sh
+        env:
+          REFHIR_PUBLIC_URL: http://localhost:8080
+
+      - name: Stop containers
+        if: always()
+        run: docker compose -f deploy/inferno/docker-compose.yml down -v

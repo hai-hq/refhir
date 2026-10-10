@@ -284,7 +284,12 @@ impl<'a> Parser<'a> {
         if start >= bytes.len() || !is_ident_start(bytes[start] as char) {
             return Err(format!(
                 "expected a name near '{}'",
-                self.source.get(start..).unwrap_or("").chars().take(12).collect::<String>()
+                self.source
+                    .get(start..)
+                    .unwrap_or("")
+                    .chars()
+                    .take(12)
+                    .collect::<String>()
             ));
         }
         self.index += 1;
@@ -317,7 +322,10 @@ impl<'a> Parser<'a> {
     fn number(&mut self) -> Result<String, String> {
         self.skip();
         let start = self.index;
-        while self.peek_char().is_some_and(|ch| ch.is_ascii_digit() || ch == '.') {
+        while self
+            .peek_char()
+            .is_some_and(|ch| ch.is_ascii_digit() || ch == '.')
+        {
             self.index += 1;
         }
         if start == self.index {

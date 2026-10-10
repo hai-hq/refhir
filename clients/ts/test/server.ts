@@ -40,10 +40,15 @@ export async function startServer(port: number): Promise<{
 }> {
   const db = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "refhir-ts-")), "db.sqlite");
   const bin = refhirBin();
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const minir4 = path.join(here, "..", "..", "..", "crates", "fhir", "fixtures", "minir4");
   const child: ChildProcess = spawn(
     bin,
-    ["--sqlite", db, "--bind", `127.0.0.1:${port}`],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    ["--sqlite", db, "--bind", `127.0.0.1:${port}`, "--package", minir4],
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, REFHIR_SKIP_DEFAULT_PACKAGES: "1" },
+    },
   );
   const base = `http://127.0.0.1:${port}`;
   const deadline = Date.now() + 60_000;

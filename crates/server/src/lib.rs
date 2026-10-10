@@ -13,6 +13,7 @@ use refhir_database::Database;
 use refhir_fhir::{Catalog, ConformanceStore};
 use tokio::net::TcpListener;
 
+pub use auth::{OidcConfig, SmartStore};
 pub use http::{app, app_with, AppState, ServerConfig};
 
 pub async fn serve(

@@ -8,7 +8,7 @@ use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    ConformanceStore, InstallError, NewExpansion, NewPackage, NewSearchParameter,
+    same_expression, ConformanceStore, InstallError, NewExpansion, NewPackage, NewSearchParameter,
     NewStructureDefinition, NewTerminology, ParamStatus,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
@@ -21,6 +21,9 @@ use crate::extract;
 use crate::run::MAX_OCC_FAILURES;
 
 const BATCH: usize = 16;
+
+// The `*_dir` fixtures below are for the test suites only. The server ships no packages: it
+// downloads the release defaults from `[conformance].package_registry` (see `npm.rs`).
 
 pub fn minir4_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/minir4"))
@@ -52,6 +55,16 @@ pub fn sdc_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sdc"))
 }
 
+/// Default FHIR NPM specs for a release (`packages.fhir.org`), selected by
+/// `[fhir].version`. Skipped when already in the conformance store; tarballs
+/// are cached under `REFHIR_PACKAGE_CACHE`.
+pub const R4_CORE_PACKAGE: &str = "hl7.fhir.r4.core@4.0.1";
+pub const SDC_PACKAGE: &str = "hl7.fhir.uv.sdc@4.0.0";
+
+pub fn default_r4_registry_specs() -> [&'static str; 2] {
+    [R4_CORE_PACKAGE, SDC_PACKAGE]
+}
+
 pub fn install_package_dir(
     store: &dyn ConformanceStore,
     db: &Database,
@@ -59,7 +72,10 @@ pub fn install_package_dir(
     path: &Path,
 ) -> Result<(), FhirError> {
     stage_package_dir(store, db, catalog, path)?;
-    run_backfills(store, db, catalog)
+    let started = std::time::Instant::now();
+    run_backfills(store, db, catalog)?;
+    tracing::debug!(target: "refhir_engine", "backfills took {:.1?}", started.elapsed());
+    Ok(())
 }
 
 pub fn stage_package_dir(
@@ -68,6 +84,55 @@ pub fn stage_package_dir(
     catalog: &RwLock<Catalog>,
     path: &Path,
 ) -> Result<(), FhirError> {
+    stage_package(store, db, catalog, path, true).map(|_| ())
+}
+
+/// Backfill work for a package whose search parameters are stored but not yet searchable.
+pub(crate) struct PendingBackfill {
+    package_id: i64,
+    bases: BTreeSet<String>,
+}
+
+impl PendingBackfill {
+    /// Queue the backfill jobs. Call this after the catalog that writers use has been
+    /// published: the watermark is read here, and backfill leaves documents newer than it to
+    /// writers, which only index a parameter once the catalog knows it.
+    pub(crate) fn create(
+        &self,
+        store: &dyn ConformanceStore,
+        db: &Database,
+    ) -> Result<(), FhirError> {
+        let watermark = db
+            .latest_ts()
+            .to_i64()
+            .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
+        for base in &self.bases {
+            store
+                .insert_backfill(self.package_id, watermark, base, &[])
+                .map_err(FhirError::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Store a package without rebuilding the catalog, for installing several in a row. The caller
+/// must [`publish`], then [`PendingBackfill::create`] each returned item and run the backfills.
+pub(crate) fn stage_package_deferred(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    path: &Path,
+) -> Result<Option<PendingBackfill>, FhirError> {
+    stage_package(store, db, catalog, path, false)
+}
+
+fn stage_package(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    path: &Path,
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
     let (name, version) = package_identity(path)?;
     let installed = store.load_packages().map_err(FhirError::from)?;
     if let Some(package) = installed
@@ -75,27 +140,49 @@ pub fn stage_package_dir(
         .find(|package| package.name == name && package.version == version)
     {
         reopen_unsupported(store, db, package.id)?;
-        return publish(store, catalog);
+        if publish_now {
+            publish(store, catalog)?;
+        }
+        return Ok(None);
     }
+    let started = std::time::Instant::now();
     let package = read_package(path)?;
+    let read = started.elapsed();
     let outcome = store.install_package(&package).map_err(install_error)?;
-    publish(store, catalog)?;
-    if outcome.inserted {
-        let watermark = db
-            .latest_ts()
-            .to_i64()
-            .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
-        let mut bases = BTreeSet::new();
-        for param in &outcome.newly_pending {
-            bases.insert(param.base.clone());
-        }
-        for base in bases {
-            store
-                .insert_backfill(outcome.package_id, watermark, &base, &[])
-                .map_err(FhirError::from)?;
-        }
+    let stored = started.elapsed();
+    if publish_now {
+        publish(store, catalog)?;
     }
-    Ok(())
+    // Installing a large package takes a while; say where the time went.
+    let catalog_time = if publish_now {
+        format!(", catalog {:.1?}", started.elapsed() - stored)
+    } else {
+        String::new()
+    };
+    tracing::info!(
+        target: "refhir_engine",
+        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; read {read:.1?}, store {:.1?}{catalog_time}",
+        package.structure_definitions.len(),
+        package.search_parameters.len(),
+        package.terminology.len(),
+        stored - read,
+    );
+    if !outcome.inserted {
+        return Ok(None);
+    }
+    let pending = PendingBackfill {
+        package_id: outcome.package_id,
+        bases: outcome
+            .newly_pending
+            .iter()
+            .map(|param| param.base.clone())
+            .collect(),
+    };
+    if publish_now {
+        pending.create(store, db)?;
+        return Ok(None);
+    }
+    Ok(Some(pending))
 }
 
 pub fn run_backfills(
@@ -310,6 +397,35 @@ pub(crate) fn package_identity(path: &Path) -> Result<(String, String), FhirErro
     Ok((name, version))
 }
 
+/// The resource types a package contributes to the conformance tables.
+fn is_kept(resource_type: Option<&str>) -> bool {
+    matches!(
+        resource_type,
+        Some("StructureDefinition")
+            | Some("SearchParameter")
+            | Some("CodeSystem")
+            | Some("ValueSet")
+            | Some("ConceptMap")
+            | Some("CompartmentDefinition")
+    )
+}
+
+/// `StructureDefinition-patient.json` and the like: the name says the file is kept. The type
+/// inside the file still decides where it goes.
+fn conventional_name(file: &Path) -> bool {
+    file.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('-'))
+        .is_some_and(|(prefix, _)| is_kept(Some(prefix)))
+}
+
+/// Just the type of a resource; every other field is skipped without being stored.
+#[derive(serde::Deserialize)]
+struct ResourceKind {
+    #[serde(rename = "resourceType")]
+    resource_type: Option<Value>,
+}
+
 fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     let root = package_root(path)?;
     let manifest = read_manifest(&root)?;
@@ -337,17 +453,39 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         }
         let text = fs::read_to_string(&file)
             .map_err(|err| FhirError::Invalid(format!("{}: {err}", file.display())))?;
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|err| FhirError::Invalid(format!("{}: {err}", file.display())))?;
-        match value.get("resourceType").and_then(|item| item.as_str()) {
-            Some("StructureDefinition") => definitions.push(value),
-            Some("SearchParameter") => parameters.push(value),
+        let parse = |text: &str| {
+            serde_json::from_str::<Value>(text)
+                .map_err(|err| FhirError::Invalid(format!("{}: {err}", file.display())))
+        };
+        // Most files in a package are examples. Files named `<Type>-<id>.json` for a type that
+        // is kept are parsed once; any other file is first checked for its type without
+        // building a value, so examples are skipped cheaply.
+        let value = if conventional_name(&file) {
+            parse(&text)?
+        } else {
+            match serde_json::from_str::<ResourceKind>(&text) {
+                Ok(kind) if is_kept(kind.resource_type.as_ref().and_then(Value::as_str)) => {
+                    parse(&text)?
+                }
+                Ok(_) => continue,
+                // Not an object (an array, a number, null): never a resource. Invalid JSON is
+                // still an error.
+                Err(_) => {
+                    parse(&text)?;
+                    continue;
+                }
+            }
+        };
+        let bucket = match value.get("resourceType").and_then(Value::as_str) {
+            Some("StructureDefinition") => &mut definitions,
+            Some("SearchParameter") => &mut parameters,
             Some("CodeSystem")
             | Some("ValueSet")
             | Some("ConceptMap")
-            | Some("CompartmentDefinition") => terminology.push(value),
-            _ => {}
-        }
+            | Some("CompartmentDefinition") => &mut terminology,
+            _ => continue,
+        };
+        bucket.push(value);
     }
     let fhir_version = fhir_version(&manifest, &definitions)?;
     let mut structure_definitions = Vec::new();
@@ -356,8 +494,38 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     }
     let scope = SearchScope::from_documents(&definitions, &parameters);
     let mut search_parameters = Vec::new();
-    for parameter in &parameters {
-        search_parameters.extend(parameter_rows(parameter, &scope)?);
+    // Non-experimental parameters go first and win: the R4 core package ships a sample
+    // `_id` parameter (`SearchParameter/example`) that disagrees with the real `Resource-id`.
+    let is_experimental =
+        |parameter: &Value| parameter.get("experimental").and_then(Value::as_bool) == Some(true);
+    let mut ordered: Vec<&Value> = parameters.iter().collect();
+    ordered.sort_by_key(|parameter| is_experimental(parameter));
+    let mut defined: BTreeMap<(String, String), (String, bool)> = BTreeMap::new();
+    for parameter in ordered {
+        // The same package ships draft `*-extensions-*` parameters with no `base`. They
+        // belong to no resource type, so there is nothing to index or search.
+        if parameter.get("base").is_none() {
+            continue;
+        }
+        let experimental = is_experimental(parameter);
+        for row in parameter_rows(parameter, &scope)? {
+            let key = (row.base.clone(), row.code.clone());
+            let expression = row.expression.clone().unwrap_or_default();
+            if let Some((first, first_experimental)) = defined.get(&key) {
+                if !same_expression(&row.base, first, &expression) && experimental {
+                    if !first_experimental {
+                        // A draft or sample yields to the real definition.
+                        continue;
+                    }
+                    return Err(FhirError::Invalid(format!(
+                        "search parameter {}.{} is defined twice with different expressions",
+                        row.base, row.code
+                    )));
+                }
+            }
+            defined.entry(key).or_insert((expression, experimental));
+            search_parameters.push(row);
+        }
     }
     let mut terminology_rows = Vec::new();
     for resource in &terminology {

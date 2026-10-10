@@ -43,5 +43,26 @@ tar = "0.4"
 base64 = "0.22"
 jsonwebtoken = "9.3"
 rand = "0.8"
-rsa = { version = "0.9", features = ["pem"] }
+rsa = { version = "0.9", features = ["pem", "pkcs5"] }
 sha2 = "0.10"
+hmac = "0.12"
+toml = "0.8"
+
+# Key derivation and RSA are unusably slow unoptimised; the SMART key tests depend on them.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+# Bulk package installs parse and store hundreds of MB; unoptimised SQLite and JSON make a
+# debug run several times slower than release.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
+[profile.dev.package.serde_json]
+opt-level = 3

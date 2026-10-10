@@ -1,0 +1,13 @@
+services:
+  refhir:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - refhir-data:/data
+      - ./refhir.toml.example:/etc/refhir/refhir.toml:ro
+    environment:
+      REFHIR_PACKAGE_CACHE: /data/package-cache
+
+volumes:
+  refhir-data:

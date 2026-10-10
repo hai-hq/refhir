@@ -18,6 +18,46 @@ use crate::compartment::{self, Compartment};
 use crate::error::FhirError;
 use crate::extract::{self, Extractor, SearchKind};
 
+/// Parse `rows` into JSON values, in order, spread over the available cores.
+fn parse_all<T: Sync>(
+    rows: &[T],
+    text: impl Fn(&T) -> &str + Sync,
+    what: &str,
+) -> Result<Vec<Value>, PersistError> {
+    let workers = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(rows.len() / 64 + 1);
+    let parse = |chunk: &[T]| -> Result<Vec<Value>, PersistError> {
+        chunk
+            .iter()
+            .map(|row| {
+                serde_json::from_str(text(row))
+                    .map_err(|err| PersistError::Definite(format!("{what}: {err}")))
+            })
+            .collect()
+    };
+    if workers <= 1 {
+        return parse(rows);
+    }
+    let size = rows.len().div_ceil(workers);
+    let parsed = std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .chunks(size)
+            .map(|chunk| scope.spawn(|| parse(chunk)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("json parse"))
+            .collect::<Vec<_>>()
+    });
+    let mut values = Vec::with_capacity(rows.len());
+    for chunk in parsed {
+        values.extend(chunk?);
+    }
+    Ok(values)
+}
+
 /// How reference targets are checked on write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ReferencePolicy {
@@ -138,28 +178,16 @@ impl Catalog {
         expansions: &[refhir_persistence::StoredExpansion],
     ) -> Result<Self, PersistError> {
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
-        let mut definition_json = Vec::new();
-        for definition in definitions {
-            let json: Value = serde_json::from_str(&definition.json).map_err(|err| {
-                PersistError::Definite(format!("structure definition json: {err}"))
-            })?;
-            definition_json.push(json);
-        }
-        let schema = Schema::from_definitions(&definition_json);
-        let mut term_json = Vec::new();
-        for resource in terminology {
-            let json: Value = serde_json::from_str(&resource.json)
-                .map_err(|err| PersistError::Definite(format!("terminology json: {err}")))?;
-            term_json.push(json);
-        }
-        let mut expansion_json = Vec::new();
-        for expansion in expansions {
-            let json: Value = serde_json::from_str(&expansion.json).map_err(|err| {
-                PersistError::Definite(format!("value set expansion json: {err}"))
-            })?;
-            expansion_json.push(json);
-        }
-        let terms = MemoryTerminology::from_stored(&term_json, &expansion_json);
+        // Loading is dominated by parsing thousands of stored JSON documents, so parse them on
+        // every core, then build the two independent indexes side by side.
+        let definition_json = parse_all(definitions, |row| &row.json, "structure definition json")?;
+        let term_json = parse_all(terminology, |row| &row.json, "terminology json")?;
+        let expansion_json = parse_all(expansions, |row| &row.json, "value set expansion json")?;
+        let (schema, terms) = std::thread::scope(|scope| {
+            let schema = scope.spawn(|| Schema::from_definitions(&definition_json));
+            let terms = MemoryTerminology::from_stored(&term_json, &expansion_json);
+            (schema.join().expect("schema build"), terms)
+        });
         let mut types = BTreeMap::new();
         for (definition, json) in definitions.iter().zip(&definition_json) {
             if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {

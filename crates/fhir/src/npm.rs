@@ -1,7 +1,8 @@
 //! Fetch a FHIR NPM package and install it the same way a local directory is
 //! installed. Network I/O stays outside the OCC transaction.
 
-use std::collections::BTreeSet;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -16,8 +17,11 @@ use sha2::{Digest, Sha256};
 
 use crate::catalog::Catalog;
 use crate::error::FhirError;
-use crate::package::{install_package_dir, package_identity, package_root, read_manifest};
+use crate::package::{
+    package_identity, package_root, publish, read_manifest, run_backfills, stage_package_deferred,
+};
 use crate::run::RunResult;
+use crate::s3::S3Source;
 
 const ENGINE: &str = "refhir_engine";
 const DEFAULT_REGISTRY: &str = "https://packages.fhir.org";
@@ -42,14 +46,18 @@ pub trait PackageFetcher {
     fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError>;
 }
 
+/// Where packages are downloaded from: a FHIR package registry (`https://packages.fhir.org`),
+/// any static host that serves `<base>/<name>/<version>`, or `s3://bucket/prefix`.
 #[derive(Clone, Debug)]
 pub struct NpmRegistry {
     pub base_url: String,
     pub cache_dir: PathBuf,
+    s3: Option<S3Source>,
 }
 
 impl NpmRegistry {
-    pub fn from_env() -> Self {
+    /// `REFHIR_PACKAGE_REGISTRY` (default packages.fhir.org) and `REFHIR_PACKAGE_CACHE`.
+    pub fn from_env() -> Result<Self, FhirError> {
         let base_url = std::env::var("REFHIR_PACKAGE_REGISTRY")
             .ok()
             .filter(|value| !value.is_empty())
@@ -59,18 +67,33 @@ impl NpmRegistry {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".refhir/packages"));
-        Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+        Self::new(&base_url, cache_dir)
+    }
+
+    pub fn new(location: &str, cache_dir: PathBuf) -> Result<Self, FhirError> {
+        let s3 = S3Source::from_location(location).transpose()?;
+        Ok(Self {
+            base_url: location.trim_end_matches('/').to_string(),
             cache_dir,
-        }
+            s3,
+        })
     }
 }
 
 impl PackageFetcher for NpmRegistry {
     fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError> {
-        let url = format!("{}/{name}/{version}", self.base_url.trim_end_matches('/'));
-        tracing::info!(target: ENGINE, name, version, url = url.as_str(), "downloading FHIR package");
-        let bytes = download_tarball(&url)?;
+        let bytes = match &self.s3 {
+            Some(s3) => {
+                let object = s3.object(name, version);
+                tracing::info!(target: ENGINE, name, version, url = object.url.as_str(), "downloading FHIR package from S3");
+                download_tarball(&object.url, &|| s3.headers(&object, unix_now()))?
+            }
+            None => {
+                let url = format!("{}/{name}/{version}", self.base_url.trim_end_matches('/'));
+                tracing::info!(target: ENGINE, name, version, url = url.as_str(), "downloading FHIR package");
+                download_tarball(&url, &Vec::new)?
+            }
+        };
         extract_tarball(&bytes, dest)?;
         write_complete(dest, &sha256_hex(&bytes))
     }
@@ -83,7 +106,7 @@ pub fn install_package(
     catalog: &RwLock<Catalog>,
     spec: &str,
 ) -> Result<(), FhirError> {
-    let registry = NpmRegistry::from_env();
+    let registry = NpmRegistry::from_env()?;
     install_with(store, db, catalog, spec, &registry, &registry.cache_dir)
 }
 
@@ -96,9 +119,23 @@ pub fn install_with(
     cache: &Path,
 ) -> Result<(), FhirError> {
     let parsed = parse_package_spec(spec)?;
-    let mut stack = BTreeSet::new();
-    install_tree(store, db, catalog, parsed, fetcher, cache, &mut stack)?;
+    install_tree(store, db, catalog, parsed, fetcher, cache)?;
     Ok(())
+}
+
+/// Whether every `name@version` spec is already in the database.
+pub fn packages_installed(store: &dyn ConformanceStore, specs: &[&str]) -> Result<bool, FhirError> {
+    for spec in specs {
+        match parse_package_spec(spec)? {
+            PackageSpec::Npm { name, version } => {
+                if !already_installed(store, &name, &version)? {
+                    return Ok(false);
+                }
+            }
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
 }
 
 pub fn install_operation(
@@ -118,7 +155,7 @@ pub fn install_operation(
     };
     let (name, version) = npm_spec_from_args(args)?;
     let spec = format!("{name}@{version}");
-    let fetcher = NpmRegistry::from_env();
+    let fetcher = NpmRegistry::from_env()?;
     install_with(store, db, catalog, &spec, &fetcher, &fetcher.cache_dir)?;
     Ok(RunResult {
         value: json!({
@@ -168,7 +205,9 @@ fn npm_spec_from_args(args: &Value) -> Result<(String, String), FhirError> {
     }
     let (name, version) = if let Some(package) = optional(args, &["package", "npm"]) {
         split_npm(package).ok_or_else(|| {
-            FhirError::Invalid("$install only accepts name@version from the package registry".into())
+            FhirError::Invalid(
+                "$install only accepts name@version from the package registry".into(),
+            )
         })?
     } else {
         match (optional(args, &["name"]), optional(args, &["version"])) {
@@ -190,6 +229,10 @@ fn npm_spec_from_args(args: &Value) -> Result<(String, String), FhirError> {
     Ok((safe_segment(&name)?, safe_segment(&version)?))
 }
 
+/// Install `spec` and everything it depends on, one version per package name.
+///
+/// The whole tree is resolved before anything is installed, so a conflict stops the install
+/// with nothing half-applied. See [`Resolver`] for the rules.
 fn install_tree(
     store: &dyn ConformanceStore,
     db: &Database,
@@ -197,47 +240,351 @@ fn install_tree(
     spec: PackageSpec,
     fetcher: &dyn PackageFetcher,
     cache: &Path,
-    stack: &mut BTreeSet<(String, String)>,
 ) -> Result<(), FhirError> {
     if let PackageSpec::Npm { name, version } = &spec {
         if already_installed(store, name, version)? {
+            return run_backfills(store, db, catalog);
+        }
+    }
+    let root = materialize(&spec, fetcher, cache)?;
+    let (name, version) = package_identity(&root.dir)?;
+    if already_installed(store, &name, &version)? {
+        return run_backfills(store, db, catalog);
+    }
+    let order = Resolver::new(store, fetcher, cache)?.resolve(root, name, version)?;
+    // Store every package first and rebuild the catalog once at the end: the rebuild grows
+    // with the catalog, so doing it after each package of a large tree costs minutes.
+    let mut staged = false;
+    let mut pending = Vec::new();
+    let mut result = Ok(());
+    for node in order {
+        if already_installed(store, &node.name, &node.version)? {
+            continue;
+        }
+        staged = true;
+        match stage_package_deferred(store, db, catalog, &node.staged.dir) {
+            Ok(backfill) => pending.extend(backfill),
+            Err(err) => {
+                result = Err(err);
+                break;
+            }
+        }
+    }
+    if !staged {
+        // Nothing new, but an earlier attempt may have left backfills behind.
+        return run_backfills(store, db, catalog);
+    }
+    // Packages already stored must reach the catalog and get their backfills even when a later
+    // one failed; otherwise their search parameters stay pending until the next restart. The
+    // backfill jobs are queued only after the publish, so the watermark they record is not
+    // older than the catalog writers use.
+    let finish = || -> Result<(), FhirError> {
+        let started = std::time::Instant::now();
+        publish(store, catalog)?;
+        tracing::info!(target: ENGINE, "rebuilt the catalog in {:.1?}", started.elapsed());
+        for backfill in &pending {
+            backfill.create(store, db)?;
+        }
+        run_backfills(store, db, catalog)
+    };
+    let finished = finish();
+    result?;
+    finished
+}
+
+/// A package that was downloaded (or read from the cache) during resolution.
+struct Node {
+    name: String,
+    version: String,
+    staged: Staged,
+    deps: Vec<(String, String)>,
+}
+
+/// More rounds than any real package graph needs; reaching it means versions keep flipping.
+const MAX_ROUNDS: usize = 64;
+
+/// Picks one version per package name across a dependency tree.
+///
+/// - The highest version that a still-needed package asks for wins, like npm's dedupe. Each
+///   round is recomputed from the packages reachable under the current choices, so requests
+///   made by a version that was later replaced do not count.
+/// - A version named by the caller is fixed: a dependency that needs something newer is an
+///   error.
+/// - An installed version at least as new as the request is used as is. A newer request is
+///   installed next to it, since there is no way to remove the old one.
+/// - Versions that are not `major.minor.patch` still order (see [`compare_versions`]).
+struct Resolver<'a> {
+    fetcher: &'a dyn PackageFetcher,
+    cache: &'a Path,
+    chosen: BTreeMap<String, String>,
+    /// Highest installed version per package name.
+    installed_latest: BTreeMap<String, String>,
+    /// Installed (name, version) pairs, so their dependencies are not walked again.
+    installed: BTreeSet<(String, String)>,
+    /// Names the caller asked for.
+    requested: BTreeSet<String>,
+    nodes: BTreeMap<(String, String), Node>,
+}
+
+impl<'a> Resolver<'a> {
+    fn new(
+        store: &dyn ConformanceStore,
+        fetcher: &'a dyn PackageFetcher,
+        cache: &'a Path,
+    ) -> Result<Self, FhirError> {
+        let mut installed_latest: BTreeMap<String, String> = BTreeMap::new();
+        let mut installed = BTreeSet::new();
+        for package in store.load_packages().map_err(FhirError::from)? {
+            installed.insert((package.name.clone(), package.version.clone()));
+            let newer = installed_latest.get(&package.name).is_none_or(|current| {
+                compare_versions(&package.version, current) == Ordering::Greater
+            });
+            if newer {
+                installed_latest.insert(package.name, package.version);
+            }
+        }
+        Ok(Self {
+            fetcher,
+            cache,
+            chosen: BTreeMap::new(),
+            installed_latest,
+            installed,
+            requested: BTreeSet::new(),
+            nodes: BTreeMap::new(),
+        })
+    }
+
+    fn resolve(
+        mut self,
+        root: Staged,
+        name: String,
+        version: String,
+    ) -> Result<Vec<Node>, FhirError> {
+        self.chosen.insert(name.clone(), version.clone());
+        self.requested.insert(name.clone());
+        let deps = dependencies_of(&root.dir)?;
+        self.nodes.insert(
+            (name.clone(), version.clone()),
+            Node {
+                name: name.clone(),
+                version,
+                staged: root,
+                deps,
+            },
+        );
+        for _ in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for (dep, (wanted, requester)) in self.best_requests(&name) {
+                changed |= self.settle(&dep, &wanted, &requester)?;
+            }
+            if !changed {
+                return self.finish(&name);
+            }
+        }
+        Err(FhirError::Invalid(
+            "package dependency versions do not settle on one version each".into(),
+        ))
+    }
+
+    /// For every package reachable from `root` under the current choices, the highest version
+    /// any reachable package asks for, and who asked.
+    fn best_requests(&self, root: &str) -> BTreeMap<String, (String, String)> {
+        let mut best: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![root.to_string()];
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let Some(version) = self.chosen.get(&name) else {
+                continue;
+            };
+            let Some(node) = self.nodes.get(&(name.clone(), version.clone())) else {
+                continue;
+            };
+            for (dep, wanted) in &node.deps {
+                let higher = best.get(dep).is_none_or(|(current, _)| {
+                    compare_versions(wanted, current) == Ordering::Greater
+                });
+                if higher {
+                    best.insert(
+                        dep.clone(),
+                        (wanted.clone(), format!("{name}@{}", node.version)),
+                    );
+                }
+                stack.push(dep.clone());
+            }
+        }
+        best
+    }
+
+    /// Choose the version of `name` for a request of `wanted`. True if the choice changed.
+    fn settle(&mut self, name: &str, wanted: &str, requester: &str) -> Result<bool, FhirError> {
+        let target = if self.requested.contains(name) {
+            let current = self.chosen[name].clone();
+            if compare_versions(wanted, &current) == Ordering::Greater {
+                return Err(FhirError::Invalid(format!(
+                    "version conflict: {requester} needs {name}@{wanted}, but {name}@{current} was requested"
+                )));
+            }
+            current
+        } else {
+            match self.installed_latest.get(name) {
+                Some(latest) if compare_versions(latest, wanted) != Ordering::Less => {
+                    latest.clone()
+                }
+                _ => wanted.to_string(),
+            }
+        };
+        if let Some(current) = self.chosen.get(name) {
+            if compare_versions(current, &target) == Ordering::Equal {
+                return Ok(false);
+            }
+        }
+        self.chosen.insert(name.to_string(), target.clone());
+        let key = (name.to_string(), target.clone());
+        if !self.installed.contains(&key) && !self.nodes.contains_key(&key) {
+            let staged = materialize(
+                &PackageSpec::Npm {
+                    name: name.to_string(),
+                    version: target.clone(),
+                },
+                self.fetcher,
+                self.cache,
+            )?;
+            let deps = dependencies_of(&staged.dir)?;
+            self.nodes.insert(
+                key,
+                Node {
+                    name: name.to_string(),
+                    version: target,
+                    staged,
+                    deps,
+                },
+            );
+        }
+        Ok(true)
+    }
+
+    /// Log the overrides, then order the packages that will be installed.
+    fn finish(mut self, root: &str) -> Result<Vec<Node>, FhirError> {
+        for (dep, (wanted, requester)) in self.best_requests(root) {
+            let chosen = &self.chosen[&dep];
+            if compare_versions(&wanted, chosen) != Ordering::Equal {
+                tracing::warn!(
+                    target: ENGINE,
+                    "{requester} wants {dep}@{wanted}; using {dep}@{chosen}"
+                );
+            }
+        }
+        let mut order = Vec::new();
+        let mut visiting = BTreeSet::new();
+        let mut done = BTreeSet::new();
+        self.visit(root, &mut visiting, &mut done, &mut order)?;
+        let mut nodes = std::mem::take(&mut self.nodes);
+        Ok(order
+            .into_iter()
+            .filter_map(|key| nodes.remove(&key))
+            .collect())
+    }
+
+    /// Depth-first over the chosen versions only, so packages reachable solely through an
+    /// overridden version are dropped. Dependencies come before the packages that need them.
+    fn visit(
+        &self,
+        name: &str,
+        visiting: &mut BTreeSet<String>,
+        done: &mut BTreeSet<String>,
+        order: &mut Vec<(String, String)>,
+    ) -> Result<(), FhirError> {
+        if done.contains(name) {
             return Ok(());
         }
-        if !stack.insert((name.clone(), version.clone())) {
+        let version = self.chosen[name].clone();
+        let key = (name.to_string(), version.clone());
+        if self.installed.contains(&key) {
+            done.insert(name.to_string());
+            return Ok(());
+        }
+        if !visiting.insert(name.to_string()) {
             return Err(FhirError::Invalid(format!(
                 "package {name}@{version} depends on itself"
             )));
         }
+        for (dep, wanted) in &self.nodes[&key].deps {
+            // A cycle that only exists because a dependency was swapped for the chosen version
+            // (terminology 6.5.0 wanting extensions 5.2.0, extensions 5.3.0 wanting terminology
+            // 6.5.0) is fine: skip that edge. A cycle in the versions as declared is an error.
+            if visiting.contains(dep)
+                && compare_versions(&self.chosen[dep], wanted) != Ordering::Equal
+            {
+                continue;
+            }
+            self.visit(dep, visiting, done, order)?;
+        }
+        visiting.remove(name);
+        done.insert(name.to_string());
+        order.push(key);
+        Ok(())
     }
-    let staged = materialize(&spec, fetcher, cache)?;
-    let (name, version) = package_identity(&staged.dir)?;
-    if already_installed(store, &name, &version)? {
-        return Ok(());
+}
+
+/// Order two package versions: `major.minor.patch` (missing parts count as 0), then
+/// pre-release (`5.3.0-ballot` sorts before `5.3.0` and after `5.2.0`). A version that is not
+/// numeric, like `current` or `dev`, means "the newest" and sorts after every numeric one.
+fn compare_versions(left: &str, right: &str) -> Ordering {
+    let parse = |text: &str| -> Option<([u64; 3], Option<String>)> {
+        let text = text.split('+').next().unwrap_or(text);
+        let (core, pre) = match text.split_once('-') {
+            Some((core, pre)) => (core, Some(pre.to_string())),
+            None => (text, None),
+        };
+        let mut numbers = [0u64; 3];
+        let mut parts = core.split('.');
+        for slot in &mut numbers {
+            match parts.next() {
+                Some(part) => *slot = part.parse().ok()?,
+                None => break,
+            }
+        }
+        parts.next().is_none().then_some((numbers, pre))
+    };
+    match (parse(left), parse(right)) {
+        (Some((left_core, left_pre)), Some((right_core, right_pre))) => left_core
+            .cmp(&right_core)
+            .then_with(|| match (&left_pre, &right_pre) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(a), Some(b)) => compare_prerelease(a, b),
+            }),
+        (None, None) => left.cmp(right),
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
     }
-    if matches!(spec, PackageSpec::Dir(_) | PackageSpec::Tarball(_))
-        && !stack.insert((name.clone(), version.clone()))
-    {
-        return Err(FhirError::Invalid(format!(
-            "package {name}@{version} depends on itself"
-        )));
+}
+
+fn compare_prerelease(left: &str, right: &str) -> Ordering {
+    let mut right_parts = right.split('.');
+    for a in left.split('.') {
+        let Some(b) = right_parts.next() else {
+            return Ordering::Greater;
+        };
+        let order = match (a.parse::<u64>(), b.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            (Err(_), Err(_)) => a.cmp(b),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
     }
-    for (dep_name, dep_version) in dependencies_of(&staged.dir)? {
-        install_tree(
-            store,
-            db,
-            catalog,
-            PackageSpec::Npm {
-                name: dep_name,
-                version: dep_version,
-            },
-            fetcher,
-            cache,
-            stack,
-        )?;
+    if right_parts.next().is_some() {
+        Ordering::Less
+    } else {
+        Ordering::Equal
     }
-    install_package_dir(store, db, catalog, &staged.dir)?;
-    stack.remove(&(name, version));
-    Ok(())
 }
 
 struct Staged {
@@ -314,7 +661,10 @@ fn materialize(
 fn dependencies_of(path: &Path) -> Result<Vec<(String, String)>, FhirError> {
     let root = package_root(path)?;
     let manifest = read_manifest(&root)?;
-    let Some(deps) = manifest.get("dependencies").and_then(|value| value.as_object()) else {
+    let Some(deps) = manifest
+        .get("dependencies")
+        .and_then(|value| value.as_object())
+    else {
         return Ok(Vec::new());
     };
     let mut rows = Vec::new();
@@ -360,16 +710,17 @@ fn write_complete(dest: &Path, token: &str) -> Result<(), FhirError> {
         .map_err(|err| FhirError::Storage(format!("package cache marker: {err}")))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn read_tarball(path: &Path) -> Result<Vec<u8>, FhirError> {
-    let file = File::open(path)
-        .map_err(|err| FhirError::Invalid(format!("{}: {err}", path.display())))?;
+    let file =
+        File::open(path).map_err(|err| FhirError::Invalid(format!("{}: {err}", path.display())))?;
     let mut bytes = Vec::new();
     file.take(MAX_TARBALL + 1)
         .read_to_end(&mut bytes)
@@ -383,10 +734,21 @@ fn read_tarball(path: &Path) -> Result<Vec<u8>, FhirError> {
     Ok(bytes)
 }
 
-fn download_tarball(url: &str) -> Result<Vec<u8>, FhirError> {
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// `headers` is called for every attempt, so a signed request is never older than one try.
+fn download_tarball(
+    url: &str,
+    headers: &dyn Fn() -> Vec<(String, String)>,
+) -> Result<Vec<u8>, FhirError> {
     let mut last = FhirError::Storage(format!("download {url} failed"));
     for _ in 0..3 {
-        match download_once(url) {
+        match download_once(url, &headers()) {
             Ok(bytes) => return Ok(bytes),
             Err(err) if retries_download(&err) => last = err,
             Err(err) => return Err(err),
@@ -399,17 +761,24 @@ fn retries_download(err: &FhirError) -> bool {
     matches!(err, FhirError::Storage(_))
 }
 
-fn download_once(url: &str) -> Result<Vec<u8>, FhirError> {
-    let response = ureq::AgentBuilder::new()
+fn download_once(url: &str, headers: &[(String, String)]) -> Result<Vec<u8>, FhirError> {
+    let mut request = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(120))
         .build()
         .get(url)
-        .set("User-Agent", "refhir/0.1")
+        .set("User-Agent", "refhir/0.1");
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    let response = request
         .call()
         .map_err(|err| match err {
             ureq::Error::Status(404, _) => {
                 FhirError::NotFound(format!("package not found at {url}"))
             }
+            ureq::Error::Status(403, _) => FhirError::Invalid(format!(
+                "download {url}: HTTP 403 (access denied: check the registry credentials, and for S3 the bucket policy; a missing object also reads as 403 without list permission)"
+            )),
             ureq::Error::Status(code, _) if (400..500).contains(&code) => {
                 FhirError::Invalid(format!("download {url}: HTTP {code}"))
             }
@@ -450,7 +819,9 @@ impl<R: Read> Read for BoundedReader<R> {
                 Err(err) => Err(err),
             };
         }
-        let take = buf.len().min(self.remaining.min(usize::MAX as u64) as usize);
+        let take = buf
+            .len()
+            .min(self.remaining.min(usize::MAX as u64) as usize);
         let n = self.inner.read(&mut buf[..take])?;
         self.remaining -= n as u64;
         Ok(n)
@@ -479,8 +850,8 @@ fn extract_tarball_limited(
         .map_err(|err| FhirError::Invalid(format!("invalid package tarball: {err}")))?;
     let mut count = 0u64;
     for entry in entries {
-        let mut entry = entry
-            .map_err(|err| FhirError::Invalid(format!("invalid package tarball: {err}")))?;
+        let mut entry =
+            entry.map_err(|err| FhirError::Invalid(format!("invalid package tarball: {err}")))?;
         let kind = entry.header().entry_type();
         if kind.is_symlink()
             || kind.is_hard_link()
@@ -662,6 +1033,105 @@ mod tests {
     }
 
     #[test]
+    fn versions_order_like_semver() {
+        let less = |a: &str, b: &str| compare_versions(a, b) == Ordering::Less;
+        assert!(less("5.2.0", "5.3.0-ballot-tc1"));
+        assert!(less("5.3.0-ballot-tc1", "5.3.0"));
+        assert!(less("6.5.0", "7.1.0"));
+        assert!(less("1.0.0-rc.2", "1.0.0-rc.10"));
+        assert!(less("1.0.0-alpha", "1.0.0-alpha.1"));
+        assert_eq!(compare_versions("4.0.1", "4.0.1"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("current", "4.0.1"), Ordering::Greater);
+        assert_eq!(compare_versions("4.0.1", "dev"), Ordering::Less);
+    }
+
+    /// Serve one request with `body`; returns the base URL and the raw request it received.
+    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = io::Read::read(&mut stream, &mut chunk).unwrap();
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (base, handle)
+    }
+
+    fn package_tarball() -> Vec<u8> {
+        gzipped_tar(|builder| {
+            let data = br#"{"name":"example.pkg","version":"1.0.0"}"#;
+            let mut header = tar::Header::new_gnu();
+            header.set_path("package/package.json").unwrap();
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "package/package.json", data.as_slice())
+                .unwrap();
+        })
+    }
+
+    #[test]
+    fn a_static_mirror_serves_packages_in_the_registry_layout() {
+        let (base, request) = serve_once(package_tarball());
+        let dest = std::env::temp_dir().join(format!("refhir-mirror-{}", uuid::Uuid::new_v4()));
+        let registry = NpmRegistry::new(&format!("{base}/mirror/"), dest.clone()).unwrap();
+        registry.fetch("example.pkg", "1.0.0", &dest).unwrap();
+        assert!(dest.join("package/package.json").is_file());
+        assert!(dest.join(COMPLETE).is_file());
+        let request = request.join().unwrap().to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /mirror/example.pkg/1.0.0 "),
+            "{request}"
+        );
+        assert!(!request.contains("authorization:"), "{request}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn an_s3_source_signs_the_request() {
+        let (base, request) = serve_once(package_tarball());
+        let dest = std::env::temp_dir().join(format!("refhir-s3-{}", uuid::Uuid::new_v4()));
+        let registry = NpmRegistry {
+            base_url: "s3://packages/fhir".into(),
+            cache_dir: dest.clone(),
+            s3: Some(S3Source::for_test(&base)),
+        };
+        registry.fetch("example.pkg", "1.0.0", &dest).unwrap();
+        assert!(dest.join("package/package.json").is_file());
+        let request = request.join().unwrap().to_ascii_lowercase();
+        assert!(
+            request.starts_with("get /packages/fhir/example.pkg/1.0.0 "),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: aws4-hmac-sha256 credential=testkey/"),
+            "{request}"
+        );
+        assert!(request.contains("x-amz-date: "), "{request}");
+        assert!(request.contains("x-amz-content-sha256: "), "{request}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn a_registry_location_that_is_not_a_bucket_is_rejected() {
+        assert!(NpmRegistry::new("s3://", PathBuf::from("x")).is_err());
+        assert!(NpmRegistry::new("https://mirror.example.com", PathBuf::from("x")).is_ok());
+    }
+
+    #[test]
     fn extract_rejects_parent_paths_and_symlinks() {
         let dest = std::env::temp_dir().join(format!("refhir-tar-{}", uuid::Uuid::new_v4()));
         let parent = gzipped_tar(|builder| {
@@ -684,7 +1154,9 @@ mod tests {
             header.set_entry_type(tar::EntryType::Symlink);
             header.set_size(0);
             header.set_cksum();
-            builder.append_link(&mut header, "link", "/etc/passwd").unwrap();
+            builder
+                .append_link(&mut header, "link", "/etc/passwd")
+                .unwrap();
         });
         assert!(extract_tarball(&link, &dest).is_err());
         let _ = fs::remove_dir_all(&dest);
@@ -708,7 +1180,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dest);
     }
 
-    fn gzipped_tar(write: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>)) -> Vec<u8> {
+    fn gzipped_tar(
+        write: impl FnOnce(&mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>),
+    ) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         let mut builder = tar::Builder::new(encoder);
         write(&mut builder);

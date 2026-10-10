@@ -79,6 +79,8 @@ CREATE TABLE IF NOT EXISTS search_parameters (
     json TEXT NOT NULL,
     PRIMARY KEY (package_id, url, base)
 );
+-- Installing a parameter looks up the rows that share its base and code.
+CREATE INDEX IF NOT EXISTS search_parameters_by_base_code ON search_parameters (base, code);
 CREATE TABLE IF NOT EXISTS index_backfills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     package_id INTEGER NOT NULL,
@@ -147,6 +149,7 @@ impl SqlitePersistence {
             .and_then(|_| connection.execute_batch(INDEXES_INIT))
             .and_then(|_| connection.execute_batch(PERSISTENCE_GLOBALS_INIT))
             .and_then(|_| connection.execute_batch(CONFORMANCE_INIT))
+            .and_then(|_| connection.execute_batch(auth_store::AUTH_INIT))
             .map_err(definite)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner { connection })),
@@ -594,6 +597,7 @@ fn uncertain(err: impl ToString) -> PersistError {
     PersistError::Uncertain(err.to_string())
 }
 
+mod auth_store;
 mod conformance_store;
 
 #[cfg(test)]

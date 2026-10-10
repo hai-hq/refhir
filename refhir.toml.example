@@ -1,0 +1,59 @@
+# Copy to refhir.toml (or mount at /etc/refhir/refhir.toml).
+# CLI flags override these values. Production template: deploy/refhir.production.toml
+
+[fhir]
+# Release defaults installed at first startup (only r4 in this build). Pinned per database:
+# you cannot point an existing database at a different version (e.g. r4 → r5).
+version = "r4"
+
+[server]
+bind = "0.0.0.0:8080"
+# Required for SMART when bind is not loopback (production TLS URL).
+# public_url = "https://refhir.example.com/fhir"
+
+[database]
+kind = "sqlite" # sqlite | memory | postgres
+sqlite_path = "/data/refhir.sqlite"
+# postgres_url = "postgresql://refhir:refhir@postgres:5432/refhir"
+# Or set REFHIR_POSTGRES_URL instead of postgres_url.
+
+[conformance]
+reference_policy = "strict" # strict | fhir
+# Where packages are downloaded from: a registry or mirror URL, or s3://bucket/prefix
+# (AWS S3 or any S3-compatible store; keys in REFHIR_S3_ACCESS_KEY_ID / REFHIR_S3_SECRET_ACCESS_KEY,
+# endpoint in REFHIR_S3_ENDPOINT; see deploy/production.md).
+# Build your own bundle with scripts/package-bundle.py.
+# package_registry = "https://packages.fhir.org"
+# package_cache = "/data/package-cache"
+
+# [fhir].version installs that release's defaults (r4 today). Optional IGs:
+# packages = ["hl7.fhir.us.core@6.1.0", "/ig/my-implementation-guide.tgz"]
+
+[smart]
+enabled = false
+# patient = "example-patient"
+# encounter = "example-encounter"
+# fhir_user = "Practitioner/example"   # demo login only
+# REFHIR_SMART_DCR_TOKEN / REFHIR_SMART_CONFIDENTIAL_SECRET in production
+#
+# SMART needs a login. Use an OpenID Connect provider for real deployments:
+# [smart.oidc]
+# issuer = "https://idp.example.com/realms/clinic"
+# client_id = "refhir"
+# client_secret via REFHIR_OIDC_CLIENT_SECRET
+# scopes = ["openid", "profile"]
+# fhir_user_claim = "fhirUser"
+# Or, for testing only (accepts any username, verifies nothing):
+# demo_login = true
+
+[export]
+# Local NDJSON output for $export jobs (no S3 yet — see deploy/production.md).
+dir = "/data/export"
+
+[terminology]
+# Optional HTTP pull into the internal terminology index (not per-request TX).
+urls = []
+
+[features]
+trace_engine = false
+sdc_archiver = false

@@ -7,7 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
 use refhir_fhir::{
-    extra_dir, install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore, MAX_OCC_FAILURES,
+    extra_dir, install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore,
+    MAX_OCC_FAILURES,
 };
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
@@ -504,6 +505,7 @@ async fn implementation_guide_install_is_an_http_route() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             smart: Some(smart),
             ..Default::default()
         },
@@ -662,6 +664,7 @@ async fn smart_scopes_gate_http_and_sync() {
         store.clone(),
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
@@ -767,14 +770,26 @@ async fn smart_scopes_gate_http_and_sync() {
 #[tokio::test]
 async fn smart_app_launch_covers_discovery_pkce_oidc_and_backend() {
     let (db, catalog, store) = memory();
+    {
+        let cat = catalog.read().expect("catalog");
+        refhir_fhir::run(
+            &db,
+            &cat,
+            "Patient/create",
+            &json!({"resource": patient("p1")}),
+        )
+        .expect("seed patient");
+    }
     let app = crate::app_with(
         db,
         catalog,
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             public_url: Some("http://127.0.0.1".into()),
             smart_patient: Some("p1".into()),
+            smart_fhir_user: Some("Patient/smart".into()),
             smart_dcr_token: Some("dcr-test".into()),
             ..Default::default()
         },
@@ -1043,6 +1058,7 @@ async fn smart_rejects_open_redirects_system_scopes_and_bad_clients() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             public_url: Some("https://fhir.example.org".into()),
             smart_dcr_token: Some("dcr-test".into()),
             smart_confidential_secret: Some("secret".into()),
@@ -1272,7 +1288,7 @@ async fn smart_rejects_open_redirects_system_scopes_and_bad_clients() {
         None,
     )
     .await;
-    let code = query_value(redirected.location.as_deref().unwrap_or(""), "code").unwrap();
+    let code = authorize_code_from_redirect(&app, &redirected, "user/Patient.read").await;
     let bad_pkce = send_text(
         &app,
         "POST",
@@ -1357,6 +1373,7 @@ async fn smart_rejects_open_redirects_system_scopes_and_bad_clients() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             smart: Some(smart),
             ..Default::default()
         },
@@ -1375,12 +1392,23 @@ async fn smart_rejects_open_redirects_system_scopes_and_bad_clients() {
 #[tokio::test]
 async fn smart_dcr_launch_issuer_and_code_are_locked_down() {
     let (db, catalog, store) = memory();
+    {
+        let cat = catalog.read().expect("catalog");
+        refhir_fhir::run(
+            &db,
+            &cat,
+            "Patient/create",
+            &json!({"resource": patient("p1")}),
+        )
+        .expect("seed patient");
+    }
     let app = crate::app_with(
         db,
         catalog,
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             public_url: Some("http://127.0.0.1".into()),
             smart_patient: Some("p1".into()),
             smart_dcr_token: Some("dcr-test".into()),
@@ -1469,7 +1497,7 @@ async fn smart_dcr_launch_issuer_and_code_are_locked_down() {
     )
     .await;
     assert_eq!(redirected.status, StatusCode::FOUND, "{}", redirected.body);
-    let code = query_value(redirected.location.as_deref().unwrap_or(""), "code").unwrap();
+    let code = authorize_code_from_redirect(&app, &redirected, "launch patient/*.read").await;
     let issued = send_text(
         &app,
         "POST",
@@ -1504,6 +1532,7 @@ async fn smart_dcr_launch_issuer_and_code_are_locked_down() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             ..Default::default()
         },
     );
@@ -1537,7 +1566,7 @@ async fn smart_dcr_launch_issuer_and_code_are_locked_down() {
         None,
     )
     .await;
-    let stolen = query_value(authorize.location.as_deref().unwrap_or(""), "code").unwrap();
+    let stolen = authorize_code_from_redirect(&app, &authorize, "user/Patient.read").await;
     let wrong_client = send_text(
         &app,
         "POST",
@@ -1624,6 +1653,7 @@ async fn access_token_query_is_decoded_and_patient_compartment_holds() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
@@ -1775,6 +1805,7 @@ async fn patient_scope_cannot_leave_its_compartment() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
@@ -1987,7 +2018,8 @@ async fn send_text(
     let status = response.status();
     let location = response
         .headers()
-        .get("content-location")
+        .get("location")
+        .or_else(|| response.headers().get("content-location"))
         .and_then(|value| value.to_str().ok())
         .map(|value| value.to_string());
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
@@ -2414,6 +2446,7 @@ async fn populate_respects_observation_scopes() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
@@ -2543,6 +2576,7 @@ async fn bundle_and_graphql_keep_read_scopes() {
         store,
         crate::ServerConfig {
             auth: true,
+            smart_demo_login: true,
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
@@ -2695,6 +2729,40 @@ async fn smart_token(app: &axum::Router, scope: &str, redirect: &str) -> Value {
     smart_token_for(app, scope, redirect, "http://127.0.0.1").await
 }
 
+async fn authorize_code_from_redirect(
+    app: &axum::Router,
+    redirected: &Reply,
+    scope: &str,
+) -> String {
+    let location = redirected.location.as_deref().unwrap_or("");
+    if location.contains("/oauth/interact") {
+        let session = query_value(location, "session").expect("session");
+        let needs_patient = scope
+            .split_whitespace()
+            .any(|item| item == "launch/patient")
+            && !scope.split_whitespace().any(|item| item == "launch");
+        let mut body = format!(
+            "session={}&username=dev&action=approve",
+            encode_query(&session)
+        );
+        if needs_patient {
+            body.push_str("&patient_id=p1");
+        }
+        let approved = send_text(
+            app,
+            "POST",
+            "/oauth/interact",
+            &body,
+            &[("content-type", "application/x-www-form-urlencoded")],
+        )
+        .await;
+        assert_eq!(approved.0, StatusCode::FOUND, "{}", approved.1);
+        query_value(&approved.1, "code").expect("code")
+    } else {
+        query_value(location, "code").expect("code")
+    }
+}
+
 async fn smart_token_for(app: &axum::Router, scope: &str, redirect: &str, aud: &str) -> Value {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -2726,7 +2794,7 @@ async fn smart_token_for(app: &axum::Router, scope: &str, redirect: &str, aud: &
     }
     let redirected = send(app, "GET", &format!("/oauth/authorize?{query}"), None, None).await;
     assert_eq!(redirected.status, StatusCode::FOUND, "{}", redirected.body);
-    let code = query_value(redirected.location.as_deref().unwrap_or(""), "code").expect("code");
+    let code = authorize_code_from_redirect(app, &redirected, scope).await;
     let issued = send_text(
         app,
         "POST",
@@ -2771,4 +2839,423 @@ fn query_value(url: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+mod oidc {
+    use super::*;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+    use rsa::traits::PublicKeyParts;
+    use sha2::{Digest, Sha256};
+    use std::sync::Mutex;
+
+    const CLIENT: &str = "refhir-client";
+
+    #[derive(Default)]
+    struct Mock {
+        base: String,
+        /// (nonce, code_challenge) recorded from the authorize redirect.
+        flow: Option<(String, String)>,
+        wrong_nonce: bool,
+        used_basic_auth: bool,
+    }
+
+    struct Idp {
+        base: String,
+        mock: Arc<Mutex<Mock>>,
+    }
+
+    async fn start_idp() -> Idp {
+        let rsa = rsa::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).unwrap();
+        let pem = rsa.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let encoding = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        let public = rsa::RsaPublicKey::from(&rsa);
+        let jwks = json!({"keys": [{
+            "kty": "RSA", "kid": "k1", "alg": "RS256", "use": "sig",
+            "n": URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+        }]});
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mock = Arc::new(Mutex::new(Mock {
+            base: base.clone(),
+            ..Default::default()
+        }));
+        let router = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get(|State(m): State<Arc<Mutex<Mock>>>| async move {
+                    let base = m.lock().unwrap().base.clone();
+                    axum::Json(json!({
+                        "issuer": base,
+                        "authorization_endpoint": format!("{base}/authorize"),
+                        "token_endpoint": format!("{base}/token"),
+                        "jwks_uri": format!("{base}/jwks"),
+                    }))
+                }),
+            )
+            .route(
+                "/jwks",
+                get(move || {
+                    let jwks = jwks.clone();
+                    async move { axum::Json(jwks) }
+                }),
+            )
+            .route(
+                "/token",
+                post(
+                    move |State(m): State<Arc<Mutex<Mock>>>,
+                          headers: HeaderMap,
+                          body: axum::body::Bytes| {
+                        let encoding = encoding.clone();
+                        async move {
+                            let form = crate::auth::parse_authorize_form(&body);
+                            let mut mock = m.lock().unwrap();
+                            mock.used_basic_auth = headers
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.starts_with("Basic "));
+                            let (nonce, challenge) = mock.flow.clone().unwrap();
+                            let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+                            let proven = URL_SAFE_NO_PAD
+                                .encode(Sha256::digest(verifier.as_bytes()))
+                                == challenge;
+                            if form.get("code").map(String::as_str) != Some("good-code") || !proven
+                            {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    axum::Json(json!({"error": "invalid_grant"})),
+                                );
+                            }
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let claims = json!({
+                                "iss": mock.base, "aud": CLIENT, "sub": "idp-user-1",
+                                "exp": now + 300, "iat": now,
+                                "nonce": if mock.wrong_nonce { "other".to_string() } else { nonce },
+                                "preferred_username": "Dr One",
+                                "fhirUser": "Practitioner/dr-1",
+                            });
+                            let mut header =
+                                jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+                            header.kid = Some("k1".into());
+                            let id_token =
+                                jsonwebtoken::encode(&header, &claims, &encoding).unwrap();
+                            (
+                                StatusCode::OK,
+                                axum::Json(json!({"id_token": id_token, "access_token": "unused"})),
+                            )
+                        }
+                    },
+                ),
+            )
+            .with_state(mock.clone());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        Idp { base, mock }
+    }
+
+    fn smart_app(oidc: Option<&Idp>, demo: bool) -> axum::Router {
+        let (db, catalog, store) = memory();
+        crate::app_with(
+            db,
+            catalog,
+            store,
+            crate::ServerConfig {
+                auth: true,
+                smart_demo_login: demo,
+                public_url: Some("http://127.0.0.1".into()),
+                oidc: oidc.map(|idp| {
+                    let mut cfg = crate::OidcConfig::new(idp.base.clone(), CLIENT);
+                    cfg.client_secret = Some("idp-secret".into());
+                    cfg
+                }),
+                ..Default::default()
+            },
+        )
+    }
+
+    async fn raw(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    fn location(headers: &HeaderMap) -> String {
+        headers["location"].to_str().unwrap().to_string()
+    }
+
+    const VERIFIER: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    /// Authorize, then follow `/oauth/interact` to the provider. Returns the client session id,
+    /// the provider `state` and the browser cookie.
+    async fn start_login(app: &axum::Router, idp: &Idp) -> (String, String, String) {
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let query = format!(
+            "response_type=code&client_id=public&redirect_uri={}&scope={}&aud=http%3A%2F%2F127.0.0.1&code_challenge={challenge}&code_challenge_method=S256&state=s1",
+            encode_query("http://127.0.0.1/cb"),
+            encode_query("openid fhirUser user/Patient.read"),
+        );
+        let (status, headers, body) =
+            raw(app, "GET", &format!("/oauth/authorize?{query}"), &[], "").await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        let interact = location(&headers);
+        assert!(interact.starts_with("/oauth/interact"), "{interact}");
+        let session = query_value(&interact, "session").unwrap();
+
+        let (status, headers, body) = raw(app, "GET", &interact, &[], "").await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        let to_idp = location(&headers);
+        assert!(
+            to_idp.starts_with(&format!("{}/authorize?", idp.base)),
+            "{to_idp}"
+        );
+        assert_eq!(
+            query_value(&to_idp, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+        assert_eq!(query_value(&to_idp, "client_id").as_deref(), Some(CLIENT));
+        let cookie = headers["set-cookie"].to_str().unwrap();
+        assert!(
+            cookie.contains("HttpOnly") && cookie.contains("SameSite=Lax"),
+            "{cookie}"
+        );
+        let cookie = cookie.split(';').next().unwrap().to_string();
+        let state = query_value(&to_idp, "state").unwrap();
+        idp.mock.lock().unwrap().flow = Some((
+            query_value(&to_idp, "nonce").unwrap(),
+            query_value(&to_idp, "code_challenge").unwrap(),
+        ));
+        (session, state, cookie)
+    }
+
+    fn callback(state: &str) -> String {
+        format!(
+            "/oauth/oidc/callback?code=good-code&state={}",
+            encode_query(state)
+        )
+    }
+
+    #[tokio::test]
+    async fn signs_in_through_the_provider() {
+        let idp = start_idp().await;
+        let app = smart_app(Some(&idp), false);
+        let (session, state, cookie) = start_login(&app, &idp).await;
+
+        // Approving before the provider has authenticated anyone issues no code.
+        let (status, headers, _) = raw(
+            &app,
+            "POST",
+            "/oauth/interact",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            &format!(
+                "session={}&username=attacker&action=approve",
+                encode_query(&session)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FOUND);
+        assert!(
+            location(&headers).starts_with("/oauth/interact"),
+            "{:?}",
+            headers
+        );
+        assert!(!location(&headers).contains("code="));
+
+        let (status, headers, body) =
+            raw(&app, "GET", &callback(&state), &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        assert!(location(&headers).starts_with("/oauth/interact"));
+        assert!(idp.mock.lock().unwrap().used_basic_auth);
+
+        let page = raw(&app, "GET", &location(&headers), &[], "").await;
+        assert_eq!(page.0, StatusCode::OK);
+        assert!(
+            page.2.contains("Signed in as <strong>Dr One</strong>"),
+            "{}",
+            page.2
+        );
+        assert!(!page.2.contains("name=\"username\""));
+
+        // Another browser holding only the session id cannot approve for the signed-in user.
+        let (status, headers, _) = raw(
+            &app,
+            "POST",
+            "/oauth/interact",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            &format!("session={}&action=approve", encode_query(&session)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(headers.get("location").is_none());
+
+        // The typed username is ignored: the provider's subject is what the token carries.
+        let (status, headers, body) = raw(
+            &app,
+            "POST",
+            "/oauth/interact",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", &cookie),
+            ],
+            &format!(
+                "session={}&username=attacker&action=approve",
+                encode_query(&session)
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        let code = query_value(&location(&headers), "code").expect("code");
+        let (status, _, body) = raw(
+            &app,
+            "POST",
+            "/oauth/token",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            &format!(
+                "grant_type=authorization_code&code={code}&redirect_uri={}&client_id=public&code_verifier={VERIFIER}",
+                encode_query("http://127.0.0.1/cb")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tokens: Value = serde_json::from_str(&body).unwrap();
+        let payload = tokens["id_token"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert_eq!(claims["sub"], "idp-user-1");
+        assert_eq!(claims["fhirUser"], "http://127.0.0.1/Practitioner/dr-1");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_callback_from_another_browser() {
+        let idp = start_idp().await;
+        let app = smart_app(Some(&idp), false);
+        let (_, state, _) = start_login(&app, &idp).await;
+        let (status, _, _) = raw(&app, "GET", &callback(&state), &[], "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (session, state, _) = start_login(&app, &idp).await;
+        let forged = format!("refhir_oidc_{session}=forged");
+        let (status, _, _) = raw(&app, "GET", &callback(&state), &[("cookie", &forged)], "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn two_logins_in_one_browser_both_complete() {
+        let idp = start_idp().await;
+        let app = smart_app(Some(&idp), false);
+        let (_, first_state, first_cookie) = start_login(&app, &idp).await;
+        let first_flow = idp.mock.lock().unwrap().flow.clone();
+        let (_, _, second_cookie) = start_login(&app, &idp).await;
+        idp.mock.lock().unwrap().flow = first_flow;
+        let cookies = format!("{first_cookie}; {second_cookie}");
+        let (status, headers, body) = raw(
+            &app,
+            "GET",
+            &callback(&first_state),
+            &[("cookie", &cookies)],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        assert!(location(&headers).starts_with("/oauth/interact"));
+    }
+
+    #[tokio::test]
+    async fn state_is_single_use_and_must_match() {
+        let idp = start_idp().await;
+        let app = smart_app(Some(&idp), false);
+        let (session, state, cookie) = start_login(&app, &idp).await;
+        let forged = format!("{session}.0000");
+        let (status, _, _) = raw(&app, "GET", &callback(&forged), &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A forged state does not end the real login.
+        let (status, _, _) = raw(&app, "GET", &callback(&state), &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::FOUND);
+        // The real state cannot be replayed.
+        let (status, _, _) = raw(&app, "GET", &callback(&state), &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_id_token_with_the_wrong_nonce_is_refused() {
+        let idp = start_idp().await;
+        let app = smart_app(Some(&idp), false);
+        let (_, state, cookie) = start_login(&app, &idp).await;
+        idp.mock.lock().unwrap().wrong_nonce = true;
+        let (status, headers, _) =
+            raw(&app, "GET", &callback(&state), &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::FOUND);
+        let back = location(&headers);
+        assert!(back.starts_with("http://127.0.0.1/cb"), "{back}");
+        assert_eq!(
+            query_value(&back, "error").as_deref(),
+            Some("access_denied")
+        );
+        assert!(query_value(&back, "code").is_none());
+    }
+
+    #[tokio::test]
+    async fn the_provider_refusing_sends_access_denied_to_the_client() {
+        let idp = start_idp().await;
+        let app = smart_app(Some(&idp), false);
+        let (_, state, cookie) = start_login(&app, &idp).await;
+        let uri = format!(
+            "/oauth/oidc/callback?error=access_denied&state={}",
+            encode_query(&state)
+        );
+        let (status, headers, _) = raw(&app, "GET", &uri, &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::FOUND);
+        assert_eq!(
+            query_value(&location(&headers), "error").as_deref(),
+            Some("access_denied")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_oidc_or_demo_login_nobody_can_sign_in() {
+        let app = smart_app(None, false);
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
+        let query = format!(
+            "response_type=code&client_id=public&redirect_uri={}&scope=openid&aud=http%3A%2F%2F127.0.0.1&code_challenge={challenge}&code_challenge_method=S256&state=s1",
+            encode_query("http://127.0.0.1/cb"),
+        );
+        let (_, headers, _) = raw(&app, "GET", &format!("/oauth/authorize?{query}"), &[], "").await;
+        let (status, _, _) = raw(&app, "GET", &location(&headers), &[], "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let (status, _, _) = raw(
+            &app,
+            "POST",
+            "/oauth/interact",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            "session=x&username=dev&action=approve",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
 }

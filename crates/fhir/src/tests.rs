@@ -15,8 +15,8 @@ use crate::conform::{commit_operation, repair_conformance};
 use crate::error::FhirError;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
-    expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
-    sdc_dir, stage_package_dir, version_clash_dir,
+    expression_clash_dir, extra_dir, install_package_dir, minir4_dir, publish, r4_dir,
+    run_backfills, sdc_dir, stage_package_deferred, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
 
@@ -483,9 +483,12 @@ struct MapFetcher {
 
 impl PackageFetcher for MapFetcher {
     fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError> {
-        let src = self.packages.get(&(name.to_string(), version.to_string())).ok_or_else(|| {
-            FhirError::NotFound(format!("{name}@{version} is not in the test registry"))
-        })?;
+        let src = self
+            .packages
+            .get(&(name.to_string(), version.to_string()))
+            .ok_or_else(|| {
+                FhirError::NotFound(format!("{name}@{version} is not in the test registry"))
+            })?;
         copy_tree(src, dest)
     }
 }
@@ -629,14 +632,8 @@ fn npm_install_rejects_dependency_cycles_and_version_ranges() {
     let cache = temp_dir("cycle-cache");
     let fetcher = MapFetcher {
         packages: BTreeMap::from([
-            (
-                ("example.cycle.a".into(), "1.0.0".into()),
-                cycle_a.clone(),
-            ),
-            (
-                ("example.cycle.b".into(), "1.0.0".into()),
-                cycle_b.clone(),
-            ),
+            (("example.cycle.a".into(), "1.0.0".into()), cycle_a.clone()),
+            (("example.cycle.b".into(), "1.0.0".into()), cycle_b.clone()),
         ]),
     };
     let err = install_with(
@@ -670,6 +667,494 @@ fn npm_install_rejects_dependency_cycles_and_version_ranges() {
     let _ = std::fs::remove_dir_all(&cycle_b);
     let _ = std::fs::remove_dir_all(&cache);
     let _ = std::fs::remove_dir_all(&ranged);
+}
+
+fn dep_package(name: &str, version: &str, deps: &[(&str, &str)]) -> PathBuf {
+    let dir = temp_dir(&format!("dep-{name}-{version}"));
+    let deps: Vec<String> = deps
+        .iter()
+        .map(|(n, v)| format!(r#""{n}":"{v}""#))
+        .collect();
+    std::fs::write(
+        dir.join("package.json"),
+        format!(
+            r#"{{"name":"{name}","version":"{version}","fhirVersion":"4.0.1","dependencies":{{{}}}}}"#,
+            deps.join(",")
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+fn installed_packages(db: &Harness) -> Vec<String> {
+    let mut rows: Vec<String> = db
+        .store
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .map(|package| format!("{}@{}", package.name, package.version))
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn registry(packages: &[(&str, &str, &PathBuf)]) -> MapFetcher {
+    MapFetcher {
+        packages: packages
+            .iter()
+            .map(|(name, version, dir)| ((name.to_string(), version.to_string()), (*dir).clone()))
+            .collect(),
+    }
+}
+
+#[test]
+fn dependency_versions_resolve_to_the_highest_one_installed_once() {
+    // app needs lib 1.0.0 and mid; mid needs lib 2.0.0 (like sdc, tools and extensions).
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.lib", "1.0.0"), ("example.mid", "1.0.0")],
+    );
+    let mid = dep_package("example.mid", "1.0.0", &[("example.lib", "2.0.0")]);
+    let lib1 = dep_package("example.lib", "1.0.0", &[]);
+    let lib2 = dep_package("example.lib", "2.0.0", &[]);
+    let fetcher = registry(&[
+        ("example.mid", "1.0.0", &mid),
+        ("example.lib", "1.0.0", &lib1),
+        ("example.lib", "2.0.0", &lib2),
+    ]);
+    let db = empty();
+    let cache = temp_dir("resolve-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.app@1.0.0",
+            "example.lib@2.0.0",
+            "example.mid@1.0.0"
+        ]
+    );
+    for dir in [app, mid, lib1, lib2, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_cycle_created_only_by_version_substitution_is_allowed() {
+    // Mirrors hl7.fhir.uv.extensions.r4 5.3.0-ballot <-> hl7.terminology.r4 6.5.0/7.1.0.
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.ext", "2.0.0"), ("example.term", "2.0.0")],
+    );
+    let ext1 = dep_package("example.ext", "1.0.0", &[]);
+    let ext2 = dep_package("example.ext", "2.0.0", &[("example.term", "1.0.0")]);
+    let term1 = dep_package("example.term", "1.0.0", &[("example.ext", "1.0.0")]);
+    let term2 = dep_package("example.term", "2.0.0", &[("example.ext", "1.0.0")]);
+    let fetcher = registry(&[
+        ("example.ext", "1.0.0", &ext1),
+        ("example.ext", "2.0.0", &ext2),
+        ("example.term", "1.0.0", &term1),
+        ("example.term", "2.0.0", &term2),
+    ]);
+    let db = empty();
+    let cache = temp_dir("subst-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.app@1.0.0",
+            "example.ext@2.0.0",
+            "example.term@2.0.0"
+        ]
+    );
+    for dir in [app, ext1, ext2, term1, term2, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+struct NoNetwork;
+
+impl PackageFetcher for NoNetwork {
+    fn fetch(&self, name: &str, version: &str, _dest: &Path) -> Result<(), FhirError> {
+        panic!("{name}@{version} was fetched although it is installed");
+    }
+}
+
+#[test]
+fn an_installed_package_is_never_fetched_again() {
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let db = empty();
+    let cache = temp_dir("no-fetch-cache");
+    install_package_dir(&db.store, &db.db, &db.catalog, &lib).unwrap();
+    assert!(crate::packages_installed(&db.store, &["example.lib@1.0.0"]).unwrap());
+    assert!(
+        !crate::packages_installed(&db.store, &["example.lib@1.0.0", "example.other@1.0.0"])
+            .unwrap()
+    );
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "example.lib@1.0.0",
+        &NoNetwork,
+        &cache,
+    )
+    .unwrap();
+    assert!(
+        !cache.join("example.lib").exists(),
+        "the cache was not touched either"
+    );
+    for dir in [lib, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_failed_install_still_backfills_the_packages_already_stored() {
+    let db = ready();
+    let mut body = patient("p1", true, "Ann");
+    body["birthDate"] = json!("1990-01-01");
+    apply(&db, "Patient/create", json!({"resource": body}));
+    // example.extra stores fine; example.invalid, installed after it, does not.
+    let invalid = dep_package("example.invalid", "1.0.0", &[]);
+    for (file, expression) in [
+        ("a", "Patient.extension('a')"),
+        ("b", "Patient.extension('b')"),
+    ] {
+        std::fs::write(
+            invalid.join(format!("SearchParameter-{file}.json")),
+            format!(
+                r#"{{"resourceType":"SearchParameter","url":"http://example.org/sp/{file}",
+                    "status":"draft","experimental":true,"code":"nickname","base":["Patient"],
+                    "type":"string","expression":"{expression}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.extra", "1.0.0"), ("example.invalid", "1.0.0")],
+    );
+    let extra = extra_dir().to_path_buf();
+    let fetcher = registry(&[
+        ("example.extra", "1.0.0", &extra),
+        ("example.invalid", "1.0.0", &invalid),
+    ]);
+    let cache = temp_dir("partial-cache");
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("defined twice"), "{err}");
+    let installed = installed_packages(&db);
+    assert!(
+        installed.contains(&"example.extra@1.0.0".to_string()),
+        "{installed:?}"
+    );
+    assert!(!installed
+        .iter()
+        .any(|name| name.starts_with("example.invalid") || name.starts_with("example.app")));
+    // The stored package reached the catalog and its backfill ran, so its parameter works.
+    let found = apply(&db, "Patient/search", json!({"birthdate": "1990-01-01"}));
+    assert_eq!(found["total"], 1);
+    for dir in [invalid, app, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn backfills_are_queued_after_the_catalog_is_published() {
+    let db = ready();
+    let mut body = patient("p1", true, "Ann");
+    body["birthDate"] = json!("1990-01-01");
+    apply(&db, "Patient/create", json!({"resource": body}));
+
+    let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
+        .unwrap()
+        .expect("the package has pending search parameters");
+    // Jobs from the fixture install are finished; only unfinished ones matter here.
+    let unfinished = || -> Vec<_> {
+        db.store
+            .load_backfills()
+            .unwrap()
+            .into_iter()
+            .filter(|job| !job.done)
+            .collect()
+    };
+    assert!(unfinished().is_empty(), "nothing is queued while staging");
+
+    // A writer that still runs on the old catalog: it indexes nothing for the new parameter.
+    let mut late = patient("p2", true, "Bea");
+    late["birthDate"] = json!("1990-01-01");
+    apply(&db, "Patient/create", json!({"resource": late}));
+
+    publish(&db.store, &db.catalog).unwrap();
+    pending.create(&db.store, &db.db).unwrap();
+    // The watermark is not older than that write, so backfill covers it.
+    let latest = db.db.latest_ts().to_i64().unwrap();
+    let jobs = unfinished();
+    assert!(!jobs.is_empty());
+    assert!(
+        jobs.iter().all(|job| job.watermark_ts == latest),
+        "{jobs:?}"
+    );
+
+    run_backfills(&db.store, &db.db, &db.catalog).unwrap();
+    let found = apply(&db, "Patient/search", json!({"birthdate": "1990-01-01"}));
+    assert_eq!(found["total"], 2);
+}
+
+#[test]
+fn json_files_that_are_not_objects_do_not_stop_an_install() {
+    let dir = temp_dir("not-objects");
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.lists","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    for (file, text) in [
+        ("list.json", "[1, 2]"),
+        ("empty.json", "[]"),
+        ("nothing.json", "null"),
+        ("number.json", "42"),
+        ("text.json", "\"text\""),
+        (
+            "Patient-example.json",
+            r#"{"resourceType":"Patient","id":"x"}"#,
+        ),
+    ] {
+        std::fs::write(dir.join(file), text).unwrap();
+    }
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+    assert!(installed_packages(&harness).contains(&"example.lists@1.0.0".to_string()));
+
+    // Invalid JSON is still an error, and names the file.
+    let other = dep_package("example.broken", "1.0.0", &[]);
+    std::fs::write(other.join("broken.json"), "{not json").unwrap();
+    let err = install_package_dir(&harness.store, &harness.db, &harness.catalog, &other)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("broken.json"), "{err}");
+    for path in [dir, other] {
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
+#[test]
+fn a_dependency_newer_than_the_installed_version_installs_next_to_it() {
+    let lib1 = dep_package("example.lib", "1.0.0", &[]);
+    let lib2 = dep_package("example.lib", "2.0.0", &[]);
+    let app = dep_package("example.app", "1.0.0", &[("example.lib", "2.0.0")]);
+    let fetcher = registry(&[("example.lib", "2.0.0", &lib2)]);
+    let db = empty();
+    let cache = temp_dir("newer-cache");
+    install_package_dir(&db.store, &db.db, &db.catalog, &lib1).unwrap();
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.app@1.0.0",
+            "example.lib@1.0.0",
+            "example.lib@2.0.0"
+        ]
+    );
+    for dir in [lib1, lib2, app, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn another_version_of_an_installed_root_package_installs_next_to_it() {
+    let v1 = dep_package("example.ig", "1.0.0", &[]);
+    let v2 = dep_package("example.ig", "2.0.0", &[]);
+    let db = empty();
+    let cache = temp_dir("root-cache");
+    install_package_dir(&db.store, &db.db, &db.catalog, &v1).unwrap();
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        v2.to_str().unwrap(),
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.ig@1.0.0", "example.ig@2.0.0"]
+    );
+    for dir in [v1, v2, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_replaced_version_does_not_pull_in_its_own_dependencies() {
+    // a needs x 1.0.0, b needs x 2.0.0. x 1.0.0 would need y, which the registry lacks,
+    // but x 1.0.0 is replaced by 2.0.0 and must not be expanded.
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.a", "1.0.0"), ("example.b", "1.0.0")],
+    );
+    let a = dep_package("example.a", "1.0.0", &[("example.x", "1.0.0")]);
+    let b = dep_package("example.b", "1.0.0", &[("example.x", "2.0.0")]);
+    let x1 = dep_package("example.x", "1.0.0", &[("example.y", "1.0.0")]);
+    let x2 = dep_package("example.x", "2.0.0", &[]);
+    let fetcher = registry(&[
+        ("example.a", "1.0.0", &a),
+        ("example.b", "1.0.0", &b),
+        ("example.x", "1.0.0", &x1),
+        ("example.x", "2.0.0", &x2),
+    ]);
+    let db = empty();
+    let cache = temp_dir("replaced-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.a@1.0.0",
+            "example.app@1.0.0",
+            "example.b@1.0.0",
+            "example.x@2.0.0"
+        ]
+    );
+    for dir in [app, a, b, x1, x2, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn non_numeric_dependency_versions_still_install() {
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.lib", "1.0"), ("example.mid", "1.0.0")],
+    );
+    let mid = dep_package("example.mid", "1.0.0", &[("example.lib", "current")]);
+    let lib1 = dep_package("example.lib", "1.0", &[]);
+    let current = dep_package("example.lib", "current", &[]);
+    let fetcher = registry(&[
+        ("example.mid", "1.0.0", &mid),
+        ("example.lib", "1.0", &lib1),
+        ("example.lib", "current", &current),
+    ]);
+    let db = empty();
+    let cache = temp_dir("current-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.app@1.0.0",
+            "example.lib@current",
+            "example.mid@1.0.0"
+        ]
+    );
+    for dir in [app, mid, lib1, current, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_requested_version_is_not_overridden_by_a_dependency() {
+    let root = dep_package("example.lib", "1.0.0", &[("example.mid", "1.0.0")]);
+    let mid = dep_package("example.mid", "1.0.0", &[("example.lib", "2.0.0")]);
+    let fetcher = registry(&[("example.mid", "1.0.0", &mid)]);
+    let db = empty();
+    let cache = temp_dir("requested-cache");
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        root.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("version conflict") && err.contains("was requested"),
+        "{err}"
+    );
+    assert!(installed_packages(&db).is_empty());
+    for dir in [root, mid, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn an_older_dependency_request_uses_the_installed_newer_version() {
+    let lib2 = dep_package("example.lib", "2.0.0", &[]);
+    let app = dep_package("example.app", "1.0.0", &[("example.lib", "1.0.0")]);
+    let db = empty();
+    let cache = temp_dir("older-cache");
+    install_package_dir(&db.store, &db.db, &db.catalog, &lib2).unwrap();
+    // lib 1.0.0 is not in the registry: it must not be fetched at all.
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.app@1.0.0", "example.lib@2.0.0"]
+    );
+    for dir in [lib2, app, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
@@ -814,6 +1299,163 @@ fn invalid_patient_is_rejected_and_validate_reports_issues() {
         .unwrap()
         .iter()
         .any(|issue| issue["severity"] == "error"));
+}
+
+#[test]
+fn a_package_search_parameter_without_a_base_is_skipped() {
+    let dir = std::env::temp_dir().join(format!("refhir-no-base-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.nobase","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    // Shaped like the draft `*-extensions-*` parameters in hl7.fhir.r4.core.
+    std::fs::write(
+        dir.join("SearchParameter-valueset-extensions-ValueSet-effective.json"),
+        r#"{
+            "resourceType": "SearchParameter",
+            "url": "http://hl7.org/fhir/SearchParameter/valueset-extensions-ValueSet-effective",
+            "name": "effective",
+            "status": "draft",
+            "code": "effective",
+            "type": "date"
+        }"#,
+    )
+    .unwrap();
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(harness
+        .store
+        .load_search_parameters()
+        .unwrap()
+        .iter()
+        .all(|param| param.code != "effective"));
+}
+
+#[test]
+fn an_experimental_parameter_yields_to_the_real_one_in_the_same_package() {
+    let dir = std::env::temp_dir().join(format!("refhir-sample-param-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.sample","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    // The sample sorts before the real parameter by file name, as in hl7.fhir.r4.core.
+    std::fs::write(
+        dir.join("SearchParameter-example.json"),
+        r#"{"resourceType":"SearchParameter","url":"http://hl7.org/fhir/SearchParameter/example",
+            "status":"draft","experimental":true,"code":"_id","base":["Resource"],
+            "type":"token","expression":"meta.id"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("SearchParameter-Resource-id.json"),
+        r#"{"resourceType":"SearchParameter","url":"http://hl7.org/fhir/SearchParameter/Resource-id",
+            "status":"active","code":"_id","base":["Resource"],
+            "type":"token","expression":"Resource.id"}"#,
+    )
+    .unwrap();
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let rows: Vec<_> = harness
+        .store
+        .load_search_parameters()
+        .unwrap()
+        .into_iter()
+        .filter(|param| param.code == "_id")
+        .collect();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].expression.as_deref(), Some("Resource.id"));
+}
+
+#[test]
+fn two_experimental_parameters_that_disagree_in_one_package_are_an_error() {
+    let dir = std::env::temp_dir().join(format!("refhir-two-draft-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.drafts","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    for (file, expression) in [
+        ("a", "Patient.extension('a')"),
+        ("b", "Patient.extension('b')"),
+    ] {
+        std::fs::write(
+            dir.join(format!("SearchParameter-{file}.json")),
+            format!(
+                r#"{{"resourceType":"SearchParameter","url":"http://example.org/sp/{file}",
+                    "status":"draft","experimental":true,"code":"nickname","base":["Patient"],
+                    "type":"string","expression":"{expression}"}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let harness = empty();
+    let err = install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir)
+        .unwrap_err()
+        .to_string();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        err.contains("Patient.nickname") && err.contains("different expressions"),
+        "{err}"
+    );
+}
+
+fn write_param_package(name: &str, experimental: bool, expression: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("refhir-{name}-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        format!(r#"{{"name":"{name}","version":"1.0.0","fhirVersion":"4.0.1"}}"#),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("SearchParameter-maiden.json"),
+        format!(
+            r#"{{"resourceType":"SearchParameter","url":"http://example.org/sp/{name}",
+                "status":"{}","experimental":{experimental},"code":"maiden","base":["Patient"],
+                "type":"string","expression":"{expression}"}}"#,
+            if experimental { "draft" } else { "active" }
+        ),
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn an_experimental_parameter_yields_to_a_real_one_from_another_package() {
+    for sample_first in [true, false] {
+        let sample = write_param_package("sample", true, "Patient.extension('draft')");
+        let real = write_param_package("real", false, "Patient.extension('real').value");
+        let harness = empty();
+        let order = if sample_first {
+            [&sample, &real]
+        } else {
+            [&real, &sample]
+        };
+        for dir in order {
+            install_package_dir(&harness.store, &harness.db, &harness.catalog, dir).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&sample);
+        let _ = std::fs::remove_dir_all(&real);
+        let rows: Vec<_> = harness
+            .store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(|param| param.code == "maiden")
+            .collect();
+        assert_eq!(rows.len(), 1, "sample_first={sample_first}: {rows:?}");
+        assert_eq!(
+            rows[0].expression.as_deref(),
+            Some("Patient.extension('real').value")
+        );
+    }
 }
 
 fn write_terms_package(dir: &std::path::Path) {

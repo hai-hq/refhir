@@ -71,9 +71,7 @@ pub fn system_history(
     for model in catalog.resource_models() {
         tx.record_span(model.by_id(), Interval::all());
     }
-    let hide = catalog
-        .sdc_archiver()
-        .then_some("QuestionnaireResponse");
+    let hide = catalog.sdc_archiver().then_some("QuestionnaireResponse");
     log_bundle(tx, None, since, count, offset, hide)
 }
 

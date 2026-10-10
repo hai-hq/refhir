@@ -18,7 +18,12 @@ impl Host for SuiteHost {
         self.strict
     }
 
-    fn member_of(&self, _system: Option<&str>, _code: &str, _value_set: &str) -> Result<Option<bool>, Error> {
+    fn member_of(
+        &self,
+        _system: Option<&str>,
+        _code: &str,
+        _value_set: &str,
+    ) -> Result<Option<bool>, Error> {
         Ok(None)
     }
 }
@@ -49,7 +54,10 @@ fn hl7_r4_fhirpath_suite() {
     let document = roxmltree::Document::parse(&suite).unwrap();
     let mut failures = Vec::new();
     let mut ran = 0;
-    for test in document.descendants().filter(|node| node.has_tag_name("test")) {
+    for test in document
+        .descendants()
+        .filter(|node| node.has_tag_name("test"))
+    {
         if test.attribute("version") == Some("2.1.0") {
             continue;
         }
@@ -62,7 +70,10 @@ fn hl7_r4_fhirpath_suite() {
             .unwrap_or("")
             .trim();
         let input_name = test.attribute("inputfile").unwrap_or("");
-        let resource = inputs.get(input_name).cloned().unwrap_or_else(|| Json::Object(Map::new()));
+        let resource = inputs
+            .get(input_name)
+            .cloned()
+            .unwrap_or_else(|| Json::Object(Map::new()));
         let host = SuiteHost {
             strict: test.attribute("mode") == Some("strict"),
         };
@@ -71,24 +82,29 @@ fn hl7_r4_fhirpath_suite() {
             .filter(|node| node.has_tag_name("output"))
             .map(|node| node.text().unwrap_or("").trim().to_string())
             .collect();
-        let actual = match parse(expression).and_then(|expr| evaluate(&expr, &resource, &model, &host)) {
-            Ok(values) => values.iter().map(Value::render).collect::<Vec<_>>(),
-            Err(_) if expected.is_empty() => continue,
-            Err(err) => {
-                failures.push(format!("{name}: {expression} -> error {err}"));
-                continue;
-            }
-        };
+        let actual =
+            match parse(expression).and_then(|expr| evaluate(&expr, &resource, &model, &host)) {
+                Ok(values) => values.iter().map(Value::render).collect::<Vec<_>>(),
+                Err(_) if expected.is_empty() => continue,
+                Err(err) => {
+                    failures.push(format!("{name}: {expression} -> error {err}"));
+                    continue;
+                }
+            };
         if test.attribute("predicate") == Some("true") {
             let holds = actual.iter().any(|value| value == "true") || !actual.is_empty();
             if expected == ["true"] && !holds {
-                failures.push(format!("{name}: {expression} -> {actual:?}, expected predicate true"));
+                failures.push(format!(
+                    "{name}: {expression} -> {actual:?}, expected predicate true"
+                ));
             }
             continue;
         }
         if expected.is_empty() {
             if !actual.is_empty() {
-                failures.push(format!("{name}: {expression} -> {actual:?}, expected empty"));
+                failures.push(format!(
+                    "{name}: {expression} -> {actual:?}, expected empty"
+                ));
             }
             continue;
         }
@@ -102,12 +118,19 @@ fn hl7_r4_fhirpath_suite() {
             actual == expected
         };
         if !same {
-            failures.push(format!("{name}: {expression} -> {actual:?}, expected {expected:?}"));
+            failures.push(format!(
+                "{name}: {expression} -> {actual:?}, expected {expected:?}"
+            ));
         }
     }
     if !failures.is_empty() {
         fs::write("/tmp/fp-fail.txt", failures.join("\n")).ok();
-        let shown = failures.iter().take(30).cloned().collect::<Vec<_>>().join("\n");
+        let shown = failures
+            .iter()
+            .take(30)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         panic!("{} of {ran} failed\n{shown}", failures.len());
     }
 }
@@ -120,11 +143,23 @@ fn resolve_contained_reference_and_member_of_without_terminology() {
     });
     let expr = parse("'#p1'.resolve().gender").unwrap();
     let values = evaluate(&expr, &patient, &Model::new(), &SuiteHost { strict: false }).unwrap();
-    assert_eq!(values.iter().map(Value::render).collect::<Vec<_>>(), vec!["female".to_string()]);
+    assert_eq!(
+        values.iter().map(Value::render).collect::<Vec<_>>(),
+        vec!["female".to_string()]
+    );
 
     let member = parse("'code'.memberOf('http://example.org/ValueSet/demo')").unwrap();
-    let error = evaluate(&member, &Json::Object(Map::new()), &Model::new(), &SuiteHost { strict: false }).unwrap_err();
-    assert!(matches!(error.kind, refhir_fhirpath::ErrorKind::Unsupported));
+    let error = evaluate(
+        &member,
+        &Json::Object(Map::new()),
+        &Model::new(),
+        &SuiteHost { strict: false },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.kind,
+        refhir_fhirpath::ErrorKind::Unsupported
+    ));
 }
 
 fn load_model() -> (Model, BTreeMap<String, Elem>) {
@@ -141,7 +176,10 @@ fn load_model() -> (Model, BTreeMap<String, Elem>) {
         if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
             continue;
         }
-        if let Some(elements) = json.pointer("/snapshot/element").and_then(|value| value.as_array()) {
+        if let Some(elements) = json
+            .pointer("/snapshot/element")
+            .and_then(|value| value.as_array())
+        {
             for element in elements {
                 let Some(path) = element.get("path").and_then(|value| value.as_str()) else {
                     continue;
@@ -152,11 +190,18 @@ fn load_model() -> (Model, BTreeMap<String, Elem>) {
                     .map(|types| {
                         types
                             .iter()
-                            .filter_map(|item| item.get("code").and_then(|code| code.as_str()).map(|code| code.to_string()))
+                            .filter_map(|item| {
+                                item.get("code")
+                                    .and_then(|code| code.as_str())
+                                    .map(|code| code.to_string())
+                            })
                             .collect()
                     })
                     .unwrap_or_default();
-                let repeating = element.get("max").and_then(|value| value.as_str()).is_some_and(|max| max != "1");
+                let repeating = element
+                    .get("max")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|max| max != "1");
                 elems.insert(path.to_string(), Elem { types, repeating });
             }
         }
@@ -179,7 +224,12 @@ fn resource_object(node: Node<'_, '_>, elems: &BTreeMap<String, Elem>) -> Json {
     Json::Object(object)
 }
 
-fn fill_children(node: Node<'_, '_>, path: &str, object: &mut Map<String, Json>, elems: &BTreeMap<String, Elem>) {
+fn fill_children(
+    node: Node<'_, '_>,
+    path: &str,
+    object: &mut Map<String, Json>,
+    elems: &BTreeMap<String, Elem>,
+) {
     let mut groups: Vec<(String, Vec<Node<'_, '_>>)> = Vec::new();
     for child in node.children().filter(|child| child.is_element()) {
         let name = child.tag_name().name().to_string();
@@ -195,8 +245,19 @@ fn fill_children(node: Node<'_, '_>, path: &str, object: &mut Map<String, Json>,
             continue;
         }
         let info = lookup(elems, path, &name);
-        if info.types.iter().any(|kind| kind == "Resource" || kind == "DomainResource") {
-            let resources: Vec<Json> = nodes.iter().flat_map(|node| node.children().filter(|child| child.is_element()).map(|child| resource_object(child, elems))).collect();
+        if info
+            .types
+            .iter()
+            .any(|kind| kind == "Resource" || kind == "DomainResource")
+        {
+            let resources: Vec<Json> = nodes
+                .iter()
+                .flat_map(|node| {
+                    node.children()
+                        .filter(|child| child.is_element())
+                        .map(|child| resource_object(child, elems))
+                })
+                .collect();
             object.insert(name, Json::Array(resources));
             continue;
         }
@@ -217,11 +278,18 @@ fn fill_children(node: Node<'_, '_>, path: &str, object: &mut Map<String, Json>,
     }
 }
 
-fn read_element(node: Node<'_, '_>, parent: &str, name: &str, elems: &BTreeMap<String, Elem>) -> (Json, Option<Json>) {
+fn read_element(
+    node: Node<'_, '_>,
+    parent: &str,
+    name: &str,
+    elems: &BTreeMap<String, Elem>,
+) -> (Json, Option<Json>) {
     let info = lookup(elems, parent, name);
     let value_attr = node.attribute("value");
     let children: Vec<Node<'_, '_>> = node.children().filter(|child| child.is_element()).collect();
-    let extension_only = children.iter().all(|child| matches!(child.tag_name().name(), "extension" | "id"));
+    let extension_only = children
+        .iter()
+        .all(|child| matches!(child.tag_name().name(), "extension" | "id"));
     if value_attr.is_some() && extension_only {
         let value = primitive_json(type_code(parent, name, &info), value_attr.unwrap_or(""));
         let extra = extension_object(node, children, elems);
@@ -234,8 +302,16 @@ fn read_element(node: Node<'_, '_>, parent: &str, name: &str, elems: &BTreeMap<S
     if let Some(id) = node.attribute("id") {
         object.insert("id".into(), Json::String(id.to_string()));
     }
-    let child_path = if info.types.iter().any(|kind| kind.chars().next().is_some_and(|ch| ch.is_uppercase())) {
-        info.types.iter().find(|kind| kind.chars().next().is_some_and(|ch| ch.is_uppercase())).cloned().unwrap_or_else(|| name.to_string())
+    let child_path = if info
+        .types
+        .iter()
+        .any(|kind| kind.chars().next().is_some_and(|ch| ch.is_uppercase()))
+    {
+        info.types
+            .iter()
+            .find(|kind| kind.chars().next().is_some_and(|ch| ch.is_uppercase()))
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     } else if parent.is_empty() {
         name.to_string()
     } else {
@@ -245,7 +321,11 @@ fn read_element(node: Node<'_, '_>, parent: &str, name: &str, elems: &BTreeMap<S
     (Json::Object(object), None)
 }
 
-fn extension_object(node: Node<'_, '_>, children: Vec<Node<'_, '_>>, elems: &BTreeMap<String, Elem>) -> Option<Json> {
+fn extension_object(
+    node: Node<'_, '_>,
+    children: Vec<Node<'_, '_>>,
+    elems: &BTreeMap<String, Elem>,
+) -> Option<Json> {
     let mut object = Map::new();
     if let Some(id) = node.attribute("id") {
         object.insert("id".into(), Json::String(id.to_string()));
@@ -271,10 +351,19 @@ fn lookup<'a>(elems: &'a BTreeMap<String, Elem>, parent: &str, name: &str) -> El
         return elem.clone();
     }
     for (path, elem) in elems {
-        let Some(stem) = path.strip_prefix(&format!("{parent}.")).and_then(|rest| rest.strip_suffix("[x]")) else {
+        let Some(stem) = path
+            .strip_prefix(&format!("{parent}."))
+            .and_then(|rest| rest.strip_suffix("[x]"))
+        else {
             continue;
         };
-        if name.starts_with(stem) && name.len() > stem.len() && name[stem.len()..].chars().next().is_some_and(|ch| ch.is_uppercase()) {
+        if name.starts_with(stem)
+            && name.len() > stem.len()
+            && name[stem.len()..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_uppercase())
+        {
             return elem.clone();
         }
     }
@@ -286,7 +375,10 @@ fn type_code(parent: &str, name: &str, info: &Elem) -> &'static str {
         return primitive_name(stem);
     }
     let _ = parent;
-    info.types.first().map(|value| primitive_name(value)).unwrap_or("string")
+    info.types
+        .first()
+        .map(|value| primitive_name(value))
+        .unwrap_or("string")
 }
 
 fn name_without_choice(name: &str) -> Option<&str> {
@@ -320,8 +412,14 @@ fn primitive_name(name: &str) -> &'static str {
 fn primitive_json(kind: &str, raw: &str) -> Json {
     match kind {
         "boolean" => Json::Bool(raw == "true"),
-        "integer" => raw.parse::<i64>().ok().map(|value| Json::Number(value.into())).unwrap_or_else(|| Json::String(raw.into())),
-        "decimal" => serde_json::from_str::<Number>(raw).map(Json::Number).unwrap_or_else(|_| Json::String(raw.into())),
+        "integer" => raw
+            .parse::<i64>()
+            .ok()
+            .map(|value| Json::Number(value.into()))
+            .unwrap_or_else(|| Json::String(raw.into())),
+        "decimal" => serde_json::from_str::<Number>(raw)
+            .map(Json::Number)
+            .unwrap_or_else(|_| Json::String(raw.into())),
         _ => Json::String(raw.into()),
     }
 }
