@@ -173,7 +173,7 @@ func TestWatchResubscribesAfterDisconnect(t *testing.T) {
 }
 
 func TestSmartBearer(t *testing.T) {
-	base := startServer(t, "--smart")
+	base := startServer(t, "--smart", "--smart-demo-login")
 	ctx := context.Background()
 	_, err := Dial(ctx, base)
 	if err == nil || !bytes.Contains([]byte(err.Error()), []byte("401")) {
@@ -310,9 +310,16 @@ func startServer(t *testing.T, extra ...string) string {
 
 	dir := t.TempDir()
 	bin := refhirBin()
-	args := []string{"--sqlite", filepath.Join(dir, "refhir.sqlite"), "--bind", fmt.Sprintf("127.0.0.1:%d", port)}
+	_, testFile, _, _ := runtime.Caller(0)
+	minir4 := filepath.Join(filepath.Dir(testFile), "..", "..", "crates", "fhir", "fixtures", "minir4")
+	args := []string{
+		"--sqlite", filepath.Join(dir, "refhir.sqlite"),
+		"--bind", fmt.Sprintf("127.0.0.1:%d", port),
+		"--package", minir4,
+	}
 	args = append(args, extra...)
 	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), "REFHIR_SKIP_DEFAULT_PACKAGES=1")
 	cmd.Dir = dir
 	var output bytes.Buffer
 	cmd.Stdout = &output

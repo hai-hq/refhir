@@ -37,6 +37,11 @@ pub struct ServerConfig {
     pub smart_dcr_token: Option<String>,
     /// Secret for the built-in `confidential` client. Generated when unset.
     pub smart_confidential_secret: Option<String>,
+    /// Sign users in through an external OpenID Connect provider. This is the login for real
+    /// deployments.
+    pub oidc: Option<crate::auth::OidcConfig>,
+    /// Accept any username with no credential check. For testing only; ignored when `oidc` is set.
+    pub smart_demo_login: bool,
     /// Injected SMART tables for tests. A fresh store is created when this is `None`.
     pub smart: Option<std::sync::Arc<crate::auth::SmartStore>>,
 }
@@ -54,6 +59,8 @@ impl Default for ServerConfig {
             smart_fhir_user: None,
             smart_dcr_token: None,
             smart_confidential_secret: None,
+            oidc: None,
+            smart_demo_login: false,
             smart: None,
         }
     }
@@ -66,6 +73,24 @@ pub struct AppState {
     pub store: Arc<dyn ConformanceStore>,
     pub config: ServerConfig,
     pub smart: Arc<crate::auth::SmartStore>,
+    pub oidc: Option<Arc<crate::auth::Oidc>>,
+}
+
+/// Delete expired OAuth rows once a minute. Reads ignore expired rows, so this only reclaims
+/// space. It stops when the store is dropped, and does nothing outside a tokio runtime.
+fn prune_in_background(smart: &Arc<crate::auth::SmartStore>) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let smart = Arc::downgrade(smart);
+    runtime.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            let Some(store) = smart.upgrade() else { break };
+            let _ = tokio::task::spawn_blocking(move || store.prune()).await;
+        }
+    });
 }
 
 pub fn app(
@@ -100,6 +125,11 @@ pub fn app_with(
         .route("/oauth/register", post(oauth_register))
         .route("/oauth/manage", get(oauth_manage))
         .route("/oauth/ehr-launch", get(oauth_ehr_launch))
+        .route(
+            "/oauth/interact",
+            get(oauth_interact).post(oauth_interact_post),
+        )
+        .route("/oauth/oidc/callback", get(oauth_oidc_callback))
         .route("/oauth/style.json", get(oauth_style))
         .route("/graphql", post(graphql_route))
         .route("/sync", get(sync_ws))
@@ -150,6 +180,7 @@ pub fn app_with(
             get(read).put(update).delete(remove).patch(patch_op),
         )
         .route("/:resource_type/:id/:compartment", get(compartment_search));
+    // Without a store from the caller, SMART state lives in memory and ends with the process.
     let smart = config.smart.clone().unwrap_or_else(|| {
         let secret = config
             .smart_confidential_secret
@@ -157,12 +188,16 @@ pub fn app_with(
             .unwrap_or_else(|| format!("secret-{}", uuid::Uuid::new_v4()));
         Arc::new(crate::auth::SmartStore::with_confidential_secret(secret))
     });
+    prune_in_background(&smart);
     let state = AppState {
         db: db.clone(),
         catalog: catalog.clone(),
         store: store.clone(),
         config: config.clone(),
         smart,
+        oidc: config.oidc.clone().map(|cfg| {
+            Arc::new(crate::auth::Oidc::new(cfg).expect("oidc config is validated at startup"))
+        }),
     };
     let router = router
         .layer(middleware::from_fn_with_state(state.clone(), smart_guard))
@@ -341,6 +376,21 @@ fn redact_query(query: Option<&str>) -> Option<String> {
     )
 }
 
+/// Scope check for a REST request; the patient compartment, if the token is patient-scoped.
+fn guard_request(
+    app: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    method: &str,
+    resource: &str,
+    path: &str,
+) -> Result<Option<String>, Response> {
+    if let Some(response) = crate::auth::check(app, headers, query, method, resource, path, None) {
+        return Err(response);
+    }
+    Ok(crate::auth::patient_compartment(app, headers, query))
+}
+
 async fn smart_guard(
     State(app): State<AppState>,
     mut request: Request<axum::body::Body>,
@@ -353,8 +403,25 @@ async fn smart_guard(
         if !open {
             let method = request.method().as_str().to_string();
             let query = request.uri().query().map(str::to_string);
+            // A token that is not cached is read from the database: keep that off the async
+            // worker threads. A cached one is a mutex and a clone, so it is checked in place.
+            let cheap = crate::auth::lookup_is_cheap(&app, request.headers(), query.as_deref());
             if path == "/sync" {
-                match crate::auth::open_sync_session(&app, request.headers(), query.as_deref()) {
+                let opened = if cheap {
+                    crate::auth::open_sync_session(&app, request.headers(), query.as_deref())
+                } else {
+                    let (guard_app, headers, query) =
+                        (app.clone(), request.headers().clone(), query.clone());
+                    match run_blocking_with(move || {
+                        crate::auth::open_sync_session(&guard_app, &headers, query.as_deref())
+                    })
+                    .await
+                    {
+                        Ok(opened) => opened,
+                        Err(response) => return response,
+                    }
+                };
+                match opened {
                     Ok(session) => {
                         request.extensions_mut().insert(session);
                     }
@@ -362,19 +429,39 @@ async fn smart_guard(
                 }
             } else {
                 let resource = fhir_type_from_path(&path);
-                if let Some(response) = crate::auth::check(
-                    &app,
-                    request.headers(),
-                    query.as_deref(),
-                    &method,
-                    &resource,
-                    &path,
-                    None,
-                ) {
-                    return response;
-                }
-                let patient =
-                    crate::auth::patient_compartment(&app, request.headers(), query.as_deref());
+                let checked = if cheap {
+                    guard_request(
+                        &app,
+                        request.headers(),
+                        query.as_deref(),
+                        &method,
+                        &resource,
+                        &path,
+                    )
+                } else {
+                    let (guard_app, headers, query) =
+                        (app.clone(), request.headers().clone(), query.clone());
+                    let (guard_method, guard_path) = (method.clone(), path.clone());
+                    match run_blocking_with(move || {
+                        guard_request(
+                            &guard_app,
+                            &headers,
+                            query.as_deref(),
+                            &guard_method,
+                            &resource,
+                            &guard_path,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(checked) => checked,
+                        Err(response) => return response,
+                    }
+                };
+                let patient = match checked {
+                    Ok(patient) => patient,
+                    Err(response) => return response,
+                };
                 if let Some(patient) = patient {
                     if let Some(response) =
                         reject_patient_http(&app, &patient, &method, &path, &mut request).await
@@ -1191,8 +1278,8 @@ async fn smart_config(State(app): State<AppState>, headers: HeaderMap) -> Respon
     crate::auth::configuration(&app, &headers)
 }
 
-async fn jwks() -> Response {
-    crate::auth::jwks()
+async fn jwks(State(app): State<AppState>) -> Response {
+    run_blocking(move || crate::auth::jwks(&app)).await
 }
 
 async fn oauth_authorize(
@@ -1200,7 +1287,8 @@ async fn oauth_authorize(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
-    crate::auth::authorize(&app, &headers, uri.query(), &[])
+    let query = uri.query().map(str::to_string);
+    run_blocking(move || crate::auth::authorize(&app, &headers, query.as_deref(), &[])).await
 }
 
 async fn oauth_authorize_post(
@@ -1209,11 +1297,12 @@ async fn oauth_authorize_post(
     uri: axum::http::Uri,
     body: Bytes,
 ) -> Response {
-    crate::auth::authorize(&app, &headers, uri.query(), &body)
+    let query = uri.query().map(str::to_string);
+    run_blocking(move || crate::auth::authorize(&app, &headers, query.as_deref(), &body)).await
 }
 
 async fn oauth_token(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    crate::auth::issue(&app, &headers, &body)
+    run_blocking(move || crate::auth::issue(&app, &headers, &body)).await
 }
 
 async fn oauth_introspect(
@@ -1221,19 +1310,78 @@ async fn oauth_introspect(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    crate::auth::introspect(&app, &headers, &body)
+    run_blocking(move || crate::auth::introspect(&app, &headers, &body)).await
 }
 
 async fn oauth_revoke(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    crate::auth::revoke(&app, &headers, &body)
+    run_blocking(move || crate::auth::revoke(&app, &headers, &body)).await
 }
 
 async fn oauth_register(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    crate::auth::register(&app, &headers, &body)
+    run_blocking(move || crate::auth::register(&app, &headers, &body)).await
 }
 
 async fn oauth_manage(State(app): State<AppState>, headers: HeaderMap) -> Response {
-    crate::auth::manage(&app, &headers)
+    run_blocking(move || crate::auth::manage(&app, &headers)).await
+}
+
+async fn oauth_interact(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let session = uri
+        .query()
+        .and_then(|query| {
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                if key == "session" {
+                    Some(crate::auth::percent_decode(value))
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+    // Starting an OpenID Connect login fetches provider metadata over blocking HTTP.
+    run_blocking(move || crate::auth::interact_get(&app, &headers, &session)).await
+}
+
+async fn oauth_oidc_callback(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+) -> Response {
+    let query = uri.query().unwrap_or("").to_string();
+    run_blocking(move || crate::auth::oidc_callback(&app, &headers, &query)).await
+}
+
+/// Run blocking work (database or HTTP calls) off the async worker threads.
+async fn run_blocking(work: impl FnOnce() -> Response + Send + 'static) -> Response {
+    run_blocking_with(work)
+        .await
+        .unwrap_or_else(|response| response)
+}
+
+async fn run_blocking_with<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Response> {
+    tokio::task::spawn_blocking(work).await.map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authorization handler failed",
+        )
+            .into_response()
+    })
+}
+
+async fn oauth_interact_post(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let form = crate::auth::parse_authorize_form(body.as_ref());
+    run_blocking(move || crate::auth::interact_post(&app, &headers, &form)).await
 }
 
 async fn oauth_ehr_launch(
@@ -1241,7 +1389,8 @@ async fn oauth_ehr_launch(
     headers: HeaderMap,
     uri: axum::http::Uri,
 ) -> Response {
-    crate::auth::ehr_launch(&app, &headers, uri.query())
+    let query = uri.query().map(str::to_string);
+    run_blocking(move || crate::auth::ehr_launch(&app, &headers, query.as_deref())).await
 }
 
 async fn oauth_style() -> Response {

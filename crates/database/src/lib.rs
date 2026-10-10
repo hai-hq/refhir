@@ -24,13 +24,7 @@ const ENGINE: &str = "refhir_engine";
 fn write_keys_summary(keys: &[(IndexId, Vec<u8>)], limit: usize) -> String {
     keys.iter()
         .take(limit)
-        .map(|(index, key)| {
-            format!(
-                "{}:{}",
-                index.as_str(),
-                String::from_utf8_lossy(key)
-            )
-        })
+        .map(|(index, key)| format!("{}:{}", index.as_str(), String::from_utf8_lossy(key)))
         .collect::<Vec<_>>()
         .join(", ")
 }

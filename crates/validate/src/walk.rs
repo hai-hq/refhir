@@ -52,7 +52,10 @@ pub fn validate(
 
 impl State<'_> {
     fn resource(&self, instance: &Json, root: &Json, profiles: &[String]) {
-        let Some(type_name) = instance.get("resourceType").and_then(|value| value.as_str()) else {
+        let Some(type_name) = instance
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+        else {
             self.issue(Severity::Error, "structure", "resourceType is required", "");
             return;
         };
@@ -103,9 +106,21 @@ impl State<'_> {
         }
     }
 
-    fn walk_object(&self, value: &Json, structure: &Structure, path: &str, root: &Json, resource: &Json) {
+    fn walk_object(
+        &self,
+        value: &Json,
+        structure: &Structure,
+        path: &str,
+        root: &Json,
+        resource: &Json,
+    ) {
         if self.depth.get() > 64 {
-            self.issue(Severity::Error, "too-costly", "validation nesting is too deep", path);
+            self.issue(
+                Severity::Error,
+                "too-costly",
+                "validation nesting is too deep",
+                path,
+            );
             return;
         }
         let Some(object) = value.as_object() else {
@@ -115,7 +130,11 @@ impl State<'_> {
         if let Some(element) = structure.base_element(path).cloned() {
             self.constraints(&element, value, path, root, resource);
         }
-        let children: Vec<ElementDef> = structure.direct_children(path).into_iter().cloned().collect();
+        let children: Vec<ElementDef> = structure
+            .direct_children(path)
+            .into_iter()
+            .cloned()
+            .collect();
         let mut used = Vec::new();
         for element in &children {
             let name = child_name(&element.path);
@@ -156,16 +175,28 @@ impl State<'_> {
             used.push(name.clone());
             let underscore = object.get(&format!("_{name}"));
             match object.get(&name) {
-                Some(item) => self.repetitions(item, element, structure, root, resource, None, underscore),
-                None if underscore.is_some() => {
-                    self.repetitions(&Json::Null, element, structure, root, resource, None, underscore)
+                Some(item) => {
+                    self.repetitions(item, element, structure, root, resource, None, underscore)
                 }
+                None if underscore.is_some() => self.repetitions(
+                    &Json::Null,
+                    element,
+                    structure,
+                    root,
+                    resource,
+                    None,
+                    underscore,
+                ),
                 None => self.cardinality(element, 0, &element.path),
             }
         }
         let closed = !children.is_empty();
         for key in object.keys() {
-            if !closed || used.iter().any(|name| name == key) || key.starts_with('_') || INFRASTRUCTURE.contains(&key.as_str()) {
+            if !closed
+                || used.iter().any(|name| name == key)
+                || key.starts_with('_')
+                || INFRASTRUCTURE.contains(&key.as_str())
+            {
                 continue;
             }
             self.issue(
@@ -178,7 +209,9 @@ impl State<'_> {
         if object.contains_key("extension") && !used.iter().any(|name| name == "extension") {
             self.extensions(object.get("extension"), path, false, root, resource);
         }
-        if object.contains_key("modifierExtension") && !used.iter().any(|name| name == "modifierExtension") {
+        if object.contains_key("modifierExtension")
+            && !used.iter().any(|name| name == "modifierExtension")
+        {
             self.extensions(object.get("modifierExtension"), path, true, root, resource);
         }
         if object.contains_key("contained") && !used.iter().any(|name| name == "contained") {
@@ -209,7 +242,10 @@ impl State<'_> {
                 &element.path,
             );
         }
-        if !matches!(element.max, Cardinality::One | Cardinality::Zero) && !value.is_array() && !items.is_empty() {
+        if !matches!(element.max, Cardinality::One | Cardinality::Zero)
+            && !value.is_array()
+            && !items.is_empty()
+        {
             self.issue(
                 Severity::Error,
                 "structure",
@@ -217,7 +253,10 @@ impl State<'_> {
                 &element.path,
             );
         }
-        let ordered = element.slicing.as_ref().is_some_and(|slicing| slicing.ordered);
+        let ordered = element
+            .slicing
+            .as_ref()
+            .is_some_and(|slicing| slicing.ordered);
         let mut seen_order: Option<usize> = None;
         for (index, item) in items.iter().enumerate() {
             let extra = sibling_at(underscore, index);
@@ -245,7 +284,11 @@ impl State<'_> {
                     let slice = slice.clone();
                     self.one(item, &slice, structure, root, resource, choice_type.clone());
                     self.primitive_extensions(extra, &slice.path, root, resource);
-                    let children: Vec<ElementDef> = structure.slice_children(index).into_iter().cloned().collect();
+                    let children: Vec<ElementDef> = structure
+                        .slice_children(index)
+                        .into_iter()
+                        .cloned()
+                        .collect();
                     if !children.is_empty() {
                         self.apply_children(item, structure, &children, root, resource);
                     }
@@ -261,7 +304,14 @@ impl State<'_> {
                     continue;
                 }
             }
-            self.one(item, element, structure, root, resource, choice_type.clone());
+            self.one(
+                item,
+                element,
+                structure,
+                root,
+                resource,
+                choice_type.clone(),
+            );
             self.primitive_extensions(extra, &element.path, root, resource);
         }
     }
@@ -293,10 +343,18 @@ impl State<'_> {
             let name = child_name(&element.path);
             let underscore = object.get(&format!("_{name}"));
             match object.get(&name) {
-                Some(value) => self.repetitions(value, element, structure, root, resource, None, underscore),
-                None if underscore.is_some() => {
-                    self.repetitions(&Json::Null, element, structure, root, resource, None, underscore)
+                Some(value) => {
+                    self.repetitions(value, element, structure, root, resource, None, underscore)
                 }
+                None if underscore.is_some() => self.repetitions(
+                    &Json::Null,
+                    element,
+                    structure,
+                    root,
+                    resource,
+                    None,
+                    underscore,
+                ),
                 None => self.cardinality(element, 0, &element.path),
             }
         }
@@ -427,7 +485,14 @@ impl State<'_> {
         self.constraints(&target, value, &element.path, root, resource);
     }
 
-    fn descend(&self, value: &Json, structure: &Structure, path: &str, root: &Json, resource: &Json) {
+    fn descend(
+        &self,
+        value: &Json,
+        structure: &Structure,
+        path: &str,
+        root: &Json,
+        resource: &Json,
+    ) {
         self.enter();
         self.walk_object(value, structure, path, root, resource);
         self.leave();
@@ -459,7 +524,12 @@ impl State<'_> {
             );
         }
         if !element.max.allows(count) {
-            self.issue(Severity::Error, "structure", format!("{path} has too many values"), path);
+            self.issue(
+                Severity::Error,
+                "structure",
+                format!("{path} has too many values"),
+                path,
+            );
         }
     }
 
@@ -494,34 +564,58 @@ impl State<'_> {
             return;
         }
         for bound in bound_codes(value, type_code.unwrap_or("")) {
-            match self.terms.contains(&binding.value_set, bound.system.as_deref(), &bound.code) {
-                TermAnswer::Yes => {
-                    self.bound_concept(element, &binding.value_set, binding.strength.as_str(), &bound)
-                }
+            match self
+                .terms
+                .contains(&binding.value_set, bound.system.as_deref(), &bound.code)
+            {
+                TermAnswer::Yes => self.bound_concept(
+                    element,
+                    &binding.value_set,
+                    binding.strength.as_str(),
+                    &bound,
+                ),
                 TermAnswer::No if binding.strength == "required" => self.issue(
                     Severity::Error,
                     "code-invalid",
-                    format!("{} code {} is not in {}", element.path, bound.code, binding.value_set),
+                    format!(
+                        "{} code {} is not in {}",
+                        element.path, bound.code, binding.value_set
+                    ),
                     &element.path,
                 ),
                 TermAnswer::No => self.issue(
                     Severity::Warning,
                     "code-invalid",
-                    format!("{} code {} is not in {}", element.path, bound.code, binding.value_set),
+                    format!(
+                        "{} code {} is not in {}",
+                        element.path, bound.code, binding.value_set
+                    ),
                     &element.path,
                 ),
                 TermAnswer::Unknown => self.issue(
                     Severity::Warning,
                     "not-supported",
-                    format!("{} value set {} is not loaded", element.path, binding.value_set),
+                    format!(
+                        "{} value set {} is not loaded",
+                        element.path, binding.value_set
+                    ),
                     &element.path,
                 ),
             }
         }
     }
 
-    fn bound_concept(&self, element: &ElementDef, value_set: &str, strength: &str, bound: &BoundCode) {
-        let Some(described) = self.terms.describe_bound(value_set, bound.system.as_deref(), &bound.code) else {
+    fn bound_concept(
+        &self,
+        element: &ElementDef,
+        value_set: &str,
+        strength: &str,
+        bound: &BoundCode,
+    ) {
+        let Some(described) =
+            self.terms
+                .describe_bound(value_set, bound.system.as_deref(), &bound.code)
+        else {
             return;
         };
         if described.inactive && strength == "required" {
@@ -561,7 +655,11 @@ impl State<'_> {
             .flat_map(|item| item.target_profiles.iter().cloned())
             .map(|url| url.rsplit('/').next().unwrap_or(&url).to_string())
             .collect();
-        if targets.is_empty() || targets.iter().any(|target| target == type_name) {
+        if targets.is_empty()
+            || targets
+                .iter()
+                .any(|target| target == "Resource" || target == type_name)
+        {
             return;
         }
         self.issue(
@@ -593,7 +691,14 @@ impl State<'_> {
         }
     }
 
-    fn extensions(&self, value: Option<&Json>, path: &str, modifier: bool, root: &Json, resource: &Json) {
+    fn extensions(
+        &self,
+        value: Option<&Json>,
+        path: &str,
+        modifier: bool,
+        root: &Json,
+        resource: &Json,
+    ) {
         let Some(value) = value else {
             return;
         };
@@ -601,7 +706,11 @@ impl State<'_> {
             Json::Array(items) => items.iter().collect(),
             other => vec![other],
         };
-        let field = if modifier { "modifierExtension" } else { "extension" };
+        let field = if modifier {
+            "modifierExtension"
+        } else {
+            "extension"
+        };
         for item in items {
             let Some(url) = item.get("url").and_then(|value| value.as_str()) else {
                 self.issue(
@@ -613,17 +722,24 @@ impl State<'_> {
                 continue;
             };
             if let Some(structure) = self.schema.structure(url).cloned() {
-                    let profile = structure.url.clone();
-                    let root_path = structure.root_path().to_string();
-                    self.enter();
-                    self.walk_object(item, &structure, &root_path, root, resource);
-                    self.leave();
-                    let _ = profile;
+                let profile = structure.url.clone();
+                let root_path = structure.root_path().to_string();
+                self.enter();
+                self.walk_object(item, &structure, &root_path, root, resource);
+                self.leave();
+                let _ = profile;
             }
         }
     }
 
-    fn constraints(&self, element: &ElementDef, focus: &Json, path: &str, root: &Json, resource: &Json) {
+    fn constraints(
+        &self,
+        element: &ElementDef,
+        focus: &Json,
+        path: &str,
+        root: &Json,
+        resource: &Json,
+    ) {
         for constraint in &element.constraints {
             let Some(expr) = &constraint.parsed else {
                 self.issue(
@@ -634,7 +750,20 @@ impl State<'_> {
                 );
                 continue;
             };
-            match refhir_fhirpath::evaluate_invariant(expr, focus, path, resource, root, self.schema.model(), self.host) {
+            let focus_path = if element.types.iter().any(|kind| kind.code == "Extension") {
+                "Extension"
+            } else {
+                path
+            };
+            match refhir_fhirpath::evaluate_invariant(
+                expr,
+                focus,
+                focus_path,
+                resource,
+                root,
+                self.schema.model(),
+                self.host,
+            ) {
                 Ok(items) if is_true(&items) => {}
                 Ok(_) => self.issue(
                     constraint.severity,
@@ -658,7 +787,13 @@ impl State<'_> {
         }
     }
 
-    fn issue(&self, severity: Severity, code: &str, diagnostics: impl Into<String>, expression: impl Into<String>) {
+    fn issue(
+        &self,
+        severity: Severity,
+        code: &str,
+        diagnostics: impl Into<String>,
+        expression: impl Into<String>,
+    ) {
         self.issues.borrow_mut().push(Issue {
             severity,
             code: code.to_string(),
@@ -697,7 +832,11 @@ fn sibling_at(underscore: Option<&Json>, index: usize) -> Option<&Json> {
     }
 }
 
-fn choice_entries(object: &Map<String, Json>, base: &str, element: &ElementDef) -> Vec<(String, String)> {
+fn choice_entries(
+    object: &Map<String, Json>,
+    base: &str,
+    element: &ElementDef,
+) -> Vec<(String, String)> {
     let mut matches = Vec::new();
     for type_ref in &element.types {
         let key = format!("{base}{}", type_suffix(&type_ref.code));
@@ -737,7 +876,11 @@ struct BoundCode {
 fn bound_codes(value: &Json, type_code: &str) -> Vec<BoundCode> {
     if let Some(text) = value.as_str() {
         if type_code == "code" || type_code.is_empty() || is_primitive(type_code) {
-            return vec![BoundCode { system: None, code: text.to_string(), display: None }];
+            return vec![BoundCode {
+                system: None,
+                code: text.to_string(),
+                display: None,
+            }];
         }
     }
     if value.get("coding").is_some() {
@@ -755,9 +898,15 @@ fn bound_codes(value: &Json, type_code: &str) -> Vec<BoundCode> {
 fn coding(value: &Json) -> Option<BoundCode> {
     let code = value.get("code").and_then(|item| item.as_str())?;
     Some(BoundCode {
-        system: value.get("system").and_then(|item| item.as_str()).map(|system| system.to_string()),
+        system: value
+            .get("system")
+            .and_then(|item| item.as_str())
+            .map(|system| system.to_string()),
         code: code.to_string(),
-        display: value.get("display").and_then(|item| item.as_str()).map(|display| display.to_string()),
+        display: value
+            .get("display")
+            .and_then(|item| item.as_str())
+            .map(|display| display.to_string()),
     })
 }
 
@@ -785,11 +934,51 @@ impl Host for TermHost<'_> {
         self.inner.resolve(reference)
     }
 
-    fn member_of(&self, system: Option<&str>, code: &str, value_set: &str) -> Result<Option<bool>, Error> {
+    fn member_of(
+        &self,
+        system: Option<&str>,
+        code: &str,
+        value_set: &str,
+    ) -> Result<Option<bool>, Error> {
         match self.terms.contains(value_set, system, code) {
             TermAnswer::Yes => Ok(Some(true)),
             TermAnswer::No => Ok(Some(false)),
             TermAnswer::Unknown => self.inner.member_of(system, code, value_set),
         }
+    }
+}
+
+#[cfg(test)]
+mod ops_setup_tests {
+    use crate::{validate_resource, MemoryTerminology, Schema};
+    use refhir_fhirpath::Host;
+    use serde_json::json;
+    struct NoHost;
+    impl Host for NoHost {}
+
+    #[test]
+    fn generic_subject_and_string_extension_are_valid() {
+        let ext = json!({"key":"ext-1","severity":"error","human":"value or nested extension","expression":"extension.exists() != value.exists()"});
+        let schema = Schema::from_definitions(&[
+            json!({"resourceType":"StructureDefinition","url":"http://hl7.org/fhir/StructureDefinition/Basic","name":"Basic","type":"Basic","kind":"resource","derivation":"specialization","snapshot":{"element":[
+                {"path":"Basic","min":0,"max":"*"},
+                {"path":"Basic.subject","min":0,"max":"1","type":[{"code":"Reference","targetProfile":["http://hl7.org/fhir/StructureDefinition/Resource"]}]},
+                {"path":"Basic.extension","min":0,"max":"*","type":[{"code":"Extension"}],"constraint":[ext.clone()]}
+            ]}}),
+            json!({"resourceType":"StructureDefinition","url":"http://hl7.org/fhir/StructureDefinition/Extension","name":"Extension","type":"Extension","kind":"complex-type","derivation":"specialization","snapshot":{"element":[
+                {"path":"Extension","min":0,"max":"*","constraint":[ext]},
+                {"path":"Extension.url","min":1,"max":"1","type":[{"code":"uri"}]},
+                {"path":"Extension.extension","min":0,"max":"*","type":[{"code":"Extension"}]},
+                {"path":"Extension.value[x]","min":0,"max":"1","type":[{"code":"string"}]}
+            ]}}),
+        ]);
+        let instance = json!({"resourceType":"Basic","subject":{"reference":"Organization/org"},"extension":[{"url":"https://boolbyte.health/fhir/StructureDefinition/onboarding-json","valueString":"{}"}]});
+        let outcome = validate_resource(&instance, &schema, &MemoryTerminology::default(), &NoHost);
+        assert!(!outcome.has_errors(), "{:?}", outcome.issues);
+        let invalid = json!({"resourceType":"Basic","extension":[{"url":"https://example.invalid","valueString":"{}","extension":[{"url":"https://example.invalid/child","valueString":"child"}]}]});
+        assert!(
+            validate_resource(&invalid, &schema, &MemoryTerminology::default(), &NoHost)
+                .has_errors()
+        );
     }
 }

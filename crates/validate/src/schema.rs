@@ -322,7 +322,10 @@ fn compile_element(element: &Json) -> Option<ElementDef> {
         .get("sliceName")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string());
-    let min = element.get("min").and_then(|value| value.as_u64()).unwrap_or(0) as u32;
+    let min = element
+        .get("min")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0) as u32;
     let max = Cardinality::parse(
         element
             .get("max")
@@ -490,9 +493,14 @@ fn walk_regex(value: &Json, found: &mut Option<String>) {
         Json::Object(object) => {
             if let Some(extensions) = object.get("extension").and_then(|item| item.as_array()) {
                 for extension in extensions {
-                    let url = extension.get("url").and_then(|item| item.as_str()).unwrap_or("");
+                    let url = extension
+                        .get("url")
+                        .and_then(|item| item.as_str())
+                        .unwrap_or("");
                     if url.ends_with("structuredefinition-regex") {
-                        if let Some(pattern) = extension.get("valueString").and_then(|item| item.as_str()) {
+                        if let Some(pattern) =
+                            extension.get("valueString").and_then(|item| item.as_str())
+                        {
                             *found = Some(pattern.to_string());
                             return;
                         }

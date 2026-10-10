@@ -1,0 +1,52 @@
+# Production-oriented ReFHIR config. Copy and adjust for your environment.
+# Do not commit real secrets — use the REFHIR_* env vars or your orchestrator's secrets.
+
+[fhir]
+version = "r4"
+
+[server]
+bind = "0.0.0.0:8080"
+public_url = "https://refhir.example.com/fhir"
+
+[database]
+kind = "postgres"
+# Prefer REFHIR_POSTGRES_URL in Kubernetes instead of inline credentials.
+postgres_url = "postgresql://refhir:CHANGE_ME@postgres:5432/refhir?sslmode=require"
+
+[conformance]
+reference_policy = "strict"
+package_cache = "/data/package-cache"
+packages = [
+  # "hl7.fhir.us.core@6.1.0",
+]
+
+[smart]
+enabled = true
+# Launch context for dev/staging only; production EHR launch supplies context.
+# patient = "example-patient"
+# Set via environment (see deploy/production.md):
+# REFHIR_SMART_DCR_TOKEN
+# REFHIR_SMART_CONFIDENTIAL_SECRET
+# REFHIR_OIDC_CLIENT_SECRET
+
+# Users sign in at your OpenID Connect provider (Keycloak, Okta, Entra ID, Auth0, ...).
+# Register this redirect URI there: <public_url>/oauth/oidc/callback
+[smart.oidc]
+issuer = "https://idp.example.com/realms/clinic"
+client_id = "refhir"
+# client_secret: set REFHIR_OIDC_CLIENT_SECRET instead of writing it here.
+scopes = ["openid", "profile"]
+# ID token claim carrying the user's FHIR identity, e.g. "Practitioner/123".
+fhir_user_claim = "fhirUser"
+
+[export]
+# Bulk $export writes NDJSON here, then clients download via GET /export/{job}/file.
+# Object storage (S3/GCS) is not implemented yet — use a volume or sync this directory.
+dir = "/data/export"
+
+[terminology]
+urls = []
+
+[features]
+trace_engine = false
+sdc_archiver = false

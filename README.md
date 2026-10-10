@@ -208,51 +208,143 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 
 ---
 
-## Quick start
+## Setup
 
-**Rust 1.85** ([rust-toolchain.toml](rust-toolchain.toml)).
+Pick one path. **Docker** is for running a server (your machine, VM, or cluster) without installing Rust. **Local development** is for hacking on ReFHIR or using repo fixtures and tests.
+
+| | Docker | Local development |
+|---|--------|-------------------|
+| **You need** | Docker (and optionally Docker Compose) | Rust 1.88 ([rust-toolchain.toml](rust-toolchain.toml)), Git |
+| **You get** | A `refhir` process in a container | `cargo run -p refhir` from a clone |
+| **Config** | `refhir.toml` on the host (recommended) | `refhir.toml` in the repo root and/or CLI flags |
+| **Data** | Docker volume (e.g. `/data`) | `refhir.sqlite` in the clone, or `--memory` |
+
+Set `[fhir].version = "r4"` (default) to install that release’s defaults (**hl7.fhir.r4.core@4.0.1**, **hl7.fhir.uv.sdc@4.0.0**) from [packages.fhir.org](https://packages.fhir.org) on first startup (cached on disk; skipped when already in the database). Add other IGs with `[conformance].packages` (`name@version`, a `.tgz`, or a local folder). See [refhir.toml.example](refhir.toml.example).
+
+**Production:** [deploy/refhir.production.toml](deploy/refhir.production.toml) and [deploy/production.md](deploy/production.md) (Postgres, SMART secrets via env, Helm, `cargo install --git …`).
+
+Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or `REFHIR_CONFIG`. CLI flags override the file. In containers, set `REFHIR_CONFIG=/etc/refhir/refhir.toml` and mount the file there.
+
+### Docker
+
+Use this when you only want to **run** ReFHIR, not build it from source.
+
+**1. Get an image**
+
+- **Release image** (after a `v*` tag on GitHub): `ghcr.io/hai-hq/refhir:latest`
+- **Build from the repo** (no registry needed):
+
+  ```bash
+  git clone https://github.com/hai-hq/haifhir.git
+  cd haifhir
+  docker build -t refhir:local .
+  ```
+
+**2. Create configuration (recommended)**
+
+```bash
+cp refhir.toml.example refhir.toml
+```
+
+Edit `refhir.toml` for bind address, database path under `/data`, optional `packages` (IGs), SMART, and terminology. The image ships a minimal default at `/etc/refhir/refhir.toml`; mounting your own file replaces it.
+
+**3. Run**
+
+Compose (builds the image from the clone and mounts the example config):
+
+```bash
+docker compose up --build
+```
+
+Or run the release image with persistent data and your config:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v refhir-data:/data \
+  -v "$PWD/refhir.toml:/etc/refhir/refhir.toml:ro" \
+  -e REFHIR_PACKAGE_CACHE=/data/package-cache \
+  ghcr.io/hai-hq/refhir:latest
+```
+
+Use `refhir:local` instead of `ghcr.io/hai-hq/refhir:latest` if you built locally.
+
+**Kubernetes:** [deploy/helm/refhir](deploy/helm/refhir/README.md).
+
+### Local development
+
+Use this when you work **in the repository** (server code, `cargo test`, seed scripts, clients).
+
+**1. Clone and toolchain**
+
+```bash
+git clone https://github.com/hai-hq/haifhir.git
+cd haifhir
+# rustup installs 1.88 from rust-toolchain.toml
+```
+
+**2. Configuration (optional)**
+
+```bash
+cp refhir.toml.example refhir.toml
+```
+
+For a quick try you can skip the file and pass flags only (next step).
+
+**3. Run the server**
+
+Persistent SQLite file in the repo:
 
 ```bash
 cargo run -p refhir -- --sqlite refhir.sqlite
 ```
 
-For a throwaway local server with no database file:
+Ephemeral (no file, good for tests):
 
 ```bash
 cargo run -p refhir -- --memory
 ```
 
-That command installs the bundled `hl7.fhir.r4.core` 4.0.1 package, so the concrete R4 resource types are available on a fresh database. Pass `--package` for more packages on the same FHIR version: a local directory, a `.tgz`, or `name@version` from [packages.fhir.org](https://packages.fhir.org) (for example `hl7.fhir.us.core@6.1.0`). Repeat the flag. Dependencies listed in `package.json` are installed first.
+Equivalent with [just](https://github.com/casey/just): `just run` or `just memory`.
 
-After startup, `POST /ImplementationGuide/$install` installs `name@version` from the same registry. It requires SMART (`--smart`) and a `system` write scope (`system/*.write` or `system/ImplementationGuide.write`). It does not take a filesystem path or a caller-supplied registry. Override the registry with `REFHIR_PACKAGE_REGISTRY`.
+**4. Load demo data (optional)**
 
-Regenerate the bundled package with `python3 crates/fhir/generate-r4.py`. It downloads the published core package and writes StructureDefinitions and SearchParameters into `crates/fhir/fixtures/r4`.
-
-- **http://127.0.0.1:8080**
-- `curl -s http://127.0.0.1:8080/metadata`
-
-| Flag | Purpose |
-|------|---------|
-| `--sqlite path` | SQLite file (default `refhir.sqlite`) |
-| `--memory` | SQLite in RAM; no file (not with `--sqlite` or `--postgres`) |
-| `--postgres url` | Postgres (not with `--sqlite` or `--memory`) |
-| `--bind host:port` | Default `127.0.0.1:8080` |
-| `--package spec` | FHIR package. Repeatable. Replaces the bundled R4 core default. Directory, `.tgz`, or `name@version` from packages.fhir.org. |
-| `--smart` | SMART App Launch 2.2 authorization (`/.well-known/smart-configuration`, `/oauth/*`) |
-| `--public-url url` | Absolute FHIR base URL advertised as the SMART `issuer` (required behind TLS) |
-| `--smart-patient id` | Patient id granted for `launch/patient` |
-| `--smart-encounter id` | Encounter id granted for `launch/encounter` |
-| `--smart-fhir-user Resource/id` | FHIR identity placed in the `fhirUser` claim |
-
-Optional: `just run` ([justfile](justfile)) if you use [just](https://github.com/casey/just).
-
-Load mock FHIR JSON after startup (from `fixtures/mock-fhir/`, or Synthea `output/fhir`):
+With the server up on port 8080 and Go 1.23+ installed:
 
 ```bash
 cd clients/go && go run ./cmd/seed -url http://127.0.0.1:8080
 ```
 
 See [fixtures/mock-fhir/README.md](fixtures/mock-fhir/README.md) and [clients/go/README.md](clients/go/README.md#demo-data-seed-script).
+
+**Packages at runtime:** `[conformance].packages` or repeat `--package` to add IGs after the `[fhir].version` defaults. After startup, `POST /ImplementationGuide/$install` can install `name@version` from the registry when SMART is enabled (`system/*.write`). Override the package source with `REFHIR_PACKAGE_REGISTRY`: a registry or mirror URL, or `s3://bucket/prefix` for a bundle you host yourself, built with `scripts/package-bundle.py` (see [deploy/production.md](deploy/production.md#package-source)). ReFHIR ships no packages, so a first start needs that source to be reachable.
+
+Regenerate the R4 fixtures used by the test suites (the server itself ships no packages): `python3 crates/fhir/generate-r4.py`.
+
+### Verify the server
+
+Base URL defaults to **http://127.0.0.1:8080** (or the host/port in `refhir.toml` / `--bind`).
+
+```bash
+curl -s http://127.0.0.1:8080/metadata
+```
+
+### CLI reference
+
+| Flag | Purpose |
+|------|---------|
+| `--config path` | Config file (also `REFHIR_CONFIG`) |
+| `--sqlite path` | SQLite file (default `refhir.sqlite`) |
+| `--memory` | SQLite in RAM; no file (not with `--sqlite` or `--postgres`) |
+| `--postgres url` | Postgres (not with `--sqlite` or `--memory`; or `REFHIR_POSTGRES_URL`) |
+| `--bind host:port` | Default `127.0.0.1:8080` |
+| `--package spec` | FHIR IG. Repeatable. Installed after `[fhir].version` defaults. Directory, `.tgz`, or `name@version`. |
+| `--smart` | SMART App Launch 2.2 (`/.well-known/smart-configuration`, `/oauth/*`) |
+| `--public-url url` | SMART `issuer` URL (required with `--smart` on non-loopback bind) |
+| `--smart-patient id` | Patient for `launch/patient` when no EHR context |
+| `--smart-encounter id` | Encounter for EHR launch |
+| `--smart-fhir-user Resource/id` | `fhirUser` claim (demo login only) |
+| `--oidc-issuer url`, `--oidc-client-id id` | Sign SMART users in through an OpenID Connect provider (secret: `REFHIR_OIDC_CLIENT_SECRET`) |
+| `--smart-demo-login` | Testing only: accept any username, verify nothing |
 
 ### HTTP examples
 
@@ -281,6 +373,8 @@ Errors: `OperationOutcome` (4xx/5xx).
 
 ### SMART on FHIR
 
+**Inferno:** SMART-enabled Docker profile and runbook — [deploy/inferno/README.md](deploy/inferno/README.md). CI runs discovery + OAuth smoke via `.github/workflows/inferno-smoke.yml`.
+
 `--smart` turns the server into a SMART App Launch 2.2 authorization server and resource server:
 
 - Discovery at `/.well-known/smart-configuration` and JWKS at `/.well-known/jwks.json`
@@ -290,6 +384,8 @@ Errors: `OperationOutcome` (4xx/5xx).
 - SMART v1 (`patient/*.read`) and v2 (`patient/*.rs`) scopes, plus patient-compartment enforcement
 
 Default clients: `public` (no secret) and `confidential` (`--smart-confidential-secret`), with loopback redirect URIs `/cb` and `/app`. App-launch tokens cannot include `system/` scopes.
+
+**Sign-in.** `--smart` needs a login and will not start without one. For real use, configure an OpenID Connect provider (`[smart.oidc]` or `--oidc-issuer`/`--oidc-client-id` plus `REFHIR_OIDC_CLIENT_SECRET`): the authorize step sends users to the provider and the verified `sub` and `fhirUser` claim go into the tokens. See [deploy/production.md](deploy/production.md#smart-sign-in-openid-connect). `--smart-demo-login` skips authentication entirely (any username works) and exists only for local testing and conformance runs such as Inferno.
 
 `POST /oauth/register` requires `--smart-dcr-token`. If either flag is omitted, a value is generated and printed once to stderr when the process has a terminal; secrets are never written to logs. Redirect URIs must be `https` or loopback `http`. Backend clients register with `private_key_jwt`, inline `jwks`, and `system/` scopes. EHR launch context comes from `--smart-patient` / `--smart-encounter`, not from query parameters. `--public-url` is required when `--smart` is combined with a non-loopback `--bind`.
 

@@ -71,6 +71,8 @@ CREATE TABLE IF NOT EXISTS search_parameters (
     json TEXT NOT NULL,
     PRIMARY KEY (package_id, url, base)
 );
+-- Installing a parameter looks up the rows that share its base and code.
+CREATE INDEX IF NOT EXISTS search_parameters_by_base_code ON search_parameters (base, code);
 CREATE TABLE IF NOT EXISTS index_backfills (
     id BIGSERIAL PRIMARY KEY,
     package_id BIGINT NOT NULL,
@@ -111,7 +113,14 @@ pub struct PostgresPersistence {
 impl PostgresPersistence {
     pub fn connect(url: &str) -> Result<Self, PersistError> {
         let mut client = Client::connect(url, NoTls).map_err(definite)?;
-        client.batch_execute(SCHEMA).map_err(definite)?;
+        // Concurrent `CREATE TABLE IF NOT EXISTS` can still collide on a fresh database, so
+        // schema setup runs under a transaction-scoped advisory lock.
+        let mut tx = client.transaction().map_err(definite)?;
+        tx.batch_execute("SELECT pg_advisory_xact_lock(7428310)")
+            .map_err(definite)?;
+        tx.batch_execute(SCHEMA).map_err(definite)?;
+        tx.batch_execute(auth_store::AUTH_INIT).map_err(definite)?;
+        tx.commit().map_err(definite)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(Inner { client })),
         })
@@ -559,6 +568,7 @@ fn uncertain(err: impl ToString) -> PersistError {
     PersistError::Uncertain(err.to_string())
 }
 
+mod auth_store;
 mod conformance_store;
 
 #[cfg(test)]
@@ -566,10 +576,24 @@ mod tests {
     use super::*;
     use refhir_persistence::conformance;
 
+    /// The Postgres URL for tests. CI sets `REFHIR_REQUIRE_POSTGRES` so a missing database
+    /// fails the test instead of letting it pass without running anything.
+    fn test_url(what: &str) -> Option<String> {
+        match std::env::var("HAIFHIR_POSTGRES_URL") {
+            Ok(url) => Some(url),
+            Err(_) if std::env::var("REFHIR_REQUIRE_POSTGRES").is_ok() => {
+                panic!("REFHIR_REQUIRE_POSTGRES is set but HAIFHIR_POSTGRES_URL is not ({what})")
+            }
+            Err(_) => {
+                eprintln!("HAIFHIR_POSTGRES_URL unset, skipping {what}");
+                None
+            }
+        }
+    }
+
     #[test]
     fn postgres_log_roundtrip_when_configured() {
-        let Ok(url) = std::env::var("HAIFHIR_POSTGRES_URL") else {
-            eprintln!("HAIFHIR_POSTGRES_URL unset, skipping postgres conformance");
+        let Some(url) = test_url("postgres conformance") else {
             return;
         };
         let persistence = PostgresPersistence::connect(&url).expect("connect");
@@ -583,5 +607,31 @@ mod tests {
                 .expect("clean");
         }
         conformance::exercise(&persistence);
+    }
+
+    #[test]
+    fn postgres_auth_store_when_configured() {
+        let Some(url) = test_url("postgres auth store") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        {
+            let mut guard = persistence.inner.lock().expect("postgres");
+            guard
+                .client
+                .batch_execute("DELETE FROM smart_oauth;")
+                .expect("clean");
+        }
+        refhir_persistence::auth::exercise(&persistence);
+    }
+
+    #[test]
+    fn postgres_parameter_clashes_when_configured() {
+        let Some(url) = test_url("postgres parameter clashes") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let tag = format!("pg{}", std::process::id());
+        refhir_persistence::conformance::exercise_parameter_clashes(&persistence, &tag);
     }
 }

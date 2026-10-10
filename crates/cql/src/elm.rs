@@ -54,7 +54,10 @@ impl Env<'_> {
             "Null" => Ok(vec![]),
             "Identifier" | "AliasRef" | "OperandRef" => self.identifier(expr),
             "ParameterRef" => {
-                let name = expr.get("name").and_then(|value| value.as_str()).unwrap_or("");
+                let name = expr
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
                 Ok(self
                     .params
                     .get(name)
@@ -67,15 +70,20 @@ impl Env<'_> {
             "Retrieve" => self.retrieve(expr),
             "Query" => self.query(expr),
             "If" => self.if_expr(expr),
-            "And" | "Or" | "Not" | "Equal" | "NotEqual" | "Greater" | "Less"
-            | "GreaterOrEqual" | "LessOrEqual" | "Add" | "Subtract" | "Multiply" | "Divide"
-            | "Concatenate" => self.operator(kind, expr),
+            "And" | "Or" | "Not" | "Equal" | "NotEqual" | "Greater" | "Less" | "GreaterOrEqual"
+            | "LessOrEqual" | "Add" | "Subtract" | "Multiply" | "Divide" | "Concatenate" => {
+                self.operator(kind, expr)
+            }
             "Exists" | "Count" | "First" | "Last" | "ToString" | "ToInteger" | "ToDecimal"
             | "ToBoolean" | "Today" | "Now" | "exists" | "count" | "first" | "last"
             | "toString" | "toInteger" | "toDecimal" => self.function(kind, expr),
             "List" => {
                 let mut items = Vec::new();
-                for item in expr.get("element").and_then(|value| value.as_array()).into_iter().flatten()
+                for item in expr
+                    .get("element")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
                 {
                     items.extend(self.eval(item)?);
                 }
@@ -86,7 +94,10 @@ impl Env<'_> {
     }
 
     fn identifier(&self, expr: &Json) -> Result<Vec<Json>, String> {
-        let name = expr.get("name").and_then(|value| value.as_str()).unwrap_or("");
+        let name = expr
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         let name = name.trim_start_matches('%');
         if let Some(value) = self.locals.get(name) {
             return Ok(value.clone());
@@ -94,7 +105,12 @@ impl Env<'_> {
         if let Some(value) = self.params.get(name) {
             return Ok(vec![value.clone()]);
         }
-        if self.context.get("resourceType").and_then(|value| value.as_str()) == Some(name) {
+        if self
+            .context
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+            == Some(name)
+        {
             return Ok(vec![self.context.clone()]);
         }
         if let Some(value) = self.context.get(name) {
@@ -104,7 +120,10 @@ impl Env<'_> {
     }
 
     fn expression_ref(&mut self, expr: &Json) -> Result<Vec<Json>, String> {
-        let name = expr.get("name").and_then(|value| value.as_str()).unwrap_or("");
+        let name = expr
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         let expression = self
             .statements
             .iter()
@@ -116,7 +135,10 @@ impl Env<'_> {
     }
 
     fn property(&mut self, expr: &Json) -> Result<Vec<Json>, String> {
-        let path = expr.get("path").and_then(|value| value.as_str()).unwrap_or("");
+        let path = expr
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
         let source = if let Some(source) = expr.get("source") {
             self.eval(source)?
         } else if let Some(scope) = expr.get("scope").and_then(|value| value.as_str()) {
@@ -233,7 +255,11 @@ impl Env<'_> {
             .cloned()
             .unwrap_or_default();
         if kind == "And" || kind == "Or" {
-            let mut acc = if kind == "And" { Some(true) } else { Some(false) };
+            let mut acc = if kind == "And" {
+                Some(true)
+            } else {
+                Some(false)
+            };
             for operand in &operands {
                 let value = self.eval(operand)?;
                 let bit = truth(&value);
@@ -312,7 +338,12 @@ impl Env<'_> {
             "Count" => Ok(vec![json!(operand.len() as i64)]),
             "First" => Ok(operand.into_iter().next().into_iter().collect()),
             "Last" => Ok(operand.into_iter().next_back().into_iter().collect()),
-            "ToString" => Ok(operand.first().and_then(as_text).map(|text| json!(text)).into_iter().collect()),
+            "ToString" => Ok(operand
+                .first()
+                .and_then(as_text)
+                .map(|text| json!(text))
+                .into_iter()
+                .collect()),
             "ToInteger" => Ok(operand
                 .first()
                 .and_then(as_number)

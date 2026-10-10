@@ -1,7 +1,8 @@
 use refhir_persistence::{
-    ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage, NewSearchParameter,
-    NewTerminology, ParamStatus, PendingParam, PersistError, StoredBackfill, StoredExpansion,
-    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    plan_search_parameter, ConformanceStore, InstallError, InstallOutcome, InstalledParam,
+    NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan, ParamStatus,
+    PendingParam, PersistError, StoredBackfill, StoredExpansion, StoredPackage,
+    StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
 };
 use rusqlite::{params, OptionalExtension, Transaction};
 
@@ -525,33 +526,50 @@ fn install_in_tx(
     }
     let mut newly_pending = Vec::new();
     for param in &package.search_parameters {
-        let prior: Option<(String, String)> = tx
-            .query_row(
-                "SELECT COALESCE(expression, ''), status FROM search_parameters \
-                 WHERE base = ?1 AND code = ?2 LIMIT 1",
-                params![param.base, param.code],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+        let installed = tx
+            .prepare(
+                "SELECT package_id, url, COALESCE(expression, ''), status, json \
+                 FROM search_parameters WHERE base = ?1 AND code = ?2",
             )
-            .optional()
+            .map_err(definite)?
+            .query_map(params![param.base, param.code], |row| {
+                Ok(InstalledParam {
+                    package_id: row.get(0)?,
+                    url: row.get(1)?,
+                    expression: row.get(2)?,
+                    status: row.get(3)?,
+                    json: row.get(4)?,
+                })
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
-        let incoming = param.expression.clone().unwrap_or_default();
-        let status = if let Some((existing_expr, existing_status)) = prior {
-            if existing_expr != incoming {
+        let (existing, remove) = match plan_search_parameter(param, &installed)? {
+            ParamPlan::Conflict => {
                 return Err(InstallError::Expression {
                     base: param.base.clone(),
                     code: param.code.clone(),
                 });
             }
-            ParamStatus::parse(&existing_status)?
-        } else {
-            if param.status == ParamStatus::Pending {
-                newly_pending.push(PendingParam {
-                    base: param.base.clone(),
-                    code: param.code.clone(),
-                });
-            }
-            param.status
+            ParamPlan::Skip => continue,
+            ParamPlan::Insert { status, remove } => (status, remove),
         };
+        for (owner, url) in remove {
+            tx.execute(
+                "DELETE FROM search_parameters \
+                 WHERE package_id = ?1 AND url = ?2 AND base = ?3 AND code = ?4",
+                params![owner, url, param.base, param.code],
+            )
+            .map_err(definite)?;
+        }
+        let is_new = existing.is_none();
+        let status = existing.unwrap_or(param.status);
+        if is_new && status == ParamStatus::Pending {
+            newly_pending.push(PendingParam {
+                base: param.base.clone(),
+                code: param.code.clone(),
+            });
+        }
         tx.execute(
             "INSERT INTO search_parameters \
              (package_id, url, base, code, param_type, expression, status, json) \
@@ -617,4 +635,15 @@ fn replace_expansions(
         .map_err(definite)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parameters_from_different_packages_resolve_clashes() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_parameter_clashes(&store, "sqlite");
+    }
 }

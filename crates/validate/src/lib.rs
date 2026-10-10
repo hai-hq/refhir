@@ -67,48 +67,89 @@ mod tests {
 
     #[test]
     fn rejects_bad_primitive_choice_and_unknown_element() {
-        let outcome = check(json!({
-            "resourceType": "Patient",
-            "birthDate": "yesterday",
-            "deceasedBoolean": true,
-            "deceasedDateTime": "2020-01-01T00:00:00Z",
-            "notAField": 1,
-            "generalPractitioner": {"reference": "Organization/1"}
-        }), &MemoryTerminology::default());
-        let messages: Vec<_> = outcome.issues.iter().map(|issue| issue.diagnostics.clone()).collect();
-        assert!(messages.iter().any(|message| message.contains("invalid date")), "{messages:?}");
-        assert!(messages.iter().any(|message| message.contains("choice")), "{messages:?}");
-        assert!(messages.iter().any(|message| message.contains("unknown element")), "{messages:?}");
+        let outcome = check(
+            json!({
+                "resourceType": "Patient",
+                "birthDate": "yesterday",
+                "deceasedBoolean": true,
+                "deceasedDateTime": "2020-01-01T00:00:00Z",
+                "notAField": 1,
+                "generalPractitioner": {"reference": "Organization/1"}
+            }),
+            &MemoryTerminology::default(),
+        );
+        let messages: Vec<_> = outcome
+            .issues
+            .iter()
+            .map(|issue| issue.diagnostics.clone())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("invalid date")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("choice")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("unknown element")),
+            "{messages:?}"
+        );
         assert!(outcome.has_errors());
     }
 
     #[test]
     fn enforces_cardinality_reference_and_contact_invariant() {
-        let outcome = check(json!({
-            "resourceType": "Patient",
-            "contact": [{}],
-            "generalPractitioner": {"reference": "Patient/1"}
-        }), &MemoryTerminology::default());
-        let messages: Vec<_> = outcome.issues.iter().map(|issue| issue.diagnostics.clone()).collect();
-        assert!(messages.iter().any(|message| message.contains("pat-1")), "{messages:?}");
-        assert!(messages.iter().any(|message| message.contains("generalPractitioner")), "{messages:?}");
+        let outcome = check(
+            json!({
+                "resourceType": "Patient",
+                "contact": [{}],
+                "generalPractitioner": {"reference": "Patient/1"}
+            }),
+            &MemoryTerminology::default(),
+        );
+        let messages: Vec<_> = outcome
+            .issues
+            .iter()
+            .map(|issue| issue.diagnostics.clone())
+            .collect();
+        assert!(
+            messages.iter().any(|message| message.contains("pat-1")),
+            "{messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.contains("generalPractitioner")),
+            "{messages:?}"
+        );
         assert!(outcome.has_errors());
     }
 
     #[test]
     fn required_binding_accepts_known_code_and_rejects_unknown() {
         let terms = gender_terms();
-        let bad = check(json!({
-            "resourceType": "Patient",
-            "gender": "otherish",
-            "generalPractitioner": {"reference": "Organization/1"}
-        }), &terms);
+        let bad = check(
+            json!({
+                "resourceType": "Patient",
+                "gender": "otherish",
+                "generalPractitioner": {"reference": "Organization/1"}
+            }),
+            &terms,
+        );
         assert!(bad.issues.iter().any(|issue| issue.code == "code-invalid"));
-        let good = check(json!({
-            "resourceType": "Patient",
-            "gender": "female",
-            "generalPractitioner": {"reference": "Organization/1"}
-        }), &terms);
+        let good = check(
+            json!({
+                "resourceType": "Patient",
+                "gender": "female",
+                "generalPractitioner": {"reference": "Organization/1"}
+            }),
+            &terms,
+        );
         assert!(!good.has_errors(), "{:?}", good.issues);
     }
 
@@ -124,7 +165,8 @@ mod tests {
         );
         assert!(!outcome.has_errors(), "{:?}", outcome.issues);
         assert!(outcome.issues.iter().any(|issue| {
-            issue.severity == Severity::Warning && issue.diagnostics.contains("administrative-gender")
+            issue.severity == Severity::Warning
+                && issue.diagnostics.contains("administrative-gender")
         }));
     }
 
@@ -144,17 +186,41 @@ mod tests {
                 {"path": "Observation.component.code", "id": "Observation.component:sys.code", "min": 1, "max": "1", "fixedCode": "sys"}
             ]}
         })]);
-        let outcome = validate_resource(&json!({
-            "resourceType": "Observation",
-            "component": [{"code": "other"}]
-        }), &schema, &MemoryTerminology::default(), &NoHost);
-        assert!(outcome.issues.iter().any(|issue| issue.diagnostics.contains("closed slice")), "{:?}", outcome.issues);
+        let outcome = validate_resource(
+            &json!({
+                "resourceType": "Observation",
+                "component": [{"code": "other"}]
+            }),
+            &schema,
+            &MemoryTerminology::default(),
+            &NoHost,
+        );
+        assert!(
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.diagnostics.contains("closed slice")),
+            "{:?}",
+            outcome.issues
+        );
 
-        let matched = validate_resource(&json!({
-            "resourceType": "Observation",
-            "component": [{"code": "sys"}]
-        }), &schema, &MemoryTerminology::default(), &NoHost);
-        assert!(!matched.issues.iter().any(|issue| issue.diagnostics.contains("closed slice")), "{:?}", matched.issues);
+        let matched = validate_resource(
+            &json!({
+                "resourceType": "Observation",
+                "component": [{"code": "sys"}]
+            }),
+            &schema,
+            &MemoryTerminology::default(),
+            &NoHost,
+        );
+        assert!(
+            !matched
+                .issues
+                .iter()
+                .any(|issue| issue.diagnostics.contains("closed slice")),
+            "{:?}",
+            matched.issues
+        );
     }
 
     #[test]
@@ -196,10 +262,25 @@ mod tests {
             &MemoryTerminology::default(),
             &NoHost,
         );
-        let messages: Vec<_> = missing.issues.iter().map(|issue| issue.diagnostics.clone()).collect();
-        assert!(messages.iter().any(|message| message.contains("linkId")), "{messages:?}");
-        assert!(messages.iter().any(|message| message.contains("que-1")), "{messages:?}");
-        assert!(!messages.iter().any(|message| message.contains("unknown element")), "{messages:?}");
+        let messages: Vec<_> = missing
+            .issues
+            .iter()
+            .map(|issue| issue.diagnostics.clone())
+            .collect();
+        assert!(
+            messages.iter().any(|message| message.contains("linkId")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("que-1")),
+            "{messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("unknown element")),
+            "{messages:?}"
+        );
 
         let ok = validate_resource(
             &json!({
@@ -249,7 +330,10 @@ mod tests {
         let mut definitions = Vec::new();
         for entry in std::fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
-            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             if !name.starts_with("StructureDefinition-") {
                 continue;
             }
@@ -266,7 +350,11 @@ mod tests {
             &MemoryTerminology::default(),
             &NoHost,
         );
-        let errors: Vec<_> = outcome.issues.iter().filter(|issue| issue.severity.fails()).collect();
+        let errors: Vec<_> = outcome
+            .issues
+            .iter()
+            .filter(|issue| issue.severity.fails())
+            .collect();
         assert!(errors.is_empty(), "{errors:#?}");
 
         let terms = MemoryTerminology::from_resources(&[json!({
@@ -279,9 +367,14 @@ mod tests {
         })]);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../fhirpath/tests/hl7/input/patient-name-extensions.json");
-        let instance: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let instance: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let outcome = validate_resource(&instance, &schema, &terms, &NoHost);
-        let errors: Vec<_> = outcome.issues.iter().filter(|issue| issue.severity.fails()).collect();
+        let errors: Vec<_> = outcome
+            .issues
+            .iter()
+            .filter(|issue| issue.severity.fails())
+            .collect();
         assert!(errors.is_empty(), "{errors:#?}");
 
         let contained = validate_resource(
@@ -294,7 +387,11 @@ mod tests {
             &MemoryTerminology::default(),
             &NoHost,
         );
-        let errors: Vec<_> = contained.issues.iter().filter(|issue| issue.severity.fails()).collect();
+        let errors: Vec<_> = contained
+            .issues
+            .iter()
+            .filter(|issue| issue.severity.fails())
+            .collect();
         assert!(errors.is_empty(), "{errors:#?}");
 
         let unmatched = validate_resource(
@@ -307,7 +404,10 @@ mod tests {
             &NoHost,
         );
         assert!(
-            unmatched.issues.iter().any(|issue| issue.diagnostics.contains("dom-3")),
+            unmatched
+                .issues
+                .iter()
+                .any(|issue| issue.diagnostics.contains("dom-3")),
             "{:#?}",
             unmatched.issues
         );
@@ -356,7 +456,10 @@ mod tests {
             &NoHost,
         );
         assert!(
-            retired.issues.iter().any(|issue| issue.severity.fails() && issue.diagnostics.contains("inactive")),
+            retired
+                .issues
+                .iter()
+                .any(|issue| issue.severity.fails() && issue.diagnostics.contains("inactive")),
             "{:#?}",
             retired.issues
         );
@@ -371,7 +474,10 @@ mod tests {
         );
         assert!(!mismatched.has_errors(), "{:#?}", mismatched.issues);
         assert!(
-            mismatched.issues.iter().any(|issue| issue.diagnostics.contains("does not match")),
+            mismatched
+                .issues
+                .iter()
+                .any(|issue| issue.diagnostics.contains("does not match")),
             "{:#?}",
             mismatched.issues
         );
@@ -400,7 +506,10 @@ mod tests {
         );
         assert!(!outcome.has_errors(), "{:#?}", outcome.issues);
         assert!(
-            outcome.issues.iter().any(|issue| issue.diagnostics.contains("must-support")),
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.diagnostics.contains("must-support")),
             "{:#?}",
             outcome.issues
         );

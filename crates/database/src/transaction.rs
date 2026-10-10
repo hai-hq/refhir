@@ -268,10 +268,7 @@ impl Transaction {
     /// Document log rows visible at this snapshot, newest first.
     /// `start` is inclusive. Callers record the read set that should wake subscribers.
     pub fn log_since(&self, start: Timestamp) -> Result<Vec<DocumentLogEntry>, PersistError> {
-        let end = self
-            .begin_ts
-            .succ()
-            .unwrap_or(Timestamp::MAX_PERSISTED);
+        let end = self.begin_ts.succ().unwrap_or(Timestamp::MAX_PERSISTED);
         self.reader.load_documents(
             TimestampRange {
                 start_inclusive: start,

@@ -1,0 +1,53 @@
+image:
+  repository: ghcr.io/hai-hq/refhir
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8080
+
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClass: ""
+
+server:
+  bind: "0.0.0.0:8080"
+  publicUrl: ""
+
+database:
+  kind: sqlite
+  sqlitePath: /data/refhir.sqlite
+  postgresUrl: ""
+
+fhir:
+  version: r4
+
+conformance:
+  referencePolicy: strict
+  packages: []
+  # Registry or mirror URL, or s3://bucket/prefix. For S3 or an S3-compatible store put the keys in
+  # secretEnv (REFHIR_S3_ACCESS_KEY_ID, REFHIR_S3_SECRET_ACCESS_KEY) and, for a non-AWS store,
+  # REFHIR_S3_ENDPOINT / REFHIR_S3_REGION.
+  packageRegistry: ""
+
+smart:
+  enabled: false
+  # Testing only: accepts any username with no credential check.
+  demoLogin: false
+  # OpenID Connect sign-in. Put the client secret in secretEnv as REFHIR_OIDC_CLIENT_SECRET.
+  oidc:
+    issuer: ""
+    clientId: ""
+    fhirUserClaim: fhirUser
+    scopes: ["openid", "profile"]
+
+# Optional keys → Secret + env (see deploy/production.md). Example:
+# secretEnv:
+#   REFHIR_POSTGRES_URL: "postgresql://..."
+#   REFHIR_SMART_DCR_TOKEN: "..."
+#   REFHIR_OIDC_CLIENT_SECRET: "..."
+secretEnv: {}
+
+resources: {}

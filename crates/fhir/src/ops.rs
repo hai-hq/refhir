@@ -256,10 +256,38 @@ fn reject_target(
     type_name: &str,
     relative: &str,
 ) -> Result<(), FhirError> {
-    if !element.targets.is_empty() && !element.targets.iter().any(|target| target == type_name) {
+    if !element.targets.is_empty()
+        && !element
+            .targets
+            .iter()
+            .any(|target| target == "Resource" || target == type_name)
+    {
         return Err(FhirError::Invalid(relative.to_string()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod reference_target_tests {
+    use super::reject_target;
+    use crate::catalog::ReferenceElement;
+
+    #[test]
+    fn generic_resource_target_accepts_concrete_fhir_types() {
+        let generic = ReferenceElement {
+            path: "subject".into(),
+            min: 0,
+            targets: vec!["Resource".into()],
+        };
+        assert!(reject_target(&generic, "Organization", "invalid reference").is_ok());
+        assert!(reject_target(&generic, "Appointment", "invalid reference").is_ok());
+        let patient = ReferenceElement {
+            path: "subject".into(),
+            min: 0,
+            targets: vec!["Patient".into()],
+        };
+        assert!(reject_target(&patient, "Organization", "invalid reference").is_err());
+    }
 }
 
 fn absolute_type(reference: &str) -> Option<&str> {

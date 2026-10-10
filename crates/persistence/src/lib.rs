@@ -298,6 +298,116 @@ pub struct NewSearchParameter {
     pub json: String,
 }
 
+/// Whether two search parameter expressions for `base` mean the same thing. Packages write
+/// the same path with or without the resource type (`Questionnaire.subjectType` in core,
+/// `subjectType` in SDC), and union branches may be spaced differently.
+pub fn same_expression(base: &str, left: &str, right: &str) -> bool {
+    let normalize = |expression: &str| {
+        let prefix = format!("{base}.");
+        expression
+            .split('|')
+            .map(|branch| {
+                let branch = branch.trim();
+                branch
+                    .strip_prefix(prefix.as_str())
+                    .unwrap_or(branch)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    normalize(left) == normalize(right)
+}
+
+/// What to do when an incoming search parameter has the same base and code as an installed
+/// one but a different expression.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpressionClash {
+    /// Refuse the package.
+    Conflict,
+    /// Drop the incoming row; the installed one is the real definition.
+    KeepInstalled,
+    /// Remove the installed row; the incoming one is the real definition.
+    ReplaceInstalled,
+}
+
+/// Experimental parameters are samples and drafts (FHIR: "for testing purposes, not real
+/// usage"), so they yield to a non-experimental parameter whichever package is installed first.
+/// Anything else with a different expression is a real conflict.
+pub fn resolve_expression_clash(installed_json: &str, incoming_json: &str) -> ExpressionClash {
+    let experimental = |json: &str| {
+        serde_json::from_str::<JsonValue>(json)
+            .ok()
+            .and_then(|value| value.get("experimental").and_then(JsonValue::as_bool))
+            == Some(true)
+    };
+    match (experimental(installed_json), experimental(incoming_json)) {
+        (true, false) => ExpressionClash::ReplaceInstalled,
+        (false, true) => ExpressionClash::KeepInstalled,
+        _ => ExpressionClash::Conflict,
+    }
+}
+
+/// An installed search parameter row for one base and code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstalledParam {
+    pub package_id: i64,
+    pub url: String,
+    pub expression: String,
+    pub status: String,
+    pub json: String,
+}
+
+/// What installing a search parameter should do given the rows already stored for its base
+/// and code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParamPlan {
+    /// Store the incoming row. `status` is the status of an installed row with the same
+    /// expression, if there is one. `remove` lists installed rows to delete first.
+    Insert {
+        status: Option<ParamStatus>,
+        remove: Vec<(i64, String)>,
+    },
+    /// Leave the installed definition alone and do not store the incoming row.
+    Skip,
+    /// Installed and incoming definitions disagree and neither may yield.
+    Conflict,
+}
+
+/// Decide how `param` meets the `installed` rows that share its base and code. Only the rows
+/// that actually disagree with it and are experimental are ever removed.
+pub fn plan_search_parameter(
+    param: &NewSearchParameter,
+    installed: &[InstalledParam],
+) -> Result<ParamPlan, PersistError> {
+    let incoming = param.expression.clone().unwrap_or_default();
+    let mut status = None;
+    let mut remove = Vec::new();
+    let (mut keep, mut conflict) = (false, false);
+    for row in installed {
+        if same_expression(&param.base, &row.expression, &incoming) {
+            if status.is_none() {
+                status = Some(ParamStatus::parse(&row.status)?);
+            }
+            continue;
+        }
+        match resolve_expression_clash(&row.json, &param.json) {
+            ExpressionClash::Conflict => conflict = true,
+            ExpressionClash::KeepInstalled => keep = true,
+            ExpressionClash::ReplaceInstalled => remove.push((row.package_id, row.url.clone())),
+        }
+    }
+    // Whatever order the rows come in, a real installed definition outranks the incoming
+    // draft, and only then is a disagreement an error.
+    Ok(if keep {
+        ParamPlan::Skip
+    } else if conflict {
+        ParamPlan::Conflict
+    } else {
+        ParamPlan::Insert { status, remove }
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredTerminology {
     pub package_id: i64,
@@ -456,8 +566,327 @@ pub trait ConformanceStore: Send + Sync {
     fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError>;
 }
 
+#[cfg(test)]
+mod clash_tests {
+    use super::*;
+
+    #[test]
+    fn expressions_match_with_or_without_the_resource_type() {
+        assert!(same_expression(
+            "Questionnaire",
+            "Questionnaire.subjectType",
+            "subjectType"
+        ));
+        assert!(same_expression(
+            "Patient",
+            "Patient.name|Patient.alias",
+            "name | alias"
+        ));
+        assert!(!same_expression("Patient", "Patient.name", "Patient.alias"));
+        assert!(!same_expression("Patient", "Observation.name", "name"));
+    }
+
+    fn param(expression: &str, experimental: bool) -> NewSearchParameter {
+        NewSearchParameter {
+            url: "http://example.org/new".into(),
+            base: "Patient".into(),
+            code: "maiden".into(),
+            param_type: "string".into(),
+            expression: Some(expression.into()),
+            status: ParamStatus::Pending,
+            json: format!(r#"{{"experimental":{experimental}}}"#),
+        }
+    }
+
+    fn row(package_id: i64, expression: &str, experimental: bool) -> InstalledParam {
+        InstalledParam {
+            package_id,
+            url: format!("http://example.org/{package_id}"),
+            expression: expression.into(),
+            status: "ready".into(),
+            json: format!(r#"{{"experimental":{experimental}}}"#),
+        }
+    }
+
+    #[test]
+    fn only_experimental_rows_that_disagree_are_removed() {
+        let incoming = param("Patient.real", false);
+        let installed = [
+            row(1, "Patient.draft", true),
+            row(2, "Patient.real", false),
+            row(3, "Patient.other", true),
+        ];
+        match plan_search_parameter(&incoming, &installed).unwrap() {
+            ParamPlan::Insert { status, remove } => {
+                assert_eq!(status, Some(ParamStatus::Ready));
+                assert_eq!(remove.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1, 3]);
+            }
+            other => panic!("{other:?}"),
+        }
+        let real_installed = [row(1, "Patient.draft", true), row(2, "Patient.real", false)];
+        let experimental = param("Patient.draft2", true);
+        assert_eq!(
+            plan_search_parameter(&experimental, &real_installed).unwrap(),
+            ParamPlan::Skip
+        );
+        let clash = [row(1, "Patient.a", false)];
+        assert_eq!(
+            plan_search_parameter(&param("Patient.b", false), &clash).unwrap(),
+            ParamPlan::Conflict
+        );
+    }
+
+    #[test]
+    fn experimental_parameters_yield_to_real_ones() {
+        let sample = r#"{"experimental":true}"#;
+        let real = r#"{"status":"active"}"#;
+        assert_eq!(
+            resolve_expression_clash(sample, real),
+            ExpressionClash::ReplaceInstalled
+        );
+        assert_eq!(
+            resolve_expression_clash(real, sample),
+            ExpressionClash::KeepInstalled
+        );
+        assert_eq!(
+            resolve_expression_clash(real, real),
+            ExpressionClash::Conflict
+        );
+        assert_eq!(
+            resolve_expression_clash(sample, sample),
+            ExpressionClash::Conflict
+        );
+        assert_eq!(
+            resolve_expression_clash("not json", real),
+            ExpressionClash::Conflict
+        );
+    }
+}
+
+/// Rows of the SMART authorization server: clients, codes, tokens, login sessions.
+///
+/// These live in their own table, outside the FHIR document log, so they never appear in
+/// `_history` or `/sync` and a delete really removes the row. `kind` names the row type and
+/// `id` is unique within it. `exp` is a Unix time in seconds; rows at or past it are dead.
+pub trait AuthStore: Send + Sync {
+    /// Insert or replace a row.
+    fn auth_put(&self, kind: &str, id: &str, json: &str, exp: u64) -> Result<(), PersistError>;
+    /// Insert a row unless a live one already exists. Returns whether it was inserted.
+    fn auth_insert(
+        &self,
+        kind: &str,
+        id: &str,
+        json: &str,
+        exp: u64,
+        now: u64,
+    ) -> Result<bool, PersistError>;
+    fn auth_get(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError>;
+    /// Delete a row and return it if it was live. Of concurrent callers, at most one gets it.
+    fn auth_take(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError>;
+    /// Every live row of `kind`.
+    fn auth_list(&self, kind: &str, now: u64) -> Result<Vec<String>, PersistError>;
+    /// Delete every dead row.
+    fn auth_prune(&self, now: u64) -> Result<(), PersistError>;
+}
+
+/// SQL `exp` column value: Unix seconds, clamped to the signed 64-bit range.
+pub fn auth_exp(exp: u64) -> i64 {
+    i64::try_from(exp).unwrap_or(i64::MAX)
+}
+
+/// [`AuthStore`] held in process memory, for tests and embedders without a database.
+#[derive(Default)]
+pub struct MemoryAuthStore {
+    rows: std::sync::Mutex<std::collections::HashMap<(String, String), (String, u64)>>,
+}
+
+impl AuthStore for MemoryAuthStore {
+    fn auth_put(&self, kind: &str, id: &str, json: &str, exp: u64) -> Result<(), PersistError> {
+        let mut rows = self.rows.lock().expect("auth");
+        rows.insert((kind.into(), id.into()), (json.into(), exp));
+        Ok(())
+    }
+
+    fn auth_insert(
+        &self,
+        kind: &str,
+        id: &str,
+        json: &str,
+        exp: u64,
+        now: u64,
+    ) -> Result<bool, PersistError> {
+        let mut rows = self.rows.lock().expect("auth");
+        let key = (kind.to_string(), id.to_string());
+        if rows.get(&key).is_some_and(|(_, live)| *live > now) {
+            return Ok(false);
+        }
+        rows.insert(key, (json.into(), exp));
+        Ok(true)
+    }
+
+    fn auth_get(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError> {
+        let rows = self.rows.lock().expect("auth");
+        Ok(rows
+            .get(&(kind.to_string(), id.to_string()))
+            .filter(|(_, exp)| *exp > now)
+            .map(|(json, _)| json.clone()))
+    }
+
+    fn auth_take(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError> {
+        let mut rows = self.rows.lock().expect("auth");
+        Ok(rows
+            .remove(&(kind.to_string(), id.to_string()))
+            .filter(|(_, exp)| *exp > now)
+            .map(|(json, _)| json))
+    }
+
+    fn auth_list(&self, kind: &str, now: u64) -> Result<Vec<String>, PersistError> {
+        let rows = self.rows.lock().expect("auth");
+        Ok(rows
+            .iter()
+            .filter(|((row_kind, _), (_, exp))| row_kind == kind && *exp > now)
+            .map(|(_, (json, _))| json.clone())
+            .collect())
+    }
+
+    fn auth_prune(&self, now: u64) -> Result<(), PersistError> {
+        self.rows
+            .lock()
+            .expect("auth")
+            .retain(|_, (_, exp)| *exp > now);
+        Ok(())
+    }
+}
+
+/// Shared checks every [`AuthStore`] backend must pass.
+pub mod auth {
+    use super::AuthStore;
+
+    pub fn exercise(store: &dyn AuthStore) {
+        store.auth_put("code", "c1", "{\"a\":1}", 100).unwrap();
+        assert_eq!(
+            store.auth_get("code", "c1", 50).unwrap().as_deref(),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(store.auth_get("code", "c1", 100).unwrap(), None, "expired");
+        assert_eq!(
+            store.auth_get("token", "c1", 50).unwrap(),
+            None,
+            "kinds are separate"
+        );
+
+        store.auth_put("code", "c1", "{\"a\":2}", 100).unwrap();
+        assert_eq!(
+            store.auth_take("code", "c1", 50).unwrap().as_deref(),
+            Some("{\"a\":2}")
+        );
+        assert_eq!(
+            store.auth_take("code", "c1", 50).unwrap(),
+            None,
+            "taken once"
+        );
+
+        store.auth_put("code", "old", "{}", 10).unwrap();
+        assert_eq!(
+            store.auth_take("code", "old", 50).unwrap(),
+            None,
+            "expired take"
+        );
+
+        assert!(store.auth_insert("jti", "j1", "{}", 100, 50).unwrap());
+        assert!(
+            !store.auth_insert("jti", "j1", "{}", 100, 50).unwrap(),
+            "live duplicate"
+        );
+        assert!(
+            store.auth_insert("jti", "j1", "{}", 300, 150).unwrap(),
+            "expired is replaced"
+        );
+
+        store.auth_put("client", "a", "\"a\"", u64::MAX).unwrap();
+        store.auth_put("client", "b", "\"b\"", u64::MAX).unwrap();
+        let mut clients = store.auth_list("client", 50).unwrap();
+        clients.sort();
+        assert_eq!(clients, vec!["\"a\"", "\"b\""]);
+
+        store.auth_put("token", "t", "{}", 60).unwrap();
+        store.auth_prune(70).unwrap();
+        assert_eq!(store.auth_get("token", "t", 0).unwrap(), None, "pruned");
+        assert!(
+            store.auth_get("client", "a", 70).unwrap().is_some(),
+            "live rows survive"
+        );
+    }
+
+    #[test]
+    fn memory_store() {
+        exercise(&super::MemoryAuthStore::default());
+    }
+}
+
 pub mod conformance {
     use super::*;
+
+    /// Search parameters that meet in different packages: a draft yields to a real definition
+    /// in either install order, and two real ones that disagree are refused. `tag` keeps
+    /// package names unique on a database that already holds earlier runs.
+    pub fn exercise_parameter_clashes(store: &dyn ConformanceStore, tag: &str) {
+        let package = |name: &str, expression: &str, experimental: bool| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: vec![NewSearchParameter {
+                url: format!("http://example.org/sp/{name}.{tag}"),
+                base: "Patient".into(),
+                code: format!("maiden-{tag}"),
+                param_type: "string".into(),
+                expression: Some(expression.into()),
+                status: ParamStatus::Pending,
+                json: format!(r#"{{"experimental":{experimental}}}"#),
+            }],
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        let stored = || -> Vec<StoredSearchParameter> {
+            store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.code == format!("maiden-{tag}"))
+                .collect()
+        };
+        // Draft first, then the real definition replaces it.
+        store
+            .install_package(&package("draft", "Patient.extension('d')", true))
+            .unwrap();
+        store
+            .install_package(&package("real", "Patient.extension('r').value", false))
+            .unwrap();
+        let rows = stored();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].expression.as_deref(),
+            Some("Patient.extension('r').value")
+        );
+        // A later draft yields to the installed real one.
+        store
+            .install_package(&package("draft2", "Patient.extension('x')", true))
+            .unwrap();
+        assert_eq!(stored().len(), 1);
+        // The same expression without the resource type is the same definition.
+        store
+            .install_package(&package("same", "extension('r').value", false))
+            .unwrap();
+        assert!(stored()
+            .iter()
+            .all(|row| row.expression.as_deref() != Some("Patient.other")));
+        // Two real definitions that disagree are refused.
+        let err = store
+            .install_package(&package("clash", "Patient.other", false))
+            .unwrap_err();
+        assert!(matches!(err, InstallError::Expression { .. }), "{err}");
+    }
     use refhir_types::TabletId;
 
     /// Feature 1: a revision and its index row are visible at that timestamp,

@@ -17,6 +17,7 @@ mod package;
 mod patch;
 mod resolve;
 mod run;
+mod s3;
 mod sdc;
 mod search;
 mod terms;
@@ -29,11 +30,13 @@ pub use catalog::{Catalog, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
 pub use npm::{
-    install_package, install_with, parse_package_spec, NpmRegistry, PackageFetcher, PackageSpec,
+    install_package, install_with, packages_installed, parse_package_spec, NpmRegistry,
+    PackageFetcher, PackageSpec,
 };
 pub use package::{
-    expression_clash_dir, extra_dir, install_package_dir, minir4_dir, r4_dir, run_backfills,
-    sdc_dir, stage_package_dir, version_clash_dir,
+    default_r4_registry_specs, expression_clash_dir, extra_dir, install_package_dir, minir4_dir,
+    r4_dir, run_backfills, sdc_dir, stage_package_dir, version_clash_dir, R4_CORE_PACKAGE,
+    SDC_PACKAGE,
 };
 pub use refhir_persistence::ConformanceStore;
 pub use run::{dispatch, run, stamp_stored_json, RunError, RunResult, MAX_OCC_FAILURES};

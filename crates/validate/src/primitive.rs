@@ -11,20 +11,50 @@ struct Pattern {
 }
 
 const PATTERNS: &[Pattern] = &[
-    Pattern { code: "string", regex: r#"^[\s\S]+$"# },
-    Pattern { code: "markdown", regex: r#"^[\s\S]+$"# },
-    Pattern { code: "xhtml", regex: r#"^[\s\S]+$"# },
-    Pattern { code: "id", regex: r"^[A-Za-z0-9\-\.]{1,64}$" },
-    Pattern { code: "code", regex: r"^[^\s]+( [^\s]+)*$" },
-    Pattern { code: "uri", regex: r"^\S*$" },
-    Pattern { code: "url", regex: r"^\S*$" },
-    Pattern { code: "canonical", regex: r"^\S*$" },
-    Pattern { code: "oid", regex: r"^urn:oid:[0-2](\.(0|[1-9][0-9]*))+$" },
+    Pattern {
+        code: "string",
+        regex: r#"^[\s\S]+$"#,
+    },
+    Pattern {
+        code: "markdown",
+        regex: r#"^[\s\S]+$"#,
+    },
+    Pattern {
+        code: "xhtml",
+        regex: r#"^[\s\S]+$"#,
+    },
+    Pattern {
+        code: "id",
+        regex: r"^[A-Za-z0-9\-\.]{1,64}$",
+    },
+    Pattern {
+        code: "code",
+        regex: r"^[^\s]+( [^\s]+)*$",
+    },
+    Pattern {
+        code: "uri",
+        regex: r"^\S*$",
+    },
+    Pattern {
+        code: "url",
+        regex: r"^\S*$",
+    },
+    Pattern {
+        code: "canonical",
+        regex: r"^\S*$",
+    },
+    Pattern {
+        code: "oid",
+        regex: r"^urn:oid:[0-2](\.(0|[1-9][0-9]*))+$",
+    },
     Pattern {
         code: "uuid",
         regex: r"(?i)^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     },
-    Pattern { code: "base64Binary", regex: r"^[ \r\n\tA-Za-z0-9+/=]*$" },
+    Pattern {
+        code: "base64Binary",
+        regex: r"^[ \r\n\tA-Za-z0-9+/=]*$",
+    },
     Pattern {
         code: "date",
         regex: r"^-?[0-9]{4}(-(0[1-9]|1[0-2])(-(0[0-9]|[1-2][0-9]|3[0-1]))?)?$",
@@ -142,11 +172,16 @@ fn integer_in(value: &Json, min: i64, max: i64, name: &str) -> Option<String> {
 }
 
 fn builtin(code: &str) -> Option<&'static str> {
-    PATTERNS.iter().find(|pattern| pattern.code == code).map(|pattern| pattern.regex)
+    PATTERNS
+        .iter()
+        .find(|pattern| pattern.code == code)
+        .map(|pattern| pattern.regex)
 }
 
 fn regex_match(pattern: &str, text: &str) -> bool {
-    Regex::new(pattern).map(|regex| regex.is_match(text)).unwrap_or(true)
+    Regex::new(pattern)
+        .map(|regex| regex.is_match(text))
+        .unwrap_or(true)
 }
 
 pub fn compiled_regex_ok(pattern: &str) -> bool {

@@ -99,7 +99,11 @@ impl MemoryTerminology {
     pub fn from_stored(resources: &[Json], expansions: &[Json]) -> Self {
         let (mut terms, _) = index_resources(resources);
         for resource in resources {
-            if resource.get("resourceType").and_then(|value| value.as_str()) != Some("ValueSet") {
+            if resource
+                .get("resourceType")
+                .and_then(|value| value.as_str())
+                != Some("ValueSet")
+            {
                 continue;
             }
             if let Some((url, expansion)) = resource
@@ -117,7 +121,9 @@ impl MemoryTerminology {
                 })
             {
                 if !url.is_empty() {
-                    terms.expansions.insert(canonical(&url).to_string(), expansion);
+                    terms
+                        .expansions
+                        .insert(canonical(&url).to_string(), expansion);
                 }
             }
         }
@@ -246,9 +252,17 @@ impl MemoryTerminology {
             return Some(expanded);
         };
         let total = contains.len();
-        let page: Vec<Json> = contains.iter().skip(offset).take(count.unwrap_or(total)).cloned().collect();
+        let page: Vec<Json> = contains
+            .iter()
+            .skip(offset)
+            .take(count.unwrap_or(total))
+            .cloned()
+            .collect();
         *contains = page;
-        if let Some(expansion) = expanded.get_mut("expansion").and_then(|value| value.as_object_mut()) {
+        if let Some(expansion) = expanded
+            .get_mut("expansion")
+            .and_then(|value| value.as_object_mut())
+        {
             expansion.insert("total".into(), json!(total));
             expansion.insert("offset".into(), json!(offset));
         }
@@ -568,7 +582,15 @@ fn note_system(expansion: &mut Expansion, expander: &Expander<'_>, system: &str)
 fn filter_supported(filter: &Json) -> bool {
     matches!(
         filter.get("op").and_then(|value| value.as_str()),
-        Some("=" | "is-a" | "descendent-of" | "is-not-a" | "exists" | "in" | "not-in" | "generalizes")
+        Some(
+            "=" | "is-a"
+                | "descendent-of"
+                | "is-not-a"
+                | "exists"
+                | "in"
+                | "not-in"
+                | "generalizes"
+        )
     )
 }
 
@@ -1099,7 +1121,11 @@ mod tests {
         });
         let terms = MemoryTerminology::from_resources(&[map]);
         assert_eq!(
-            terms.translate_coding("http://example.org/map", Some("http://example.org/src"), "a"),
+            terms.translate_coding(
+                "http://example.org/map",
+                Some("http://example.org/src"),
+                "a"
+            ),
             Some(json!("b"))
         );
         assert!(terms

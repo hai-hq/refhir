@@ -46,7 +46,9 @@ pub fn apply(
         .iter()
         .find(|input| input.get("mode").and_then(|value| value.as_str()) == Some("target"))
         .cloned()
-        .unwrap_or_else(|| json!({"name": "out", "type": "QuestionnaireResponse", "mode": "target"}));
+        .unwrap_or_else(
+            || json!({"name": "out", "type": "QuestionnaireResponse", "mode": "target"}),
+        );
     let target_name = target
         .get("name")
         .and_then(|value| value.as_str())
@@ -183,7 +185,8 @@ fn parse_rule(left: &str, right: &str) -> Result<Json, String> {
         }
     } else {
         target["transform"] = json!("copy");
-        target["parameter"] = json!([{"valueString": transform.trim_matches('\'').trim_matches('"')}]);
+        target["parameter"] =
+            json!([{"valueString": transform.trim_matches('\'').trim_matches('"')}]);
     }
     Ok(json!({"name": element, "source": [source], "target": [target]}))
 }
@@ -319,7 +322,12 @@ fn apply_target(
             }
         }
         "uuid" => json!(format!("urn:uuid:{}", Uuid::new_v4())),
-        "truncate" => json!(param_value(target, row).as_str().unwrap_or("").chars().take(32).collect::<String>()),
+        "truncate" => json!(param_value(target, row)
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(32)
+            .collect::<String>()),
         "append" => {
             let current = vars.get(context).cloned().unwrap_or(Json::Null);
             let prior = read_path(&current, element)
@@ -425,7 +433,10 @@ fn read_path(value: &Json, path: &str) -> Vec<Json> {
 }
 
 fn write_path(root: &mut Json, path: &str, value: Json, append: bool) {
-    let segments: Vec<&str> = path.split('.').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     if segments.is_empty() {
         *root = value;
         return;
@@ -554,16 +565,12 @@ mod tests {
                 }]
             }]
         });
-        let got = apply(
-            &map,
-            &json!({"code": "M"}),
-            &mut |map, system, code| {
-                assert_eq!(map, "http://example.org/ConceptMap/gender");
-                assert_eq!(system, None);
-                assert_eq!(code, "M");
-                Some(json!({"coding": [{"code": "male"}]}))
-            },
-        )
+        let got = apply(&map, &json!({"code": "M"}), &mut |map, system, code| {
+            assert_eq!(map, "http://example.org/ConceptMap/gender");
+            assert_eq!(system, None);
+            assert_eq!(code, "M");
+            Some(json!({"coding": [{"code": "male"}]}))
+        })
         .unwrap();
         assert_eq!(got["code"]["coding"][0]["code"], "male");
     }

@@ -282,7 +282,9 @@ pub fn number_key(value: f64, doc_id: &str) -> Vec<u8> {
 /// Inclusive `start`, exclusive `end`. `None` is unbounded on that side.
 pub fn number_range(start: Option<f64>, end_exclusive: Option<f64>) -> Interval {
     Interval {
-        start: start.map(|value| sortable_f64(value).to_vec()).unwrap_or_default(),
+        start: start
+            .map(|value| sortable_f64(value).to_vec())
+            .unwrap_or_default(),
         end: end_exclusive.map(|value| sortable_f64(value).to_vec()),
     }
 }
@@ -352,8 +354,7 @@ mod tests {
 
     #[test]
     fn number_keys_sort_with_the_value() {
-        let keys = [-2.0, -0.5, 0.0, 1.0, 10.0]
-            .map(|value| number_key(value, "a"));
+        let keys = [-2.0, -0.5, 0.0, 1.0, 10.0].map(|value| number_key(value, "a"));
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);

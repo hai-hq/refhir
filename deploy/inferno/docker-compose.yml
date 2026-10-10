@@ -1,0 +1,23 @@
+# SMART-enabled ReFHIR for Inferno manual runs and CI smoke tests (not for production).
+# From repo root: docker compose -f deploy/inferno/docker-compose.yml up --build
+
+services:
+  refhir:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - refhir-data:/data
+      - ./refhir.toml:/etc/refhir/refhir.toml:ro
+    environment:
+      REFHIR_CONFIG: /etc/refhir/refhir.toml
+      REFHIR_PUBLIC_URL: http://localhost:8080
+      # The Inferno profile uses demo login on 0.0.0.0; refused otherwise.
+      REFHIR_ALLOW_REMOTE_DEMO_LOGIN: "1"
+      REFHIR_SMART_DCR_TOKEN: inferno-dcr
+      REFHIR_SMART_CONFIDENTIAL_SECRET: inferno-confidential
+
+volumes:
+  refhir-data:

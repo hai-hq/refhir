@@ -1,7 +1,6 @@
 //! SMART App Launch 2.2 authorization server.
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{header, HeaderMap, StatusCode};
@@ -9,17 +8,14 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rsa::pkcs8::{EncodePrivateKey, LineEnding};
-use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use jsonwebtoken::{Algorithm, DecodingKey, Header, Validation};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::store::{
-    code_ttl, is_loopback_host, launch_ttl, normalize_patient_id, parse_http_uri, redirect_allowed,
-    redirect_uri_valid, AuthCode, Client, Launch,
+    is_loopback_host, launch_ttl, normalize_patient_id, parse_http_uri, redirect_allowed,
+    redirect_uri_valid, Client, Launch,
 };
 use super::Token;
 use crate::http::AppState;
@@ -27,30 +23,6 @@ use crate::http::AppState;
 const ACCESS_TTL: u64 = 3600;
 const BACKEND_TTL: u64 = 300;
 const REFRESH_TTL: u64 = 60 * 60 * 24 * 30;
-
-struct ServerKeys {
-    kid: String,
-    encoding: EncodingKey,
-    n: String,
-    e: String,
-}
-
-fn keys() -> &'static ServerKeys {
-    static KEYS: OnceLock<ServerKeys> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        let mut rng = rand::thread_rng();
-        let key = RsaPrivateKey::new(&mut rng, 2048).expect("rsa key");
-        let pem = key.to_pkcs8_pem(LineEnding::LF).expect("pem");
-        let encoding = EncodingKey::from_rsa_pem(pem.as_bytes()).expect("encoding key");
-        let public = RsaPublicKey::from(&key);
-        ServerKeys {
-            kid: "refhir-1".into(),
-            encoding,
-            n: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
-            e: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
-        }
-    })
-}
 
 pub fn configuration(app: &AppState, headers: &HeaderMap) -> Response {
     let issuer = issuer(app, headers);
@@ -119,8 +91,11 @@ pub fn configuration(app: &AppState, headers: &HeaderMap) -> Response {
     )
 }
 
-pub fn jwks() -> Response {
-    let keys = keys();
+pub fn jwks(app: &AppState) -> Response {
+    let keys = match app.smart.signing_keys() {
+        Ok(keys) => keys,
+        Err(err) => return signing_unavailable(&err),
+    };
     json_response(
         StatusCode::OK,
         json!({
@@ -193,7 +168,6 @@ pub fn authorize(
             "smart is not enabled",
         );
     }
-    app.smart.prune();
     let mut params = parse_form(raw_query.unwrap_or("").as_bytes());
     for (key, value) in parse_form(body) {
         params.insert(key, value);
@@ -258,20 +232,9 @@ pub fn authorize(
     if scopes.is_empty() {
         return fail("invalid_scope", "no supported scopes were requested");
     }
-    let mut patient = app
-        .config
-        .smart_patient
-        .clone()
-        .map(|id| normalize_patient_id(&id));
-    let mut encounter = app.config.smart_encounter.clone();
-    let mut fhir_user = Some(format!(
-        "{}/{}",
-        issuer(app, headers).trim_end_matches('/'),
-        app.config
-            .smart_fhir_user
-            .clone()
-            .unwrap_or_else(|| "Patient/smart".into())
-    ));
+    let mut patient = None;
+    let mut encounter = None;
+    let mut fhir_user = None;
     if let Some(launch_id) = params.get("launch").filter(|value| !value.is_empty()) {
         if !scopes.iter().any(|scope| scope == "launch") {
             return fail("invalid_request", "EHR launch requires the launch scope");
@@ -286,36 +249,61 @@ pub fn authorize(
         if launch.client_id != client.id {
             return fail("invalid_request", "launch id belongs to another client");
         }
-        if launch.patient.is_some() {
-            patient = launch.patient.clone();
+        patient = launch.patient.clone();
+        encounter = launch.encounter.clone();
+        fhir_user = launch.fhir_user.clone();
+        if scopes_need_patient(&scopes) && patient.is_none() {
+            return fail("invalid_request", "launch is missing patient context");
         }
-        if launch.encounter.is_some() {
-            encounter = launch.encounter.clone();
-        }
-        if launch.fhir_user.is_some() {
-            fhir_user = launch.fhir_user.clone();
-        }
-    } else if scopes.iter().any(|scope| scope == "launch/patient") {
-        patient = patient.or_else(|| Some("example".into()));
     }
-    if scopes.iter().any(|scope| scope == "launch/encounter") {
-        encounter = encounter.or_else(|| Some("example".into()));
-    }
-    let code = format!("code-{}", uuid::Uuid::new_v4());
-    app.smart.put_code(
-        code.clone(),
-        AuthCode {
-            client_id: client.id,
+    // Any scope that needs a patient shows the picker up front instead of failing after consent.
+    let needs_patient_pick = scopes_need_patient(&scopes) && patient.is_none();
+    let needs_encounter_pick = scopes_need_encounter(&scopes) && encounter.is_none();
+    let nonce = params.get("nonce").cloned().filter(|v| !v.is_empty());
+    let session_id = format!("sess-{}", uuid::Uuid::new_v4());
+    let stored = app.smart.put_pending(
+        session_id.clone(),
+        super::store::PendingSession {
+            client_id: client.id.clone(),
             redirect_uri: redirect_uri.clone(),
+            state: state.clone(),
             scopes,
             challenge,
             patient,
             encounter,
             fhir_user,
-            exp: now() + code_ttl(),
+            needs_patient_pick,
+            needs_encounter_pick,
+            nonce,
+            identity: None,
+            oidc: None,
+            browser: None,
+            exp: now() + launch_ttl(),
         },
     );
-    redirect_with(&redirect_uri, &[("code", &code), ("state", &state)])
+    if stored.is_err() {
+        return storage_unavailable();
+    }
+    super::interact::redirect_to_interact(&session_id)
+}
+
+/// The signing key could not be loaded: log why, and keep the details out of the response.
+fn signing_unavailable(err: &str) -> Response {
+    tracing::error!("smart signing key unavailable: {err}");
+    oauth_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "the signing key is unavailable",
+    )
+}
+
+/// The request was valid but the credential could not be saved, so none is handed out.
+pub(crate) fn storage_unavailable() -> Response {
+    oauth_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+        "the authorization server could not store the request; try again",
+    )
 }
 
 pub fn issue(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
@@ -326,7 +314,6 @@ pub fn issue(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
             "smart is not enabled",
         );
     }
-    app.smart.prune();
     let form = parse_form(body);
     let grant = form
         .get("grant_type")
@@ -593,14 +580,16 @@ pub fn register(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
     let id = format!("client-{}", uuid::Uuid::new_v4());
     let client = Client {
         id: id.clone(),
-        secret: secret.clone(),
+        secret: secret.as_deref().map(super::store::hash_secret),
         public,
         redirect_uris: redirects.clone(),
         jwks: requested.get("jwks").cloned(),
         grants: grants.clone(),
         allowed_scopes: scopes.clone(),
     };
-    app.smart.put_client(client);
+    if app.smart.put_client(client).is_err() {
+        return storage_unavailable();
+    }
     let mut body = json!({
         "client_id": id,
         "token_endpoint_auth_method": method,
@@ -615,6 +604,20 @@ pub fn register(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
         body["scope"] = json!(scopes.join(" "));
     }
     json_response(StatusCode::CREATED, body)
+}
+
+fn launcher_authenticated(
+    client: &Client,
+    headers: &HeaderMap,
+    params: &HashMap<String, String>,
+) -> bool {
+    if client.public {
+        return false;
+    }
+    let secret = basic_client(headers)
+        .and_then(|(_, secret)| secret)
+        .or_else(|| params.get("client_secret").cloned());
+    secret.is_some_and(|got| client.secret_matches(&got))
 }
 
 pub fn ehr_launch(app: &AppState, headers: &HeaderMap, raw_query: Option<&str>) -> Response {
@@ -655,33 +658,64 @@ pub fn ehr_launch(app: &AppState, headers: &HeaderMap, raw_query: Option<&str>) 
         );
     }
     let iss = issuer(app, headers);
-    let fhir_user = app.config.smart_fhir_user.as_ref().map(|id| {
-        if parse_http_uri(id).is_some() {
-            id.clone()
-        } else {
-            format!(
-                "{}/{}",
-                iss.trim_end_matches('/'),
-                id.trim_start_matches('/')
-            )
-        }
-    });
-    let id = format!("launch-{}", uuid::Uuid::new_v4());
-    app.smart.put_launch(
-        id.clone(),
-        Launch {
-            client_id: client.id,
-            patient: app
-                .config
+    // Only an authenticated launcher may choose the context; everyone else gets the configured one.
+    let trusted = launcher_authenticated(&client, headers, &params);
+    let launcher_param = |name: &str| params.get(name).filter(|_| trusted);
+    let patient = launcher_param("patient")
+        .map(|value| normalize_patient_id(value))
+        .or_else(|| {
+            app.config
                 .smart_patient
                 .as_deref()
                 .map(normalize_patient_id)
-                .filter(|id| !id.is_empty()),
-            encounter: app.config.smart_encounter.clone(),
+        })
+        .filter(|id| !id.is_empty());
+    let Some(patient) = patient else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "patient is required for EHR launch",
+        );
+    };
+    if !super::interact::patient_exists(app, &patient) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "patient does not exist",
+        );
+    }
+    let encounter = launcher_param("encounter")
+        .cloned()
+        .or_else(|| app.config.smart_encounter.clone())
+        .filter(|id| !id.is_empty());
+    let requested = launcher_param("fhir_user")
+        .map(String::as_str)
+        .or(app.config.smart_fhir_user.as_deref())
+        .filter(|reference| !reference.is_empty());
+    if let Some(reference) = requested {
+        if !reference.contains("://") && !super::interact::valid_fhir_reference(reference) {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "fhir_user must be an absolute URL or ResourceType/id",
+            );
+        }
+    }
+    let fhir_user = requested.map(|reference| super::interact::absolute_fhir_user(&iss, reference));
+    let id = format!("launch-{}", uuid::Uuid::new_v4());
+    let stored = app.smart.put_launch(
+        id.clone(),
+        Launch {
+            client_id: client.id,
+            patient: Some(patient),
+            encounter,
             fhir_user,
             exp: now() + launch_ttl(),
         },
     );
+    if stored.is_err() {
+        return storage_unavailable();
+    }
     redirect_with(&launch_uri, &[("iss", &iss), ("launch", &id)])
 }
 
@@ -730,7 +764,7 @@ fn token_authorization_code(
         );
     }
     if record.client_id != client.id {
-        app.smart.put_code(code.clone(), record);
+        let _ = app.smart.put_code(code.clone(), record);
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -738,7 +772,7 @@ fn token_authorization_code(
         );
     }
     if record.redirect_uri != *redirect_uri {
-        app.smart.put_code(code.clone(), record);
+        let _ = app.smart.put_code(code.clone(), record);
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -760,6 +794,8 @@ fn token_authorization_code(
         record.patient,
         record.encounter,
         record.fhir_user,
+        record.sub,
+        record.nonce.clone(),
         ACCESS_TTL,
     )
 }
@@ -791,7 +827,7 @@ fn token_refresh(app: &AppState, headers: &HeaderMap, form: &HashMap<String, Str
         );
     }
     if record.client_id != client.id {
-        app.smart.put_refresh(refresh.clone(), record);
+        let _ = app.smart.put_refresh(refresh.clone(), record);
         return oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_grant",
@@ -810,7 +846,8 @@ fn token_refresh(app: &AppState, headers: &HeaderMap, form: &HashMap<String, Str
         }
         scopes = next;
     }
-    issue_tokens(
+    let rotated_from = record.clone();
+    let response = issue_tokens(
         app,
         headers,
         &client,
@@ -818,8 +855,18 @@ fn token_refresh(app: &AppState, headers: &HeaderMap, form: &HashMap<String, Str
         record.patient,
         record.encounter,
         record.fhir_user,
+        record
+            .sub
+            .clone()
+            .unwrap_or_else(|| "smart-user".to_string()),
+        None,
         ACCESS_TTL,
-    )
+    );
+    // The old refresh token was consumed; if the new one could not be stored, give it back.
+    if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+        let _ = app.smart.put_refresh(refresh.clone(), rotated_from);
+    }
+    response
 }
 
 fn token_client_credentials(
@@ -854,7 +901,18 @@ fn token_client_credentials(
             "no supported scopes were requested",
         );
     }
-    issue_tokens(app, headers, &client, scopes, None, None, None, BACKEND_TTL)
+    issue_tokens(
+        app,
+        headers,
+        &client,
+        scopes,
+        None,
+        None,
+        None,
+        "backend".into(),
+        None,
+        BACKEND_TTL,
+    )
 }
 
 fn issue_tokens(
@@ -865,6 +923,8 @@ fn issue_tokens(
     patient: Option<String>,
     encounter: Option<String>,
     fhir_user: Option<String>,
+    sub: String,
+    nonce: Option<String>,
     ttl: u64,
 ) -> Response {
     let issuer = issuer(app, headers);
@@ -873,21 +933,19 @@ fn issue_tokens(
     let openid = scopes.iter().any(|scope| scope == "openid");
     let want_fhir_user = scopes.iter().any(|scope| scope == "fhirUser");
     let want_profile = scopes.iter().any(|scope| scope == "profile");
-    let sub = Some("smart-user".to_string());
-    let fhir_user = if want_fhir_user {
-        fhir_user.or_else(|| {
-            Some(format!(
-                "{}/{}",
-                issuer.trim_end_matches('/'),
-                app.config
-                    .smart_fhir_user
-                    .clone()
-                    .unwrap_or_else(|| "Patient/smart".into())
-            ))
-        })
+    let sub = if sub.is_empty() {
+        "smart-user".to_string()
     } else {
-        None
+        sub
     };
+    let fhir_user = if want_fhir_user { fhir_user } else { None };
+    if want_fhir_user && fhir_user.is_none() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "fhirUser scope requires a fhirUser identity",
+        );
+    }
     let record = Token {
         scopes: scopes.clone(),
         patient: patient.clone().filter(|_| {
@@ -899,7 +957,7 @@ fn issue_tokens(
         fhir_user: fhir_user.clone(),
         client_id: client.id.clone(),
         exp: now + ttl,
-        sub: sub.clone(),
+        sub: Some(sub.clone()),
         iss: Some(issuer.clone()),
         need_patient_banner: scopes.iter().any(|scope| scope == "launch").then_some(true),
         smart_style_url: scopes
@@ -908,12 +966,18 @@ fn issue_tokens(
             .then(|| format!("{issuer}/oauth/style.json")),
     };
     let id_token = if openid {
+        let keys = match app.smart.signing_keys() {
+            Ok(keys) => keys,
+            Err(err) => return signing_unavailable(&err),
+        };
         match encode_id_token(
+            keys,
             &issuer,
             &client.id,
-            sub.as_deref().unwrap_or("smart-user"),
+            &sub,
             fhir_user.as_deref(),
             want_profile,
+            nonce.as_deref(),
             now + ttl,
         ) {
             Ok(id_token) => Some(id_token),
@@ -928,7 +992,9 @@ fn issue_tokens(
     } else {
         None
     };
-    app.smart.put_token(access.clone(), record.clone());
+    if app.smart.put_token(access.clone(), record.clone()).is_err() {
+        return storage_unavailable();
+    }
     let mut body = json!({
         "access_token": access,
         "token_type": "Bearer",
@@ -957,7 +1023,9 @@ fn issue_tokens(
         let refresh = format!("rt-{}", uuid::Uuid::new_v4());
         let mut stored = record.clone();
         stored.exp = now + REFRESH_TTL;
-        app.smart.put_refresh(refresh.clone(), stored);
+        if app.smart.put_refresh(refresh.clone(), stored).is_err() {
+            return storage_unavailable();
+        }
         body["refresh_token"] = json!(refresh);
     }
     if let Some(id_token) = id_token {
@@ -975,11 +1043,13 @@ fn issue_tokens(
 }
 
 fn encode_id_token(
+    keys: &super::signing::ServerKeys,
     issuer: &str,
     aud: &str,
     sub: &str,
     fhir_user: Option<&str>,
     profile: bool,
+    nonce: Option<&str>,
     exp: u64,
 ) -> Result<String, jsonwebtoken::errors::Error> {
     #[derive(Serialize)]
@@ -993,8 +1063,9 @@ fn encode_id_token(
         fhir_user: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        nonce: Option<&'a str>,
     }
-    let keys = keys();
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(keys.kid.clone());
     jsonwebtoken::encode(
@@ -1007,6 +1078,7 @@ fn encode_id_token(
             iat: now(),
             fhir_user,
             name: profile.then_some("SMART User"),
+            nonce,
         },
         &keys.encoding,
     )
@@ -1058,8 +1130,8 @@ fn authenticate_client(
         }
         return Ok(client);
     }
-    match (&client.secret, secret) {
-        (Some(expected), Some(got)) if secrets_equal(expected, &got) => Ok(client),
+    match secret {
+        Some(got) if client.secret_matches(&got) => Ok(client),
         _ => Err(oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
@@ -1233,6 +1305,16 @@ fn decoding_key(jwks: &Value, kid: Option<&str>) -> Option<DecodingKey> {
     DecodingKey::from_rsa_components(n, e).ok()
 }
 
+pub(crate) fn scopes_need_patient(scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| {
+        scope.starts_with("patient/") || scope == "launch" || scope == "launch/patient"
+    })
+}
+
+pub(crate) fn scopes_need_encounter(scopes: &[String]) -> bool {
+    scopes.iter().any(|scope| scope == "launch/encounter")
+}
+
 fn grant_scopes(client: &Client, requested: &str, grant: &str) -> Vec<String> {
     requested
         .split_whitespace()
@@ -1346,6 +1428,10 @@ fn basic_client(headers: &HeaderMap) -> Option<(String, Option<String>)> {
     Some((percent_decode(id), Some(percent_decode(secret))))
 }
 
+pub(crate) fn parse_authorize_form(body: &[u8]) -> HashMap<String, String> {
+    parse_form(body)
+}
+
 fn parse_form(body: &[u8]) -> HashMap<String, String> {
     let text = String::from_utf8_lossy(body);
     let mut out = HashMap::new();
@@ -1359,7 +1445,7 @@ fn parse_form(body: &[u8]) -> HashMap<String, String> {
     out
 }
 
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     super::percent_decode(input)
 }
 
@@ -1391,14 +1477,14 @@ fn dcr_authorized(app: &AppState, headers: &HeaderMap) -> bool {
     secrets_equal(expected, got)
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
 
-fn redirect_with(base: &str, pairs: &[(&str, &str)]) -> Response {
+pub(crate) fn redirect_with(base: &str, pairs: &[(&str, &str)]) -> Response {
     let mut url = base.to_string();
     let mut first = !base.contains('?');
     for (key, value) in pairs {
@@ -1414,7 +1500,7 @@ fn redirect_with(base: &str, pairs: &[(&str, &str)]) -> Response {
     (StatusCode::FOUND, [(header::LOCATION, url)]).into_response()
 }
 
-fn query_encode(input: &str) -> String {
+pub(crate) fn query_encode(input: &str) -> String {
     let mut out = String::new();
     for byte in input.bytes() {
         match byte {
@@ -1436,7 +1522,7 @@ fn json_response(status: StatusCode, value: Value) -> Response {
         .into_response()
 }
 
-fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
+pub(crate) fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response {
     json_response(
         status,
         json!({
