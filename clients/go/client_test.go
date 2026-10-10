@@ -3,12 +3,15 @@ package refhir
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -258,9 +261,63 @@ func family(t *testing.T, body json.RawMessage) string {
 	return bundle.Entry[0].Resource.Name[0].Family
 }
 
+// issueToken signs in through the server's authorization-code flow: authorize, approve the
+// consent page with the demo login, then redeem the code with PKCE. The server must be started
+// with --smart-demo-login.
 func issueToken(t *testing.T, base string) string {
 	t.Helper()
-	resp, err := http.Post(base+"/oauth/token", "application/x-www-form-urlencoded", bytes.NewBufferString("scope=user/*.read+user/*.write"))
+	// Redirects carry the session and the code, so read them instead of following them.
+	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}}
+	redirectURI := "http://127.0.0.1/cb"
+	verifier := "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	digest := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(digest[:])
+
+	authorize := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {"public"},
+		"redirect_uri":          {redirectURI},
+		"scope":                 {"user/*.read user/*.write"},
+		"state":                 {"s1"},
+		"aud":                   {base},
+		"code_challenge":        {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	resp, err := client.Get(base + "/oauth/authorize?" + authorize.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	interact, err := resp.Location()
+	if err != nil || interact.Path != "/oauth/interact" {
+		t.Fatalf("authorize %d: want a redirect to /oauth/interact, got %v (%v)", resp.StatusCode, interact, err)
+	}
+
+	consent := url.Values{
+		"session":  {interact.Query().Get("session")},
+		"username": {"tester"},
+		"action":   {"approve"},
+	}
+	resp, err = client.PostForm(base+"/oauth/interact", consent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	back, err := resp.Location()
+	if err != nil || back.Query().Get("code") == "" {
+		t.Fatalf("interact %d: want a redirect carrying a code, got %v (%v)", resp.StatusCode, back, err)
+	}
+
+	token := url.Values{
+		"grant_type":    {"authorization_code"},
+		"code":          {back.Query().Get("code")},
+		"redirect_uri":  {redirectURI},
+		"client_id":     {"public"},
+		"code_verifier": {verifier},
+	}
+	resp, err = client.PostForm(base+"/oauth/token", token)
 	if err != nil {
 		t.Fatal(err)
 	}
