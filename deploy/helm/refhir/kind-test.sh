@@ -6,8 +6,10 @@
 #   deploy/helm/refhir/kind-test.sh [--keep]
 #
 # Needs docker, kind, kubectl, helm, curl and python3, and the image (default refhir:cluster; build
-# it with `docker build -t refhir:cluster .`). It creates its own cluster, named below, and never
-# touches another kube context; the cluster is deleted afterwards unless --keep is given.
+# it with `docker build -t refhir:cluster .`). It creates its own cluster, named below, with a
+# kubeconfig file of its own, so your ~/.kube/config (its contexts and its current context) is
+# never read or changed; the cluster and that file are deleted afterwards unless --keep is given
+# (then the file's path is printed, to use with KUBECONFIG=...).
 #
 # What it checks:
 #   - exactly one writer pod is ready (the primary) and the other is not (a standby answers /healthz
@@ -29,11 +31,21 @@ WRITE_SECONDS="${WRITE_SECONDS:-40}"
 KILL_AFTER="${KILL_AFTER:-10}"
 FAIL_BUDGET="${FAIL_BUDGET:-5}"
 CTX="kind-$CLUSTER"
+# Everything below (kind, kubectl, helm) reads and writes this file only. `kind create cluster`
+# would otherwise make its cluster the current context of ~/.kube/config, and deleting it leaves
+# no current context at all.
+KUBECONFIG="$(mktemp -t refhir-kind-kubeconfig.XXXXXX)"
+export KUBECONFIG
 K=(kubectl --context "$CTX" -n "$NS")
 BASE="http://localhost:$HOST_PORT"
 
 cleanup() {
-  if [[ $KEEP == 0 ]]; then kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true; fi
+  if [[ $KEEP == 0 ]]; then
+    kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+    rm -f "$KUBECONFIG"
+  else
+    echo "kept the cluster $CLUSTER; its kubeconfig is $KUBECONFIG"
+  fi
 }
 trap cleanup EXIT
 

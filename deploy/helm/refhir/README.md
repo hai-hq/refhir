@@ -55,8 +55,10 @@ docker build -t refhir:cluster .
 deploy/helm/refhir/kind-test.sh        # --keep leaves the cluster up
 ```
 
-It needs docker, kind, kubectl and helm, and does not touch any other kube context. Last run, on
+It needs docker, kind, kubectl and helm. It uses a kubeconfig file of its own, so your
+`~/.kube/config` is neither read nor changed (checked: identical checksum and current context
+before and after a run). Last run, on
 the final code: of the two writer pods exactly one was ready (the other, a standby, answers `/healthz`
 503), the `<release>-primary` Service had one endpoint and the main Service had the primary plus
-both replicas; across two pod kills 543 writes were acknowledged (214 and 329), none failed, none
+both replicas; across two pod kills 611 writes were acknowledged (277 and 334), none failed, none
 was lost, commit timestamps only increased, and the writer epoch went 1, 2, 3.
