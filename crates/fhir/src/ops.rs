@@ -9,21 +9,45 @@ use crate::catalog::{index_keys, valid_id, Catalog, ReferencePolicy, ResourceMod
 use crate::error::FhirError;
 use crate::resolve::TxHost;
 
+/// What `create` does with an `id` in the request body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdPolicy {
+    /// Ignore it and assign a new one. This is the FHIR create interaction: a client cannot
+    /// choose the id of a resource it creates (R4: "the server SHALL ignore it").
+    Assign,
+    /// The id was chosen by the server already: a transaction assigns ids up front so that its
+    /// entries can refer to each other, and fixtures need stable ones. It is kept.
+    Keep,
+}
+
+/// The FHIR create interaction. The server assigns the id and the version, whatever the body
+/// says.
 pub fn create(
     tx: &mut Transaction,
     catalog: &Catalog,
     model: &ResourceModel,
+    resource: Value,
+) -> Result<Value, FhirError> {
+    create_with(tx, catalog, model, resource, IdPolicy::Assign)
+}
+
+pub(crate) fn create_with(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
     mut resource: Value,
+    policy: IdPolicy,
 ) -> Result<Value, FhirError> {
     expect_type(model, &resource)?;
-    let id = match resource.get("id").and_then(|value| value.as_str()) {
-        Some(id) => {
+    strip_server_meta(&mut resource);
+    let id = match (policy, resource.get("id").and_then(|value| value.as_str())) {
+        (IdPolicy::Keep, Some(id)) => {
             if !valid_id(id) {
                 return Err(FhirError::Invalid(format!("invalid id {id}")));
             }
             id.to_string()
         }
-        None => {
+        _ => {
             let id = Uuid::new_v4().to_string();
             resource["id"] = json!(id);
             id
@@ -52,6 +76,23 @@ pub fn create(
     Ok(resource)
 }
 
+/// `meta.versionId` and `meta.lastUpdated` belong to the server; a create ignores the client's.
+fn strip_server_meta(resource: &mut Value) {
+    let Some(meta) = resource
+        .get_mut("meta")
+        .and_then(|value| value.as_object_mut())
+    else {
+        return;
+    };
+    meta.remove("versionId");
+    meta.remove("lastUpdated");
+    if meta.is_empty() {
+        if let Some(object) = resource.as_object_mut() {
+            object.remove("meta");
+        }
+    }
+}
+
 pub fn read(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Value, FhirError> {
     let stored = load(tx, model, id)?;
     Ok(decorate(stored.json, id, stored.ts))
@@ -62,9 +103,22 @@ pub fn update(
     catalog: &Catalog,
     model: &ResourceModel,
     id: &str,
-    mut resource: Value,
+    resource: Value,
     if_match: Option<&str>,
 ) -> Result<Value, FhirError> {
+    update_status(tx, catalog, model, id, resource, if_match).map(|(value, _)| value)
+}
+
+/// The update interaction and the HTTP status it ends in: 200, or 201 when the deployment allows
+/// update-as-create and `id` was not in use.
+pub fn update_status(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    id: &str,
+    mut resource: Value,
+    if_match: Option<&str>,
+) -> Result<(Value, u16), FhirError> {
     if !valid_id(id) {
         return Err(FhirError::Invalid(format!("invalid id {id}")));
     }
@@ -77,7 +131,20 @@ pub fn update(
         }
     }
     resource["id"] = json!(id);
-    let current = load(tx, model, id)?;
+    let current = match load(tx, model, id) {
+        Err(FhirError::NotFound(_)) if catalog.update_create() => {
+            if if_match.is_some() {
+                return Err(FhirError::Precondition(format!(
+                    "If-Match was given but {}/{id} does not exist",
+                    model.name
+                )));
+            }
+            let created = create_with(tx, catalog, model, resource, IdPolicy::Keep)?;
+            return Ok((created, 201));
+        }
+        Err(FhirError::NotFound(_)) => return Err(update_as_create(model, id)),
+        other => other?,
+    };
     check_version(current.ts, if_match, &resource)?;
     require_references(tx, catalog, model, &resource)?;
     check_instance(tx, catalog, &resource)?;
@@ -96,7 +163,7 @@ pub fn update(
         old_keys,
         prev_ts: current.ts,
     })?;
-    Ok(resource)
+    Ok((resource, 200))
 }
 
 pub fn delete(
@@ -301,7 +368,7 @@ fn absolute_type(reference: &str) -> Option<&str> {
     }
 }
 
-fn reference_strings(resource: &Value, path: &str) -> Vec<String> {
+pub(crate) fn reference_strings(resource: &Value, path: &str) -> Vec<String> {
     let mut current = vec![resource];
     for segment in path.split('.') {
         let mut next = Vec::new();
@@ -381,6 +448,17 @@ fn check_version(
     Ok(())
 }
 
+/// Update-as-create is the one optional part of `PUT` this server leaves out: a client cannot
+/// pick the id of a resource that does not exist yet. FHIR R4 gives the answer to a server in
+/// that position: 405. The capability statement says `updateCreate: false`.
+fn update_as_create(model: &ResourceModel, id: &str) -> FhirError {
+    FhirError::MethodNotAllowed(format!(
+        "{}/{id} does not exist and this server does not support update-as-create \
+         (client-defined ids); POST to {} to create a resource, and the server assigns its id",
+        model.name, model.name
+    ))
+}
+
 pub fn conditional_create(
     tx: &mut Transaction,
     catalog: &Catalog,
@@ -388,9 +466,27 @@ pub fn conditional_create(
     resource: Value,
     if_none_exist: &str,
 ) -> Result<(Value, u16), FhirError> {
+    conditional_create_with(
+        tx,
+        catalog,
+        model,
+        resource,
+        if_none_exist,
+        IdPolicy::Assign,
+    )
+}
+
+pub(crate) fn conditional_create_with(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: Value,
+    if_none_exist: &str,
+    policy: IdPolicy,
+) -> Result<(Value, u16), FhirError> {
     let found = search_ids(tx, catalog, model, if_none_exist)?;
     match found.len() {
-        0 => Ok((create(tx, catalog, model, resource)?, 201)),
+        0 => Ok((create_with(tx, catalog, model, resource, policy)?, 201)),
         1 => {
             let existing = read(tx, model, &found[0])?;
             Ok((existing, 200))
@@ -410,9 +506,49 @@ pub fn conditional_update(
     resource: Value,
     query: &str,
 ) -> Result<(Value, u16), FhirError> {
+    conditional_update_with(tx, catalog, model, resource, query, None)
+}
+
+/// With no match this creates the resource, as the create interaction does. A body that names an
+/// id is asking for update-as-create instead, which is not supported. `assigned` is the id a
+/// transaction already gave the entry, so that other entries can refer to it.
+pub(crate) fn conditional_update_with(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    mut resource: Value,
+    query: &str,
+    assigned: Option<&str>,
+) -> Result<(Value, u16), FhirError> {
     let found = search_ids(tx, catalog, model, query)?;
     match found.len() {
-        0 => Ok((create(tx, catalog, model, resource)?, 201)),
+        0 => {
+            if let Some(id) = resource.get("id").and_then(|value| value.as_str()) {
+                if !catalog.update_create() {
+                    return Err(update_as_create(model, id));
+                }
+                // The id is the client's to name, but only if nothing is using it: a resource
+                // with that id that the query did not match is someone else's.
+                let id = id.to_string();
+                if tx.get(&model.tablet(), &id, &model.by_id())?.is_some() {
+                    return Err(FhirError::Conflict(format!(
+                        "{}/{id} exists but does not match the conditional update query",
+                        model.name
+                    )));
+                }
+                return update_status(tx, catalog, model, &id, resource, None);
+            }
+            match assigned {
+                Some(id) => {
+                    resource["id"] = json!(id);
+                    Ok((
+                        create_with(tx, catalog, model, resource, IdPolicy::Keep)?,
+                        201,
+                    ))
+                }
+                None => Ok((create(tx, catalog, model, resource)?, 201)),
+            }
+        }
         1 => Ok((update(tx, catalog, model, &found[0], resource, None)?, 200)),
         _ => Err(FhirError::Precondition(format!(
             "{} conditional update matched {} resources",

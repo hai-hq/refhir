@@ -168,15 +168,19 @@ func rank(key string) int {
 	return 500
 }
 
+// transactionBundle sends each resource as PUT [type]/[id]. The demo data names its own ids and
+// refers to itself by Type/id, so a POST (which gives every resource a new id) would leave those
+// references pointing at nothing. The server must allow update-as-create (--update-as-create).
 func transactionBundle(resources []map[string]any) map[string]any {
 	entries := make([]map[string]any, 0, len(resources))
 	for _, resource := range resources {
 		rt, _ := resource["resourceType"].(string)
+		id, _ := resource["id"].(string)
 		entries = append(entries, map[string]any{
 			"resource": resource,
 			"request": map[string]string{
-				"method": "POST",
-				"url":    rt,
+				"method": "PUT",
+				"url":    rt + "/" + id,
 			},
 		})
 	}

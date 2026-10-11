@@ -94,7 +94,7 @@ Reconnect, batching, and protocol details match the Go client. See [clients/go/R
 
 ## Mock data
 
-Seed JSON from `fixtures/mock-fhir/library` while the server is running:
+Seed JSON from `fixtures/mock-fhir/library` while the server is running. The data names its own ids, so each resource is sent as `PUT [type]/[id]`, which needs a server started with `--update-as-create`:
 
 ```bash
 cd clients/ts && npm run seed -- -url http://127.0.0.1:8080

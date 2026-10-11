@@ -22,8 +22,10 @@ if [[ "${status}" != "404" ]]; then
   exit 1
 fi
 
+# The server assigns the id of a resource it creates, so Patient/p1 is created with PUT, which
+# refhir.toml allows with update_as_create.
 echo "Seeding Patient/p1 at ${BASE} ..."
-curl -sfS -X POST "${BASE}/Patient" \
+curl -sfS -X PUT "${BASE}/Patient/p1" \
   -H 'Content-Type: application/fhir+json' \
   -H "Authorization: Bearer ${token}" \
   --data-binary @"${ROOT}/patient-p1.json"

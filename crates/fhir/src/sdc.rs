@@ -78,7 +78,7 @@ impl Chart for Bridge<'_> {
         let result = self
             .catalog
             .terms()
-            .validate_code(Some(value_set), system, code, None);
+            .validate_code(Some(value_set), system, None, code, None);
         if result.get("resourceType").and_then(|value| value.as_str()) == Some("OperationOutcome") {
             return None;
         }

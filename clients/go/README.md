@@ -26,10 +26,12 @@ From a clone of this repo, use a `replace` in your `go.mod` or depend on the pub
 Loads `.json` files from a directory (single resources or Synthea-style Bundles) and commits them in transaction batches over `/sync`.
 
 ```bash
-cargo run -p refhir -- --memory
+cargo run -p refhir -- --memory --update-as-create
 cd clients/go
 go run ./cmd/seed -url http://127.0.0.1:8080
 ```
+
+The data names its own ids, so each resource is sent as `PUT [type]/[id]`; the server must be started with `--update-as-create`.
 
 Default `-dir` resolves `fixtures/mock-fhir/library` from the repo root or `../../fixtures/mock-fhir/library` when run from `clients/go`.
 

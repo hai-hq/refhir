@@ -13,7 +13,7 @@ use config::{
 };
 use refhir_database::Database;
 use refhir_fhir::Catalog;
-use refhir_persistence::{AuthStore, ConformanceStore, Persistence};
+use refhir_persistence::{AuthStore, ConformanceStore, JobStore, Persistence};
 use refhir_postgres::PostgresPersistence;
 use refhir_sqlite::SqlitePersistence;
 use tokio::net::TcpListener;
@@ -28,6 +28,15 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// One backend serves every table the server keeps: the log, the conformance tables, the
+/// SMART tables and the background jobs.
+type Stores = (
+    Arc<dyn Persistence>,
+    Arc<dyn ConformanceStore>,
+    Arc<dyn AuthStore>,
+    Arc<dyn JobStore>,
+);
 
 #[tokio::main]
 async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
@@ -53,6 +62,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_terminology_urls: Option<Vec<String>> = None;
     let mut cli_trace_engine = false;
     let mut cli_sdc_archiver = false;
+    let mut cli_update_as_create = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -124,6 +134,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 cli_oidc_client_id = Some(required(&args, index, "--oidc-client-id")?);
             }
             "--sdc-archiver" => cli_sdc_archiver = true,
+            "--update-as-create" => cli_update_as_create = true,
             "--export-dir" => {
                 index += 1;
                 cli_export_dir = Some(required(&args, index, "--export-dir")?);
@@ -222,6 +233,9 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if cli_sdc_archiver {
         cfg.sdc_archiver = true;
     }
+    if cli_update_as_create {
+        cfg.update_as_create = true;
+    }
 
     if cfg.postgres.is_some() && (cfg.sqlite.is_some() || cfg.memory) {
         return Err("pass only one of --sqlite, --memory, or --postgres".into());
@@ -259,34 +273,63 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_package_cache_env(&cfg);
 
-    let (db, store, auth_store): (
-        Arc<dyn Persistence>,
-        Arc<dyn ConformanceStore>,
-        Arc<dyn AuthStore>,
-    ) = if let Some(url) = &cfg.postgres {
+    let (db, store, auth_store, job_store): Stores = if let Some(url) = &cfg.postgres {
         let persistence = Arc::new(PostgresPersistence::connect(url)?);
-        (persistence.clone(), persistence.clone(), persistence)
+        (
+            persistence.clone(),
+            persistence.clone(),
+            persistence.clone(),
+            persistence,
+        )
     } else if cfg.memory {
         let persistence = Arc::new(SqlitePersistence::open_in_memory()?);
-        (persistence.clone(), persistence.clone(), persistence)
+        (
+            persistence.clone(),
+            persistence.clone(),
+            persistence.clone(),
+            persistence,
+        )
     } else {
         let path = cfg.sqlite.unwrap_or_else(|| "refhir.sqlite".to_string());
         let persistence = Arc::new(SqlitePersistence::open(Path::new(&path))?);
-        (persistence.clone(), persistence.clone(), persistence)
+        (
+            persistence.clone(),
+            persistence.clone(),
+            persistence.clone(),
+            persistence,
+        )
     };
+    // Nothing listens until this is done, so a slow start is a refused connection. Each phase
+    // says how long it took, so that a wait can be put down to the package download, the
+    // install, or the catalog.
+    let phase = std::time::Instant::now();
     let db = Arc::new(Database::open(db)?);
     let catalog = Arc::new(RwLock::new(Catalog::open(store.as_ref())?));
+    tracing::info!(target: "refhir", elapsed_ms = phase.elapsed().as_millis() as u64, "database and catalog opened");
     check_release_matches_database(release_from_plan(&cfg.packages), store.as_ref())?;
+    let phase = std::time::Instant::now();
     install_packages(store.as_ref(), &db, &catalog, &cfg.packages)?;
+    tracing::info!(target: "refhir", elapsed_ms = phase.elapsed().as_millis() as u64, "packages installed");
 
+    let phase = std::time::Instant::now();
     refhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;
     refhir_fhir::repair_conformance(store.as_ref(), &db, &catalog)?;
+    tracing::info!(target: "refhir", elapsed_ms = phase.elapsed().as_millis() as u64, "search index backfills and conformance repair done");
+    let unexpandable = refhir_fhir::unexpandable_value_sets(&catalog);
+    if !unexpandable.is_empty() {
+        tracing::info!(
+            target: "refhir",
+            count = unexpandable.len(),
+            "value sets cannot be expanded with the installed terminology; POST ValueSet/$expandability lists them with the reason for each"
+        );
+    }
     let policy = refhir_fhir::ReferencePolicy::parse(&cfg.references)
         .ok_or_else(|| format!("--references must be strict or fhir"))?;
-    catalog
-        .write()
-        .expect("catalog")
-        .set_reference_policy(policy);
+    {
+        let mut current = catalog.write().expect("catalog");
+        current.set_reference_policy(policy);
+        current.set_update_create(cfg.update_as_create);
+    }
     let addr: SocketAddr = cfg.bind.parse()?;
 
     let mut smart_dcr_token = cfg.smart_dcr_token;
@@ -322,6 +365,8 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             oidc: cfg.oidc,
             smart_demo_login: cfg.smart_demo_login,
             smart,
+            // Export jobs are rows in the same database, so they outlive a restart.
+            jobs: Some(refhir_server::SharedJobStore::new(job_store)),
         },
     )
     .await?;
@@ -465,7 +510,7 @@ fn print_help() {
         "refhir [--config path] [--sqlite path] [--memory] [--postgres url] [--bind 127.0.0.1:8080]\n\
          [--package dir|name@version] [--references strict|fhir] [--smart]\n\
          [--public-url url] [--smart-patient id] [--smart-encounter id]\n\
-         [--smart-fhir-user Resource/id] [--smart-dcr-token token]\n\
+         [--smart-fhir-user Resource/id] [--smart-dcr-token token] [--update-as-create]\n\
          [--smart-confidential-secret secret]\n\
          [--oidc-issuer url --oidc-client-id id] [--smart-demo-login]\n\
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\

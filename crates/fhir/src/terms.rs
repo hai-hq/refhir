@@ -2,6 +2,8 @@
 
 use serde_json::{json, Value};
 
+use refhir_validate::{ExpansionFailure, MemoryTerminology};
+
 use crate::catalog::Catalog;
 use crate::error::FhirError;
 
@@ -18,20 +20,22 @@ pub fn operation(
             let filter = optional(args, &["filter"]);
             let offset = optional_usize(args, &["offset"]).unwrap_or(0);
             let count = optional_usize(args, &["count"]);
-            Ok(terms
+            terms
                 .expand_page(url, filter, offset, count)
-                .unwrap_or_else(|| {
-                    outcome(
-                        "warning",
-                        "not-supported",
-                        &format!("value set {url} expansion is not supported"),
-                    )
-                }))
+                .ok_or_else(|| not_expandable(terms, url))
         }
+        ("ValueSet", "$expandability") => Ok(expandability(terms, &all_urls(args))),
         ("ValueSet", "$validate-code") => {
             let url = required(args, &["url"])?;
             let (system, code, display) = code_parts(args)?;
-            Ok(terms.validate_code(Some(url), system.as_deref(), &code, display.as_deref()))
+            let system_version = optional(args, &["systemVersion", "system-version"]);
+            Ok(terms.validate_code(
+                Some(url),
+                system.as_deref(),
+                system_version,
+                &code,
+                display.as_deref(),
+            ))
         }
         ("CodeSystem", "$validate-code") => {
             let (system, code, display) = code_parts(args)?;
@@ -40,7 +44,9 @@ pub fn operation(
                 .map(str::to_string)
                 .or(system)
                 .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
-            Ok(terms.validate_code(None, Some(&system), &code, display.as_deref()))
+            // `version` is the version of the code system, which this server keeps side by side.
+            let version = optional(args, &["version"]);
+            Ok(terms.validate_code(None, Some(&system), version, &code, display.as_deref()))
         }
         ("CodeSystem", "$lookup") => {
             let (system, code, _) = code_parts(args)?;
@@ -49,7 +55,8 @@ pub fn operation(
                 .map(str::to_string)
                 .or(system)
                 .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
-            Ok(terms.lookup(&system, &code).unwrap_or_else(|| {
+            let version = optional(args, &["version"]);
+            Ok(terms.lookup(&system, version, &code).unwrap_or_else(|| {
                 outcome(
                     "error",
                     "not-found",
@@ -62,13 +69,14 @@ pub fn operation(
                 .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
             let code_a = required(args, &["codeA", "code"])?;
             let code_b = required(args, &["codeB"])?;
-            let outcome = if terms.subsumes(system, code_a, code_b)
-                && terms.subsumes(system, code_b, code_a)
+            let version = optional(args, &["version"]);
+            let outcome = if terms.subsumes(system, version, code_a, code_b)
+                && terms.subsumes(system, version, code_b, code_a)
             {
                 "equivalent"
-            } else if terms.subsumes(system, code_a, code_b) {
+            } else if terms.subsumes(system, version, code_a, code_b) {
                 "subsumes"
-            } else if terms.subsumes(system, code_b, code_a) {
+            } else if terms.subsumes(system, version, code_b, code_a) {
                 "subsumed-by"
             } else {
                 "not-subsumed"
@@ -88,13 +96,114 @@ pub fn operation(
                 optional(args, &["targetsystem", "targetSystem"]),
             ))
         }
-        (_, "$expand" | "$validate-code" | "$lookup" | "$translate" | "$subsumes") => Err(
-            FhirError::Unsupported(format!("unsupported operation {type_name}/{op}")),
-        ),
+        (
+            _,
+            "$expand" | "$expandability" | "$validate-code" | "$lookup" | "$translate"
+            | "$subsumes",
+        ) => Err(FhirError::Unsupported(format!(
+            "unsupported operation {type_name}/{op}"
+        ))),
         _ => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{op}"
         ))),
     }
+}
+
+/// A value set that cannot be expanded is a failed request, not an empty answer: HTTP 422, with
+/// one issue per cause and the part of the value set each one comes from. Returning only the
+/// codes that could be expanded would look like a complete answer.
+fn not_expandable(terms: &MemoryTerminology, url: &str) -> FhirError {
+    let failures = terms.why_not_expanded(url).unwrap_or_else(|| {
+        vec![ExpansionFailure::NotExpanded {
+            value_set: url.to_string(),
+        }]
+    });
+    let headline = format!("value set {url} expansion is not supported");
+    let issues: Vec<Value> = failures
+        .iter()
+        .enumerate()
+        .map(|(position, failure)| {
+            let diagnostics = if position == 0 {
+                format!("{headline}: {}", failure.message())
+            } else {
+                failure.message()
+            };
+            let mut issue = json!({
+                "severity": "error",
+                "code": "not-supported",
+                "diagnostics": diagnostics
+            });
+            if let Some(expression) = failure.expression() {
+                issue["expression"] = json!([expression]);
+            }
+            issue
+        })
+        .collect();
+    FhirError::Unprocessable(json!({
+        "resourceType": "OperationOutcome",
+        "issue": issues
+    }))
+}
+
+/// A report, not an expansion: for each value set asked about (or, with none named, every loaded
+/// value set that cannot be expanded), whether it expands and, when it does not, why. It lets a
+/// deployment check the value sets a UI depends on before the UI asks for them.
+fn expandability(terms: &MemoryTerminology, urls: &[String]) -> Value {
+    let entries: Vec<(String, Option<Vec<ExpansionFailure>>)> = if urls.is_empty() {
+        terms
+            .unexpandable()
+            .into_iter()
+            .map(|(url, failures)| (url, Some(failures)))
+            .collect()
+    } else {
+        urls.iter()
+            .map(|url| (url.clone(), terms.why_not_expanded(url)))
+            .collect()
+    };
+    let parameters: Vec<Value> = entries
+        .into_iter()
+        .map(|(url, failures)| {
+            let mut part = vec![
+                json!({"name": "url", "valueUri": url}),
+                json!({"name": "expandable", "valueBoolean": failures.is_none()}),
+            ];
+            for failure in failures.iter().flatten() {
+                part.push(json!({"name": "reason", "valueCode": failure.reason()}));
+                part.push(json!({"name": "diagnostics", "valueString": failure.message()}));
+            }
+            json!({"name": "valueSet", "part": part})
+        })
+        .collect();
+    json!({"resourceType": "Parameters", "parameter": parameters})
+}
+
+/// Every `url` the request names: a string or array in a plain body, or each `url` parameter of
+/// a Parameters resource.
+fn all_urls(args: &Value) -> Vec<String> {
+    let mut urls = Vec::new();
+    match args.get("url") {
+        Some(Value::String(url)) if !url.is_empty() => urls.push(url.clone()),
+        Some(Value::Array(items)) => {
+            urls.extend(
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::to_string),
+            );
+        }
+        _ => {}
+    }
+    for parameter in parameters(args).into_iter().flatten() {
+        if parameter.get("name").and_then(|value| value.as_str()) != Some("url") {
+            continue;
+        }
+        for key in ["valueUri", "valueUrl", "valueCanonical", "valueString"] {
+            if let Some(url) = parameter.get(key).and_then(|value| value.as_str()) {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    urls
 }
 
 fn code_parts(args: &Value) -> Result<(Option<String>, String, Option<String>), FhirError> {
