@@ -1,0 +1,21 @@
+{{- if .Values.cluster.enabled }}
+# Only the live writer is ready, so this Service always points at the primary. Replicas send
+# the writes they receive here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "refhir.fullname" . }}-primary
+  labels:
+    {{- include "refhir.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app.kubernetes.io/name: {{ include "refhir.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    refhir.io/component: writer
+{{- end }}
