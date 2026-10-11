@@ -49,105 +49,84 @@ moves with the pool.
 
 ## Phase 2: does read and search throughput rise with the pool?
 
-**Reads: yes, by a lot. Searches, and the Phase 0 mix: no gain, and a pool cannot give one.** The
-plan's criterion ("read/search throughput rises with pool size versus Phase 0") is therefore met
-for reads and **not met for searches**. The cause is not the pool or the measurement: the server
-itself is CPU-bound in its search code (see "Why searches do not scale" below). Raising search
-throughput means making searches cheaper, which is work on the search engine, not on the pool.
+**Yes, for reads and for searches, once a search-code bug was fixed.** The plan's criterion
+("read/search throughput rises with pool size versus Phase 0") is met in every workload, 12 of 12
+pairs, by +77 % to +359 %. It was *not* met before the fix, and the reason is worth keeping on record.
 
 `scripts/perf-criteria.sh` (run by hand, or from the manual `perf-smoke` job in CI) restarts the
 server for every configuration, **checks from `/healthz` that it really has the pool size it asked
-for**, warms it up, and compares a pool of 8 with the baseline pool of 1 over alternating pairs.
-A verdict is the median of the pairs, because a single comparison on this machine swings by tens of
+for**, warms it up, and compares a pool of 8 with the baseline pool of 1 over alternating pairs. A
+verdict is the median of the pairs, because a single comparison on this machine swings by tens of
 percent (the server, Postgres and the load generator share 12 cores, and other programs were using
-them too: the load average was 25 to 100 during these runs).
+them too: the load average was 15 to 100 during these runs). Each result line also shows the
+total time the clients waited for a connection and how many cores the server used.
 
-### Reads only (`read=100`, 32 clients): the pool is what limits throughput
+### After the fix (3 alternating pairs per workload, pool 1 then pool 8)
 
-| Run | pool 1 (ops/s) | pool 8 (ops/s) | gain |
-|---|---|---|---|
-| script, pair 1 | 1,186 | 2,555 | +115 % |
-| script, pair 2 | 1,130 | 2,622 | +132 % |
-| script, pair 3 | 1,107 | 2,676 | +142 % |
-| by hand, 5 pairs | 935 to 1,004 | 2,344 to 2,409 | +137 % to +154 % |
+| Workload | pool 1 (ops/s) | pool 8 (ops/s) | median gain | pairs |
+|---|---|---|---|---|
+| Reads (`read=100`, 32 clients) | 587, 348, 534 | 1,099, 1,122, 1,657 | **+210 %** | +87, +223, +210 |
+| Phase 0 mix, read+search (32 clients) | 210, 144, 196 | 420, 492, 429 | **+119 %** | +100, +242, +119 |
+| Reads+searches beside 8 writers (24 clients) | 120, 124, 263 | 552, 422, 819 | **+240 %** | +359, +240, +211 |
+| Search-heavy (`read=20,search=80`, 12 clients) | 447, 356, 252 | 790, 800, 800 | **+125 %** | +77, +125, +217 |
 
-All 8 pairs are positive, median **+132 %** in the script run. Read p50 fell from about 31 ms to
-12.6 ms and p99 from 55 to 110 ms down to 28 to 35 ms. The reason is in the counters: with one
-connection the 32 clients together spent 612 to 920 s of a 640 to 960 s window waiting for it (more
-than 90 % of their time); with eight, 440 to 670 s.
+With one connection the clients waited 330 to 920 s per run for it (most of their time) and the
+server used 0.3 to 0.5 cores: the connection was the limit. With eight, the wait fell to 57 to 680 s
+and throughput rose with it. (Absolute figures for reads are lower than in the runs before the fix;
+that code is untouched, and the machine was busier. Compare within a table, not across them.)
 
-### The Phase 0 mix (`read=60,search=25,write=15`, 32 clients): flat
+### Before the fix: searches did not gain, and that was a bug
 
-Read + search operations per second, 10 alternating pairs from the script:
+The same comparison before the fix, over 14 pairs of search-heavy and 10 of the Phase 0 mix, gave
+medians of -6.2 % and +1.6 %, while reads gained +132 %. Dedicated readers running beside writers
+(to rule out the Phase 0 mix's closed-loop artifact, where a client that draws a four second write
+is not reading meanwhile) were flat too: median -0.4 % over 5 pairs.
 
-`+5.6, -8.9, -0.7, +11.3, +15.4, +1.1, -8.2, +4.6, +2.0, -6.9` (%), median **+1.6 %**, 6 of 10
-positive. The script's own verdict is FAIL against the +3 % bar (seven-pair run: +1.1 %; three-pair
-run: +2.0 %). Throughput is about 27 to 30 ops/s either way. What does change is the wait for a
-connection: 17 to 28 s per run with one connection, 1.3 to 1.9 s with eight. That wait is only 2 to
-3 % of the clients' time, so removing it cannot move throughput much, and the work that is left
-(index extraction on writes, a few multi-second searches) is CPU. Latency moves: read p50 20 to 64 ms
-with one connection, 4 ms with eight.
+The server's own counters said why: during a search-heavy run the refhir process used **9.9 of the
+machine's 12 cores** while Postgres used 22 % of one. A profile (`sample` on the running server)
+put 95 % of the on-CPU time in one function, reached as
+`search` -> `Extractor::matches_op` -> `path_match` -> `fhirpath::evaluate` -> `Model::known_child`.
+Every search re-checks each candidate row by evaluating the search parameter's FHIRPath
+expression, and `known_child` answered "is this an element of this path?" by **scanning every
+element path in the FHIR model** (tens of thousands for R4) and building a `format!` string for
+each one. That is one allocation per element, for every step of every row of every search, about
+145 to 190 CPU-ms per operation on the search-heavy mix. With the server saturated by that, no
+number of connections could raise throughput.
 
-### Search-heavy (`read=20,search=80`, 12 clients): no gain
+The cost was already in the original commit (CPU per operation on SQLite: 144.0 ms there, 147.6 ms
+on this branch, a 2.5 % difference inside the run-to-run spread; the original's `--postgres`
+panics at startup, which this work fixed, so there is no Postgres baseline from it).
 
-14 pairs from four script runs: `+23.4, -15.8, +8.1, -15.5, +7.9, -5.9, +24.1, -24.7, -15.2, -6.5,
--45.8, +10.4, +3.4, -9.9` (%), median **-6.2 %**, 6 of 14 positive: no gain, just noise. A pool of 1
-waited 1 to 2 s for a connection in a 360 s client window (0.5 %), so the connection was never the
-limit; a few very slow searches use the cores however many connections there are.
+### The fix
 
-### Reads and searches beside writers: flat
+`known_child` is now two lookups in the model's sorted map, `is_choice` one, and `has_descendants`
+a range query that looks at the first key not below the prefix (keys that share a prefix are
+contiguous). Tests check each against the scan it replaced over every key of a model.
 
-The Phase 0 mix is a closed loop: every client draws every operation type in turn, so a client
-that draws a write (about 4 s here) is not reading or searching meanwhile, which could cap read +
-search throughput whatever the pool does. To rule that out, 24 dedicated clients ran
-`read=70,search=30` while 8 other clients wrote at the same time (the contention Phase 0 was
-about, without the artifact). Read + search ops/s, 5 alternating pairs, pool 1 then pool 8:
+On SQLite, search only, 12 clients, same data and workload:
 
-`142.9 / 138.3, 145.6 / 150.2, 140.3 / 139.7, 142.6 / 138.9, 140.0 / 176.3`, gains
-`-3.2, +3.2, -0.4, -2.6, +25.9` (%), median **-0.4 %**. Read p50 did improve (6 to 7 ms with one
-connection, 3 ms with eight) and the wait for a connection fell from 72 to 93 s to 1 to 2 s per run
-(a tenth of the readers' time), but throughput did not move. The artifact was real (throughput is
-5x higher without it: about 140 against 27 ops/s) and it was not what hid a pool effect.
+| | before | after |
+|---|---|---|
+| Throughput | 286.8 ops/s | **1,688 ops/s** (5.9x) |
+| `search_patient_family` p50 | 62 ms | 5 ms |
+| Server CPU per operation | not recorded for this run | 1.6 ms |
+| On-CPU profile samples (25 s) | 48,568, one function 95 % | 10,314, flat (syscalls, allocator, SQLite) |
 
-### Why searches do not scale
+(On the Postgres search-heavy mix, before the fix, the server averaged 181 to 198 CPU-ms per
+operation; the SQLite run above was not timed in CPU terms before the fix.) A deeper saving remains available, because a search
+still fetches every row in the index interval, re-verifies each one and builds the whole result
+before applying `_count`; it was not needed to meet the criterion and the profile is flat now.
 
-During a search-heavy run with a pool of 8, the refhir process used **9.9 of the machine's 12
-cores** while Postgres used 22 % of one core. The database is nearly idle and the server is
-saturated by its own work, so a larger pool has nothing to unblock. The expensive operation is
-`search_patient_family` (p50 about 316 ms; the other operations are 3 to 5 ms), and on average a
-search-heavy operation costs about 145 to 190 CPU-ms of server time.
+### Notes
 
-That cost is not something this work added. The same workload on SQLite, which the original
-commit can run (its `--postgres` panics at startup, a defect fixed here, so there is no Postgres
-baseline from the original), costs 148.7, 136.8 and 146.4 CPU-ms per operation on the original
-commit and 145.8, 150.2 and 146.8 on this branch (means 144.0 and 147.6, a 2.5 % difference, inside
-the run-to-run spread). CPU time per operation is used instead of throughput because it barely
-changes when other programs load the machine.
-
-### What this means
-
-- The pool removes queueing on the connection, which matters when requests are cheap and many
-  (reads: 2.4x), and it cuts latency. It cannot raise throughput that the CPU limits (searches, and
-  the write path's index extraction), and on a machine this busy that is most of the mix.
-- Earlier figures that suggested a search gain (+11 % to +16 % on a warmed-up run, +45 % on a larger
-  database, and one script run with a +7.9 % median) were single comparisons or a lucky five pairs;
-  14 pairs say there is no gain. Treat them as noise.
-- The default stays at 8: reads gain 2.4x, latency falls, and searches lose nothing measurable.
-  `--db-pool` (or `REFHIR_DB_POOL`) tunes it.
-- Not tested: Postgres across a network (a round trip of a millisecond or more makes each query hold
-  its connection far longer, which is where a pool of 1 would hurt searches too), and a machine
-  whose cores are otherwise idle. Neither changes the finding above, that on this hardware the
-  server's own CPU is the limit for searches.
-- To make search throughput rise, make a search cheaper. The first place to look is
-  `search_patient_family`, a string search on `Patient.name.family` (p50 about 316 ms where the
-  other operations take 3 to 5 ms; the whole search-heavy mix averages 145 to 190 CPU-ms per
-  operation). That is a change to the search engine, not to the pool.
-
-A note on method: an earlier version of the script started its servers inside a command
-substitution, lost track of the first one, and measured it over and over; its "pool of 8" runs
-reported `max: 1`. Those results (+31 %, +13 %, -9 %, and a -66 % pair) were noise between
-identical servers and are discarded. The script now refuses to run if something is already
-listening, and fails if the server does not report the requested pool size.
+- The default pool stays at 8. `--db-pool` (or `REFHIR_DB_POOL`) tunes it.
+- Not tested: Postgres across a network, where each query holds its connection longer and a pool
+  matters more, and a machine with a very different core count.
+- An earlier version of the script started its servers inside a command substitution, lost track
+  of the first one, and measured it over and over (its "pool of 8" runs reported `max: 1`); those
+  results (+31 %, +13 %, -9 %, and a -66 % pair) were noise between identical servers and are
+  discarded. The script now refuses to run if something is already listening, and fails if the
+  server does not report the requested pool size.
 
 ## Phase 3: what the published-up-to watermark costs
 

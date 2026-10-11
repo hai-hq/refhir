@@ -72,21 +72,18 @@ that the pool is the size it asked for, and compares a pool of 8 with a pool of 
 pairs, judging each workload by the median gain. It needs an empty Postgres database and a release
 build, and the GitHub Actions `perf-smoke` job (manual `workflow_dispatch`) runs it.
 
-- **Reads** (`read=100`, 32 clients) are judged: PASS needs a median gain of at least
-  `MIN_GAIN_PCT` (default 3), and the script's exit code follows it.
-- The **Phase 0 mix**, **reads and searches beside writers** and a **search-heavy** workload are
-  reported with their own verdicts but do not set the exit code. They are limited by the server's
-  own CPU, not by the connection, so a pool does not raise their throughput (`baseline.md` has the
-  measurements, including the FAILs, and the CPU figures that show why).
-- Every result line also shows the **cores** the server process used. Close to the machine's core
-  count means the server is CPU-bound and no pool can help.
+- Four workloads, each judged: **reads** (`read=100`), the **Phase 0 mix** (read+search ops/s),
+  **reads and searches beside writers**, and **search-heavy**. A workload passes with a median
+  gain of at least `MIN_GAIN_PCT` (default 3), and the exit code is non-zero if any fails.
+- Every result line shows the total time the clients **waited** for a connection and the **cores**
+  the server process used. If cores is near the machine's core count the server is CPU-bound, and a
+  FAIL is a CPU problem, not a pool problem (that is how a quadratic scan in search was found;
+  `baseline.md` has the story and the numbers).
 - `PAIRS`, `MIXED_PAIRS`, `SPLIT_PAIRS`, `INFO_PAIRS`, `DURATION`, `CLIENTS`, `READERS`, `WRITERS`
-  and `--quick` tune the run time.
+  and `--quick` (reads only) tune the run time.
 
 ```bash
 PERF_DB_URL=postgres://postgres:refhir@127.0.0.1:5432/emptydb scripts/perf-criteria.sh
 ```
 
-Pairs on a shared machine are noisy, so judge the median, not one run. The "waited" figure beside
-each result is the clients' total wait for a connection: compare it with clients x run length to
-see whether the connection limited that run at all.
+Pairs on a shared machine are noisy, so judge the median, not one run.

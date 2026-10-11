@@ -11,27 +11,24 @@
 #   Phase 2 exit criterion: "read/search throughput rises with pool size versus Phase 0". A pool of
 #   1 is the baseline (one connection, as before the pool); each workload is compared with a pool
 #   of 8 over alternating pairs, and a verdict is the MEDIAN gain, because one comparison on a
-#   shared machine swings by tens of percent. PASS needs at least MIN_GAIN_PCT (default 3).
+#   shared machine swings by tens of percent. A workload PASSES with a median gain of at least
+#   MIN_GAIN_PCT (default 3), and the script's exit code is non-zero if any of them fails.
 #
-#   1. Reads (judged, sets the exit code): read=100 at CLIENTS clients (default 32). A read is a
-#      round trip to the database, so with one connection that connection is the limit and a pool
-#      should raise throughput a lot. PAIRS pairs (default 3).
-#   2. The Phase 0 mix (read=60,search=25,write=15), read+search ops/s, MIXED_PAIRS pairs (default
-#      3). Reported with its own verdict, but it does not set the exit code.
-#   3. Reads and searches beside writers (read=70,search=30 from READERS clients, default 24, while
-#      WRITERS clients, default 8, write at the same time): the Phase 0 contention without its
-#      closed-loop artifact, in which a client that draws a four second write is not reading
-#      meanwhile. Read + search ops/s of the readers only. SPLIT_PAIRS pairs (default 3). Reported.
-#   4. Search-heavy (read=20,search=80) at as many clients as the machine has CPUs, INFO_PAIRS
-#      pairs (default 1). Reported only.
+#   1. Reads: read=100 at CLIENTS clients (default 32). PAIRS pairs (default 3).
+#   2. The Phase 0 mix (read=60,search=25,write=15), read+search ops/s, MIXED_PAIRS pairs (default 3).
+#   3. Reads and searches beside writers: read=70,search=30 from READERS clients (default 24) while
+#      WRITERS clients (default 8) write at the same time; read+search ops/s of the readers only.
+#      This is the Phase 0 contention without its closed-loop artifact, in which a client that draws
+#      a four second write is not reading meanwhile. SPLIT_PAIRS pairs (default 3).
+#   4. Search-heavy: read=20,search=80 at as many clients as the machine has CPUs. INFO_PAIRS pairs
+#      (default 3).
 #
-#   Why 2, 3 and 4 do not set the exit code: their cost is a few slow searches and writes that use the
-#   CPU, so the connection is not what limits them, and a pool cannot raise throughput that the CPU
-#   limits. The "waited" figure printed next to each result is the total time the clients spent
-#   waiting for a connection; compare it with clients x run length to see how much of the run that
-#   was. "cores" is how many cores the server process used (CPU time over wall time): near the
-#   machine's core count means the server is CPU-bound and no pool can help. The result of 2 to 4 on the machine this was developed on is in docs/perf/baseline.md,
-#   including that they showed no reliable gain.
+#   "waited" is the total time the clients spent waiting for a connection, and "cores" is how many
+#   cores the server process used (CPU time over wall time). A pool can only raise throughput that
+#   the connection limits: if "cores" is near the machine's core count the server is CPU-bound and
+#   a FAIL here is a CPU problem, not a pool problem. That is how a quadratic scan in the FHIRPath
+#   model (Model::known_child, run for every step of every row of a search) showed up: searches used
+#   ~10 of 12 cores and gained nothing from a pool until it was fixed (docs/perf/baseline.md).
 set -euo pipefail
 
 QUICK=0; [[ "${1:-}" == "--quick" ]] && QUICK=1
@@ -45,7 +42,7 @@ CLIENTS="${CLIENTS:-32}"
 CLIENTS_MATCHED="${CLIENTS_MATCHED:-$(python3 -c 'import os; print(os.cpu_count() or 8)')}"
 PAIRS="${PAIRS:-3}"
 MIXED_PAIRS="${MIXED_PAIRS:-3}"
-INFO_PAIRS="${INFO_PAIRS:-1}"
+INFO_PAIRS="${INFO_PAIRS:-3}"
 SPLIT_PAIRS="${SPLIT_PAIRS:-3}"
 READERS="${READERS:-24}"
 WRITERS="${WRITERS:-8}"
@@ -156,6 +153,7 @@ PY
 )
 }
 
+FAILED=()
 verdict() { # LABEL PAIRS  (uses MEDIAN POSITIVE PAIRLIST)
   python3 - "$1" "$2" "$MIN_GAIN_PCT" "$MEDIAN" "$POSITIVE" "$PAIRLIST" <<'PY'
 import sys
@@ -163,37 +161,34 @@ label, pairs, need, median, positive, listed = sys.argv[1:]
 word = "PASS" if float(median) >= float(need) else "FAIL"
 print(f"{word}  {label}: median gain with a pool of 8 is {median} % ({positive} of {pairs} pairs positive; pairs: {listed.replace(',', ', ')}; needed {float(need):+.1f} %)")
 PY
+  if awk -v m="$MEDIAN" -v n="$MIN_GAIN_PCT" 'BEGIN { exit !(m + 0 < n + 0) }'; then FAILED+=("$1"); fi
 }
 
 echo "1. reads only (read=100), $CLIENTS clients, $PAIRS alternating pair(s)"
 compare reads read=100 "$SEED_READ" "$CLIENTS" total "$PAIRS"
-READ_MEDIAN=$MEDIAN
-verdict "reads (judged)" "$PAIRS"
+verdict "reads" "$PAIRS"
 
 if (( MIXED_PAIRS > 0 )); then
   echo "2. the Phase 0 mix (read=60,search=25,write=15), $CLIENTS clients, read+search ops/s, $MIXED_PAIRS alternating pair(s)"
   compare mixed read=60,search=25,write=15 "$SEED_MIXED" "$CLIENTS" readsearch "$MIXED_PAIRS"
-  verdict "Phase 0 mix (reported, does not set the exit code)" "$MIXED_PAIRS"
+  verdict "Phase 0 mix" "$MIXED_PAIRS"
 fi
 
 if (( SPLIT_PAIRS > 0 )); then
   echo "3. reads and searches (read=70,search=30) from $READERS clients beside $WRITERS writing clients, $SPLIT_PAIRS alternating pair(s)"
   compare split read=70,search=30 100 "$READERS" split "$SPLIT_PAIRS"
-  verdict "reads and searches beside writers (reported, does not set the exit code)" "$SPLIT_PAIRS"
+  verdict "reads and searches beside writers" "$SPLIT_PAIRS"
 fi
 
 if (( INFO_PAIRS > 0 )); then
   echo "4. search-heavy (read=20,search=80), $CLIENTS_MATCHED clients (= CPUs), $INFO_PAIRS alternating pair(s)"
   compare heavy read=20,search=80 "$SEED_HEAVY" "$CLIENTS_MATCHED" total "$INFO_PAIRS"
-  verdict "search-heavy (reported, does not set the exit code)" "$INFO_PAIRS"
+  verdict "search-heavy" "$INFO_PAIRS"
 fi
 
-python3 - "$MIN_GAIN_PCT" "$READ_MEDIAN" <<'PY'
-import sys
-need, median = float(sys.argv[1]), float(sys.argv[2])
-if median >= need:
-    print(f"PASS  Phase 2 exit criterion for reads: median read throughput gain with a pool of 8 is {median:+.1f} % (needed {need:+.1f} %). See above for searches and the mixed workload.")
-else:
-    print(f"FAIL  Phase 2 exit criterion for reads: median read throughput gain with a pool of 8 is {median:+.1f} % (needed {need:+.1f} %)")
-    sys.exit(1)
-PY
+if (( ${#FAILED[@]} == 0 )); then
+  echo "PASS  Phase 2 exit criterion: throughput rises with a pool of 8 in every workload (median gain at least $MIN_GAIN_PCT %)"
+else
+  echo "FAIL  Phase 2 exit criterion: no median gain of $MIN_GAIN_PCT % with a pool of 8 for: ${FAILED[*]}"
+  exit 1
+fi
