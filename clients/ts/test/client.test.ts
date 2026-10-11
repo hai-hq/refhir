@@ -34,25 +34,25 @@ describe("integration", () => {
     const writer = await dial(base);
     try {
       await reader.metadata();
-      await reader.create("Patient", {
+      // The server assigns the id of a resource it creates, whatever the body says.
+      const created = (await reader.create("Patient", {
         resourceType: "Patient",
-        id: "p1",
         active: true,
         name: [{ family: "Ann" }],
-      });
+      })) as { id: string };
       const watch = await reader.search("Patient", { active: "true" });
       expect(family(watch.latest())).toBe("Ann");
 
-      await writer.update("Patient", "p1", {
+      await writer.update("Patient", created.id, {
         resourceType: "Patient",
-        id: "p1",
+        id: created.id,
         active: true,
         name: [{ family: "Bee" }],
       });
       const next = await watch.next();
       expect(family(next)).toBe("Bee");
 
-      const one = await reader.query("Patient/read", { id: "p1" });
+      const one = await reader.query("Patient/read", { id: created.id });
       expect(family(one)).toBe("Bee");
     } finally {
       await reader.close();
