@@ -16,6 +16,11 @@ decisions that were measured before being made.
 
 ## Phase 0: the baseline, and where the time goes
 
+These figures were taken before the search fix described under Phase 2 (`Model::known_child` scanned
+the whole FHIR model for every step of every row of a search), so searches in them are about as slow
+as they will ever be; the same workload on the current code gives much higher read+search
+throughput. They are kept as the record of where the time went at the start, not as a target.
+
 Mixed workload `read=60,search=25,write=15`, 20 s, a pool of 1 connection:
 
 | | |
