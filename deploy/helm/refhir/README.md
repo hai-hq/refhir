@@ -43,3 +43,20 @@ helm install refhir ./deploy/helm/refhir \
   `secretEnv`. Every pod must use the same values, and a pod refuses to start without them.
 - Each pod keeps its own package cache and export directory on an `emptyDir`; export jobs are
   tracked by the writer that accepted them.
+
+## Testing the chart
+
+`kind-test.sh` deploys the chart in cluster mode into a throwaway kind cluster of its own (with a
+Postgres in the cluster), checks what the probes and Services do, then hard-kills the primary pod
+twice while writing through the main Service:
+
+```bash
+docker build -t refhir:cluster .
+deploy/helm/refhir/kind-test.sh        # --keep leaves the cluster up
+```
+
+It needs docker, kind, kubectl and helm, and does not touch any other kube context. Last run, on
+the final code: of the two writer pods exactly one was ready (the other, a standby, answers `/healthz`
+503), the `<release>-primary` Service had one endpoint and the main Service had the primary plus
+both replicas; across two pod kills 543 writes were acknowledged (214 and 329), none failed, none
+was lost, commit timestamps only increased, and the writer epoch went 1, 2, 3.

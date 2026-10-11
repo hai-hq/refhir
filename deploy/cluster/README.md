@@ -63,17 +63,20 @@ asking for at least the commit timestamp it was acknowledged with.
 deploy/cluster/failover-test.sh          # builds the image if there is none; --keep leaves the stack up
 ```
 
-Last run, on a machine that was also running other heavy programs (load average above 100 on 12
-cores), with the full FHIR R4 core installed:
+`failover-test.sh` and `deploy/helm/refhir/kind-test.sh` share the write-and-check code in
+`failover_load.py`. Last run, on the final code, with the full FHIR R4 core installed:
 
 | | round 1 (writer2 killed) | round 2 (writer1 killed) |
 |---|---|---|
-| Writes acknowledged | 38 | 53 |
-| Requests that failed | 1 (a 502 in flight on the killed primary) | 0 |
-| Longest gap between two acknowledgements | 7.2 s | 3.8 s |
+| Writes acknowledged | 187 | 182 |
+| Requests that failed | 0 | 1 (a 502 in flight on the killed primary) |
+| Longest gap between two acknowledgements | 4.2 s | 3.3 s |
 | Acknowledged writes missing afterwards | 0 | 0 |
 | Commit timestamps strictly increasing | yes | yes |
 | Writer epoch afterwards | 2 | 3 |
+
+An earlier run, on a machine that was also running other heavy programs, had gaps of 7.2 s and
+3.8 s, so expect a few seconds and more when the machine is busy.
 
 Where the gap goes, from one more run that logged the standby's clock against the moment of the
 kill (same loaded machine):

@@ -72,37 +72,7 @@ round() {
   victim=$(primary)
   echo "--- $label: the primary is $victim, epoch $(epoch)"
   local log; log=$(mktemp)
-  python3 - "$LB" "$WRITE_SECONDS" "$label" >"$log" <<'PY' &
-import json, sys, time, urllib.request, urllib.error, uuid
-lb, seconds = sys.argv[1], float(sys.argv[2])
-label = "".join(c for c in sys.argv[3] if c.isalnum())  # a FHIR id has no spaces
-acked, failed = [], []
-last_ack, longest_gap, gap_at = None, 0.0, 0.0
-end = time.time() + seconds
-n = 0
-while time.time() < end:
-    n += 1
-    pid = f"{label}-{n}-{uuid.uuid4().hex[:6]}"
-    body = json.dumps({"resourceType": "Patient", "id": pid, "active": True}).encode()
-    req = urllib.request.Request(f"{lb}/Patient", data=body, method="POST",
-                                 headers={"content-type": "application/fhir+json"})
-    started = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            ts = resp.headers.get("X-Refhir-Commit-Ts")
-            now = time.time()
-            if last_ack is not None and now - last_ack > longest_gap:
-                longest_gap, gap_at = now - last_ack, now - (end - seconds)
-            last_ack = now
-            acked.append({"id": pid, "ts": int(ts) if ts else None})
-    except urllib.error.HTTPError as err:
-        failed.append({"id": pid, "status": err.code, "at": round(started - (end - seconds), 2)})
-    except Exception as err:  # connection reset, timeout
-        failed.append({"id": pid, "status": str(err)[:60], "at": round(started - (end - seconds), 2)})
-    time.sleep(0.1)
-print(json.dumps({"acked": acked, "failed": failed,
-                  "longest_gap_s": round(longest_gap, 2), "gap_at_s": round(gap_at, 1)}))
-PY
+  python3 "$HERE/failover_load.py" write "$LB" "$WRITE_SECONDS" "$label" >"$log" &
   local writer=$!
   sleep "$KILL_AFTER"
   local killed_at=$SECONDS
@@ -111,46 +81,7 @@ PY
   wait "$writer"
   # Bring the killed writer back; it returns as the standby.
   "${COMPOSE[@]}" start "$victim" >/dev/null 2>&1
-  python3 - "$LB" "$log" "$FAIL_BUDGET" <<'PY'
-import json, sys, time, urllib.request, urllib.error
-lb, path, budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
-r = json.load(open(path))
-acked, failed = r["acked"], r["failed"]
-problems = []
-stamped = [a["ts"] for a in acked if a["ts"] is not None]
-if len(stamped) != len(acked):
-    problems.append(f"{len(acked) - len(stamped)} acknowledged writes carried no X-Refhir-Commit-Ts")
-backwards = sum(1 for a, b in zip(stamped, stamped[1:]) if b <= a)
-if backwards:
-    problems.append(f"{backwards} acknowledged writes got a commit timestamp not above the one before")
-missing = []
-for a in acked:
-    headers = {"X-Refhir-Min-Ts": str(a["ts"])} if a["ts"] else {}
-    deadline = time.time() + 20
-    while True:
-        try:
-            req = urllib.request.Request(f"{lb}/Patient/{a['id']}", headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status == 200:
-                    break
-        except Exception:
-            pass
-        if time.time() > deadline:
-            missing.append(a["id"])
-            break
-        time.sleep(0.2)
-if missing:
-    problems.append(f"{len(missing)} acknowledged writes cannot be read: {missing[:5]}")
-if len(failed) > budget:
-    problems.append(f"{len(failed)} requests failed (budget {budget})")
-print(f"    {len(acked)} writes acknowledged, {len(failed)} failed {[(f['at'], f['status']) for f in failed]}, "
-      f"longest gap between acknowledgements {r['longest_gap_s']}s (at t={r['gap_at_s']}s)")
-print(f"    timestamps strictly increasing: {not backwards}; acknowledged writes missing: {len(missing)}")
-if problems:
-    for p in problems:
-        print("    FAIL:", p)
-    sys.exit(1)
-PY
+  python3 "$HERE/failover_load.py" verify "$LB" "$log" "$FAIL_BUDGET"
   rm -f "$log"
   wait_for "the restarted writer to be up as the standby, with a primary serving" 120 has_primary
   echo "    now the primary is $(primary), epoch $(epoch)"

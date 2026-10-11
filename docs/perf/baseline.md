@@ -75,6 +75,31 @@ server used 0.3 to 0.5 cores: the connection was the limit. With eight, the wait
 and throughput rose with it. (Absolute figures for reads are lower than in the runs before the fix;
 that code is untouched, and the machine was busier. Compare within a table, not across them.)
 
+### Across a network (5 ms added delay)
+
+Everything above ran against a Postgres on the same machine. To see a database that is not next
+door, the same script ran against a Postgres container with `tc netem delay 5ms` on its interface
+(a connection plus one request took 1.0 ms to the normal container and 15.5 ms to this one; the
+delay is on the database's replies only, so it is a rough stand-in for a database in another zone,
+not a measurement of one). 2 pairs per workload, pool 1 then pool 8:
+
+| Workload | pool 1 (ops/s) | pool 8 (ops/s) | median gain |
+|---|---|---|---|
+| Reads | 67, 62 | 378, 468 | **+562 %** |
+| Phase 0 mix, read+search | 17, 12 | 86, 92 | **+520 %** |
+| Reads+searches beside writers | 36, 35 | 265, 253 | **+635 %** |
+| Search-heavy | 54, 54 | 435, 442 | **+713 %** |
+
+8 of 8 pairs positive. With a delay between the server and its database a pool matters far more,
+because every query holds its connection for the whole round trip: one connection is limited to
+about 1 / (round trip) queries per second, and eight give about eight times that. The first
+start's install of the R4 definitions into this database took more than 4 minutes (the script's
+old fixed wait for the server, which it now takes from `START_TIMEOUT`).
+
+The cluster integration tests (lease, takeover, a killed primary, replicas, catalog reload, `/sync`
+on a replica) also pass through this delay, 9 of 9 (15 s, against 8 s without it), so none of the
+lease keepalive, takeover or refresh timers is too tight for a few milliseconds of latency.
+
 ### Before the fix: searches did not gain, and that was a bug
 
 The same comparison before the fix, over 14 pairs of search-heavy and 10 of the Phase 0 mix, gave
@@ -143,6 +168,11 @@ from other programs (load average above 100 on 12 cores), so read the range, not
 An earlier set of three runs on a quieter machine measured 13.1 % and 4.5 % (medians), so the
 cost of the 8-writer case is somewhere between a few percent and about a quarter of commit
 throughput, and the spread is the machine's, not the code's.
+
+Through the same 5 ms delay (three runs): one writer 13.6 %, 14.1 %, 6.0 % (median 13.6 %), eight
+writers 13.2 %, 6.0 %, 10.1 % (median 10.1 %), with 8 to 12 ms of watermark time per commit. The
+share is about the same as on a local database, because a commit already takes several round trips
+and the watermark is one more.
 
 What the cost is: the watermark is one extra database round trip on the commit path, after the
 in-order publish. Concurrent publishers share it (whichever holds the flush lock writes the newest

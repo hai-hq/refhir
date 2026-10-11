@@ -38,6 +38,7 @@ DB="${PERF_DB_URL:?set PERF_DB_URL to an empty Postgres database}"
 OUT="${PERF_OUT:-$(mktemp -d)}"
 PORT="${PERF_PORT:-18080}"
 MIN_GAIN_PCT="${MIN_GAIN_PCT:-3}"
+START_TIMEOUT="${START_TIMEOUT:-240}"
 CLIENTS="${CLIENTS:-32}"
 CLIENTS_MATCHED="${CLIENTS_MATCHED:-$(python3 -c 'import os; print(os.cpu_count() or 8)')}"
 PAIRS="${PAIRS:-3}"
@@ -64,10 +65,14 @@ start_server() { # pool size
   REFHIR_SKIP_DEFAULT_PACKAGES=1 "$BIN" --postgres "$DB" --bind "127.0.0.1:$PORT" \
     --package "$ROOT/crates/fhir/fixtures/r4" --db-pool "$1" >"$OUT/server.log" 2>&1 &
   SERVER_PID=$!
-  for _ in $(seq 1 240); do
+  # The first start installs the FHIR definitions into the database, which takes minutes over a
+  # slow link (a 5 ms round trip made it take longer than the old fixed 240 s wait), so the wait is
+  # START_TIMEOUT seconds (default 240) and running out of it is an error, not something to carry on from.
+  local waited=0
+  until curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null 2>&1; do
     kill -0 "$SERVER_PID" 2>/dev/null || { echo "the server exited; see $OUT/server.log" >&2; exit 2; }
-    curl -sf "http://127.0.0.1:$PORT/healthz" >/dev/null && break
-    sleep 1
+    (( waited < START_TIMEOUT )) || { echo "the server was not ready after ${START_TIMEOUT}s (set START_TIMEOUT higher on a slow database); see $OUT/server.log" >&2; exit 2; }
+    sleep 1; waited=$((waited + 1))
   done
   # Prove this is the server just started, with the pool that was asked for, not a stale one.
   local reported
