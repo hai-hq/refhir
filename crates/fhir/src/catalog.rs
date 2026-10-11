@@ -144,6 +144,9 @@ pub struct Catalog {
     compartments: BTreeMap<String, Compartment>,
     /// Form Archiver: store QuestionnaireResponse, never return one.
     sdc_archiver: bool,
+    /// Whether a PUT to an id that does not exist creates it under that id. Off by default: the
+    /// server assigns ids.
+    update_create: bool,
 }
 
 impl Catalog {
@@ -157,6 +160,7 @@ impl Catalog {
             reference_policy: ReferencePolicy::Strict,
             compartments: compartment::load(&[]),
             sdc_archiver: false,
+            update_create: false,
         }
     }
 
@@ -267,6 +271,7 @@ impl Catalog {
             reference_policy: ReferencePolicy::Strict,
             compartments: compartment::load(&term_json),
             sdc_archiver: false,
+            update_create: false,
         })
     }
 
@@ -284,6 +289,16 @@ impl Catalog {
 
     pub fn set_sdc_archiver(&mut self, enabled: bool) {
         self.sdc_archiver = enabled;
+    }
+
+    /// Update-as-create: `PUT [type]/[id]` creates the resource when `id` is not in use. FHIR
+    /// leaves it to the deployment, so it is a setting, and the capability statement reports it.
+    pub fn update_create(&self) -> bool {
+        self.update_create
+    }
+
+    pub fn set_update_create(&mut self, enabled: bool) {
+        self.update_create = enabled;
     }
 
     /// Form Archiver may store a QuestionnaireResponse and must not return one.
@@ -315,6 +330,12 @@ impl Catalog {
 
     pub fn terms(&self) -> &MemoryTerminology {
         &self.terms
+    }
+
+    /// For a change to terminology alone, applied in place rather than by rebuilding the whole
+    /// catalog from the store.
+    pub(crate) fn terms_mut(&mut self) -> &mut MemoryTerminology {
+        &mut self.terms
     }
 
     pub fn get(&self, name: &str) -> Result<&ResourceModel, FhirError> {
@@ -358,7 +379,15 @@ impl Catalog {
                         })
                     }).collect::<Vec<_>>(),
                     "versioning": "versioned",
-                    "readHistory": true
+                    "readHistory": true,
+                    // The server assigns ids. A PUT to an id that does not exist is a 405 unless
+                    // the deployment turned update-as-create on. The conditional interactions
+                    // are implemented (`If-None-Exist`, `PUT [type]?query`, `DELETE [type]?query`
+                    // matching at most one resource).
+                    "updateCreate": self.update_create,
+                    "conditionalCreate": true,
+                    "conditionalUpdate": true,
+                    "conditionalDelete": "single"
                 })
             })
             .collect();
@@ -457,6 +486,16 @@ fn dedup_keys(mut keys: Vec<(IndexId, Vec<u8>)>) -> Vec<(IndexId, Vec<u8>)> {
     keys
 }
 
+/// The resource type a `Reference` target profile allows. Only a core definition URL names its
+/// type; any other profile's id says nothing about it, so it leaves the element unrestricted
+/// (`Resource`) and the validator, which can resolve the profile, decides.
+fn target_name(profile: &str) -> String {
+    match profile.strip_prefix("http://hl7.org/fhir/StructureDefinition/") {
+        Some(name) if !name.is_empty() && !name.contains('/') => name.to_string(),
+        _ => "Resource".to_string(),
+    }
+}
+
 fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
     let Some(list) = json
         .pointer("/snapshot/element")
@@ -473,9 +512,12 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
         let Some(relative) = path.strip_prefix(&prefix) else {
             continue;
         };
-        if relative.is_empty() || relative.contains('.') {
+        // A choice (`value[x]`) is stored under a name this path does not spell, so it cannot be
+        // followed.
+        if relative.is_empty() || relative.contains("[x]") {
             continue;
         }
+        let nested = relative.contains('.');
         let Some(types) = element.get("type").and_then(|value| value.as_array()) else {
             continue;
         };
@@ -492,15 +534,20 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
                 profiles
                     .iter()
                     .filter_map(|profile| profile.as_str())
-                    .filter_map(|profile| profile.rsplit('/').next())
-                    .map(|name| name.to_string())
+                    .map(target_name)
                     .collect()
             })
             .unwrap_or_default();
-        let min = element
-            .get("min")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0) as u32;
+        // `min` is the element's own: at least one value *if its parent is present*. That is
+        // only a requirement of the resource for a top-level element.
+        let min = if nested {
+            0
+        } else {
+            element
+                .get("min")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0) as u32
+        };
         references.push(ReferenceElement {
             path: relative.to_string(),
             min,

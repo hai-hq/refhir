@@ -127,12 +127,17 @@ function rank(key: string): number {
   return uploadRank[rt] ?? 500;
 }
 
+/**
+ * The demo data names its own ids and refers to itself by `Type/id`, so each resource is sent as
+ * `PUT [type]/[id]`. A POST would give every resource a new id and leave those references
+ * pointing at nothing. The server must allow update-as-create (`--update-as-create`).
+ */
 export function transactionBundle(resources: Record<string, JsonValue>[]): JsonValue {
   const entries = resources.map((resource) => {
     const rt = resource.resourceType as string;
     return {
       resource,
-      request: { method: "POST", url: rt },
+      request: { method: "PUT", url: `${rt}/${resource.id as string}` },
     };
   });
   return {

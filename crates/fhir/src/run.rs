@@ -74,6 +74,38 @@ pub fn run(
     if path == "Bundle/batch" {
         return bundle::batch(db, catalog, args);
     }
+    run_in_transaction(db, path, |tx| dispatch(tx, catalog, path, args))
+}
+
+/// Load a resource under the id it names, for code that embeds the server and has data with ids
+/// of its own: fixtures, a restore, a migration.
+///
+/// This is not an interaction. The `create` a client can reach assigns the id whatever the body
+/// says, and no operation name leads here, so `/sync`, GraphQL and REST cannot. The resource is
+/// validated and indexed like any other; an id already in use is a conflict.
+pub fn import_resource(
+    db: &Database,
+    catalog: &Catalog,
+    resource: &Value,
+) -> Result<RunResult, RunError> {
+    let type_name = resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let path = format!("{type_name}/import");
+    run_in_transaction(db, &path, |tx| {
+        let model = catalog.get(type_name)?;
+        let value = ops::create_with(tx, catalog, model, resource.clone(), ops::IdPolicy::Keep)?;
+        set_status(201);
+        Ok(value)
+    })
+}
+
+fn run_in_transaction(
+    db: &Database,
+    path: &str,
+    mut body: impl FnMut(&mut refhir_database::Transaction) -> Result<Value, FhirError>,
+) -> Result<RunResult, RunError> {
     for attempt in 0..=MAX_OCC_FAILURES {
         let mut tx = db.begin();
         let snapshot_ts = tx.begin_timestamp();
@@ -85,7 +117,7 @@ pub fn run(
             "operation started"
         );
         set_status(0);
-        let mut value = match dispatch(&mut tx, catalog, path, args) {
+        let mut value = match body(&mut tx) {
             Ok(value) => value,
             Err(err) => return Err(RunError::Fhir(err)),
         };
@@ -175,7 +207,7 @@ pub fn dispatch(
         .ok_or_else(|| FhirError::Invalid(format!("bad operation {path}")))?;
     if matches!(
         op,
-        "$expand" | "$validate-code" | "$lookup" | "$translate" | "$subsumes"
+        "$expand" | "$expandability" | "$validate-code" | "$lookup" | "$translate" | "$subsumes"
     ) {
         return crate::terms::operation(catalog, type_name, op, args);
     }
@@ -202,14 +234,18 @@ pub fn dispatch(
         }
         "update" => {
             let resource = crate::sdc::prepare_store(tx, catalog, args, resource_arg(args)?)?;
-            ops::update(
+            let (value, status) = ops::update_status(
                 tx,
                 catalog,
                 model,
                 &id_arg(args)?,
                 resource,
                 args.get("ifMatch").and_then(|value| value.as_str()),
-            )
+            )?;
+            if status == 201 {
+                set_status(201);
+            }
+            Ok(value)
         }
         "delete" => ops::delete(tx, catalog, model, &id_arg(args)?),
         "patch" => {

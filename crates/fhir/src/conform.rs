@@ -8,11 +8,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use refhir_database::{CommitError, Database, DocumentWrite, IndexPut};
 use refhir_persistence::{
-    ConformanceStore, NewExpansion, NewSearchParameter, NewTerminology, ParamStatus,
-    StoredSearchParameter, StoredTerminology,
+    ConformanceStore, ExpansionChange, NewExpansion, NewSearchParameter, NewTerminology,
+    ParamStatus, StoredSearchParameter, StoredTerminology,
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
-use refhir_validate::MemoryTerminology;
+use refhir_validate::{MemoryTerminology, TerminologyChange};
 use serde_json::Value;
 
 use crate::error::FhirError;
@@ -36,8 +36,24 @@ pub fn commit_operation(
         let guard = catalog.read().expect("catalog");
         run::run(db, &guard, path, args)?
     };
-    project_writes(store, db, catalog, result.ts, &result.writes).map_err(RunError::Fhir)?;
-    Ok(result)
+    match project_writes(store, db, catalog, result.ts, &result.writes) {
+        Ok(()) => Ok(result),
+        // The document is committed. A failure of the store itself is repaired from the stored
+        // resources straight away, so the request does not report a write that happened as one
+        // that did not; a failure that is about the request still goes back to the client.
+        Err(err @ FhirError::Storage(_)) => {
+            tracing::error!(error = %err, "conformance projection failed after commit; repairing");
+            match repair_conformance(store, db, catalog) {
+                Ok(()) => Ok(result),
+                Err(repair) => Err(RunError::Fhir(FhirError::Storage(format!(
+                    "the write was committed, but projecting it into the conformance tables \
+                     failed ({err}) and so did the repair ({repair}); it is repaired from the \
+                     stored resources at the next start"
+                )))),
+            }
+        }
+        Err(err) => Err(RunError::Fhir(err)),
+    }
 }
 
 pub fn repair_conformance(
@@ -52,10 +68,16 @@ pub fn repair_conformance(
             continue;
         }
         let live = package::live_ids(db, type_name)?;
+        // The key each live resource is stored under now. A row under any other key for the same
+        // resource is left over from a version it no longer has.
+        let mut keys: BTreeMap<String, String> = BTreeMap::new();
         for id in &live {
             let Some(resource) = live_json(db, type_name, id)? else {
                 continue;
             };
+            if let Some(key) = row_key(&resource) {
+                keys.insert(id.clone(), key);
+            }
             if terminology_current(store, local_id, &resource)? {
                 continue;
             }
@@ -63,7 +85,7 @@ pub fn repair_conformance(
                 term_dirty = true;
             }
         }
-        if delete_orphan_terminology(store, local_id, type_name, &live)? {
+        if delete_orphan_terminology(store, local_id, type_name, &keys)? {
             term_dirty = true;
         }
     }
@@ -107,9 +129,25 @@ fn preflight(
         return Ok(());
     }
     let local_id = local_package(store, catalog)?;
-    let parameters = store.load_search_parameters()?;
-    let terminology = store.load_terminology()?;
-    let scope = SearchScope::from_store(store)?.with_parameters(&resources);
+    // A ValueSet is checked against the one row that could share its URL, and the search
+    // parameter tables are read only for a request that carries a SearchParameter. Reading every
+    // installed code system and every search parameter for each write is what made a one-line
+    // ValueSet cost as much as the whole catalog.
+    let terminology = store.load_terminology_for(&terminology_urls(&resources))?;
+    let parameters_wanted = resources.iter().any(|resource| {
+        resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+            == Some("SearchParameter")
+    });
+    let (parameters, scope) = if parameters_wanted {
+        (
+            store.load_search_parameters()?,
+            Some(SearchScope::from_store(store)?.with_parameters(&resources)),
+        )
+    } else {
+        (Vec::new(), None)
+    };
     let mut seen = Vec::new();
     for resource in &resources {
         match resource
@@ -117,7 +155,10 @@ fn preflight(
             .and_then(|value| value.as_str())
         {
             Some("SearchParameter") => {
-                let rows = check_parameter(&parameters, &seen, resource, &scope)?;
+                let scope = scope
+                    .as_ref()
+                    .expect("scope is built for search parameters");
+                let rows = check_parameter(&parameters, &seen, resource, scope)?;
                 seen.extend(rows);
             }
             Some("ValueSet" | "CodeSystem" | "ConceptMap") => {
@@ -144,7 +185,9 @@ fn project_writes(
         return Ok(());
     }
     let local_id = local_package(store, catalog)?;
-    let mut term_dirty = false;
+    let mut written: Vec<String> = Vec::new();
+    let mut removed: Vec<(String, String)> = Vec::new();
+    let mut rebuild = false;
     for write in &interesting {
         if !matches!(
             write.tablet.as_str(),
@@ -155,22 +198,70 @@ fn project_writes(
         let Some(resource) = write_resource(db, write, ts)? else {
             continue;
         };
+        let Some(key) = row_key(&resource) else {
+            if write.json.is_some() {
+                return Err(FhirError::Invalid("url is required".into()));
+            }
+            continue;
+        };
         if write.json.is_none() {
-            if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
-                store.delete_terminology(local_id, url)?;
-                term_dirty = true;
+            store.delete_terminology(local_id, &key)?;
+            // An installed package can hold the same canonical, and then the deletion is not the
+            // end of it: what the catalog holds for that URL becomes the package's. Only a
+            // rebuild from the stored rows says what that is.
+            if store
+                .load_terminology_for(std::slice::from_ref(&key))?
+                .iter()
+                .any(|row| row.package_id != local_id && row.url == key)
+            {
+                rebuild = true;
+            } else {
+                removed.push((write.tablet.clone(), key));
             }
             continue;
         }
+        // An update that changes a code system's version makes it a different row: the row for
+        // the version it had must not be left behind as if that version still existed.
+        if let Some(previous) = previous_body(db, &write.tablet, &write.id, ts)? {
+            if let Some(old_key) = serde_json::from_str::<Value>(&previous)
+                .ok()
+                .and_then(|old| row_key(&old))
+                .filter(|old_key| *old_key != key)
+            {
+                store.delete_terminology(local_id, &old_key)?;
+                removed.push((write.tablet.clone(), old_key));
+            }
+        }
+        drop_unversioned_row(store, local_id, &resource, &key, &mut removed)?;
         if project_terminology(store, local_id, &resource, true)? {
-            term_dirty = true;
+            written.push(key);
         }
     }
-    if term_dirty {
-        sync_expansions(store)?;
-        package::publish(store, catalog)?;
+    if rebuild || !written.is_empty() || !removed.is_empty() {
+        // The terminology changed and nothing else did, so only what the change touches is
+        // recomputed. If that cannot be done, the full rebuild gives the same answer.
+        let applied = if rebuild {
+            None
+        } else {
+            Some(apply_terminology(
+                store, catalog, local_id, &written, &removed,
+            ))
+        };
+        if !matches!(applied, Some(Ok(()))) {
+            if let Some(Err(err)) = &applied {
+                tracing::warn!(error = %err, "incremental terminology update failed; rebuilding");
+            }
+            sync_expansions(store)?;
+            package::publish(store, catalog)?;
+        }
     }
 
+    let parameters_written = interesting
+        .iter()
+        .any(|write| write.tablet == "SearchParameter");
+    if !parameters_written {
+        return Ok(());
+    }
     let scope = SearchScope::from_store(store)?.with_parameters(
         &interesting
             .iter()
@@ -258,11 +349,70 @@ fn project_terminology(
         local_id,
         &NewTerminology {
             resource_type,
-            url: url.to_string(),
+            url: row_key(resource).unwrap_or_else(|| url.to_string()),
             json: resource.to_string(),
         },
     )?;
     Ok(true)
+}
+
+/// The key a terminology resource is stored under. A code system with a version is stored as
+/// `url|version`, so that two versions of one system are two rows, as a package's are; anything
+/// else is stored under its URL.
+fn row_key(resource: &Value) -> Option<String> {
+    if resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        == Some("CodeSystem")
+    {
+        return refhir_validate::code_system_row_key(resource);
+    }
+    resource
+        .get("url")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
+/// Before code systems were stored by version, one with a version was stored under its bare URL.
+/// When that resource is written again its row moves to the key with the version, and the old
+/// one goes, so it is not counted twice.
+fn drop_unversioned_row(
+    store: &dyn ConformanceStore,
+    local_id: i64,
+    resource: &Value,
+    key: &str,
+    removed: &mut Vec<(String, String)>,
+) -> Result<(), FhirError> {
+    if resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
+        != Some("CodeSystem")
+    {
+        return Ok(());
+    }
+    let Some(url) = resource.get("url").and_then(|value| value.as_str()) else {
+        return Ok(());
+    };
+    if url == key {
+        return Ok(());
+    }
+    let id = resource.get("id").and_then(|value| value.as_str());
+    for row in store.load_terminology_for(&[url.to_string()])? {
+        if row.package_id != local_id || row.url != url {
+            continue;
+        }
+        let Ok(old) = serde_json::from_str::<Value>(&row.json) else {
+            continue;
+        };
+        if old.get("id").and_then(|value| value.as_str()) != id {
+            continue;
+        }
+        store.delete_terminology(local_id, &row.url)?;
+        if let Some(old_key) = row_key(&old) {
+            removed.push(("CodeSystem".to_string(), old_key));
+        }
+    }
+    Ok(())
 }
 
 fn project_parameter(
@@ -414,10 +564,13 @@ fn terminology_current(
     let Some(url) = resource.get("url").and_then(|value| value.as_str()) else {
         return Ok(true);
     };
-    let stored = store.load_terminology()?;
+    let Some(key) = row_key(resource) else {
+        return Ok(true);
+    };
+    let stored = store.load_terminology_for(&[url.to_string()])?;
     let Some(row) = stored
         .iter()
-        .find(|row| row.package_id == local_id && canonical_url(&row.url) == canonical_url(url))
+        .find(|row| row.package_id == local_id && row.url == key)
     else {
         return Ok(false);
     };
@@ -441,9 +594,8 @@ fn delete_orphan_terminology(
     store: &dyn ConformanceStore,
     local_id: i64,
     type_name: &str,
-    live: &[String],
+    live: &BTreeMap<String, String>,
 ) -> Result<bool, FhirError> {
-    let live: BTreeSet<_> = live.iter().cloned().collect();
     let stored = store.load_terminology()?;
     let mut dirty = false;
     for row in stored {
@@ -456,7 +608,7 @@ fn delete_orphan_terminology(
         let Some(id) = json.get("id").and_then(|value| value.as_str()) else {
             continue;
         };
-        if live.contains(id) {
+        if live.get(id) == Some(&row.url) {
             continue;
         }
         store.delete_terminology(local_id, &row.url)?;
@@ -498,6 +650,118 @@ fn delete_orphan_parameters(
         dirty = true;
     }
     Ok(dirty)
+}
+
+/// The canonical URLs of the terminology resources in `resources`.
+fn terminology_urls(resources: &[Value]) -> Vec<String> {
+    let mut urls: Vec<String> = resources
+        .iter()
+        .filter(|resource| {
+            matches!(
+                resource
+                    .get("resourceType")
+                    .and_then(|value| value.as_str()),
+                Some("ValueSet" | "CodeSystem" | "ConceptMap")
+            )
+        })
+        .filter_map(|resource| resource.get("url").and_then(|value| value.as_str()))
+        .map(|url| canonical_url(url).to_string())
+        .collect();
+    urls.sort();
+    urls.dedup();
+    urls
+}
+
+/// Bring the catalog and the stored expansions up to date with terminology that was written or
+/// removed, recomputing only the expansions the change can alter: the value sets written, and
+/// those that include them, or a code system written or removed, directly or through others.
+/// What this does not touch is not read, not expanded and not rewritten.
+///
+/// The change is applied to the live catalog in place under its write lock, together with the
+/// stored expansions, so two writers cannot each rebuild from what the other has not applied.
+fn apply_terminology(
+    store: &dyn ConformanceStore,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+    local_id: i64,
+    written: &[String],
+    removed: &[(String, String)],
+) -> Result<(), FhirError> {
+    let mut upserted = Vec::new();
+    for row in store.load_terminology_for(written)? {
+        // The lookup also matches other versions of the same system; only what was written
+        // is applied.
+        if row.package_id != local_id || !written.contains(&row.url) {
+            continue;
+        }
+        upserted.push(
+            serde_json::from_str::<Value>(&row.json)
+                .map_err(|err| FhirError::Invalid(format!("terminology json: {err}")))?,
+        );
+    }
+    let change = TerminologyChange {
+        upserted,
+        removed: removed.to_vec(),
+    };
+    let urls = change.urls();
+    // Stored rows of the value sets that depend on the change, by canonical URL. A URL can be
+    // held by more than one package; the last one is the one a full rebuild expands, the first
+    // is the one that owns the stored expansion.
+    let mut dependents: BTreeMap<String, Value> = BTreeMap::new();
+    let mut owners: HashMap<String, i64> = HashMap::new();
+    for url in &urls {
+        owners.insert(url.clone(), local_id);
+    }
+    loop {
+        let wanted = catalog
+            .read()
+            .expect("catalog")
+            .terms()
+            .dependents_of(&urls);
+        let missing: Vec<String> = wanted
+            .iter()
+            .filter(|url| !dependents.contains_key(*url))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            for row in store.load_terminology_for(&missing)? {
+                let url = canonical_url(&row.url).to_string();
+                owners.entry(url.clone()).or_insert(row.package_id);
+                dependents.insert(
+                    url,
+                    serde_json::from_str::<Value>(&row.json)
+                        .map_err(|err| FhirError::Invalid(format!("terminology json: {err}")))?,
+                );
+            }
+            // The catalog says these depend on the change, so their rows must exist. If one
+            // does not, the catalog and the store disagree, and only a full rebuild settles it.
+            if let Some(absent) = missing.iter().find(|url| !dependents.contains_key(*url)) {
+                return Err(FhirError::Storage(format!(
+                    "value set {absent} is in the catalog but not in the store"
+                )));
+            }
+        }
+        let mut guard = catalog.write().expect("catalog");
+        // Another writer may have changed what depends on this since it was read.
+        let wanted = guard.terms().dependents_of(&urls);
+        if wanted.iter().any(|url| !dependents.contains_key(url)) {
+            continue;
+        }
+        let loaded: Vec<Value> = wanted
+            .iter()
+            .filter_map(|url| dependents.get(url).cloned())
+            .collect();
+        let updates = guard.terms_mut().apply(&change, &loaded);
+        let changes: Vec<ExpansionChange> = updates
+            .into_iter()
+            .map(|update| ExpansionChange {
+                package_id: owners.get(&update.url).copied().unwrap_or(local_id),
+                url: update.url,
+                json: update.document.map(|document| document.to_string()),
+            })
+            .collect();
+        store.apply_expansions(&changes)?;
+        return Ok(());
+    }
 }
 
 fn sync_expansions(store: &dyn ConformanceStore) -> Result<(), FhirError> {
@@ -675,7 +939,7 @@ fn terminology_owned_elsewhere(
     local_id: i64,
     url: &str,
 ) -> Result<bool, FhirError> {
-    let stored = store.load_terminology()?;
+    let stored = store.load_terminology_for(&[canonical_url(url).to_string()])?;
     Ok(stored
         .iter()
         .any(|row| row.package_id != local_id && canonical_url(&row.url) == canonical_url(url)))

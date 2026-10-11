@@ -190,6 +190,10 @@ First **Rust** implementation: Convex-shaped engine (document log, index log, sn
 
 **Persistence:** SQLite (`refhir.sqlite`), in-memory SQLite (`--memory`), or Postgres.
 
+**Export jobs are durable.** `$export` records each job in a `jobs` table in the same database (SQLite file or Postgres), so `GET /export/{job}` and `GET /export/{job}/file` still answer after a restart. The NDJSON output is a file under `[export].dir`. With `--memory` the table is in memory too, so nothing survives a restart.
+
+**Any number of servers can share the job table.** A job is worked on by the server that holds its *lease*: an owner and an expiry, taken in one atomic statement (on Postgres with `FOR UPDATE SKIP LOCKED`, so servers do not queue behind each other), renewed every third of its 30 seconds while the work goes on, and released when it ends. A server that dies simply stops renewing; each server sweeps for jobs nobody holds, so another one takes the job once the lease runs out, without waiting for a restart. Only the holder can record how a job ended, so a server that lost its lease cannot overwrite the result of the one that took over. A server takes only jobs of kinds it has a handler for, so an older server in a rolling deploy leaves a newer kind of job alone. A job that has been started three times without finishing is marked failed rather than run forever. Exports write to the local `[export].dir`, so run them where that directory is shared if more than one server is serving `/export`.
+
 **This build:**
 
 - `Observation.subject` must be `Patient/{id}` with Patient present in the same snapshot.
@@ -345,22 +349,41 @@ curl -s http://127.0.0.1:8080/metadata
 | `--smart-fhir-user Resource/id` | `fhirUser` claim (demo login only) |
 | `--oidc-issuer url`, `--oidc-client-id id` | Sign SMART users in through an OpenID Connect provider (secret: `REFHIR_OIDC_CLIENT_SECRET`) |
 | `--smart-demo-login` | Testing only: accept any username, verify nothing |
+| `--update-as-create` | Let `PUT [type]/[id]` create a resource under an id the client names (also `[conformance].update_as_create`). Off by default: the server assigns ids. |
 
 ### HTTP examples
 
 ```bash
-curl -s -X POST http://127.0.0.1:8080/Patient \
+# The server assigns the id of a resource it creates (see "Resource ids" below).
+ID=$(curl -s -X POST http://127.0.0.1:8080/Patient \
   -H 'Content-Type: application/fhir+json' \
-  -d '{"resourceType":"Patient","id":"p1","active":true,"name":[{"family":"Ann"}]}'
+  -d '{"resourceType":"Patient","active":true,"name":[{"family":"Ann"}]}' | jq -r .id)
 
-curl -s http://127.0.0.1:8080/Patient/p1
+curl -s "http://127.0.0.1:8080/Patient/$ID"
 curl -s 'http://127.0.0.1:8080/Patient?name=ann'
-curl -s http://127.0.0.1:8080/Patient/p1/_history
+curl -s "http://127.0.0.1:8080/Patient/$ID/_history"
 
 curl -s -X POST http://127.0.0.1:8080/Observation \
   -H 'Content-Type: application/fhir+json' \
-  -d '{"resourceType":"Observation","id":"o1","subject":{"reference":"Patient/p1"},"code":{"coding":[{"code":"8480-6"}]},"effectiveDateTime":"2020-01-02"}'
+  -d "{\"resourceType\":\"Observation\",\"subject\":{\"reference\":\"Patient/$ID\"},\"code\":{\"coding\":[{\"code\":\"8480-6\"}]},\"effectiveDateTime\":\"2020-01-02\"}"
 ```
+
+### Resource ids
+
+The server assigns the id of every resource it creates. `POST [type]` ignores an `id`, and a `meta.versionId` or `meta.lastUpdated`, in the body (FHIR R4 create) and answers `201` with the new id in `Location`. GraphQL and `/sync` `create` do the same.
+
+- **`PUT [type]/[id]`** updates a resource that exists. For an id that does not, it answers `405` with an `OperationOutcome`, because update-as-create is off. `GET /metadata` says so (`updateCreate: false` on every resource), and also reports the conditional interactions that are implemented (`conditionalCreate`, `conditionalUpdate`, `conditionalDelete: single`).
+- **Transactions** give entries that create resources their ids up front. Entries that refer to one another name each other by `fullUrl`, as FHIR defines: give the creating entry `"fullUrl": "urn:uuid:..."` and use that string in the references. A `Patient/p1` written in the bundle by hand does not name the resource the server creates.
+- **Update-as-create** is a deployment choice in FHIR. Start with `--update-as-create` (or `update_as_create = true` under `[conformance]`) to let `PUT [type]/[id]` create the resource under that id (`201`); `/metadata` then reports `updateCreate: true`. Data that has ids of its own, such as the demo data under `fixtures/mock-fhir` and the Inferno profile, is loaded this way. The environment variable `REFHIR_UPDATE_AS_CREATE=true` turns it on too. With SMART enabled, a `PUT` then needs the `create` permission as well as `update`, since it may create. An SDC `$extract` whose templates name a `resourceId` (or an `id`) returns those entries as `PUT [type]/[id]`, so the bundle it returns needs this setting to be accepted by a server that has not got it, which answers each such entry with `405`.
+- Rust code that embeds the server and needs a known id can call `refhir_fhir::import_resource`. It is a function, not an operation: nothing a client sends reaches it.
+
+### Terminology
+
+`ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
+
+A code system can be installed in several versions, and each is kept. HL7's v2 tables carry theirs in the URL (`.../v2-0006|2.1`), other packages in `CodeSystem.version`; a code system written through the API with a `version` is stored the same way. A value set that names a version (`system|version`, or `include.version`) gets exactly that one; with none named, the latest installed version is used, and the expansion records the version it read. A version that is not installed is refused, naming the versions that are, rather than answered from another one. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
+
+`POST /ValueSet/$expandability` reports, for the value sets named in `url` (a string, an array, or `url` parameters of a Parameters resource), whether each can be expanded and why not; with none named it lists every loaded value set that cannot. Use it as a deployment check for the value sets a UI depends on. `POST /ImplementationGuide/$install` adds a warning to its response for any value set the package made unexpandable, and the server logs how many there are at start-up.
 
 | Method | Path | Notes |
 |--------|------|--------|

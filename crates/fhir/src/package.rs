@@ -237,13 +237,18 @@ pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let (policy, archiver) = {
+    let (policy, archiver, update_create) = {
         let current = catalog.read().expect("catalog");
-        (current.reference_policy(), current.sdc_archiver())
+        (
+            current.reference_policy(),
+            current.sdc_archiver(),
+            current.update_create(),
+        )
     };
     let mut loaded = Catalog::open(store)?;
     loaded.set_reference_policy(policy);
     loaded.set_sdc_archiver(archiver);
+    loaded.set_update_create(update_create);
     *catalog.write().expect("catalog") = loaded;
     Ok(())
 }

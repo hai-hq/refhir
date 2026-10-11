@@ -29,11 +29,19 @@ pub fn transaction(
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
-    rewrite_urns(&mut entries);
+    assign_ids(&mut entries);
     let mut response_entries = vec![Value::Null; entries.len()];
     for index in apply_order(catalog, &entries) {
-        response_entries[index] =
+        let response =
             apply_entry(tx, catalog, args, &entries[index]).map_err(|err| annotate(index, err))?;
+        // A conditional entry that matched an existing resource did not create the id it was
+        // given up front; what refers to it must now refer to the one it matched.
+        if let Some(matched) = matched_instead(&entries[index], &response) {
+            for entry in entries.iter_mut() {
+                replace_urns(entry, &matched);
+            }
+        }
+        response_entries[index] = response;
     }
     Ok(json!({
         "resourceType": "Bundle",
@@ -99,14 +107,13 @@ fn written_resource(entry: &Value) -> Option<(String, String)> {
     if method != "POST" && method != "PUT" {
         return None;
     }
-    let (type_name, id) = parse_url(request_url(entry)?).ok()?;
+    let (type_name, id) = parse_url(request_url(entry)?.split('?').next()?).ok()?;
     if let Some(id) = id {
         return Some((type_name, id));
     }
-    let id = entry
-        .pointer("/resource/id")
-        .and_then(|value| value.as_str())?;
-    valid_id(id).then(|| (type_name, id.to_string()))
+    // A create has no id of its own: the one the server assigned is what others refer to.
+    let id = entry.get(ASSIGNED).and_then(|value| value.as_str())?;
+    Some((type_name, id.to_string()))
 }
 
 fn referenced_resources(catalog: &Catalog, entry: &Value) -> Vec<(String, String)> {
@@ -132,17 +139,9 @@ fn referenced_resources(catalog: &Catalog, entry: &Value) -> Vec<(String, String
         return keys;
     };
     for element in &model.references {
-        let Some(node) = resource.get(&element.path) else {
-            continue;
-        };
-        let values = match node {
-            Value::Array(items) => items.iter().collect::<Vec<_>>(),
-            other => vec![other],
-        };
-        for value in values {
-            let Some(reference) = value.get("reference").and_then(|item| item.as_str()) else {
-                continue;
-            };
+        // The path may go through repeating elements (`participant.individual`), which is why
+        // it is followed rather than read as a single key.
+        for reference in ops::reference_strings(resource, &element.path) {
             let Some((target_type, id)) = reference.split_once('/') else {
                 continue;
             };
@@ -191,11 +190,24 @@ fn apply_entry(
     let model = catalog.get(&type_name)?;
     match method {
         "POST" => {
+            if id.is_some() {
+                return Err(FhirError::Invalid(
+                    "POST url names a type, not an id: the server assigns the id".into(),
+                ));
+            }
+            let assigned = entry.get(ASSIGNED).and_then(|value| value.as_str());
             if let Some(query) = request.get("ifNoneExist").and_then(|value| value.as_str()) {
                 let resource = entry.get("resource").cloned().unwrap_or(Value::Null);
+                let resource = with_assigned_id(resource, assigned);
                 let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
-                let (created, status) =
-                    ops::conditional_create(tx, catalog, model, resource, query)?;
+                let (created, status) = ops::conditional_create_with(
+                    tx,
+                    catalog,
+                    model,
+                    resource,
+                    query,
+                    ops::IdPolicy::Keep,
+                )?;
                 let code = if status == 201 {
                     "201 Created"
                 } else {
@@ -211,22 +223,14 @@ fn apply_entry(
                     "resource": created
                 }));
             }
-            let mut resource = entry
+            let resource = entry
                 .get("resource")
                 .cloned()
                 .ok_or_else(|| FhirError::Invalid("POST entry requires a resource".into()))?;
-            if let Some(id) = id {
-                if let Some(body_id) = resource.get("id").and_then(|value| value.as_str()) {
-                    if body_id != id {
-                        return Err(FhirError::Invalid(
-                            "entry resource id does not match request url".into(),
-                        ));
-                    }
-                }
-                resource["id"] = json!(id);
-            }
+            // Whatever id the client put in the resource is not the id it gets.
+            let resource = with_assigned_id(resource, assigned);
             let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
-            let created = ops::create(tx, catalog, model, resource)?;
+            let created = ops::create_with(tx, catalog, model, resource, ops::IdPolicy::Keep)?;
             let id = created["id"].as_str().unwrap_or("").to_string();
             Ok(json!({
                 "response": {
@@ -244,10 +248,10 @@ fn apply_entry(
                 .cloned()
                 .ok_or_else(|| FhirError::Invalid("PUT entry requires a resource".into()))?;
             let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
-            let updated = ops::update(tx, catalog, model, &id, resource, None)?;
+            let (updated, status) = ops::update_status(tx, catalog, model, &id, resource, None)?;
             Ok(json!({
                 "response": {
-                    "status": "200 OK",
+                    "status": if status == 201 { "201 Created" } else { "200 OK" },
                     "location": format!("{}/{id}/_history/0", model.name),
                     "etag": "W/\"0\""
                 },
@@ -325,8 +329,10 @@ fn conditional_entry(
     let resource = entry.get("resource").cloned().unwrap_or(Value::Null);
     match method {
         "POST" | "PUT" => {
+            let assigned = entry.get(ASSIGNED).and_then(|value| value.as_str());
             let resource = crate::sdc::prepare_store(tx, catalog, args, resource)?;
-            let (updated, status) = ops::conditional_update(tx, catalog, model, resource, query)?;
+            let (updated, status) =
+                ops::conditional_update_with(tx, catalog, model, resource, query, assigned)?;
             let code = if status == 201 {
                 "201 Created"
             } else {
@@ -360,45 +366,64 @@ fn conditional_entry(
     }
 }
 
-fn rewrite_urns(entries: &mut [Value]) {
+/// Entry key holding the id the server chose for an entry that creates a resource. It is set
+/// here, never read from the request.
+const ASSIGNED: &str = "_assignedId";
+
+/// Give every entry that creates a resource its id before anything is applied, and point the
+/// references at it.
+///
+/// A client cannot choose the id of a resource it creates, so entries that refer to one another
+/// do it the way FHIR defines: each names itself by `fullUrl` (`urn:uuid:...`) and the others
+/// use that. The id the server picks for the entry replaces the `urn:uuid:` wherever it appears,
+/// and the same id is what the create then uses, so the references resolve.
+fn assign_ids(entries: &mut [Value]) {
     let mut assigned = std::collections::BTreeMap::new();
     for entry in entries.iter_mut() {
+        if let Some(object) = entry.as_object_mut() {
+            object.remove(ASSIGNED);
+        }
+        let Some(method) = request_method(entry).map(str::to_string) else {
+            continue;
+        };
+        let Some(url) = request_url(entry).map(str::to_string) else {
+            continue;
+        };
+        let (path, query) = match url.split_once('?') {
+            Some((path, query)) => (path.to_string(), Some(query.to_string())),
+            None => (url.clone(), None),
+        };
+        let Ok((type_name, url_id)) = parse_url(&path) else {
+            continue;
+        };
+        // A create, or a conditional update that creates when nothing matches.
+        let creates = method == "POST" || (method == "PUT" && query.is_some());
+        let id = if creates {
+            let id = uuid::Uuid::new_v4().to_string();
+            entry[ASSIGNED] = json!(id);
+            Some(id)
+        } else if method == "PUT" {
+            url_id
+        } else {
+            None
+        };
         let Some(full) = entry
             .get("fullUrl")
             .and_then(|value| value.as_str())
-            .map(|value| value.to_string())
+            .filter(|full| full.starts_with("urn:uuid:"))
+            .map(|full| full.to_string())
         else {
             continue;
         };
-        if !full.starts_with("urn:uuid:") {
+        let Some(id) = id else {
             continue;
-        }
-        let type_name = entry
-            .pointer("/request/url")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .split(['/', '?'])
-            .next()
-            .unwrap_or("")
-            .trim_start_matches('/')
-            .to_string();
-        if type_name.is_empty() {
-            continue;
-        }
-        let id = entry
-            .pointer("/resource/id")
-            .and_then(|value| value.as_str())
-            .filter(|id| valid_id(id))
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let resolved = format!("{type_name}/{id}");
+        };
         if let Some(resource) = entry.get_mut("resource") {
-            resource["id"] = json!(id);
             if resource.get("resourceType").is_none() {
                 resource["resourceType"] = json!(type_name);
             }
         }
-        assigned.insert(full, resolved);
+        assigned.insert(full, format!("{type_name}/{id}"));
     }
     if assigned.is_empty() {
         return;
@@ -406,6 +431,30 @@ fn rewrite_urns(entries: &mut [Value]) {
     for entry in entries.iter_mut() {
         replace_urns(entry, &assigned);
     }
+}
+
+/// `Type/assigned` to `Type/actual`, when the entry's result is a resource other than the one
+/// whose id the server assigned to it.
+fn matched_instead(
+    entry: &Value,
+    response: &Value,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let assigned = entry.get(ASSIGNED).and_then(|value| value.as_str())?;
+    let type_name = response.pointer("/resource/resourceType")?.as_str()?;
+    let actual = response.pointer("/resource/id")?.as_str()?;
+    (actual != assigned).then(|| {
+        std::collections::BTreeMap::from([(
+            format!("{type_name}/{assigned}"),
+            format!("{type_name}/{actual}"),
+        )])
+    })
+}
+
+fn with_assigned_id(mut resource: Value, assigned: Option<&str>) -> Value {
+    if let (Some(id), Some(object)) = (assigned, resource.as_object_mut()) {
+        object.insert("id".into(), json!(id));
+    }
+    resource
 }
 
 fn replace_urns(value: &mut Value, assigned: &std::collections::BTreeMap<String, String>) {
@@ -499,6 +548,9 @@ fn batch_entry(
 fn batch_failure(err: &crate::run::RunError) -> Value {
     let (status, outcome) = match err {
         crate::run::RunError::Fhir(FhirError::Outcome(value)) => ("400 Bad Request", value.clone()),
+        crate::run::RunError::Fhir(FhirError::Unprocessable(value)) => {
+            ("422 Unprocessable Entity", value.clone())
+        }
         crate::run::RunError::Fhir(fhir) => (
             entry_status(fhir),
             operation_outcome(outcome_code(fhir), &fhir.to_string()),
@@ -528,6 +580,8 @@ fn entry_status(err: &FhirError) -> &'static str {
         FhirError::Precondition(_) => "412 Precondition Failed",
         FhirError::Storage(_) => "500 Internal Server Error",
         FhirError::Forbidden(_) => "403 Forbidden",
+        FhirError::Unprocessable(_) => "422 Unprocessable Entity",
+        FhirError::MethodNotAllowed(_) => "405 Method Not Allowed",
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
             "400 Bad Request"
         }
@@ -720,6 +774,8 @@ fn annotate(index: usize, err: FhirError) -> FhirError {
         FhirError::UnknownResource(_) => FhirError::UnknownResource(message),
         FhirError::Unsupported(_) => FhirError::Unsupported(message),
         FhirError::Forbidden(_) => FhirError::Forbidden(message),
+        FhirError::Unprocessable(value) => FhirError::Unprocessable(prefix_outcome(index, value)),
+        FhirError::MethodNotAllowed(_) => FhirError::MethodNotAllowed(message),
         FhirError::Storage(_) => FhirError::Storage(message),
     }
 }

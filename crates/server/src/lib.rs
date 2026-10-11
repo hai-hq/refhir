@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 
 pub use auth::{OidcConfig, SmartStore};
 pub use http::{app, app_with, AppState, ServerConfig};
+pub use jobs::SharedJobStore;
 
 pub async fn serve(
     db: Arc<Database>,

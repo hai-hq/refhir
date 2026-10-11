@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 
 use refhir_fhirpath::{Error, ErrorKind, Host, Value};
 use serde_json::{Map, Value as Json};
@@ -21,13 +22,38 @@ const INFRASTRUCTURE: &[&str] = &[
     "modifierExtension",
 ];
 
+/// Where the walker is, in both coordinate systems. `element` is the snapshot path the walk is
+/// working from (`Extension`, `Basic.extension`); `instance` is the FHIRPath of the node in the
+/// resource being validated (`Basic.extension[0]`). Issues arrive carrying element paths; the
+/// innermost frame whose element path they start with turns them into instance paths.
+struct Frame {
+    element: String,
+    instance: String,
+}
+
+struct FrameGuard<'a> {
+    frames: &'a RefCell<Vec<Frame>>,
+}
+
+impl Drop for FrameGuard<'_> {
+    fn drop(&mut self) {
+        self.frames.borrow_mut().pop();
+    }
+}
+
 struct State<'a> {
     schema: &'a Schema,
     terms: &'a dyn Terminology,
     host: &'a dyn Host,
     issues: RefCell<Vec<Issue>>,
     depth: Cell<usize>,
+    frames: RefCell<Vec<Frame>>,
+    /// An invariant is copied into the snapshot of every element of its type, so the element
+    /// and the datatype it is walked as both carry it. Evaluated once per node.
+    evaluated: RefCell<HashSet<(String, String)>>,
 }
+
+const CORE_STRUCTURE: &str = "http://hl7.org/fhir/StructureDefinition/";
 
 pub fn validate(
     instance: &Json,
@@ -43,6 +69,8 @@ pub fn validate(
         host: &term_host,
         issues: RefCell::new(Vec::new()),
         depth: Cell::new(0),
+        frames: RefCell::new(Vec::new()),
+        evaluated: RefCell::new(HashSet::new()),
     };
     state.resource(instance, instance, profiles);
     Outcome {
@@ -51,6 +79,53 @@ pub fn validate(
 }
 
 impl State<'_> {
+    /// A frame for `element` at the current instance node. Dropped when the node is done.
+    fn frame(&self, element: &str, instance: Option<String>) -> FrameGuard<'_> {
+        let instance = instance.unwrap_or_else(|| {
+            self.frames
+                .borrow()
+                .last()
+                .map(|frame| frame.instance.clone())
+                .unwrap_or_else(|| element.to_string())
+        });
+        self.frames.borrow_mut().push(Frame {
+            element: element.to_string(),
+            instance,
+        });
+        FrameGuard {
+            frames: &self.frames,
+        }
+    }
+
+    /// The child of the current node named `segment`, with `[index]` when the element repeats.
+    fn child_instance(&self, segment: &str) -> String {
+        match self.frames.borrow().last() {
+            Some(frame) => format!("{}.{segment}", frame.instance),
+            None => segment.to_string(),
+        }
+    }
+
+    fn locate(&self, expression: String) -> String {
+        let frames = self.frames.borrow();
+        if expression.is_empty() {
+            return frames
+                .last()
+                .map(|frame| frame.instance.clone())
+                .unwrap_or(expression);
+        }
+        for frame in frames.iter().rev() {
+            if expression == frame.element {
+                return frame.instance.clone();
+            }
+            if let Some(rest) = expression.strip_prefix(frame.element.as_str()) {
+                if rest.starts_with('.') {
+                    return format!("{}{rest}", frame.instance);
+                }
+            }
+        }
+        expression
+    }
+
     fn resource(&self, instance: &Json, root: &Json, profiles: &[String]) {
         let Some(type_name) = instance
             .get("resourceType")
@@ -114,6 +189,7 @@ impl State<'_> {
         root: &Json,
         resource: &Json,
     ) {
+        let _frame = self.frame(path, None);
         if self.depth.get() > 64 {
             self.issue(
                 Severity::Error,
@@ -258,7 +334,19 @@ impl State<'_> {
             .as_ref()
             .is_some_and(|slicing| slicing.ordered);
         let mut seen_order: Option<usize> = None;
+        let name = child_name(&element.path);
+        let key = match &choice_type {
+            Some(code) => format!("{}{}", name.trim_end_matches("[x]"), type_suffix(code)),
+            None => name,
+        };
+        let indexed = value.is_array() || underscore.is_some_and(|extra| extra.is_array());
         for (index, item) in items.iter().enumerate() {
+            let segment = if indexed {
+                format!("{key}[{index}]")
+            } else {
+                key.clone()
+            };
+            let _frame = self.frame(&element.path, Some(self.child_instance(&segment)));
             let extra = sibling_at(underscore, index);
             if item.is_null() {
                 let focus = extra.cloned().unwrap_or(Json::Null);
@@ -592,15 +680,24 @@ impl State<'_> {
                     ),
                     &element.path,
                 ),
-                TermAnswer::Unknown => self.issue(
-                    Severity::Warning,
-                    "not-supported",
-                    format!(
-                        "{} value set {} is not loaded",
-                        element.path, binding.value_set
-                    ),
-                    &element.path,
-                ),
+                TermAnswer::Unknown => {
+                    let diagnostics = match self.terms.expansion_problem(&binding.value_set) {
+                        Some(reason) => format!(
+                            "{} value set {} cannot be expanded: {reason}",
+                            element.path, binding.value_set
+                        ),
+                        None => format!(
+                            "{} value set {} is not loaded",
+                            element.path, binding.value_set
+                        ),
+                    };
+                    self.issue(
+                        Severity::Warning,
+                        "not-supported",
+                        diagnostics,
+                        &element.path,
+                    );
+                }
             }
         }
     }
@@ -648,13 +745,9 @@ impl State<'_> {
         let Some((type_name, _)) = reference.split_once('/') else {
             return;
         };
-        let targets: Vec<String> = element
-            .types
-            .iter()
-            .filter(|item| item.code == "Reference")
-            .flat_map(|item| item.target_profiles.iter().cloned())
-            .map(|url| url.rsplit('/').next().unwrap_or(&url).to_string())
-            .collect();
+        let Some(targets) = self.target_types(element) else {
+            return;
+        };
         if targets.is_empty()
             || targets
                 .iter()
@@ -674,6 +767,33 @@ impl State<'_> {
         );
     }
 
+    /// The resource types a `Reference` element may point at. A target is a profile URL, not a
+    /// type name: `.../us-core-patient` constrains `Patient`. Targets are resolved to the type
+    /// of the installed definition; a core definition that is not installed falls back to the
+    /// name in its URL. `None` means a target that cannot be resolved, which leaves the element
+    /// unrestricted rather than guessing from the profile's id.
+    fn target_types(&self, element: &ElementDef) -> Option<Vec<String>> {
+        let mut types = Vec::new();
+        for url in element
+            .types
+            .iter()
+            .filter(|item| item.code == "Reference")
+            .flat_map(|item| item.target_profiles.iter())
+        {
+            if let Some(structure) = self.schema.structure(url) {
+                types.push(structure.type_name.clone());
+                continue;
+            }
+            match url.strip_prefix(CORE_STRUCTURE) {
+                Some(name) if !name.is_empty() && !name.contains('/') => {
+                    types.push(name.to_string());
+                }
+                _ => return None,
+            }
+        }
+        Some(types)
+    }
+
     fn contained(&self, value: Option<&Json>, element: &ElementDef, root: &Json) {
         let Some(value) = value else {
             self.cardinality(element, 0, &element.path);
@@ -684,7 +804,14 @@ impl State<'_> {
             other => vec![other],
         };
         self.cardinality(element, items.len(), &element.path);
-        for item in items {
+        let indexed = value.is_array();
+        for (index, item) in items.into_iter().enumerate() {
+            let segment = if indexed {
+                format!("contained[{index}]")
+            } else {
+                "contained".to_string()
+            };
+            let _frame = self.frame(&element.path, Some(self.child_instance(&segment)));
             self.enter();
             self.resource(item, root, &[]);
             self.leave();
@@ -711,7 +838,17 @@ impl State<'_> {
         } else {
             "extension"
         };
-        for item in items {
+        let indexed = value.is_array();
+        for (index, item) in items.into_iter().enumerate() {
+            let segment = if indexed {
+                format!("{field}[{index}]")
+            } else {
+                field.to_string()
+            };
+            let _frame = self.frame(
+                &format!("{path}.{field}"),
+                Some(self.child_instance(&segment)),
+            );
             let Some(url) = item.get("url").and_then(|value| value.as_str()) else {
                 self.issue(
                     Severity::Error,
@@ -721,13 +858,18 @@ impl State<'_> {
                 );
                 continue;
             };
-            if let Some(structure) = self.schema.structure(url).cloned() {
-                let profile = structure.url.clone();
+            // An extension whose definition is not installed is still an Extension: it carries
+            // the datatype's invariants, which is where `ext-1` lives.
+            let structure = self
+                .schema
+                .structure(url)
+                .or_else(|| self.schema.base_type("Extension"))
+                .cloned();
+            if let Some(structure) = structure {
                 let root_path = structure.root_path().to_string();
                 self.enter();
                 self.walk_object(item, &structure, &root_path, root, resource);
                 self.leave();
-                let _ = profile;
             }
         }
     }
@@ -740,7 +882,17 @@ impl State<'_> {
         root: &Json,
         resource: &Json,
     ) {
+        let node = self.locate(path.to_string());
         for constraint in &element.constraints {
+            // The key alone is not the rule: a profile can redefine an inherited key with another
+            // severity or wording, and that one still has to run.
+            let rule = format!(
+                "{}|{:?}|{}",
+                constraint.key, constraint.severity, constraint.human
+            );
+            if !self.evaluated.borrow_mut().insert((node.clone(), rule)) {
+                continue;
+            }
             let Some(expr) = &constraint.parsed else {
                 self.issue(
                     Severity::Warning,
@@ -794,11 +946,12 @@ impl State<'_> {
         diagnostics: impl Into<String>,
         expression: impl Into<String>,
     ) {
+        let expression = self.locate(expression.into());
         self.issues.borrow_mut().push(Issue {
             severity,
             code: code.to_string(),
             diagnostics: diagnostics.into(),
-            expression: expression.into(),
+            expression,
         });
     }
 }

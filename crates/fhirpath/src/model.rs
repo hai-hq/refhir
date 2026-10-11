@@ -118,11 +118,7 @@ impl Model {
         self.inner
             .elements
             .contains_key(&format!("{path}.{name}[x]"))
-            || self
-                .inner
-                .elements
-                .keys()
-                .any(|key| key == &format!("{name}[x]"))
+            || self.inner.elements.contains_key(&format!("{name}[x]"))
     }
 
     pub fn choice_path(&self, path: &str, name: &str) -> Option<String> {
@@ -141,10 +137,16 @@ impl Model {
     pub fn has_descendants(&self, path: &str) -> bool {
         let path = self.canonical(path);
         let prefix = format!("{path}.");
+        // Keys are ordered, so everything under a prefix sits together at the first key at or
+        // after it.
         self.inner
             .elements
-            .keys()
-            .any(|key| key.starts_with(&prefix))
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(&prefix))
     }
 
     pub fn known_child(&self, path: &str, name: &str) -> bool {
@@ -154,10 +156,10 @@ impl Model {
         } else {
             format!("{path}.{name}")
         };
-        self.inner
-            .elements
-            .keys()
-            .any(|key| key == &prefix || key == &format!("{prefix}[x]"))
+        // Member navigation asks this for every step of every expression, so it must not scan
+        // the model: two lookups, not a pass over every element path.
+        self.inner.elements.contains_key(&prefix)
+            || self.inner.elements.contains_key(&format!("{prefix}[x]"))
     }
 
     /// `code` is a `string`. `boolean` is not a `Boolean`.
