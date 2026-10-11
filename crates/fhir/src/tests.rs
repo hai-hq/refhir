@@ -508,13 +508,16 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), FhirError> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // Tests run in parallel and several use the same tag (`dep-example.lib-2.0.0`). A clock
+    // reading is not enough to tell them apart: two tests can read the same value, and on a
+    // virtual machine a clock can even repeat or step back, which gave two tests one directory.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
-        "refhir-{tag}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "refhir-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
+    let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }
@@ -2799,4 +2802,406 @@ fn structure_map_translate_uses_the_installed_concept_map() {
         }),
     );
     assert_eq!(translated["status"], "male");
+}
+
+// ---- the writer changes: a takeover, and what other processes see of a backfill ----
+
+mod takeover {
+    use super::*;
+    use refhir_persistence as rp;
+    use refhir_persistence::Persistence as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A store that behaves like the real one until it has been asked to move a backfill's
+    /// cursor `updates` times, then fails every later update: the process died there.
+    struct DiesAfter {
+        inner: SqlitePersistence,
+        updates_left: AtomicUsize,
+    }
+
+    impl rp::ConformanceStore for DiesAfter {
+        fn catalog_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.catalog_version()
+        }
+        fn bump_catalog_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.bump_catalog_version()
+        }
+        fn catalog_revision(&self) -> Result<u64, rp::PersistError> {
+            self.inner.catalog_revision()
+        }
+        fn bump_catalog_revision(&self) -> Result<u64, rp::PersistError> {
+            self.inner.bump_catalog_revision()
+        }
+        fn claim_backfill(&self, id: i64) -> Result<bool, rp::PersistError> {
+            self.inner.claim_backfill(id)
+        }
+        fn load_packages(&self) -> Result<Vec<rp::StoredPackage>, rp::PersistError> {
+            self.inner.load_packages()
+        }
+        fn load_structure_definitions(
+            &self,
+        ) -> Result<Vec<rp::StoredStructureDefinition>, rp::PersistError> {
+            self.inner.load_structure_definitions()
+        }
+        fn load_search_parameters(
+            &self,
+        ) -> Result<Vec<rp::StoredSearchParameter>, rp::PersistError> {
+            self.inner.load_search_parameters()
+        }
+        fn load_terminology(&self) -> Result<Vec<rp::StoredTerminology>, rp::PersistError> {
+            self.inner.load_terminology()
+        }
+        fn load_expansions(&self) -> Result<Vec<rp::StoredExpansion>, rp::PersistError> {
+            self.inner.load_expansions()
+        }
+        fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, rp::PersistError> {
+            self.inner.ensure_local_package(fhir_version)
+        }
+        fn upsert_search_parameter(
+            &self,
+            package_id: i64,
+            param: &rp::NewSearchParameter,
+        ) -> Result<bool, rp::PersistError> {
+            self.inner.upsert_search_parameter(package_id, param)
+        }
+        fn delete_search_parameter(
+            &self,
+            package_id: i64,
+            url: &str,
+        ) -> Result<(), rp::PersistError> {
+            self.inner.delete_search_parameter(package_id, url)
+        }
+        fn upsert_terminology(
+            &self,
+            package_id: i64,
+            row: &rp::NewTerminology,
+        ) -> Result<(), rp::PersistError> {
+            self.inner.upsert_terminology(package_id, row)
+        }
+        fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), rp::PersistError> {
+            self.inner.delete_terminology(package_id, url)
+        }
+        fn replace_expansions(
+            &self,
+            package_id: i64,
+            expansions: &[rp::NewExpansion],
+        ) -> Result<(), rp::PersistError> {
+            self.inner.replace_expansions(package_id, expansions)
+        }
+        fn install_package(
+            &self,
+            package: &rp::NewPackage,
+        ) -> Result<rp::InstallOutcome, rp::InstallError> {
+            self.inner.install_package(package)
+        }
+        fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), rp::PersistError> {
+            self.inner.mark_base_ready(package_id, base)
+        }
+        fn complete_backfill(
+            &self,
+            backfill_id: i64,
+            package_id: i64,
+            base: &str,
+        ) -> Result<(), rp::PersistError> {
+            self.inner.complete_backfill(backfill_id, package_id, base)
+        }
+        fn set_search_parameter_status(
+            &self,
+            package_id: i64,
+            url: &str,
+            base: &str,
+            status: rp::ParamStatus,
+        ) -> Result<(), rp::PersistError> {
+            self.inner
+                .set_search_parameter_status(package_id, url, base, status)
+        }
+        fn insert_backfill(
+            &self,
+            package_id: i64,
+            watermark_ts: i64,
+            tablet: &str,
+            urls: &[String],
+        ) -> Result<i64, rp::PersistError> {
+            self.inner
+                .insert_backfill(package_id, watermark_ts, tablet, urls)
+        }
+        fn update_backfill(
+            &self,
+            id: i64,
+            cursor_id: Option<&str>,
+            done: bool,
+        ) -> Result<(), rp::PersistError> {
+            if self.updates_left.load(Ordering::SeqCst) == 0 {
+                return Err(rp::PersistError::Definite("the process died".into()));
+            }
+            self.updates_left.fetch_sub(1, Ordering::SeqCst);
+            self.inner.update_backfill(id, cursor_id, done)
+        }
+        fn load_backfills(&self) -> Result<Vec<rp::StoredBackfill>, rp::PersistError> {
+            self.inner.load_backfills()
+        }
+    }
+
+    fn temp_file(tag: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "refhir-takeover-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    fn remove(path: &Path) {
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
+    }
+
+    fn with_birth_date(id: &str) -> Value {
+        let mut body = patient(id, true, "Ann");
+        body["birthDate"] = json!("1990-01-01");
+        body
+    }
+
+    fn search_total(db: &Database, catalog: &Catalog, args: Value) -> Result<u64, RunError> {
+        run(db, catalog, "Patient/search", &args)
+            .map(|result| result.value["total"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn a_takeover_finishes_the_backfill_the_old_primary_left_half_done() {
+        let path = temp_file("resume");
+        let patients = 40;
+        let job_id = {
+            // The first primary: queues a backfill over 40 patients, runs two batches of it,
+            // then dies before the third.
+            let store = SqlitePersistence::open(&path).unwrap();
+            assert!(matches!(
+                store.try_acquire_writer_lease().unwrap(),
+                rp::Lease::Held { epoch: 1 }
+            ));
+            let db = Database::open(Arc::new(store.clone())).unwrap();
+            let catalog = std::sync::RwLock::new(Catalog::empty());
+            install_package_dir(&store, &db, &catalog, minir4_dir()).unwrap();
+            for n in 0..patients {
+                let id = format!("p{n:03}");
+                let loaded = catalog.read().unwrap();
+                run(
+                    &db,
+                    &loaded,
+                    "Patient/create",
+                    &json!({"resource": with_birth_date(&id)}),
+                )
+                .unwrap();
+            }
+            let pending = stage_package_deferred(&store, &db, &catalog, extra_dir())
+                .unwrap()
+                .expect("the package has pending search parameters");
+            publish(&store, &catalog).unwrap();
+            pending.create(&store, &db).unwrap();
+            let crashing = DiesAfter {
+                inner: store.clone(),
+                updates_left: AtomicUsize::new(2),
+            };
+            let died = run_backfills(&crashing, &db, &catalog);
+            assert!(died.is_err(), "the backfill was meant to be interrupted");
+            let jobs: Vec<_> = store
+                .load_backfills()
+                .unwrap()
+                .into_iter()
+                .filter(|job| !job.done)
+                .collect();
+            assert_eq!(jobs.len(), 1, "{jobs:?}");
+            let cursor = jobs[0]
+                .cursor_id
+                .clone()
+                .expect("two batches were recorded");
+            assert!(
+                cursor.as_str() > "p000" && cursor.as_str() < "p039",
+                "half way: {cursor}"
+            );
+            jobs[0].id
+            // Dropping the store, database and catalog here ends this process.
+        };
+
+        // The standby takes the lease and starts up as the primary: it builds its own catalog
+        // and picks the unfinished job up from the cursor.
+        let store = SqlitePersistence::open(&path).unwrap();
+        assert!(matches!(
+            store.try_acquire_writer_lease().unwrap(),
+            rp::Lease::Held { epoch: 2 }
+        ));
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let (loaded, _) = Catalog::open_consistent(&store, crate::CatalogClock::Latest).unwrap();
+        let catalog = std::sync::RwLock::new(loaded);
+        let before = search_total(
+            &db,
+            &catalog.read().unwrap(),
+            json!({"birthdate": "1990-01-01"}),
+        );
+        assert!(
+            before.is_err(),
+            "the parameter is not ready while the backfill is unfinished"
+        );
+
+        run_backfills(&store, &db, &catalog).unwrap();
+        let job = store
+            .load_backfills()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .unwrap();
+        assert!(job.done);
+        assert_eq!(
+            job.claimed_epoch,
+            Some(2),
+            "the claim moved to the writer that finished the job"
+        );
+        let found = search_total(
+            &db,
+            &catalog.read().unwrap(),
+            json!({"birthdate": "1990-01-01"}),
+        )
+        .unwrap();
+        assert_eq!(found, patients, "every patient is indexed, none twice");
+        remove(&path);
+    }
+
+    #[test]
+    fn a_standby_that_loaded_its_catalog_while_waiting_is_current_when_it_takes_over() {
+        let primary = ready();
+        let store: Arc<dyn rp::ConformanceStore> = Arc::new(primary.store.clone());
+
+        // The standby loads the catalog while it waits, and watches it. The watcher is slow
+        // here on purpose, so it has not yet noticed what the primary does next.
+        let (loaded, version) =
+            Catalog::open_consistent(store.as_ref(), crate::CatalogClock::Latest).unwrap();
+        let warm = Arc::new(std::sync::RwLock::new(loaded));
+        let watcher = crate::package::watch_catalog(
+            store.clone(),
+            &warm,
+            version,
+            std::time::Duration::from_secs(3600),
+            crate::CatalogClock::Latest,
+        );
+        let types = |catalog: &std::sync::RwLock<Catalog>| {
+            catalog.read().unwrap().capability_statement()["rest"][0]["resource"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let before = types(&warm);
+
+        // The primary installs another package and then dies.
+        install_package_dir(&primary.store, &primary.db, &primary.catalog, extra_dir()).unwrap();
+        assert!(types(&primary.catalog) > before);
+        assert_eq!(types(&warm), before, "the standby has not seen it yet");
+
+        // Taking over: stop watching, then catch up once.
+        let seen = watcher.stop();
+        assert_eq!(seen, version, "the slow watcher never reloaded");
+        let now = crate::package::reload_catalog(
+            store.as_ref(),
+            &warm,
+            seen,
+            crate::CatalogClock::Latest,
+        )
+        .unwrap();
+        assert!(now > version);
+        assert_eq!(types(&warm), types(&primary.catalog));
+
+        // When nothing changed there is nothing to do: the same version comes back and the
+        // catalog is not rebuilt.
+        let kept = warm.read().unwrap().capability_statement();
+        let again =
+            crate::package::reload_catalog(store.as_ref(), &warm, now, crate::CatalogClock::Latest)
+                .unwrap();
+        assert_eq!(again, now);
+        assert_eq!(warm.read().unwrap().capability_statement(), kept);
+    }
+
+    #[test]
+    fn the_version_replicas_follow_moves_only_after_a_backfill_completes() {
+        use crate::CatalogClock::{Latest, Stable};
+        let db = ready();
+        for n in 0..5 {
+            apply(
+                &db,
+                "Patient/create",
+                json!({"resource": with_birth_date(&format!("p{n}"))}),
+            );
+        }
+        let version = || db.store.catalog_version().unwrap();
+        let revision = || db.store.catalog_revision().unwrap();
+        let (version_before, revision_before) = (version(), revision());
+
+        // What a replica loaded before the install: it follows the stable version.
+        let (replica_catalog, replica_at) = Catalog::open_consistent(&db.store, Stable).unwrap();
+        let replica_catalog = std::sync::RwLock::new(replica_catalog);
+        assert_eq!(replica_at, version_before);
+
+        // The package is installed and published, but its backfill has not run.
+        let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
+            .unwrap()
+            .expect("the package has pending search parameters");
+        publish(&db.store, &db.catalog).unwrap();
+        pending.create(&db.store, &db.db).unwrap();
+
+        // Writers are told: the revision moved. Replicas are not: the version did not, so a
+        // replica keeps its catalog and never loads a parameter whose index is incomplete.
+        assert!(revision() > revision_before, "a standby sees every change");
+        assert_eq!(version(), version_before, "a replica is not told yet");
+        let kept = crate::package::reload_catalog(&db.store, &replica_catalog, replica_at, Stable)
+            .unwrap();
+        assert_eq!(kept, replica_at, "nothing to reload for a replica");
+        assert!(
+            search_total(
+                &db.db,
+                &replica_catalog.read().unwrap(),
+                json!({"birthdate": "1990-01-01"})
+            )
+            .is_err(),
+            "the replica's catalog has no such parameter"
+        );
+        // A standby loading the latest sees the pending parameter, but cannot search it either.
+        let (standby, _) = Catalog::open_consistent(&db.store, Latest).unwrap();
+        assert!(standby.has_pending_parameters());
+        assert!(search_total(&db.db, &standby, json!({"birthdate": "1990-01-01"})).is_err());
+
+        // Completing the backfill publishes again, now with nothing pending, and that is what
+        // moves the version.
+        run_backfills(&db.store, &db.db, &db.catalog).unwrap();
+        assert!(
+            version() > version_before,
+            "the version moves on completion"
+        );
+        let now = crate::package::reload_catalog(&db.store, &replica_catalog, replica_at, Stable)
+            .unwrap();
+        assert_eq!(now, version());
+        assert!(!replica_catalog.read().unwrap().has_pending_parameters());
+        assert_eq!(
+            search_total(
+                &db.db,
+                &replica_catalog.read().unwrap(),
+                json!({"birthdate": "1990-01-01"})
+            )
+            .unwrap(),
+            5,
+            "the replica can search it, and its index is complete"
+        );
+    }
+
+    #[test]
+    fn a_change_with_nothing_to_backfill_moves_the_version_at_once() {
+        let db = ready();
+        let before = db.store.catalog_version().unwrap();
+        let revision = db.store.catalog_revision().unwrap();
+        // A package with no search parameters has nothing pending, so it is stable at once.
+        let plain = dep_package("example.plain", "1.0.0", &[]);
+        install_package_dir(&db.store, &db.db, &db.catalog, &plain).unwrap();
+        assert!(db.store.catalog_version().unwrap() > before);
+        assert!(db.store.catalog_revision().unwrap() > revision);
+    }
 }

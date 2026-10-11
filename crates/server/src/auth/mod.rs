@@ -25,6 +25,8 @@ use store::normalize_patient_id;
 pub use oidc::{Oidc, OidcConfig};
 pub use store::SmartStore;
 
+#[cfg(test)]
+pub(crate) use interact::patient_exists;
 pub(crate) use interact::{interact_get, interact_post, oidc_callback};
 pub(crate) use oauth::{
     authorize, configuration, ehr_launch, introspect, issue, jwks, manage, parse_authorize_form,

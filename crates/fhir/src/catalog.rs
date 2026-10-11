@@ -133,6 +133,28 @@ impl ResourceModel {
     }
 }
 
+/// Which counter a process follows to know its catalog is out of date.
+///
+/// A catalog change that leaves search parameters pending (their index is still being built)
+/// moves only `Latest`. `Stable` moves once the backfill has completed and every parameter is
+/// ready. A replica never writes, so it follows `Stable` and never loads a parameter whose index
+/// is incomplete. A standby may have to finish the backfill when it takes over, so it follows
+/// `Latest` and already knows about the pending parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogClock {
+    Stable,
+    Latest,
+}
+
+impl CatalogClock {
+    pub fn read(self, store: &dyn ConformanceStore) -> Result<u64, PersistError> {
+        match self {
+            CatalogClock::Stable => store.catalog_version(),
+            CatalogClock::Latest => store.catalog_revision(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Catalog {
     fhir_version: Option<String>,
@@ -147,6 +169,13 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Whether any search parameter is still waiting for its backfill.
+    pub fn has_pending_parameters(&self) -> bool {
+        self.types
+            .values()
+            .any(|model| model.pending_params().next().is_some())
+    }
+
     pub fn empty() -> Self {
         Self {
             fhir_version: None,
@@ -157,6 +186,25 @@ impl Catalog {
             reference_policy: ReferencePolicy::Strict,
             compartments: compartment::load(&[]),
             sdc_archiver: false,
+        }
+    }
+
+    /// The catalog and the value of `clock` it reflects. `open` reads five tables one after
+    /// another, so a change made in between could give a catalog that mixes two states; this
+    /// reads the clock before and after and tries again if it moved.
+    pub fn open_consistent(
+        store: &dyn ConformanceStore,
+        clock: CatalogClock,
+    ) -> Result<(Self, u64), PersistError> {
+        let mut attempts = 0;
+        loop {
+            let before = clock.read(store)?;
+            let catalog = Self::open(store)?;
+            let after = clock.read(store)?;
+            attempts += 1;
+            if before == after || attempts >= 5 {
+                return Ok((catalog, after));
+            }
         }
     }
 

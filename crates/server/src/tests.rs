@@ -3259,3 +3259,667 @@ mod oidc {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 }
+
+// ---- several processes on one database: a writer, and replicas that follow it ----
+
+mod cluster {
+    use super::*;
+    use crate::{app_with, ServerConfig};
+    use axum::http::HeaderMap;
+
+    struct Pair {
+        path: std::path::PathBuf,
+        primary_db: Arc<Database>,
+        primary_catalog: Arc<RwLock<Catalog>>,
+        primary_addr: std::net::SocketAddr,
+        replica_db: Arc<Database>,
+        replica_app: axum::Router,
+        replica_store: Arc<dyn ConformanceStore>,
+        replica_catalog: Arc<RwLock<Catalog>>,
+    }
+
+    impl Drop for Pair {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm", ".lock"] {
+                let mut name = self.path.as_os_str().to_owned();
+                name.push(suffix);
+                let _ = std::fs::remove_file(name);
+            }
+            let _ = std::fs::remove_dir_all(self.path.with_extension("export"));
+        }
+    }
+
+    /// A primary serving on a real port and a replica of the same database file, as two
+    /// processes would be. The replica refreshes only when a test says so.
+    async fn pair(config: impl FnOnce(&mut ServerConfig)) -> Pair {
+        // A counter, not just the clock: tests start in the same microsecond.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "refhir-cluster-{}-{}.sqlite",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let primary_store = Arc::new(SqlitePersistence::open(&path).unwrap());
+        let primary_db = Arc::new(Database::open(primary_store.clone()).unwrap());
+        let primary_catalog = Arc::new(RwLock::new(Catalog::empty()));
+        install_package_dir(
+            primary_store.as_ref(),
+            &primary_db,
+            &primary_catalog,
+            minir4_dir(),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = listener.local_addr().unwrap();
+        let primary_app = app_with(
+            primary_db.clone(),
+            primary_catalog.clone(),
+            primary_store.clone(),
+            ServerConfig {
+                export_dir: path.with_extension("export").display().to_string(),
+                ..ServerConfig::default()
+            },
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, primary_app).await.unwrap();
+        });
+
+        let replica_store = Arc::new(SqlitePersistence::open(&path).unwrap());
+        let replica_db = Arc::new(Database::open_read_only(replica_store.clone()).unwrap());
+        let (loaded, _) =
+            Catalog::open_consistent(replica_store.as_ref(), refhir_fhir::CatalogClock::Stable)
+                .unwrap();
+        let replica_catalog = Arc::new(RwLock::new(loaded));
+        let mut settings = ServerConfig {
+            primary_url: Some(format!("http://{primary_addr}")),
+            min_ts_wait: Duration::from_millis(100),
+            max_staleness: Duration::from_millis(300),
+            ..ServerConfig::default()
+        };
+        config(&mut settings);
+        let replica_store: Arc<dyn ConformanceStore> = replica_store;
+        let replica_app = app_with(
+            replica_db.clone(),
+            replica_catalog.clone(),
+            replica_store.clone(),
+            settings,
+        );
+        Pair {
+            path,
+            primary_db,
+            primary_catalog,
+            primary_addr,
+            replica_db,
+            replica_app,
+            replica_store,
+            replica_catalog,
+        }
+    }
+
+    struct Full {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Value,
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+    ) -> Full {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        if body.is_some() {
+            builder = builder.header("content-type", "application/fhir+json");
+        }
+        let payload = body.map(|value| value.to_string()).unwrap_or_default();
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::from(payload)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+        };
+        Full {
+            status,
+            headers,
+            body,
+        }
+    }
+
+    fn header<'a>(reply: &'a Full, name: &str) -> &'a str {
+        reply
+            .headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+    }
+
+    fn create_on_primary(pair: &Pair, id: &str) -> u64 {
+        let loaded = pair.primary_catalog.read().unwrap();
+        refhir_fhir::run(
+            &pair.primary_db,
+            &loaded,
+            "Patient/create",
+            &json!({"resource": patient(id)}),
+        )
+        .unwrap()
+        .ts
+        .as_u64()
+    }
+
+    #[tokio::test]
+    async fn healthz_tells_a_balancer_which_processes_can_take_traffic() {
+        let cluster = pair(|_| {}).await;
+        let primary = format!("http://{}", cluster.primary_addr);
+        let primary_health = tokio::task::spawn_blocking(move || {
+            let body = ureq::get(&format!("{primary}/healthz?verbose=1"))
+                .call()
+                .unwrap()
+                .into_string()
+                .unwrap();
+            serde_json::from_str::<Value>(&body).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(primary_health["role"], "primary");
+        assert_eq!(primary_health["status"], "ok");
+        assert!(primary_health["pool"]["max"].as_u64().unwrap() >= 1);
+        assert!(primary_health["time_ns"]["persist"].is_number());
+
+        let fresh = call(&cluster.replica_app, "GET", "/healthz", None, &[]).await;
+        assert_eq!(fresh.status, StatusCode::OK);
+        assert_eq!(fresh.body["role"], "replica");
+        assert!(fresh.body["lag_ts"].is_number());
+
+        // A replica that stops following the primary leaves rotation, and comes back when it
+        // catches up.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let stale = call(&cluster.replica_app, "GET", "/healthz", None, &[]).await;
+        assert_eq!(stale.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(stale.body["status"], "unhealthy");
+        let db = cluster.replica_db.clone();
+        tokio::task::spawn_blocking(move || db.refresh().unwrap())
+            .await
+            .unwrap();
+        let back = call(&cluster.replica_app, "GET", "/healthz", None, &[]).await;
+        assert_eq!(back.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn responses_carry_the_timestamp_a_client_echoes_back() {
+        let cluster = pair(|_| {}).await;
+        let primary = cluster_primary_app(&cluster);
+        let created = call(&primary, "POST", "/Patient", Some(patient("p1")), &[]).await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        let ts: u64 = header(&created, "x-refhir-commit-ts").parse().unwrap();
+        assert_eq!(created.body["meta"]["versionId"], ts.to_string());
+        assert_eq!(header(&created, "x-refhir-role"), "primary");
+
+        // A read reports the snapshot it ran at, so a client's reads never go backwards.
+        let read = call(&primary, "GET", "/Patient/p1", None, &[]).await;
+        let read_ts: u64 = header(&read, "x-refhir-commit-ts").parse().unwrap();
+        assert!(read_ts >= ts);
+
+        // Every kind of write reports it: a bundle, an update, and a delete (which has no body).
+        let bundle = call(
+            &primary,
+            "POST",
+            "/",
+            Some(json!({
+                "resourceType": "Bundle",
+                "type": "transaction",
+                "entry": [{
+                    "resource": patient("p2"),
+                    "request": {"method": "POST", "url": "Patient"}
+                }]
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(bundle.status, StatusCode::OK, "{}", bundle.body);
+        let bundle_ts: u64 = header(&bundle, "x-refhir-commit-ts").parse().unwrap();
+        assert!(bundle_ts > ts);
+        let deleted = call(&primary, "DELETE", "/Patient/p1", None, &[]).await;
+        assert_eq!(deleted.status, StatusCode::NO_CONTENT);
+        let delete_ts: u64 = header(&deleted, "x-refhir-commit-ts").parse().unwrap();
+        assert!(delete_ts > bundle_ts);
+    }
+
+    /// The primary as a router in this process (the replica forwards to its TCP listener).
+    fn cluster_primary_app(cluster: &Pair) -> axum::Router {
+        let store: Arc<dyn ConformanceStore> =
+            Arc::new(SqlitePersistence::open(&cluster.path).unwrap());
+        app_with(
+            cluster.primary_db.clone(),
+            cluster.primary_catalog.clone(),
+            store,
+            ServerConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_replica_sends_writes_to_the_primary() {
+        let cluster = pair(|_| {}).await;
+        let created = call(
+            &cluster.replica_app,
+            "POST",
+            "/Patient",
+            Some(patient("via-replica")),
+            &[],
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        assert_eq!(header(&created, "x-refhir-role"), "primary");
+        let ts: u64 = header(&created, "x-refhir-commit-ts").parse().unwrap();
+
+        // The write is in the shared database, and the primary has it.
+        let loaded = cluster.primary_catalog.read().unwrap();
+        let result = refhir_fhir::run(
+            &cluster.primary_db,
+            &loaded,
+            "Patient/read",
+            &json!({"id": "via-replica"}),
+        )
+        .unwrap();
+        assert_eq!(result.value["id"], "via-replica");
+        assert!(cluster.primary_db.latest_ts().as_u64() >= ts);
+        // The replica itself has not moved, which is why the header exists.
+        assert!(cluster.replica_db.latest_ts().as_u64() < ts);
+    }
+
+    #[tokio::test]
+    async fn a_read_after_a_write_waits_for_the_replica_or_asks_the_primary() {
+        let cluster = pair(|_| {}).await;
+        let ts = create_on_primary(&cluster, "p1");
+        let min = ts.to_string();
+
+        // The replica has not refreshed: it waits briefly, then the primary answers.
+        let behind = call(
+            &cluster.replica_app,
+            "GET",
+            "/Patient/p1",
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(behind.status, StatusCode::OK);
+        assert_eq!(behind.body["id"], "p1");
+        assert_eq!(header(&behind, "x-refhir-role"), "primary");
+
+        // Without the header a replica answers from what it has.
+        let stale = call(&cluster.replica_app, "GET", "/Patient/p1", None, &[]).await;
+        assert_eq!(stale.status, StatusCode::NOT_FOUND);
+        assert_eq!(header(&stale, "x-refhir-role"), "replica");
+
+        // Once it has caught up it answers the same request itself.
+        let db = cluster.replica_db.clone();
+        tokio::task::spawn_blocking(move || db.refresh().unwrap())
+            .await
+            .unwrap();
+        let caught_up = call(
+            &cluster.replica_app,
+            "GET",
+            "/Patient/p1",
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(caught_up.status, StatusCode::OK);
+        assert_eq!(header(&caught_up, "x-refhir-role"), "replica");
+    }
+
+    #[tokio::test]
+    async fn a_replica_waits_for_a_refresh_that_is_about_to_land() {
+        let cluster = pair(|settings| settings.min_ts_wait = Duration::from_secs(5)).await;
+        cluster
+            .replica_db
+            .start_refresher(Duration::from_millis(20));
+        let ts = create_on_primary(&cluster, "p1");
+        let min = ts.to_string();
+        let read = call(
+            &cluster.replica_app,
+            "GET",
+            "/Patient/p1",
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(read.status, StatusCode::OK);
+        assert_eq!(
+            header(&read, "x-refhir-role"),
+            "replica",
+            "it caught up in time"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_that_lives_on_the_primary_is_sent_there() {
+        let cluster = pair(|_| {}).await;
+        // Export jobs are kept by the process that accepted them.
+        let export = call(&cluster.replica_app, "POST", "/$export", None, &[]).await;
+        assert_eq!(export.status, StatusCode::ACCEPTED);
+        assert_eq!(header(&export, "x-refhir-role"), "primary");
+        // Installing a package writes the conformance tables, which a replica never does: the
+        // operation answers `ReadOnly`, which the replica turns into a request to the primary.
+        let install = refhir_fhir::commit_operation(
+            cluster.replica_store.as_ref(),
+            &cluster.replica_db,
+            &cluster.replica_catalog,
+            "ImplementationGuide/$install",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                install,
+                refhir_fhir::RunError::Commit(refhir_database::CommitError::ReadOnly)
+            ),
+            "{install:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_without_a_primary_refuses_writes_and_never_loops() {
+        let cluster = pair(|settings| settings.primary_url = None).await;
+        let refused = call(
+            &cluster.replica_app,
+            "POST",
+            "/Patient",
+            Some(patient("p1")),
+            &[],
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&refused, "x-refhir-read-only"), "1");
+        assert_eq!(refused.body["issue"][0]["code"], "transient");
+
+        // A request that was already forwarded once is not forwarded again.
+        let looping = pair(|_| {}).await;
+        let bounced = call(
+            &looping.replica_app,
+            "POST",
+            "/Patient",
+            Some(patient("p2")),
+            &[("x-refhir-forwarded", "1")],
+        )
+        .await;
+        assert_eq!(bounced.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(header(&bounced, "x-refhir-role"), "replica");
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_cannot_ask_the_primary_never_answers_older_than_requested() {
+        // No --primary-url, so a replica that is behind cannot forward. It must not quietly
+        // answer from an older snapshot than the one the caller asked for: it says to retry.
+        let cluster = pair(|settings| settings.primary_url = None).await;
+        let ts = create_on_primary(&cluster, "p1");
+        let min = ts.to_string();
+
+        let behind = call(
+            &cluster.replica_app,
+            "GET",
+            "/Patient/p1",
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(
+            behind.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            behind.body
+        );
+        assert_eq!(header(&behind, "retry-after"), "1");
+        assert_eq!(behind.body["issue"][0]["code"], "transient");
+
+        // Without the header the caller did not ask for anything newer, so it gets the snapshot
+        // the replica has.
+        let plain = call(&cluster.replica_app, "GET", "/Patient/p1", None, &[]).await;
+        assert_eq!(plain.status, StatusCode::NOT_FOUND);
+
+        // Once it has caught up, the same request is answered.
+        let db = cluster.replica_db.clone();
+        tokio::task::spawn_blocking(move || db.refresh().unwrap())
+            .await
+            .unwrap();
+        let caught_up = call(
+            &cluster.replica_app,
+            "GET",
+            "/Patient/p1",
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(caught_up.status, StatusCode::OK);
+        assert_eq!(header(&caught_up, "x-refhir-role"), "replica");
+    }
+
+    #[tokio::test]
+    async fn the_smart_patient_picker_reads_the_replicas_snapshot() {
+        // The picker's lookups (`patient_exists`) read the process's own snapshot. On a replica
+        // that is a few tens of milliseconds behind the primary, and the decision is to accept
+        // that by default: a patient created a moment ago may not be pickable until the replica
+        // refreshes. A caller that must see it sends X-Refhir-Min-Ts, which the next test shows.
+        let cluster = pair(|_| {}).await;
+        create_on_primary(&cluster, "fresh-patient");
+        let app = crate::AppState {
+            db: cluster.replica_db.clone(),
+            catalog: cluster.replica_catalog.clone(),
+            store: cluster.replica_store.clone(),
+            config: ServerConfig::default(),
+            smart: Arc::new(crate::SmartStore::with_defaults()),
+            oidc: None,
+        };
+        assert!(
+            !crate::auth::patient_exists(&app, "fresh-patient"),
+            "the replica has not refreshed, so the picker does not see the new patient yet"
+        );
+        let db = cluster.replica_db.clone();
+        tokio::task::spawn_blocking(move || db.refresh().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            crate::auth::patient_exists(&app, "fresh-patient"),
+            "after a refresh the picker sees it"
+        );
+    }
+
+    #[tokio::test]
+    async fn smart_pages_honor_min_ts_on_a_replica() {
+        // `/oauth/*` is not exempt from the read-your-writes gate, so a SMART page request that
+        // carries X-Refhir-Min-Ts is answered from a snapshot at least that new: by the primary
+        // when the replica has not got there, by the replica itself once it has.
+        let cluster = pair(|_| {}).await;
+        let ts = create_on_primary(&cluster, "p1");
+        let min = ts.to_string();
+        let page = "/oauth/interact?session=none";
+
+        let without = call(&cluster.replica_app, "GET", page, None, &[]).await;
+        assert_eq!(header(&without, "x-refhir-role"), "replica");
+
+        let behind = call(
+            &cluster.replica_app,
+            "GET",
+            page,
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(
+            header(&behind, "x-refhir-role"),
+            "primary",
+            "a replica that is behind asks the primary"
+        );
+
+        let db = cluster.replica_db.clone();
+        tokio::task::spawn_blocking(move || db.refresh().unwrap())
+            .await
+            .unwrap();
+        let caught_up = call(
+            &cluster.replica_app,
+            "GET",
+            page,
+            None,
+            &[("x-refhir-min-ts", min.as_str())],
+        )
+        .await;
+        assert_eq!(
+            header(&caught_up, "x-refhir-role"),
+            "replica",
+            "once it has caught up it serves the page itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_serves_live_queries_and_sends_mutations_to_the_primary() {
+        let cluster = pair(|_| {}).await;
+        create_on_primary(&cluster, "p1");
+        let db = cluster.replica_db.clone();
+        tokio::task::spawn_blocking(move || db.refresh().unwrap())
+            .await
+            .unwrap();
+        cluster
+            .replica_db
+            .start_refresher(Duration::from_millis(15));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let replica_addr = listener.local_addr().unwrap();
+        let replica = cluster.replica_app.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, replica).await.unwrap();
+        });
+
+        let url = format!("ws://{replica_addr}/sync");
+        let (mut subscriber, _) = connect(&url).await;
+        subscriber
+            .send(Message::Text(
+                json!({
+                    "type": "ModifyQuerySet",
+                    "baseVersion": 0,
+                    "newVersion": 1,
+                    "modifications": [{
+                        "type": "Add",
+                        "queryId": 1,
+                        "udfPath": "Patient/search",
+                        "args": {"active": "true"}
+                    }]
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let first = next_json(&mut subscriber).await;
+        assert_eq!(first["modifications"][0]["value"]["total"], 1);
+
+        // The mutation goes in through the replica; the primary commits it.
+        let (mut writer, _) = connect(&url).await;
+        writer
+            .send(Message::Text(
+                json!({
+                    "type": "Mutation",
+                    "requestId": 9,
+                    "udfPath": "Patient/update",
+                    "args": {
+                        "id": "p1",
+                        "resource": {
+                            "resourceType": "Patient",
+                            "id": "p1",
+                            "active": true,
+                            "name": [{"family": "Bee"}]
+                        }
+                    }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        let mutation = next_json(&mut writer).await;
+        assert_eq!(mutation["type"], "MutationResponse");
+        assert_eq!(mutation["success"], true, "{mutation}");
+        assert_eq!(mutation["requestId"], 9);
+        let committed: u64 = mutation["ts"].as_str().unwrap().parse().unwrap();
+        // The caller is only told once the replica itself has the write.
+        assert!(cluster.replica_db.latest_ts().as_u64() >= committed);
+
+        // The live query on the replica heard about the primary's commit.
+        let transition = next_json(&mut subscriber).await;
+        assert_eq!(transition["type"], "Transition");
+        let family =
+            &transition["modifications"][0]["value"]["entry"][0]["resource"]["name"][0]["family"];
+        assert_eq!(family, "Bee");
+        let _ = (&cluster.replica_store, &cluster.replica_catalog);
+    }
+
+    #[tokio::test]
+    async fn a_replica_reloads_its_catalog_when_the_primary_changes_it() {
+        let cluster = pair(|_| {}).await;
+        let before = cluster
+            .replica_catalog
+            .read()
+            .unwrap()
+            .capability_statement()["rest"][0]["resource"]
+            .as_array()
+            .unwrap()
+            .len();
+        let (_, loaded_version) = Catalog::open_consistent(
+            cluster.replica_store.as_ref(),
+            refhir_fhir::CatalogClock::Stable,
+        )
+        .unwrap();
+        refhir_fhir::watch_catalog(
+            cluster.replica_store.clone(),
+            &cluster.replica_catalog,
+            loaded_version,
+            Duration::from_millis(20),
+            refhir_fhir::CatalogClock::Stable,
+        );
+        // The primary installs another package: more resource types, and a version bump.
+        let primary_store: Arc<dyn ConformanceStore> =
+            Arc::new(SqlitePersistence::open(&cluster.path).unwrap());
+        install_package_dir(
+            primary_store.as_ref(),
+            &cluster.primary_db,
+            &cluster.primary_catalog,
+            extra_dir(),
+        )
+        .unwrap();
+        let expected = cluster
+            .primary_catalog
+            .read()
+            .unwrap()
+            .capability_statement()["rest"][0]["resource"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert!(expected > before, "the extra package adds resource types");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let now = cluster
+                .replica_catalog
+                .read()
+                .unwrap()
+                .capability_statement()["rest"][0]["resource"]
+                .as_array()
+                .unwrap()
+                .len();
+            if now == expected {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the replica never reloaded: {now} of {expected} resource types"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}

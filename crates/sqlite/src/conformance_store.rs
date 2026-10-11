@@ -1,16 +1,92 @@
 use refhir_persistence::{
     plan_search_parameter, ConformanceStore, InstallError, InstallOutcome, InstalledParam,
     NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan, ParamStatus,
-    PendingParam, PersistError, StoredBackfill, StoredExpansion, StoredPackage,
-    StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
+    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
 };
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{definite, SqlitePersistence};
 
+impl SqlitePersistence {
+    fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
+        let guard = self.read()?;
+        let text: Option<String> = guard
+            .connection
+            .query_row(
+                "SELECT json_value FROM persistence_globals WHERE key = ?1",
+                params![key.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(definite)?;
+        Ok(text.and_then(|text| text.trim().parse().ok()).unwrap_or(0))
+    }
+
+    /// Adds one, fenced like every other conformance write.
+    fn bump_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
+        self.fenced(|tx| {
+            let value: i64 = tx
+                .query_row(
+                    "INSERT INTO persistence_globals (key, json_value) VALUES (?1, '1')
+                     ON CONFLICT (key) DO UPDATE
+                     SET json_value = CAST(CAST(json_value AS INTEGER) + 1 AS TEXT)
+                     RETURNING CAST(json_value AS INTEGER)",
+                    params![key.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(definite)?;
+            Ok(value as u64)
+        })
+    }
+
+    /// The writer epoch check, inside the transaction of a conformance write. Document commits
+    /// are fenced in `write`; these tables are written outside it, so without this a primary
+    /// that was paused and replaced could wake up and mark a backfill done or a parameter ready
+    /// behind its successor's back.
+    fn check_fence(&self, tx: &Transaction<'_>) -> Result<(), PersistError> {
+        match self.lease.epoch() {
+            Some(epoch) => crate::lease::check_epoch(tx, epoch),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `work` in a transaction that takes the write lock, then checks the epoch.
+    fn fenced<T>(
+        &self,
+        work: impl FnOnce(&Transaction<'_>) -> Result<T, PersistError>,
+    ) -> Result<T, PersistError> {
+        let mut guard = self.inner.lock()?;
+        let tx = guard
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(definite)?;
+        self.check_fence(&tx)?;
+        let out = work(&tx)?;
+        tx.commit().map_err(definite)?;
+        Ok(out)
+    }
+}
+
 impl ConformanceStore for SqlitePersistence {
+    fn catalog_version(&self) -> Result<u64, PersistError> {
+        self.read_counter(PersistenceGlobalKey::CatalogVersion)
+    }
+
+    fn bump_catalog_version(&self) -> Result<u64, PersistError> {
+        self.bump_counter(PersistenceGlobalKey::CatalogVersion)
+    }
+
+    fn catalog_revision(&self) -> Result<u64, PersistError> {
+        self.read_counter(PersistenceGlobalKey::CatalogRevision)
+    }
+
+    fn bump_catalog_revision(&self) -> Result<u64, PersistError> {
+        self.bump_counter(PersistenceGlobalKey::CatalogRevision)
+    }
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare("SELECT id, name, version, fhir_version FROM packages ORDER BY id")
@@ -31,7 +107,7 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare(
@@ -58,7 +134,7 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare(
@@ -102,7 +178,7 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare(
@@ -124,8 +200,79 @@ impl ConformanceStore for SqlitePersistence {
         Ok(rows)
     }
 
+    fn load_terminology_of(&self, package_id: i64) -> Result<Vec<StoredTerminology>, PersistError> {
+        let guard = self.inner.lock()?;
+        let mut stmt = guard
+            .connection
+            .prepare(
+                "SELECT package_id, resource_type, url, json FROM terminology \
+                 WHERE package_id = ?1 ORDER BY url",
+            )
+            .map_err(definite)?;
+        let rows = stmt
+            .query_map(params![package_id], |row| {
+                Ok(StoredTerminology {
+                    package_id: row.get(0)?,
+                    resource_type: row.get(1)?,
+                    url: row.get(2)?,
+                    json: row.get(3)?,
+                })
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?;
+        Ok(rows)
+    }
+
+    fn load_search_parameters_of(
+        &self,
+        package_id: i64,
+    ) -> Result<Vec<StoredSearchParameter>, PersistError> {
+        let guard = self.inner.lock()?;
+        let mut stmt = guard
+            .connection
+            .prepare(
+                "SELECT package_id, url, base, code, param_type, expression, status, json \
+                 FROM search_parameters WHERE package_id = ?1 ORDER BY base, code",
+            )
+            .map_err(definite)?;
+        let rows = stmt
+            .query_map(params![package_id], |row| {
+                let status: String = row.get(6)?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    status,
+                    row.get(7)?,
+                ))
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?;
+        rows.into_iter()
+            .map(
+                |(package_id, url, base, code, param_type, expression, status, json)| {
+                    Ok(StoredSearchParameter {
+                        package_id,
+                        url,
+                        base,
+                        code,
+                        param_type,
+                        expression,
+                        status: ParamStatus::parse(&status)?,
+                        json,
+                    })
+                },
+            )
+            .collect()
+    }
+
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare(
@@ -147,8 +294,9 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let tx = guard.connection.unchecked_transaction().map_err(definite)?;
+        self.check_fence(&tx)?;
         let outcome = install_in_tx(&tx, package)?;
         tx.commit().map_err(definite)?;
         Ok(outcome)
@@ -161,48 +309,44 @@ impl ConformanceStore for SqlitePersistence {
         base: &str,
         status: ParamStatus,
     ) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            tx.execute(
                 "UPDATE search_parameters SET status = ?1 \
                  WHERE package_id = ?2 AND url = ?3 AND base = ?4 AND status = 'unsupported'",
                 params![status.as_str(), package_id, url, base],
             )
             .map_err(definite)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        let existing: Option<i64> = guard
-            .connection
-            .query_row(
-                "SELECT id FROM packages WHERE name = 'refhir.local' AND version = '0'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(definite)?;
-        if let Some(id) = existing {
-            return Ok(id);
-        }
-        let current: Option<String> = guard
-            .connection
-            .query_row("SELECT fhir_version FROM packages LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(definite)?;
-        let version = current.unwrap_or_else(|| fhir_version.to_string());
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM packages WHERE name = 'refhir.local' AND version = '0'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(definite)?;
+            if let Some(id) = existing {
+                return Ok(id);
+            }
+            let current: Option<String> = tx
+                .query_row("SELECT fhir_version FROM packages LIMIT 1", [], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(definite)?;
+            let version = current.unwrap_or_else(|| fhir_version.to_string());
+            tx.execute(
                 "INSERT INTO packages (name, version, fhir_version) VALUES ('refhir.local', '0', ?1)",
                 params![version],
             )
             .map_err(definite)?;
-        Ok(guard.connection.last_insert_rowid())
+            Ok(tx.last_insert_rowid())
+        })
     }
 
     fn upsert_search_parameter(
@@ -210,34 +354,32 @@ impl ConformanceStore for SqlitePersistence {
         package_id: i64,
         param: &NewSearchParameter,
     ) -> Result<bool, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        let prior: Option<(String, String, String, String)> = guard
-            .connection
-            .query_row(
-                "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
-                 WHERE package_id = ?1 AND url = ?2 AND base = ?3",
-                params![package_id, param.url, param.base],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(definite)?;
-        let incoming = param.expression.clone().unwrap_or_default();
-        if let Some((code, param_type, expression, _status)) = &prior {
-            if code == &param.code && param_type == &param.param_type && expression == &incoming {
-                guard
-                    .connection
-                    .execute(
+        self.fenced(|tx| {
+            let prior: Option<(String, String, String, String)> = tx
+                .query_row(
+                    "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
+                     WHERE package_id = ?1 AND url = ?2 AND base = ?3",
+                    params![package_id, param.url, param.base],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(definite)?;
+            let incoming = param.expression.clone().unwrap_or_default();
+            if let Some((code, param_type, expression, _status)) = &prior {
+                if code == &param.code
+                    && param_type == &param.param_type
+                    && expression == &incoming
+                {
+                    tx.execute(
                         "UPDATE search_parameters SET json = ?1 \
                          WHERE package_id = ?2 AND url = ?3 AND base = ?4",
                         params![param.json, package_id, param.url, param.base],
                     )
                     .map_err(definite)?;
-                return Ok(false);
+                    return Ok(false);
+                }
             }
-        }
-        guard
-            .connection
-            .execute(
+            tx.execute(
                 "INSERT INTO search_parameters \
                  (package_id, url, base, code, param_type, expression, status, json) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
@@ -256,19 +398,19 @@ impl ConformanceStore for SqlitePersistence {
                 ],
             )
             .map_err(definite)?;
-        Ok(true)
+            Ok(true)
+        })
     }
 
     fn delete_search_parameter(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            tx.execute(
                 "DELETE FROM search_parameters WHERE package_id = ?1 AND url = ?2",
                 params![package_id, url],
             )
             .map_err(definite)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn upsert_terminology(
@@ -276,10 +418,8 @@ impl ConformanceStore for SqlitePersistence {
         package_id: i64,
         row: &NewTerminology,
     ) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            tx.execute(
                 "INSERT INTO terminology (package_id, resource_type, url, json) \
                  VALUES (?1, ?2, ?3, ?4) \
                  ON CONFLICT (package_id, url) DO UPDATE SET \
@@ -287,19 +427,19 @@ impl ConformanceStore for SqlitePersistence {
                 params![package_id, row.resource_type, row.url, row.json],
             )
             .map_err(definite)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            tx.execute(
                 "DELETE FROM terminology WHERE package_id = ?1 AND url = ?2",
                 params![package_id, url],
             )
             .map_err(definite)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn replace_expansions(
@@ -307,8 +447,9 @@ impl ConformanceStore for SqlitePersistence {
         package_id: i64,
         expansions: &[NewExpansion],
     ) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let tx = guard.connection.unchecked_transaction().map_err(definite)?;
+        self.check_fence(&tx)?;
         tx.execute(
             "DELETE FROM value_set_expansion WHERE package_id = ?1",
             params![package_id],
@@ -331,52 +472,48 @@ impl ConformanceStore for SqlitePersistence {
         package_id: i64,
         base: &str,
     ) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        let urls = {
-            let mut stmt = guard
-                .connection
-                .prepare("SELECT url FROM backfill_parameter WHERE backfill_id = ?1")
-                .map_err(definite)?;
-            let mapped = stmt
-                .query_map(params![backfill_id], |row| row.get::<_, String>(0))
-                .map_err(definite)?;
-            mapped.collect::<Result<Vec<_>, _>>().map_err(definite)?
-        };
-        if urls.is_empty() {
-            guard
-                .connection
-                .execute(
+        // Marking parameters ready changes what search may use, so a stale primary must not be
+        // able to do it after a successor took over.
+        self.fenced(|tx| {
+            let urls = {
+                let mut stmt = tx
+                    .prepare("SELECT url FROM backfill_parameter WHERE backfill_id = ?1")
+                    .map_err(definite)?;
+                let mapped = stmt
+                    .query_map(params![backfill_id], |row| row.get::<_, String>(0))
+                    .map_err(definite)?;
+                mapped.collect::<Result<Vec<_>, _>>().map_err(definite)?
+            };
+            if urls.is_empty() {
+                tx.execute(
                     "UPDATE search_parameters SET status = 'ready' \
                      WHERE package_id = ?1 AND base = ?2 AND status = 'pending'",
                     params![package_id, base],
                 )
                 .map_err(definite)?;
-            return Ok(());
-        }
-        for url in urls {
-            guard
-                .connection
-                .execute(
+            }
+            for url in urls {
+                tx.execute(
                     "UPDATE search_parameters SET status = 'ready' \
                      WHERE package_id = ?1 AND base = ?2 AND url = ?3 AND status = 'pending'",
                     params![package_id, base, url],
                 )
                 .map_err(definite)?;
-        }
-        Ok(())
+            }
+            Ok(())
+        })
     }
 
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            tx.execute(
                 "UPDATE search_parameters SET status = 'ready' \
                  WHERE package_id = ?1 AND base = ?2 AND status = 'pending'",
                 params![package_id, base],
             )
             .map_err(definite)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn insert_backfill(
@@ -386,38 +523,33 @@ impl ConformanceStore for SqlitePersistence {
         tablet: &str,
         urls: &[String],
     ) -> Result<i64, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        guard
-            .connection
-            .execute(
+        self.fenced(|tx| {
+            tx.execute(
                 "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done) \
                  VALUES (?1, ?2, ?3, NULL, 0)",
                 params![package_id, watermark_ts, tablet],
             )
             .map_err(definite)?;
-        let backfill_id = guard.connection.last_insert_rowid();
-        if urls.is_empty() {
-            guard
-                .connection
-                .execute(
+            let backfill_id = tx.last_insert_rowid();
+            if urls.is_empty() {
+                tx.execute(
                     "INSERT INTO backfill_parameter (backfill_id, url) \
                      SELECT ?1, url FROM search_parameters \
                      WHERE package_id = ?2 AND base = ?3 AND status = 'pending'",
                     params![backfill_id, package_id, tablet],
                 )
                 .map_err(definite)?;
-        } else {
-            for url in urls {
-                guard
-                    .connection
-                    .execute(
+            } else {
+                for url in urls {
+                    tx.execute(
                         "INSERT OR IGNORE INTO backfill_parameter (backfill_id, url) VALUES (?1, ?2)",
                         params![backfill_id, url],
                     )
                     .map_err(definite)?;
+                }
             }
-        }
-        Ok(backfill_id)
+            Ok(backfill_id)
+        })
     }
 
     fn update_backfill(
@@ -426,24 +558,24 @@ impl ConformanceStore for SqlitePersistence {
         cursor_id: Option<&str>,
         done: bool,
     ) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
-        let done_flag: i64 = if done { 1 } else { 0 };
-        guard
-            .connection
-            .execute(
+        // The cursor is what a takeover resumes from, so only the lease holder may move it.
+        self.fenced(|tx| {
+            let done_flag: i64 = if done { 1 } else { 0 };
+            tx.execute(
                 "UPDATE index_backfills SET cursor_id = ?1, done = ?2 WHERE id = ?3",
                 params![cursor_id, done_flag, id],
             )
             .map_err(definite)?;
-        Ok(())
+            Ok(())
+        })
     }
 
     fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare(
-                "SELECT id, package_id, watermark_ts, tablet, cursor_id, done \
+                "SELECT id, package_id, watermark_ts, tablet, cursor_id, done, claimed_epoch \
                  FROM index_backfills ORDER BY id",
             )
             .map_err(definite)?;
@@ -457,12 +589,44 @@ impl ConformanceStore for SqlitePersistence {
                     tablet: row.get(3)?,
                     cursor_id: row.get(4)?,
                     done: done != 0,
+                    claimed_epoch: row.get(6)?,
                 })
             })
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn claim_backfill(&self, id: i64) -> Result<bool, PersistError> {
+        let ours = self.lease.epoch().unwrap_or(0) as i64;
+        self.fenced(|tx| {
+            let row: Option<(i64, Option<i64>)> = tx
+                .query_row(
+                    "SELECT done, claimed_epoch FROM index_backfills WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(definite)?;
+            let Some((done, held)) = row else {
+                return Ok(false);
+            };
+            if done != 0 {
+                return Ok(false);
+            }
+            if let Some(held) = held.filter(|held| *held > ours) {
+                return Err(PersistError::Fenced(format!(
+                    "backfill {id} is claimed by writer epoch {held}, this process holds {ours}"
+                )));
+            }
+            tx.execute(
+                "UPDATE index_backfills SET claimed_epoch = ?1 WHERE id = ?2",
+                params![ours, id],
+            )
+            .map_err(definite)?;
+            Ok(true)
+        })
     }
 }
 

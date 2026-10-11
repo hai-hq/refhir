@@ -91,6 +91,10 @@ pub async fn accept_export(
     body: &[u8],
 ) -> Response {
     let _ = body;
+    // Export jobs and their files live on the process that accepted them, which is the primary.
+    if app.db.is_read_only() {
+        return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE);
+    }
     let job_id = Uuid::new_v4().to_string();
     let dir = PathBuf::from(&app.config.export_dir);
     let _ = fs::create_dir_all(&dir);
@@ -139,7 +143,9 @@ pub async fn accept_export(
 }
 
 pub fn status(app: &AppState, job: &str) -> Response {
-    let _ = app;
+    if app.db.is_read_only() {
+        return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE);
+    }
     let table = jobs().lock().expect("jobs");
     let Some(job) = table.get(job) else {
         return fhir_json_public(
@@ -155,7 +161,9 @@ pub fn status(app: &AppState, job: &str) -> Response {
 }
 
 pub fn file(app: &AppState, job: &str) -> Response {
-    let _ = app;
+    if app.db.is_read_only() {
+        return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE);
+    }
     let table = jobs().lock().expect("jobs");
     let Some(job) = table.get(job) else {
         return StatusCode::NOT_FOUND.into_response();

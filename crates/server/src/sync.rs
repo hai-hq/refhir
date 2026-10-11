@@ -8,8 +8,8 @@ use std::sync::{Arc, RwLock};
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
-use refhir_database::{Database, SubToken};
-use refhir_fhir::{Catalog, ConformanceStore, RunResult};
+use refhir_database::{CommitError, Database, SubToken};
+use refhir_fhir::{Catalog, ConformanceStore, RunError, RunResult};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -17,6 +17,123 @@ use crate::auth::SyncSession;
 use crate::http::{self, execute};
 
 const ENGINE: &str = "refhir_engine";
+
+/// Where a replica sends the mutations it cannot commit itself.
+#[derive(Clone, Debug)]
+pub struct Upstream {
+    /// The primary's `/sync` URL, `ws://host:port/sync`.
+    pub url: String,
+    /// The caller's bearer token, so the primary applies the same scopes.
+    pub bearer: Option<String>,
+}
+
+/// Runs one mutation on the primary over a connection of its own and returns its
+/// `MutationResponse`. Per-mutation connections keep a replica's socket free of state to
+/// reconnect, and a write is rare next to the reads a replica serves.
+async fn forward_mutation(
+    upstream: &Upstream,
+    request_id: u64,
+    udf_path: &str,
+    args: &Value,
+) -> Result<Value, String> {
+    use std::time::Duration;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::Message as Wire;
+
+    let mut request = upstream
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|err| err.to_string())?;
+    if let Some(token) = &upstream.bearer {
+        let value = format!("Bearer {token}")
+            .parse()
+            .map_err(|_| "the bearer token is not a valid header value".to_string())?;
+        request.headers_mut().insert("Authorization", value);
+    }
+    let (mut socket, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::connect_async(request),
+    )
+    .await
+    .map_err(|_| "connecting to the primary timed out".to_string())?
+    .map_err(|err| format!("connecting to the primary: {err}"))?;
+    let message = json!({
+        "type": "Mutation",
+        "requestId": request_id,
+        "udfPath": udf_path,
+        "args": args,
+    });
+    socket
+        .send(Wire::Text(message.to_string()))
+        .await
+        .map_err(|err| format!("sending to the primary: {err}"))?;
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(120), socket.next())
+            .await
+            .map_err(|_| "the primary did not answer".to_string())?;
+        match next {
+            Some(Ok(Wire::Text(text))) => {
+                let value: Value = serde_json::from_str(&text).map_err(|err| err.to_string())?;
+                if value["type"] == "MutationResponse" {
+                    let _ = socket.close(None).await;
+                    return Ok(value);
+                }
+                if value["type"] == "FatalError" {
+                    return Err(value["message"]
+                        .as_str()
+                        .unwrap_or("fatal error")
+                        .to_string());
+                }
+            }
+            Some(Ok(_)) => {}
+            Some(Err(err)) => return Err(format!("the primary's connection failed: {err}")),
+            None => return Err("the primary closed the connection".to_string()),
+        }
+    }
+}
+
+/// The reply to a mutation a replica sent to the primary. Before answering, it waits for its own
+/// snapshot to include the commit, so a live query on this socket reflects the write by the time
+/// the caller hears it succeeded.
+async fn forwarded_response(
+    db: &Arc<Database>,
+    upstream: &Upstream,
+    request_id: u64,
+    udf_path: &str,
+    args: &Value,
+) -> Value {
+    match forward_mutation(upstream, request_id, udf_path, args).await {
+        Ok(response) => {
+            let committed = response["ts"]
+                .as_str()
+                .and_then(|text| text.parse::<u64>().ok())
+                .and_then(|ts| refhir_types::Timestamp::from_u64(ts).ok());
+            if let Some(ts) = committed {
+                let db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    db.wait_for_ts(ts, std::time::Duration::from_millis(500))
+                })
+                .await;
+            }
+            response
+        }
+        Err(message) => json!({
+            "type": "MutationResponse",
+            "requestId": request_id,
+            "success": false,
+            "result": {
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "transient",
+                    "diagnostics": format!("could not reach the primary: {message}")
+                }]
+            },
+            "ts": Value::Null
+        }),
+    }
+}
 
 struct LiveQuery {
     token: SubToken,
@@ -30,6 +147,7 @@ pub async fn handle_socket(
     catalog: Arc<RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
     session: Option<SyncSession>,
+    upstream: Option<Upstream>,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (inv_tx, mut inv_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -49,7 +167,7 @@ pub async fn handle_socket(
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Text(text))) => {
-                        if handle_text(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), &text).await.is_err() {
+                        if handle_text(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), upstream.as_ref(), &text).await.is_err() {
                             break;
                         }
                     }
@@ -90,6 +208,7 @@ async fn handle_text(
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
     session: Option<&SyncSession>,
+    upstream: Option<&Upstream>,
     text: &str,
 ) -> Result<(), ()> {
     let message: ClientMessage = match serde_json::from_str(text) {
@@ -232,7 +351,7 @@ async fn handle_text(
                     .await;
                 }
             };
-            let response = match execute(db, catalog, store, &udf_path, args).await {
+            let response = match execute(db, catalog, store, &udf_path, args.clone()).await {
                 Ok(result) => json!({
                     "type": "MutationResponse",
                     "requestId": request_id,
@@ -240,6 +359,11 @@ async fn handle_text(
                     "result": result.value,
                     "ts": result.ts.to_string()
                 }),
+                // A replica cannot commit. The primary can, so ask it.
+                Err(RunError::Commit(CommitError::ReadOnly)) if upstream.is_some() => {
+                    let upstream = upstream.expect("checked");
+                    forwarded_response(db, upstream, request_id, &udf_path, &args).await
+                }
                 Err(err) => json!({
                     "type": "MutationResponse",
                     "requestId": request_id,

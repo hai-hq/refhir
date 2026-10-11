@@ -10,8 +10,12 @@ export async function dial(baseURL: string, options: DialOptions = {}): Promise<
     throw new Error("refhir: the browser build does not include the Node WebSocket transport");
   }
   const { httpBase, wsURL } = splitBase(baseURL);
-  return Client.connect(httpBase, wsURL, options.token, (url) =>
-    openBrowserSocket(url, options.token),
+  return Client.connect(
+    httpBase,
+    wsURL,
+    options.token,
+    (url) => openBrowserSocket(url, options.token),
+    { readYourWrites: options.readYourWrites },
   );
 }
 

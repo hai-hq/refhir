@@ -87,10 +87,27 @@ function PatientList() {
 | `client.create` / `update` / `delete` / `transaction` | Mutations |
 | `client.metadata()` | `GET /metadata` |
 | `client.doRequest(method, path, body?)` | One HTTP call |
+| `client.requestWithHeaders(method, path, body?)` | Same, returning `{ status, headers, body }` |
+| `client.lastCommitTs` | Highest commit timestamp seen (`bigint`, `0n` until known) |
+
+### Read-your-writes
+
+Against a replica, a read right after a write could be served before the replica has applied that write. The client tracks the highest commit timestamp it has seen, from `X-Refhir-Commit-Ts` on REST responses and `ts` on successful `/sync` mutations, and sends it as `X-Refhir-Min-Ts` on every later REST request (`doRequest`, `metadata`, SDC calls). The server holds the read until it has caught up, or forwards it to the primary. The value only moves up and is a `bigint` because timestamps are u64.
+
+```ts
+const client = await dial(url);                          // read-your-writes on
+await client.create("Patient", patient);
+client.lastCommitTs;                                     // e.g. 4172n
+await client.doRequest("GET", "/Patient/p1");            // sends X-Refhir-Min-Ts: 4172
+
+await dial(url, { readYourWrites: false });              // never send the header
+```
+
+With `readYourWrites: false`, `lastCommitTs` still tracks. In browsers, `fetch` can only read `X-Refhir-Commit-Ts` if the server lists it in `Access-Control-Expose-Headers`; timestamps from `/sync` mutations always count. Watches are not affected: they follow committed state over `/sync`.
 
 Failed mutations throw `OutcomeError` with `.outcome`. HTTP errors throw `HttpError` with `.status` and `.body`.
 
-Reconnect, batching, and protocol details match the Go client. See [clients/go/README.md](../go/README.md).
+After a dropped socket the client redials with backoff (50 ms doubling to 1 s, with jitter) until it is back or `close()` is called. Reconnect, batching, and protocol details match the Go client. See [clients/go/README.md](../go/README.md).
 
 ## Mock data
 

@@ -7,6 +7,10 @@
 //! Streams in Convex are `Vec` here. The rows and the timestamp rules are the same.
 //! `DocumentLogEntry::value` is JSON text, not `ResolvedDocument`.
 
+mod pool;
+
+pub use pool::{Pool, PoolGuard, PoolStats};
+
 use std::sync::Arc;
 
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
@@ -23,13 +27,32 @@ pub enum ConflictStrategy {
 /// Convex `PersistenceGlobalKey`. Retention keys are not written yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceGlobalKey {
+    /// Highest persisted timestamp. Written at persist time, so it can run ahead of what
+    /// has been published: never use it as a read bound for another process.
     MaxRepeatableTimestamp,
+    /// Epoch of the process holding the writer lease. Bumped each time a lease is taken.
+    WriterEpoch,
+    /// Highest timestamp the writer has published, in order, with no gaps before it.
+    /// Readers in other processes may serve every snapshot at or below it.
+    PublishedTimestamp,
+    /// Moves when the catalog is in a state a reader may use: it is not bumped while search
+    /// parameters are still waiting for their backfill, so a replica never loads a parameter
+    /// whose index is not complete. Replicas watch this one.
+    CatalogVersion,
+    /// Moves on every change to the conformance tables, including ones that leave parameters
+    /// pending. A standby watches this one: when it takes over it may have to finish a backfill,
+    /// so it needs to know about parameters a replica must not see yet.
+    CatalogRevision,
 }
 
 impl PersistenceGlobalKey {
     pub fn as_str(self) -> &'static str {
         match self {
             PersistenceGlobalKey::MaxRepeatableTimestamp => "max_repeatable_ts",
+            PersistenceGlobalKey::WriterEpoch => "writer_epoch",
+            PersistenceGlobalKey::PublishedTimestamp => "published_ts",
+            PersistenceGlobalKey::CatalogVersion => "catalog_version",
+            PersistenceGlobalKey::CatalogRevision => "catalog_revision",
         }
     }
 }
@@ -90,6 +113,9 @@ pub struct TimestampRange {
 pub enum PersistError {
     Definite(String),
     Uncertain(String),
+    /// A newer writer holds the lease. Nothing was written, and this process must stop
+    /// writing: it is a stale primary.
+    Fenced(String),
 }
 
 impl std::fmt::Display for PersistError {
@@ -97,6 +123,7 @@ impl std::fmt::Display for PersistError {
         match self {
             PersistError::Definite(msg) => write!(f, "{msg}"),
             PersistError::Uncertain(msg) => write!(f, "uncertain persistence write: {msg}"),
+            PersistError::Fenced(msg) => write!(f, "fenced by a newer writer: {msg}"),
         }
     }
 }
@@ -186,10 +213,61 @@ pub trait PersistenceReader: Send + Sync {
     ) -> Result<Option<JsonValue>, PersistError>;
 
     fn max_ts(&self) -> Result<Option<Timestamp>, PersistError>;
+
+    /// Every index row written in `range`, in timestamp order. This is what a commit put
+    /// into the write log, which a reader in another process needs to invalidate live
+    /// queries. Index-only commits (backfills) have rows here and no document.
+    fn load_index_writes(
+        &self,
+        range: TimestampRange,
+    ) -> Result<Vec<PersistenceIndexEntry>, PersistError>;
+}
+
+/// Outcome of asking to become the single writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lease {
+    /// This process is the writer now, at this epoch.
+    Held { epoch: u64 },
+    /// Another process holds it.
+    Busy,
 }
 
 pub trait Persistence: PersistenceReader {
     fn is_fresh(&self) -> bool;
+
+    /// Tries once to become the only writer. A backend with nothing to coordinate with (an
+    /// in-memory database) always succeeds with epoch 0, which fences nothing.
+    ///
+    /// On success the backend keeps the lease for the life of the process, bumps the writer
+    /// epoch, and from then on rejects its own writes with `PersistError::Fenced` if a newer
+    /// epoch appears. If the lease is lost it exits the process.
+    fn try_acquire_writer_lease(&self) -> Result<Lease, PersistError> {
+        Ok(Lease::Held { epoch: 0 })
+    }
+
+    /// Records that every timestamp up to `ts` is published. Never moves backwards.
+    fn advance_published_ts(&self, _ts: Timestamp) -> Result<(), PersistError> {
+        Ok(())
+    }
+
+    /// Connection pool counters, for backends that have one.
+    fn pool_stats(&self) -> Option<PoolStats> {
+        None
+    }
+
+    /// Waits up to `timeout` for the writer to say it published a commit, and returns whether
+    /// it did. A reader calls this between refreshes so it need not poll quickly: it wakes as
+    /// soon as the writer announces something, and still looks every `timeout` in case an
+    /// announcement was missed. A backend with no such channel just sleeps.
+    fn wait_for_publish(&self, timeout: std::time::Duration) -> bool {
+        std::thread::sleep(timeout);
+        false
+    }
+
+    /// Whether `wait_for_publish` is woken by the writer rather than only timing out.
+    fn publishes_notifications(&self) -> bool {
+        false
+    }
 
     fn reader(&self) -> Arc<dyn PersistenceReader>;
 
@@ -276,6 +354,9 @@ pub struct StoredBackfill {
     pub tablet: String,
     pub cursor_id: Option<String>,
     pub done: bool,
+    /// Writer epoch that last claimed the job: the process that is running it, or that died
+    /// running it. `None` until the first claim.
+    pub claimed_epoch: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -492,6 +573,20 @@ impl From<PersistError> for InstallError {
 /// Direct SQL for packages, structure definitions, and search parameters.
 /// Resource transactions do not use this trait.
 pub trait ConformanceStore: Send + Sync {
+    /// The counter every conformance change bumps. A process that serves from an in-memory
+    /// catalog compares it with the value it loaded to know when to reload.
+    fn catalog_version(&self) -> Result<u64, PersistError>;
+
+    /// Adds one to the catalog version and returns the new value.
+    fn bump_catalog_version(&self) -> Result<u64, PersistError>;
+
+    /// The counter every conformance change bumps, including ones that leave search parameters
+    /// pending. A standby follows this, not the version.
+    fn catalog_revision(&self) -> Result<u64, PersistError>;
+
+    /// Adds one to the catalog revision and returns the new value.
+    fn bump_catalog_revision(&self) -> Result<u64, PersistError>;
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError>;
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError>;
@@ -501,6 +596,30 @@ pub trait ConformanceStore: Send + Sync {
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError>;
 
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError>;
+
+    /// The terminology rows of one package. The full load returns every installed package's
+    /// JSON (the whole R4 core is thousands of resources); a caller that only wants the rows
+    /// written through the API, which are few, should not pay for that. Backends override this
+    /// with a query that filters in the database.
+    fn load_terminology_of(&self, package_id: i64) -> Result<Vec<StoredTerminology>, PersistError> {
+        Ok(self
+            .load_terminology()?
+            .into_iter()
+            .filter(|row| row.package_id == package_id)
+            .collect())
+    }
+
+    /// The search parameter rows of one package. See [`ConformanceStore::load_terminology_of`].
+    fn load_search_parameters_of(
+        &self,
+        package_id: i64,
+    ) -> Result<Vec<StoredSearchParameter>, PersistError> {
+        Ok(self
+            .load_search_parameters()?
+            .into_iter()
+            .filter(|row| row.package_id == package_id)
+            .collect())
+    }
 
     /// Package row for resources authored through the FHIR API.
     fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError>;
@@ -562,6 +681,12 @@ pub trait ConformanceStore: Send + Sync {
         cursor_id: Option<&str>,
         done: bool,
     ) -> Result<(), PersistError>;
+
+    /// Records that this writer is the one running backfill `id`, taking it over from an
+    /// earlier writer that died with it half done. Returns false if the job is finished and
+    /// there is nothing to run. Fails with `PersistError::Fenced` if a *newer* writer has
+    /// already claimed it: this process is the stale one.
+    fn claim_backfill(&self, id: i64) -> Result<bool, PersistError>;
 
     fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError>;
 }
@@ -683,6 +808,9 @@ pub trait AuthStore: Send + Sync {
     fn auth_get(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError>;
     /// Delete a row and return it if it was live. Of concurrent callers, at most one gets it.
     fn auth_take(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError>;
+    /// Delete a row only if it still holds exactly `json`. Returns whether it was deleted, so a
+    /// caller that read a bad row cannot remove a good one another process wrote since.
+    fn auth_delete_if(&self, kind: &str, id: &str, json: &str) -> Result<bool, PersistError>;
     /// Every live row of `kind`.
     fn auth_list(&self, kind: &str, now: u64) -> Result<Vec<String>, PersistError>;
     /// Delete every dead row.
@@ -740,6 +868,16 @@ impl AuthStore for MemoryAuthStore {
             .map(|(json, _)| json))
     }
 
+    fn auth_delete_if(&self, kind: &str, id: &str, json: &str) -> Result<bool, PersistError> {
+        let mut rows = self.rows.lock().expect("auth");
+        let key = (kind.to_string(), id.to_string());
+        if rows.get(&key).is_some_and(|(stored, _)| stored == json) {
+            rows.remove(&key);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn auth_list(&self, kind: &str, now: u64) -> Result<Vec<String>, PersistError> {
         let rows = self.rows.lock().expect("auth");
         Ok(rows
@@ -763,6 +901,19 @@ pub mod auth {
     use super::AuthStore;
 
     pub fn exercise(store: &dyn AuthStore) {
+        // A row is deleted by value only if it still holds that value.
+        store
+            .auth_put("delete-if", "d1", "json-a", u64::MAX)
+            .unwrap();
+        assert!(!store.auth_delete_if("delete-if", "d1", "json-b").unwrap());
+        assert_eq!(
+            store.auth_get("delete-if", "d1", 0).unwrap().as_deref(),
+            Some("json-a")
+        );
+        assert!(store.auth_delete_if("delete-if", "d1", "json-a").unwrap());
+        assert!(store.auth_get("delete-if", "d1", 0).unwrap().is_none());
+        assert!(!store.auth_delete_if("delete-if", "d1", "json-a").unwrap());
+
         store.auth_put("code", "c1", "{\"a\":1}", 100).unwrap();
         assert_eq!(
             store.auth_get("code", "c1", 50).unwrap().as_deref(),
@@ -981,11 +1132,40 @@ pub mod conformance {
             .unwrap();
         assert_eq!(loaded.len(), 2);
 
-        let global = p
-            .get_persistence_global(PersistenceGlobalKey::MaxRepeatableTimestamp)
+        // What each commit wrote to the index, in order, tombstones included: this is what a
+        // reader in another process turns into write-log entries.
+        let writes = p
+            .load_index_writes(TimestampRange {
+                start_inclusive: ts1,
+                end_exclusive: Timestamp::from_u64(3).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        assert_eq!(
+            (writes[0].ts, writes[0].value.clone()),
+            (ts1, Some(id.clone()))
+        );
+        assert_eq!((writes[1].ts, writes[1].value.clone()), (ts2, None));
+        assert_eq!(writes[1].key, key);
+        assert!(p
+            .load_index_writes(TimestampRange {
+                start_inclusive: Timestamp::from_u64(3).unwrap(),
+                end_exclusive: Timestamp::from_u64(9).unwrap(),
+            })
             .unwrap()
-            .expect("max repeatable");
-        assert_eq!(global.as_u64(), Some(2));
+            .is_empty());
+
+        // The published watermark only moves forward.
+        let published = |p: &dyn Persistence| {
+            p.get_persistence_global(PersistenceGlobalKey::PublishedTimestamp)
+                .unwrap()
+                .and_then(|value| value.as_u64())
+        };
+        p.advance_published_ts(ts2).unwrap();
+        assert_eq!(published(p), Some(2));
+        p.advance_published_ts(ts1).unwrap();
+        assert_eq!(published(p), Some(2));
+
         assert_eq!(p.max_ts().unwrap(), Some(ts2));
         assert!(!p.is_fresh());
     }

@@ -2,15 +2,79 @@ use postgres::Transaction;
 use refhir_persistence::{
     plan_search_parameter, ConformanceStore, InstallError, InstallOutcome, InstalledParam,
     NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan, ParamStatus,
-    PendingParam, PersistError, StoredBackfill, StoredExpansion, StoredPackage,
-    StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
+    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
 };
 
 use crate::{definite, PostgresPersistence};
 
+impl PostgresPersistence {
+    fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
+        let mut guard = self.inner.lock()?;
+        let row = guard
+            .client
+            .query_opt(
+                "SELECT json_value FROM persistence_globals WHERE key = $1",
+                &[&key.as_str()],
+            )
+            .map_err(definite)?;
+        Ok(row
+            .and_then(|row| row.get::<_, String>(0).trim().parse().ok())
+            .unwrap_or(0))
+    }
+
+    /// Adds one, fenced like every other conformance write.
+    fn bump_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        let text: String = tx
+            .query_one(
+                "INSERT INTO persistence_globals (key, json_value) VALUES ($1, '1')
+                 ON CONFLICT (key) DO UPDATE
+                 SET json_value = (persistence_globals.json_value::bigint + 1)::text
+                 RETURNING json_value",
+                &[&key.as_str()],
+            )
+            .map_err(definite)?
+            .get(0);
+        tx.commit().map_err(definite)?;
+        text.trim()
+            .parse()
+            .map_err(|_| PersistError::Definite(format!("bad {} {text:?}", key.as_str())))
+    }
+
+    /// The writer epoch check, inside the transaction of a conformance write. Document commits
+    /// are fenced in `write`; these tables are written outside it, so without this a primary
+    /// that was paused and replaced could wake up and mark a backfill done or a parameter ready
+    /// behind its successor's back, in the moments before its lease keepalive stops it.
+    fn fence(&self, tx: &mut Transaction<'_>) -> Result<(), PersistError> {
+        match self.lease.epoch() {
+            Some(epoch) => crate::lease::check_epoch(tx, epoch),
+            None => Ok(()),
+        }
+    }
+}
+
 impl ConformanceStore for PostgresPersistence {
+    fn catalog_version(&self) -> Result<u64, PersistError> {
+        self.read_counter(PersistenceGlobalKey::CatalogVersion)
+    }
+
+    fn bump_catalog_version(&self) -> Result<u64, PersistError> {
+        self.bump_counter(PersistenceGlobalKey::CatalogVersion)
+    }
+
+    fn catalog_revision(&self) -> Result<u64, PersistError> {
+        self.read_counter(PersistenceGlobalKey::CatalogRevision)
+    }
+
+    fn bump_catalog_revision(&self) -> Result<u64, PersistError> {
+        self.bump_counter(PersistenceGlobalKey::CatalogRevision)
+    }
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let mut guard = self.inner.lock()?;
         let rows = guard
             .client
             .query(
@@ -30,7 +94,7 @@ impl ConformanceStore for PostgresPersistence {
     }
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let mut guard = self.inner.lock()?;
         let rows = guard
             .client
             .query(
@@ -56,7 +120,7 @@ impl ConformanceStore for PostgresPersistence {
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let mut guard = self.inner.lock()?;
         let rows = guard
             .client
             .query(
@@ -83,7 +147,7 @@ impl ConformanceStore for PostgresPersistence {
     }
 
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let mut guard = self.inner.lock()?;
         let rows = guard
             .client
             .query(
@@ -102,8 +166,59 @@ impl ConformanceStore for PostgresPersistence {
             .collect())
     }
 
+    fn load_terminology_of(&self, package_id: i64) -> Result<Vec<StoredTerminology>, PersistError> {
+        let mut guard = self.inner.lock()?;
+        let rows = guard
+            .client
+            .query(
+                "SELECT package_id, resource_type, url, json FROM terminology \
+                 WHERE package_id = $1 ORDER BY url",
+                &[&package_id],
+            )
+            .map_err(definite)?;
+        Ok(rows
+            .iter()
+            .map(|row| StoredTerminology {
+                package_id: row.get(0),
+                resource_type: row.get(1),
+                url: row.get(2),
+                json: row.get(3),
+            })
+            .collect())
+    }
+
+    fn load_search_parameters_of(
+        &self,
+        package_id: i64,
+    ) -> Result<Vec<StoredSearchParameter>, PersistError> {
+        let mut guard = self.inner.lock()?;
+        let rows = guard
+            .client
+            .query(
+                "SELECT package_id, url, base, code, param_type, expression, status, json \
+                 FROM search_parameters WHERE package_id = $1 ORDER BY base, code",
+                &[&package_id],
+            )
+            .map_err(definite)?;
+        rows.iter()
+            .map(|row| {
+                let status: String = row.get(6);
+                Ok(StoredSearchParameter {
+                    package_id: row.get(0),
+                    url: row.get(1),
+                    base: row.get(2),
+                    code: row.get(3),
+                    param_type: row.get(4),
+                    expression: row.get(5),
+                    status: ParamStatus::parse(&status)?,
+                    json: row.get(7),
+                })
+            })
+            .collect()
+    }
+
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let mut guard = self.inner.lock()?;
         let rows = guard
             .client
             .query(
@@ -122,8 +237,10 @@ impl ConformanceStore for PostgresPersistence {
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
         let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
         let outcome = install_in_tx(&mut tx, package)?;
         tx.commit().map_err(definite)?;
         Ok(outcome)
@@ -136,25 +253,28 @@ impl ConformanceStore for PostgresPersistence {
         base: &str,
         status: ParamStatus,
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
         let status = status.as_str().to_string();
         let url = url.to_string();
         let base = base.to_string();
-        guard
-            .client
-            .execute(
-                "UPDATE search_parameters SET status = $1 \
-                 WHERE package_id = $2 AND url = $3 AND base = $4 AND status = 'unsupported'",
-                &[&status, &package_id, &url, &base],
-            )
-            .map_err(definite)?;
-        Ok(())
+        tx.execute(
+            "UPDATE search_parameters SET status = $1 \
+             WHERE package_id = $2 AND url = $3 AND base = $4 AND status = 'unsupported'",
+            &[&status, &package_id, &url, &base],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)
     }
 
     fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
-        let existing = guard
-            .client
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        let existing = tx
             .query_opt(
                 "SELECT id FROM packages WHERE name = 'refhir.local' AND version = '0'",
                 &[],
@@ -163,22 +283,22 @@ impl ConformanceStore for PostgresPersistence {
         if let Some(row) = existing {
             return Ok(row.get(0));
         }
-        let current = guard
-            .client
+        let current = tx
             .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
             .map_err(definite)?;
         let version = current
             .map(|row| row.get::<_, String>(0))
             .unwrap_or_else(|| fhir_version.to_string());
-        let inserted = guard
-            .client
+        let inserted = tx
             .query_one(
                 "INSERT INTO packages (name, version, fhir_version) \
                  VALUES ('refhir.local', '0', $1) RETURNING id",
                 &[&version],
             )
             .map_err(definite)?;
-        Ok(inserted.get(0))
+        let id: i64 = inserted.get(0);
+        tx.commit().map_err(definite)?;
+        Ok(id)
     }
 
     fn upsert_search_parameter(
@@ -186,9 +306,11 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         param: &NewSearchParameter,
     ) -> Result<bool, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
-        let prior = guard
-            .client
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        let prior = tx
             .query_opt(
                 "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
                  WHERE package_id = $1 AND url = $2 AND base = $3",
@@ -201,53 +323,52 @@ impl ConformanceStore for PostgresPersistence {
             let param_type: String = row.get(1);
             let expression: String = row.get(2);
             if code == param.code && param_type == param.param_type && expression == incoming {
-                guard
-                    .client
-                    .execute(
-                        "UPDATE search_parameters SET json = $1 \
-                         WHERE package_id = $2 AND url = $3 AND base = $4",
-                        &[&param.json, &package_id, &param.url, &param.base],
-                    )
-                    .map_err(definite)?;
+                tx.execute(
+                    "UPDATE search_parameters SET json = $1 \
+                     WHERE package_id = $2 AND url = $3 AND base = $4",
+                    &[&param.json, &package_id, &param.url, &param.base],
+                )
+                .map_err(definite)?;
+                tx.commit().map_err(definite)?;
                 return Ok(false);
             }
         }
         let status = param.status.as_str();
-        guard
-            .client
-            .execute(
-                "INSERT INTO search_parameters \
-                 (package_id, url, base, code, param_type, expression, status, json) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-                 ON CONFLICT (package_id, url, base) DO UPDATE SET \
-                 code = EXCLUDED.code, param_type = EXCLUDED.param_type, \
-                 expression = EXCLUDED.expression, status = EXCLUDED.status, json = EXCLUDED.json",
-                &[
-                    &package_id,
-                    &param.url,
-                    &param.base,
-                    &param.code,
-                    &param.param_type,
-                    &param.expression,
-                    &status,
-                    &param.json,
-                ],
-            )
-            .map_err(definite)?;
+        tx.execute(
+            "INSERT INTO search_parameters \
+             (package_id, url, base, code, param_type, expression, status, json) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (package_id, url, base) DO UPDATE SET \
+             code = EXCLUDED.code, param_type = EXCLUDED.param_type, \
+             expression = EXCLUDED.expression, status = EXCLUDED.status, json = EXCLUDED.json",
+            &[
+                &package_id,
+                &param.url,
+                &param.base,
+                &param.code,
+                &param.param_type,
+                &param.expression,
+                &status,
+                &param.json,
+            ],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)?;
         Ok(true)
     }
 
     fn delete_search_parameter(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
         let url = url.to_string();
-        guard
-            .client
-            .execute(
-                "DELETE FROM search_parameters WHERE package_id = $1 AND url = $2",
-                &[&package_id, &url],
-            )
-            .map_err(definite)?;
-        Ok(())
+        tx.execute(
+            "DELETE FROM search_parameters WHERE package_id = $1 AND url = $2",
+            &[&package_id, &url],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)
     }
 
     fn upsert_terminology(
@@ -255,31 +376,33 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         row: &NewTerminology,
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
-        guard
-            .client
-            .execute(
-                "INSERT INTO terminology (package_id, resource_type, url, json) \
-                 VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (package_id, url) DO UPDATE SET \
-                 resource_type = EXCLUDED.resource_type, json = EXCLUDED.json",
-                &[&package_id, &row.resource_type, &row.url, &row.json],
-            )
-            .map_err(definite)?;
-        Ok(())
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        tx.execute(
+            "INSERT INTO terminology (package_id, resource_type, url, json) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (package_id, url) DO UPDATE SET \
+             resource_type = EXCLUDED.resource_type, json = EXCLUDED.json",
+            &[&package_id, &row.resource_type, &row.url, &row.json],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)
     }
 
     fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
         let url = url.to_string();
-        guard
-            .client
-            .execute(
-                "DELETE FROM terminology WHERE package_id = $1 AND url = $2",
-                &[&package_id, &url],
-            )
-            .map_err(definite)?;
-        Ok(())
+        tx.execute(
+            "DELETE FROM terminology WHERE package_id = $1 AND url = $2",
+            &[&package_id, &url],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)
     }
 
     fn replace_expansions(
@@ -287,8 +410,10 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         expansions: &[NewExpansion],
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
         let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
         tx.execute(
             "DELETE FROM value_set_expansion WHERE package_id = $1",
             &[&package_id],
@@ -311,52 +436,52 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         base: &str,
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
-        let urls: Vec<String> = {
-            let rows = guard
-                .client
-                .query(
-                    "SELECT url FROM backfill_parameter WHERE backfill_id = $1",
-                    &[&backfill_id],
-                )
-                .map_err(definite)?;
-            rows.iter().map(|row| row.get(0)).collect()
-        };
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        // Marking parameters ready changes what search may use, so a stale primary must not
+        // be able to do it after a successor took over.
+        self.fence(&mut tx)?;
+        let urls: Vec<String> = tx
+            .query(
+                "SELECT url FROM backfill_parameter WHERE backfill_id = $1",
+                &[&backfill_id],
+            )
+            .map_err(definite)?
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
         if urls.is_empty() {
-            guard
-                .client
-                .execute(
-                    "UPDATE search_parameters SET status = 'ready' \
-                     WHERE package_id = $1 AND base = $2 AND status = 'pending'",
-                    &[&package_id, &base],
-                )
-                .map_err(definite)?;
-            return Ok(());
-        }
-        for url in urls {
-            guard
-                .client
-                .execute(
-                    "UPDATE search_parameters SET status = 'ready' \
-                     WHERE package_id = $1 AND base = $2 AND url = $3 AND status = 'pending'",
-                    &[&package_id, &base, &url],
-                )
-                .map_err(definite)?;
-        }
-        Ok(())
-    }
-
-    fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
-        guard
-            .client
-            .execute(
+            tx.execute(
                 "UPDATE search_parameters SET status = 'ready' \
                  WHERE package_id = $1 AND base = $2 AND status = 'pending'",
                 &[&package_id, &base],
             )
             .map_err(definite)?;
-        Ok(())
+        }
+        for url in urls {
+            tx.execute(
+                "UPDATE search_parameters SET status = 'ready' \
+                 WHERE package_id = $1 AND base = $2 AND url = $3 AND status = 'pending'",
+                &[&package_id, &base, &url],
+            )
+            .map_err(definite)?;
+        }
+        tx.commit().map_err(definite)
+    }
+
+    fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError> {
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        tx.execute(
+            "UPDATE search_parameters SET status = 'ready' \
+             WHERE package_id = $1 AND base = $2 AND status = 'pending'",
+            &[&package_id, &base],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)
     }
 
     fn insert_backfill(
@@ -366,9 +491,11 @@ impl ConformanceStore for PostgresPersistence {
         tablet: &str,
         urls: &[String],
     ) -> Result<i64, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
-        let row = guard
-            .client
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        let row = tx
             .query_one(
                 "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done) \
                  VALUES ($1, $2, $3, NULL, 0) RETURNING id",
@@ -377,27 +504,24 @@ impl ConformanceStore for PostgresPersistence {
             .map_err(definite)?;
         let backfill_id: i64 = row.get(0);
         if urls.is_empty() {
-            guard
-                .client
-                .execute(
-                    "INSERT INTO backfill_parameter (backfill_id, url) \
-                     SELECT $1, url FROM search_parameters \
-                     WHERE package_id = $2 AND base = $3 AND status = 'pending'",
-                    &[&backfill_id, &package_id, &tablet],
-                )
-                .map_err(definite)?;
+            tx.execute(
+                "INSERT INTO backfill_parameter (backfill_id, url) \
+                 SELECT $1, url FROM search_parameters \
+                 WHERE package_id = $2 AND base = $3 AND status = 'pending'",
+                &[&backfill_id, &package_id, &tablet],
+            )
+            .map_err(definite)?;
         } else {
             for url in urls {
-                guard
-                    .client
-                    .execute(
-                        "INSERT INTO backfill_parameter (backfill_id, url) VALUES ($1, $2) \
-                         ON CONFLICT (backfill_id, url) DO NOTHING",
-                        &[&backfill_id, url],
-                    )
-                    .map_err(definite)?;
+                tx.execute(
+                    "INSERT INTO backfill_parameter (backfill_id, url) VALUES ($1, $2) \
+                     ON CONFLICT (backfill_id, url) DO NOTHING",
+                    &[&backfill_id, url],
+                )
+                .map_err(definite)?;
             }
         }
+        tx.commit().map_err(definite)?;
         Ok(backfill_id)
     }
 
@@ -407,24 +531,26 @@ impl ConformanceStore for PostgresPersistence {
         cursor_id: Option<&str>,
         done: bool,
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        // The cursor is what a takeover resumes from, so only the lease holder may move it.
+        self.fence(&mut tx)?;
         let done_flag: i32 = if done { 1 } else { 0 };
-        guard
-            .client
-            .execute(
-                "UPDATE index_backfills SET cursor_id = $1, done = $2 WHERE id = $3",
-                &[&cursor_id, &done_flag, &id],
-            )
-            .map_err(definite)?;
-        Ok(())
+        tx.execute(
+            "UPDATE index_backfills SET cursor_id = $1, done = $2 WHERE id = $3",
+            &[&cursor_id, &done_flag, &id],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)
     }
 
     fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError> {
-        let mut guard = self.inner.lock().expect("postgres");
+        let mut guard = self.inner.lock()?;
         let rows = guard
             .client
             .query(
-                "SELECT id, package_id, watermark_ts, tablet, cursor_id, done \
+                "SELECT id, package_id, watermark_ts, tablet, cursor_id, done, claimed_epoch \
                  FROM index_backfills ORDER BY id",
                 &[],
             )
@@ -440,9 +566,44 @@ impl ConformanceStore for PostgresPersistence {
                     tablet: row.get(3),
                     cursor_id: row.get(4),
                     done: done != 0,
+                    claimed_epoch: row.get(6),
                 }
             })
             .collect())
+    }
+
+    fn claim_backfill(&self, id: i64) -> Result<bool, PersistError> {
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        let ours = self.lease.epoch().unwrap_or(0) as i64;
+        let row = tx
+            .query_opt(
+                "SELECT done, claimed_epoch FROM index_backfills WHERE id = $1 FOR UPDATE",
+                &[&id],
+            )
+            .map_err(definite)?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let done: i32 = row.get(0);
+        let held: Option<i64> = row.get(1);
+        if done != 0 {
+            return Ok(false);
+        }
+        if let Some(held) = held.filter(|held| *held > ours) {
+            return Err(PersistError::Fenced(format!(
+                "backfill {id} is claimed by writer epoch {held}, this process holds {ours}"
+            )));
+        }
+        tx.execute(
+            "UPDATE index_backfills SET claimed_epoch = $1 WHERE id = $2",
+            &[&ours, &id],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)?;
+        Ok(true)
     }
 }
 
