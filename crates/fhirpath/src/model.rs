@@ -1,6 +1,7 @@
 //! Element types and the FHIR type hierarchy, built from StructureDefinition snapshots.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -118,11 +119,7 @@ impl Model {
         self.inner
             .elements
             .contains_key(&format!("{path}.{name}[x]"))
-            || self
-                .inner
-                .elements
-                .keys()
-                .any(|key| key == &format!("{name}[x]"))
+            || self.inner.elements.contains_key(&format!("{name}[x]"))
     }
 
     pub fn choice_path(&self, path: &str, name: &str) -> Option<String> {
@@ -141,23 +138,30 @@ impl Model {
     pub fn has_descendants(&self, path: &str) -> bool {
         let path = self.canonical(path);
         let prefix = format!("{path}.");
+        // The keys that start with `prefix` are contiguous in a sorted map and begin at the first
+        // key that is not below `prefix`, so one look at that key answers the question.
         self.inner
             .elements
-            .keys()
-            .any(|key| key.starts_with(&prefix))
+            .range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded))
+            .next()
+            .is_some_and(|(key, _)| key.starts_with(&prefix))
     }
 
+    /// Whether `name` is an element of `path`, directly or as the base of a choice (`value[x]`).
+    /// Search evaluates this for every step of every candidate row, so it is two lookups, not a
+    /// scan of every element in the model with a string built for each one.
     pub fn known_child(&self, path: &str, name: &str) -> bool {
         let path = self.canonical(path);
-        let prefix = if path.is_empty() {
+        let mut key = if path.is_empty() {
             name.to_string()
         } else {
             format!("{path}.{name}")
         };
-        self.inner
-            .elements
-            .keys()
-            .any(|key| key == &prefix || key == &format!("{prefix}[x]"))
+        if self.inner.elements.contains_key(key.as_str()) {
+            return true;
+        }
+        key.push_str("[x]");
+        self.inner.elements.contains_key(key.as_str())
     }
 
     /// `code` is a `string`. `boolean` is not a `Boolean`.
@@ -185,4 +189,142 @@ impl Model {
 
 pub fn simple_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name).trim_matches('`')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn model() -> Model {
+        let element = |path: &str, code: &str| json!({"path": path, "type": [{"code": code}]});
+        Model::from_definitions(&[
+            json!({"name": "Patient", "snapshot": {"element": [
+                {"path": "Patient"},
+                element("Patient.gender", "code"),
+                element("Patient.name", "HumanName"),
+                element("Patient.deceased[x]", "boolean"),
+                element("Patient.contact", "BackboneElement"),
+                element("Patient.contact.name", "HumanName"),
+            ]}}),
+            json!({"name": "HumanName", "snapshot": {"element": [
+                element("HumanName.family", "string"),
+                element("HumanName.given", "string"),
+            ]}}),
+            json!({"name": "Observation", "snapshot": {"element": [
+                element("Observation.value[x]", "Quantity"),
+                element("Observation.component", "BackboneElement"),
+                {"path": "Observation.component.component", "contentReference": "#Observation.component"},
+            ]}}),
+        ])
+    }
+
+    // The scans these replaced, kept as the reference the lookups must agree with.
+    fn known_child_by_scan(model: &Model, path: &str, name: &str) -> bool {
+        let path = model.canonical(path);
+        let prefix = if path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{path}.{name}")
+        };
+        model
+            .inner
+            .elements
+            .keys()
+            .any(|key| key == &prefix || key == &format!("{prefix}[x]"))
+    }
+
+    fn has_descendants_by_scan(model: &Model, path: &str) -> bool {
+        let path = model.canonical(path);
+        let prefix = format!("{path}.");
+        model
+            .inner
+            .elements
+            .keys()
+            .any(|key| key.starts_with(&prefix))
+    }
+
+    fn is_choice_by_scan(model: &Model, path: &str, name: &str) -> bool {
+        model
+            .inner
+            .elements
+            .contains_key(&format!("{path}.{name}[x]"))
+            || model
+                .inner
+                .elements
+                .keys()
+                .any(|key| key == &format!("{name}[x]"))
+    }
+
+    #[test]
+    fn known_child_finds_elements_and_the_base_of_a_choice() {
+        let model = model();
+        assert!(model.known_child("Patient", "gender"));
+        assert!(model.known_child("Patient", "deceased"), "deceased[x]");
+        assert!(model.known_child("Observation", "value"), "value[x]");
+        assert!(
+            !model.known_child("Patient.name", "family"),
+            "HumanName.family belongs to the type, not to the path Patient.name"
+        );
+        assert!(!model.known_child("Patient", "gendr"));
+        assert!(!model.known_child("Patient", "gender.x"));
+        // With no path the name is the whole key.
+        assert!(model.known_child("", "Patient.gender"));
+        assert!(
+            !model.known_child("", "Patient"),
+            "a root without a type is not an element"
+        );
+        // A repeated backbone keeps the original element's children.
+        assert!(model.known_child("Observation.component.component", "component"));
+    }
+
+    #[test]
+    fn has_descendants_looks_only_below_the_path() {
+        let model = model();
+        assert!(model.has_descendants("Patient"));
+        assert!(model.has_descendants("Patient.contact"));
+        assert!(!model.has_descendants("Patient.gender"), "a leaf");
+        assert!(
+            !model.has_descendants("Patient.gend"),
+            "a prefix of a name is not a parent"
+        );
+        assert!(!model.has_descendants("Pat"));
+        assert!(!model.has_descendants("Zebra"));
+    }
+
+    #[test]
+    fn the_lookups_agree_with_the_scans_they_replaced() {
+        let model = model();
+        let keys: Vec<String> = model.inner.elements.keys().cloned().collect();
+        let mut paths: Vec<String> = vec![String::new(), "Zebra".into(), "Patient.gend".into()];
+        let mut names: Vec<String> = vec!["".into(), "x".into(), "value".into(), "family".into()];
+        for key in &keys {
+            paths.push(key.clone());
+            paths.push(key.trim_end_matches("[x]").to_string());
+            if let Some((parent, leaf)) = key.rsplit_once('.') {
+                paths.push(parent.to_string());
+                names.push(leaf.trim_end_matches("[x]").to_string());
+                names.push(leaf.to_string());
+            }
+        }
+        for path in &paths {
+            assert_eq!(
+                model.has_descendants(path),
+                has_descendants_by_scan(&model, path),
+                "has_descendants({path:?})"
+            );
+            for name in &names {
+                assert_eq!(
+                    model.known_child(path, name),
+                    known_child_by_scan(&model, path, name),
+                    "known_child({path:?}, {name:?})"
+                );
+                assert_eq!(
+                    model.is_choice(path, name),
+                    is_choice_by_scan(&model, path, name),
+                    "is_choice({path:?}, {name:?})"
+                );
+            }
+        }
+    }
 }
