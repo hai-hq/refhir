@@ -1,0 +1,47 @@
+{{- include "refhir.checkCluster" . -}}
+{{- if .Values.cluster.enabled }}
+# Every writer pod starts as a standby; the one that takes the writer lease serves.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "refhir.fullname" . }}-writers
+  labels:
+    {{- include "refhir.labels" . | nindent 4 }}
+    refhir.io/component: writer
+spec:
+  replicas: {{ .Values.cluster.writers }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "refhir.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      refhir.io/component: writer
+  template:
+    metadata:
+      labels:
+        {{- include "refhir.labels" . | nindent 8 }}
+        refhir.io/component: writer
+    spec:
+      {{- include "refhir.pod" (dict "root" . "role" "writer" "data" "empty") | nindent 6 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "refhir.fullname" . }}-replicas
+  labels:
+    {{- include "refhir.labels" . | nindent 4 }}
+    refhir.io/component: replica
+spec:
+  replicas: {{ .Values.cluster.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "refhir.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      refhir.io/component: replica
+  template:
+    metadata:
+      labels:
+        {{- include "refhir.labels" . | nindent 8 }}
+        refhir.io/component: replica
+    spec:
+      {{- include "refhir.pod" (dict "root" . "role" "replica" "data" "empty") | nindent 6 }}
+{{- end }}

@@ -18,7 +18,9 @@ function openSocket(options: DialOptions): (wsURL: string) => Promise<SocketConn
 
 export async function dial(baseURL: string, options: DialOptions = {}): Promise<Client> {
   const { httpBase, wsURL } = splitBase(baseURL);
-  return Client.connect(httpBase, wsURL, options.token, openSocket(options));
+  return Client.connect(httpBase, wsURL, options.token, openSocket(options), {
+    readYourWrites: options.readYourWrites,
+  });
 }
 
 /** Explicit browser entry (e.g. bundlers that define `process`). */

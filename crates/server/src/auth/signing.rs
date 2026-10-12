@@ -35,11 +35,24 @@ const ENCRYPTED_HEADER: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
 /// invalidate every token already issued. These cases are returned as errors, not panics, so
 /// startup can report them and a request that needs the key can answer with a 500.
 pub(crate) fn load_or_create(store: &dyn AuthStore) -> Result<ServerKeys, String> {
+    load(store, true)
+}
+
+/// Load the stored signing key and never write one. A process that only reads (a replica)
+/// uses this: it must not create a key the writer would then have to throw away, nor
+/// re-encrypt or replace one that is there.
+pub(crate) fn load_existing(store: &dyn AuthStore) -> Result<ServerKeys, String> {
+    load(store, false)
+}
+
+fn load(store: &dyn AuthStore, create: bool) -> Result<ServerKeys, String> {
     let passphrase = std::env::var("REFHIR_SIGNING_KEY_PASSPHRASE")
         .ok()
         .filter(|value| !value.is_empty());
-    load_or_create_with(store, passphrase.as_deref())
+    load_with(store, passphrase.as_deref(), create)
 }
+
+const NO_KEY_YET: &str = "the smart signing key has not been created yet; start the primary first";
 
 fn seal(key: &RsaPrivateKey, passphrase: Option<&str>) -> String {
     let pem = match passphrase {
@@ -57,9 +70,18 @@ fn seal(key: &RsaPrivateKey, passphrase: Option<&str>) -> String {
     serde_json::to_string(&pem).expect("pem json")
 }
 
+#[cfg(test)]
 fn load_or_create_with(
     store: &dyn AuthStore,
     passphrase: Option<&str>,
+) -> Result<ServerKeys, String> {
+    load_with(store, passphrase, true)
+}
+
+fn load_with(
+    store: &dyn AuthStore,
+    passphrase: Option<&str>,
+    create: bool,
 ) -> Result<ServerKeys, String> {
     loop {
         match store.auth_get(SIGNING_KEY, ACTIVE, 0) {
@@ -79,7 +101,7 @@ fn load_or_create_with(
                 }
                 match RsaPrivateKey::from_pkcs8_pem(&pem) {
                     Ok(key) => {
-                        if passphrase.is_some() {
+                        if passphrase.is_some() && create {
                             // Encrypt a key that was stored before a passphrase was set.
                             if let Err(err) = store.auth_put(
                                 SIGNING_KEY,
@@ -92,14 +114,24 @@ fn load_or_create_with(
                         }
                         return Ok(keys_from_rsa(&key));
                     }
+                    Err(_) if !create => {
+                        return Err(
+                            "the stored smart signing key is invalid; the primary replaces it"
+                                .into(),
+                        );
+                    }
                     Err(err) => {
                         let backup = format!("{ACTIVE}.corrupt-{}", super::oauth::now());
                         tracing::error!(
                             "smart signing key is invalid ({err}); generating a new one, old key kept as {backup}"
                         );
+                        // Remove the bad row only if it is still the bad row: another server
+                        // may have replaced it with a good key since this one read it.
                         store
                             .auth_put(SIGNING_KEY, &backup, &json, u64::MAX)
-                            .and_then(|_| store.auth_take(SIGNING_KEY, ACTIVE, 0).map(drop))
+                            .and_then(|_| {
+                                store.auth_delete_if(SIGNING_KEY, ACTIVE, &json).map(drop)
+                            })
                             .map_err(|err| {
                                 format!(
                                     "the invalid smart signing key could not be set aside: {err}"
@@ -108,6 +140,7 @@ fn load_or_create_with(
                     }
                 }
             }
+            Ok(None) if !create => return Err(NO_KEY_YET.into()),
             Ok(None) => {}
             Err(err) => return Err(format!("smart signing key could not be read: {err}")),
         }

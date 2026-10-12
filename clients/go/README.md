@@ -130,6 +130,12 @@ refhir.Dial(ctx, baseURL, refhir.Bearer(accessToken))
 
 `Bearer` sets `Authorization` on the WebSocket upgrade and on `Metadata` / `Do`.
 
+```go
+refhir.Dial(ctx, baseURL, refhir.WithReadYourWrites(false)) // default: on
+```
+
+`WithReadYourWrites` controls [read-your-writes](#read-your-writes) for REST calls.
+
 Always call `Close` when finished. It tears down watches and the background session loop.
 
 ## Watches
@@ -232,6 +238,21 @@ body, err := client.Do(ctx, http.MethodGet, "/Patient/p1", nil)
 ```
 
 Non-2xx responses return `*refhir.HTTPError` with `Status` and `Body`.
+
+### Read-your-writes
+
+Against a replica, a read right after a write could be served before the replica has applied that write. To avoid that, the client tracks the highest commit timestamp it has seen:
+
+- `X-Refhir-Commit-Ts` on every REST response (`Do`, `Metadata`)
+- `ts` on every successful `/sync` `MutationResponse` (`Create`, `Update`, `Delete`, `Transaction`, `Mutate`)
+
+and sends it as `X-Refhir-Min-Ts` on every later REST request. The server holds the read until it has caught up to that timestamp, or forwards it to the primary. The timestamp only moves up; a stale response never lowers it.
+
+```go
+ts := client.LastCommitTs() // 0 until the server has reported one
+```
+
+This is on by default. `WithReadYourWrites(false)` stops the header from being sent; `LastCommitTs` still tracks. Watches are not affected: they follow committed state over `/sync`.
 
 ## Reconnect
 

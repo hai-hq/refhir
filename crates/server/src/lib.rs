@@ -1,6 +1,7 @@
 //! Axum HTTP and the `/sync` websocket. Both call `refhir_fhir::run`.
 
 mod auth;
+mod cluster;
 mod graphql;
 mod http;
 mod jobs;
@@ -14,6 +15,7 @@ use refhir_fhir::{Catalog, ConformanceStore};
 use tokio::net::TcpListener;
 
 pub use auth::{OidcConfig, SmartStore};
+pub use cluster::{bootstrap_router, serve_bootstrap, Bootstrap};
 pub use http::{app, app_with, AppState, ServerConfig};
 pub use jobs::SharedJobStore;
 

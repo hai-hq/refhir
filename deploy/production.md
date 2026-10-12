@@ -127,6 +127,53 @@ Tested against MinIO. Installing the default packages on a fresh database took a
 - Mount a persistent volume at `/data/export` and pull files out of band, or
 - Front ReFHIR with a job that copies completed files to object storage (future native support).
 
+## Availability and read scaling
+
+One process is a single point of failure. On Postgres you can run a **standby** that takes over
+within about a second when the primary is gone (it keeps its catalog loaded while it waits, so
+takeover does not wait for that), and **replicas** that serve reads:
+
+- `refhir --postgres $URL` is the primary. It holds a lease on the database and refuses to start
+  while another primary has it.
+- `refhir --postgres $URL --standby` waits for the lease and then starts serving.
+- `refhir --postgres $URL --role replica --primary-url http://<primary-or-balancer>` serves reads
+  and sends writes to the primary.
+
+Put a load balancer in front that checks `GET /healthz` (200 means it can take traffic, 503 means
+it cannot) and sends nothing to a process that answers 503. Give replicas a `--primary-url` that
+always reaches the current primary, such as a second balancer port that routes only to the process
+whose `/healthz` says `"role":"primary"`. A ready-made Compose file and HAProxy configuration are
+in [cluster/](cluster/README.md), and the Helm chart has `cluster.enabled`.
+
+Things to know before relying on it:
+
+- **Same secrets everywhere.** With SMART on, every process needs the same
+  `REFHIR_SMART_DCR_TOKEN` and `REFHIR_SMART_CONFIDENTIAL_SECRET`; standbys and replicas refuse to
+  start without them. Set `REFHIR_SIGNING_KEY_PASSPHRASE` the same on every process too.
+- **A sign-in can be lost to a crash.** While a user is at the identity provider, the pending
+  login is held by the process that started it, and the callback takes it, asks the provider,
+  and puts it back. If that process dies in those moments the user simply signs in again.
+  Nothing is issued twice and no token is lost.
+- **Revocation is not instant on other processes.** Each process caches token lookups for two
+  seconds, so a revoked token may still work on another process for up to that long.
+- **Replicas are slightly behind.** They follow the primary within tens of milliseconds. Clients
+  that must read their own writes send `X-Refhir-Min-Ts` (the Go and TypeScript clients do).
+  The SMART patient picker reads the replica's own snapshot, so a patient created a moment ago can
+  be missing from it until the replica refreshes (accepted by design). A request that must see it
+  sends `X-Refhir-Min-Ts` like any other: `/oauth/*` goes through the same gate, so a replica that
+  is behind hands the request to the primary. A replica with no `--primary-url` cannot hand it
+  over, so it answers `503` with `Retry-After: 1` instead of an older snapshot.
+- **Database connections.** Each process opens up to `REFHIR_DB_POOL` (default 8) Postgres
+  connections, and a writer keeps one more for its lease. Size Postgres `max_connections` for all of them.
+- **Failure behaviour.** A writer that loses its lease, or finds a newer writer in the database,
+  exits (codes 70 and 71) rather than risk a second writer. Run it under a supervisor that
+  restarts it; it comes back as a standby if started with `--standby`.
+- **Backfills resume.** A new search parameter's index is built in the background and the
+  parameter is searchable only when it finishes. If the primary dies part way, the standby that
+  takes over claims the job and continues from where it stopped. Replicas do not see the
+  parameter until the job is complete.
+- **Export jobs and Subscription delivery** belong to the primary.
+
 ## Install the binary without Docker
 
 The crate is not on crates.io yet (`publish = false` in the workspace). Install from GitHub:

@@ -21,4 +21,11 @@ export {
   transaction,
 } from "./helpers.js";
 
-export { metadata, doRequest } from "./rest.js";
+export {
+  metadata,
+  doRequest,
+  requestWithHeaders,
+  COMMIT_TS_HEADER,
+  MIN_TS_HEADER,
+} from "./rest.js";
+export type { RestResponse } from "./rest.js";
