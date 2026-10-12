@@ -158,6 +158,71 @@ before applying `_count`; it was not needed to meet the criterion and the profil
   discarded. The script now refuses to run if something is already listening, and fails if the
   server does not report the requested pool size.
 
+## Search: the cost no longer grows with the matches
+
+After the `known_child` fix `search()` still had three costs that grew with the number of
+*matches*, not with `_count`: it read every row in the index range with its document (decoded), it
+evaluated the parameter against each of those documents again even though the index had already
+selected them, and it copied, sorted and counted every match before cutting the result to the page.
+
+What changed (`crates/fhir/src/search.rs`, `crates/database/src/transaction.rs`,
+`PersistenceReader::index_scan_ids`):
+
+- **Rows.** When the index range decides every clause, only the keys and document ids of the range
+  are read (no join to `documents`, no JSON), and only the page's documents are fetched. The scan
+  reads the index table straight in key order, so with `_total=none` and a `_count` it stops one
+  row after the page instead of listing the range. The read recorded for conflict detection is
+  still the whole range.
+- **Re-check.** A string, token, reference or uri parameter read from a path is "proven" by its
+  range (the keys are written from the very values the check compares), so the clause the range
+  was chosen for is not evaluated again. Every other clause, the date and number kinds, any
+  modifier, `_sort`, `_compartment`, chains and `_has` are still checked, and so is any expression
+  that asks the world something when it is read (`resolve()`, the clock, a profile, a value set).
+- **Whole result.** Rows are decoded one at a time, only the page is kept, and without `_sort`
+  nothing is copied or sorted. Without a wanted total the scan ends once the page and one more match
+  are found.
+
+Measured on a SQLite database of 22,000 patients, 2,000 per family name, one query at a time, p50
+latency in ms, two alternating rounds (`scripts/perf-search.sh`; the machine was busy, so the second
+round is slower throughout):
+
+| Query | before, round 1 / 2 | after, round 1 / 2 |
+|---|---|---|
+| `family=X&_count=10` | 107.5 / 94.1 | 30.3 / 22.0 |
+| `family=X&_count=10&_total=none` | 105.3 / 97.4 | **3.5 / 2.7** |
+| `family=X&_count=10&_offset=1000` | 108.3 / 97.1 | 11.8 / 18.6 |
+| the same, `_total=none` | 101.7 / 107.4 | **7.1 / 11.1** |
+| `family=X&_summary=count` | 111.9 / 101.5 | 21.1 / 37.5 |
+| `_count=10`, no filter | 515.5 / 503.2 | 109.1 / 174.7 |
+| `_count=10&_total=none`, no filter | 485.7 / 1731.6 | **1.4 / 3.8** |
+| `family=X&name=<prefix>&_count=10&_total=none` (second clause checked, all match) | 158.6 / 164.5 | 29.2 / 50.0 |
+| `family=X&name=<prefix>&_count=10` (exact total) | 169.6 / 148.7 | 80.1 / 156.5 |
+| `family=X&birthdate=ge1900-01-01&_count=10` (second clause checked, none match) | 95.2 / 86.5 | 79.1 / 148.2 |
+
+What improved: a search the index decides is about 3 to 9x cheaper with an exact total and 10 to
+450x cheaper without one (the larger the range, the larger the saving). What did **not**: a search with a clause the index cannot decide, with an exact
+total, still has to evaluate that clause on every row of the range, and there is no saving there
+(the last two rows, within the noise of the machine). With `_total=none` and a second clause the
+scan stops early but still reads its whole candidate range with the documents in one query, so
+it is 3 to 5x cheaper, not 50x. An exact total still counts the range: 5 to 8 microseconds a row
+on SQLite, from the no-filter rows above (22,000 rows in 109 to 175 ms).
+
+The assumption this adds: the keys are trusted. They are written by the same extraction code that
+reads them, and a write tombstones every key that stops applying, so a live row means a matching
+document. Across a release that changes how a value becomes keys, rows saved by the older release
+keep their old keys until they are written again, and a search will no longer set aside the ones
+that would not match now (its second check used to). Re-index after such a release.
+
+How it is held to the old behaviour: `search_reference` keeps the previous implementation for
+tests, and 817 Patient and 72 Observation queries (every combination of the parameters, paging,
+`_total`, `_summary`, `_sort`, `_include`/`_revinclude`, modifiers and boundary dates, over data
+with updated, deleted and multi-key documents) must return the same bundle and record the same
+reads; an oracle that does not use either implementation checks the matches; counters assert that
+a page of 10 among 300 matches decodes 10 documents and that `_total=none` reads 11 rows; and the
+storage conformance test (SQLite and Postgres) checks the id-only scan against the full scan across
+timestamps, intervals, both orders and limits, with moved keys, deleted and re-created documents,
+and a key rewritten thirty times that a chunked read has to resume in the middle of.
+
 ## Phase 3: what the published-up-to watermark costs
 
 The same commits through Postgres with and without the watermark write (`bench_watermark`,

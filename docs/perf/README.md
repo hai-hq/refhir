@@ -87,3 +87,11 @@ PERF_DB_URL=postgres://postgres:refhir@127.0.0.1:5432/emptydb scripts/perf-crite
 ```
 
 Pairs on a shared machine are noisy, so judge the median, not one run.
+
+## 6. How a search scales with its matches
+
+`scripts/perf-search.sh [--patients N] BINARY [BINARY...]` seeds a SQLite database (default 20,000
+patients, ten family names), starts each binary on a copy of it and times a set of searches over
+the family with the most matches: p50, p95 and the server's CPU per query. Give it the binary
+before and after a change, and `ROUNDS=2` to alternate and repeat. Results and the story are in
+`baseline.md` ("Search: the cost no longer grows with the matches").
