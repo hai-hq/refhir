@@ -1,0 +1,7 @@
+{
+  "name": "hl7.fhir.uv.xver-r5.r4",
+  "version": "0.1.0",
+  "fhirVersions": ["4.0.1"],
+  "type": "IG",
+  "description": "A cross-version package: R4 definitions that carry R5 content. It holds 5.0.0 of R4's own encounter-status code system, with the same URL as the one in hl7.fhir.r4.core."
+}

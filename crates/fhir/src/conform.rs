@@ -12,7 +12,7 @@ use refhir_persistence::{
     ParamStatus, StoredSearchParameter, StoredTerminology,
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
-use refhir_validate::{MemoryTerminology, TerminologyChange};
+use refhir_validate::{winning_scopes, MemoryTerminology, TerminologyChange};
 use serde_json::Value;
 
 use crate::error::FhirError;
@@ -88,6 +88,13 @@ pub fn repair_conformance(
         if delete_orphan_terminology(store, local_id, type_name, &keys)? {
             term_dirty = true;
         }
+    }
+    // Expansions stored under other rules are rebuilt once, here: a database that ran the previous
+    // version's rebuild has expansions read from one pool for every package (R5's encounter-status
+    // codes for R4's value set), and nothing else would ever replace them. The rebuild writes the
+    // current rules, so the next start finds nothing to do.
+    if catalog.read().expect("catalog").expansions_stale() {
+        term_dirty = true;
     }
     if term_dirty {
         sync_expansions(store)?;
@@ -703,11 +710,19 @@ fn apply_terminology(
         removed: removed.to_vec(),
     };
     let urls = change.urls();
-    // Stored rows of the value sets that depend on the change, by canonical URL. A URL can be
-    // held by more than one package; the last one is the one a full rebuild expands, the first
-    // is the one that owns the stored expansion.
-    let mut dependents: BTreeMap<String, Value> = BTreeMap::new();
+    // Stored rows of the value sets that depend on the change, by canonical URL, with the package
+    // of each. A URL can be held by more than one package, and the package whose definition is in
+    // use (a rebuild expands that one) is the one that holds the stored expansion: it is the row a
+    // start reads.
+    let release = catalog
+        .read()
+        .expect("catalog")
+        .terms()
+        .release()
+        .map(str::to_string);
+    let mut dependents: BTreeMap<String, Vec<(i64, Value)>> = BTreeMap::new();
     let mut owners: HashMap<String, i64> = HashMap::new();
+    let mut holders: HashMap<String, Vec<i64>> = HashMap::new();
     for url in &urls {
         owners.insert(url.clone(), local_id);
     }
@@ -724,13 +739,15 @@ fn apply_terminology(
             .collect();
         if !missing.is_empty() {
             for row in store.load_terminology_for(&missing)? {
+                if row.resource_type != "ValueSet" {
+                    continue;
+                }
                 let url = canonical_url(&row.url).to_string();
-                owners.entry(url.clone()).or_insert(row.package_id);
-                dependents.insert(
-                    url,
+                dependents.entry(url).or_default().push((
+                    row.package_id,
                     serde_json::from_str::<Value>(&row.json)
                         .map_err(|err| FhirError::Invalid(format!("terminology json: {err}")))?,
-                );
+                ));
             }
             // The catalog says these depend on the change, so their rows must exist. If one
             // does not, the catalog and the store disagree, and only a full rebuild settles it.
@@ -739,6 +756,21 @@ fn apply_terminology(
                     "value set {absent} is in the catalog but not in the store"
                 )));
             }
+            let rows: Vec<(i64, &Value)> = missing
+                .iter()
+                .flat_map(|url| dependents[url].iter())
+                .map(|(package, row)| (*package, row))
+                .collect();
+            owners.extend(winning_scopes(&rows, release.as_deref()));
+            for url in &missing {
+                holders.insert(
+                    url.clone(),
+                    dependents[url]
+                        .iter()
+                        .map(|(package, _)| *package)
+                        .collect(),
+                );
+            }
         }
         let mut guard = catalog.write().expect("catalog");
         // Another writer may have changed what depends on this since it was read.
@@ -746,19 +778,38 @@ fn apply_terminology(
         if wanted.iter().any(|url| !dependents.contains_key(url)) {
             continue;
         }
-        let loaded: Vec<Value> = wanted
+        let loaded: Vec<(i64, &Value)> = wanted
             .iter()
-            .filter_map(|url| dependents.get(url).cloned())
+            .flat_map(|url| dependents.get(url).into_iter().flatten())
+            .map(|(package, row)| (*package, row))
             .collect();
-        let updates = guard.terms_mut().apply(&change, &loaded);
-        let changes: Vec<ExpansionChange> = updates
-            .into_iter()
-            .map(|update| ExpansionChange {
-                package_id: owners.get(&update.url).copied().unwrap_or(local_id),
-                url: update.url,
-                json: update.document.map(|document| document.to_string()),
-            })
-            .collect();
+        let updates = guard.terms_mut().apply_scoped(&change, local_id, &loaded);
+        let mut changes: Vec<ExpansionChange> = Vec::new();
+        for update in updates {
+            let owner = owners.get(&update.url).copied().unwrap_or(local_id);
+            match update.document {
+                Some(document) => changes.push(ExpansionChange {
+                    package_id: owner,
+                    url: update.url,
+                    json: Some(document.to_string()),
+                }),
+                // Nothing answers for it now, so no package may keep an expansion that a start
+                // would fall back to.
+                None => {
+                    let mut stored_in = holders.get(&update.url).cloned().unwrap_or_default();
+                    if !stored_in.contains(&owner) {
+                        stored_in.push(owner);
+                    }
+                    for package_id in stored_in {
+                        changes.push(ExpansionChange {
+                            package_id,
+                            url: update.url.clone(),
+                            json: None,
+                        });
+                    }
+                }
+            }
+        }
         store.apply_expansions(&changes)?;
         return Ok(());
     }
@@ -767,24 +818,35 @@ fn apply_terminology(
 fn sync_expansions(store: &dyn ConformanceStore) -> Result<(), FhirError> {
     let terminology = store.load_terminology()?;
     let existing = store.load_expansions()?;
+    // The release the first package was written for, as the catalog takes it. Without it an
+    // unversioned include would read the highest version of a code system, and a package that
+    // carries another release's copy (`hl7.fhir.uv.xver-r5.r4` has `5.0.0` of R4's
+    // `encounter-status`) would change what R4's own value sets mean.
+    let release = store
+        .load_packages()?
+        .first()
+        .map(|package| package.fhir_version.clone());
     let mut resources = Vec::new();
-    let mut owners: HashMap<String, i64> = HashMap::new();
+    let mut packages = Vec::new();
     let mut by_package: BTreeMap<i64, Vec<NewExpansion>> = BTreeMap::new();
     for row in &terminology {
         by_package.entry(row.package_id).or_default();
         let value: Value = serde_json::from_str(&row.json)
             .map_err(|err| FhirError::Invalid(format!("terminology json: {err}")))?;
-        if let Some(url) = value.get("url").and_then(|item| item.as_str()) {
-            owners
-                .entry(canonical_url(url).to_string())
-                .or_insert(row.package_id);
-        }
         resources.push(value);
+        packages.push(row.package_id);
     }
     for row in &existing {
         by_package.entry(row.package_id).or_default();
     }
-    for document in MemoryTerminology::expansion_documents(&resources) {
+    // Every package's resources together, but each value set read with the code systems and
+    // value sets of its own package first, which is how installing the package expanded it. A
+    // rebuild that read one pool would give a value set another package's copy of a code system.
+    let scoped: Vec<(i64, &Value)> = packages.iter().copied().zip(&resources).collect();
+    // The package whose definition of a value set is in use holds its stored expansion, because
+    // that is the row a start reads for it.
+    let owners = winning_scopes(&scoped, release.as_deref());
+    for document in MemoryTerminology::expansion_documents_scoped(&scoped, release.as_deref()) {
         let Some(url) = document.get("url").and_then(|value| value.as_str()) else {
             continue;
         };

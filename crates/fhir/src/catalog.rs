@@ -11,7 +11,7 @@ use refhir_persistence::{
     ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
 };
 use refhir_types::{exact_key, IndexId, TabletId};
-use refhir_validate::{MemoryTerminology, Schema};
+use refhir_validate::{expansion_is_current, MemoryTerminology, Schema};
 use serde_json::{json, Value};
 
 use crate::compartment::{self, Compartment};
@@ -147,6 +147,9 @@ pub struct Catalog {
     /// Whether a PUT to an id that does not exist creates it under that id. Off by default: the
     /// server assigns ids.
     update_create: bool,
+    /// Whether any stored expansion was made under other rules than the current ones, so that it
+    /// may be wrong and the stored expansions need rebuilding.
+    stale_expansions: bool,
 }
 
 impl Catalog {
@@ -161,6 +164,7 @@ impl Catalog {
             compartments: compartment::load(&[]),
             sdc_archiver: false,
             update_create: false,
+            stale_expansions: false,
         }
     }
 
@@ -187,9 +191,24 @@ impl Catalog {
         let definition_json = parse_all(definitions, |row| &row.json, "structure definition json")?;
         let term_json = parse_all(terminology, |row| &row.json, "terminology json")?;
         let expansion_json = parse_all(expansions, |row| &row.json, "value set expansion json")?;
+        // Each resource with the package it came from, so a value set reads the code systems of
+        // its own package first, as installing the package expanded it.
+        let scoped: Vec<(i64, &serde_json::Value)> = terminology
+            .iter()
+            .map(|row| row.package_id)
+            .zip(&term_json)
+            .collect();
+        // Each stored expansion with the package that stored it, so that a value set more than one
+        // package defines is answered by the definition in use, not by the package installed last.
+        let stored: Vec<(i64, &serde_json::Value)> = expansions
+            .iter()
+            .map(|row| row.package_id)
+            .zip(&expansion_json)
+            .collect();
         let (schema, terms) = std::thread::scope(|scope| {
             let schema = scope.spawn(|| Schema::from_definitions(&definition_json));
-            let terms = MemoryTerminology::from_stored(&term_json, &expansion_json);
+            let terms =
+                MemoryTerminology::from_stored_scoped(&scoped, &stored, fhir_version.as_deref());
             (schema.join().expect("schema build"), terms)
         });
         let mut types = BTreeMap::new();
@@ -272,7 +291,17 @@ impl Catalog {
             compartments: compartment::load(&term_json),
             sdc_archiver: false,
             update_create: false,
+            stale_expansions: expansion_json
+                .iter()
+                .any(|document| !expansion_is_current(document)),
         })
+    }
+
+    /// Whether any stored expansion was made under other rules than the current ones. A database
+    /// the previous version rebuilt has expansions read from one pool for every package, and
+    /// nothing else would ever correct them.
+    pub fn expansions_stale(&self) -> bool {
+        self.stale_expansions
     }
 
     pub fn reference_policy(&self) -> ReferencePolicy {

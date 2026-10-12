@@ -1,0 +1,11 @@
+{
+  "resourceType": "ValueSet",
+  "id": "allerg-intol-substance-exp-risk",
+  "url": "http://hl7.org/fhir/ValueSet/allerg-intol-substance-exp-risk",
+  "version": "5.3.0-ballot-tc1",
+  "name": "AllergyIntoleranceSubstanceExposureRisk",
+  "status": "active",
+  "compose": {
+    "include": [{"system": "http://hl7.org/fhir/allerg-intol-substance-exp-risk"}]
+  }
+}
