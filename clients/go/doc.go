@@ -8,6 +8,11 @@
 // or Transaction for writes. Resource bodies are encoding/json.RawMessage; the
 // server validates against its installed FHIR packages.
 //
+// REST calls made with Do and Metadata echo the highest commit timestamp seen
+// (X-Refhir-Commit-Ts, or ts on /sync mutations) as X-Refhir-Min-Ts so a replica
+// never serves a read older than this client's own writes. See LastCommitTs and
+// WithReadYourWrites.
+//
 // See README.md in this directory for examples, operation arguments, and
 // reconnect behavior.
 package refhir

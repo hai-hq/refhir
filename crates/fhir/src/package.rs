@@ -15,6 +15,7 @@ use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::MemoryTerminology;
 use serde_json::Value;
 
+use crate::catalog::CatalogClock;
 use crate::catalog::{pending_index_keys, Catalog};
 use crate::error::FhirError;
 use crate::extract;
@@ -153,9 +154,11 @@ fn stage_package(
     if publish_now {
         publish(store, catalog)?;
     }
-    // Installing a large package takes a while; say where the time went.
+    // Installing a large package takes a while; say where the time went. The readings are taken
+    // in quick succession, and a monotonic clock on a virtual machine can read slightly earlier
+    // the second time, so the differences saturate at zero instead of panicking over a log line.
     let catalog_time = if publish_now {
-        format!(", catalog {:.1?}", started.elapsed() - stored)
+        format!(", catalog {:.1?}", started.elapsed().saturating_sub(stored))
     } else {
         String::new()
     };
@@ -165,7 +168,7 @@ fn stage_package(
         package.structure_definitions.len(),
         package.search_parameters.len(),
         package.terminology.len(),
-        stored - read,
+        stored.saturating_sub(read),
     );
     if !outcome.inserted {
         return Ok(None);
@@ -193,6 +196,12 @@ pub fn run_backfills(
     let jobs = store.load_backfills().map_err(FhirError::from)?;
     let mut refreshed = false;
     for job in jobs.into_iter().filter(|job| !job.done) {
+        // This writer owns the job from here. If an earlier writer died with it half done, the
+        // claim moves to this one and the cursor tells where to resume; if a newer writer has
+        // already claimed it, this process is the stale one and is refused.
+        if !store.claim_backfill(job.id).map_err(FhirError::from)? {
+            continue;
+        }
         let watermark = Timestamp::from_i64(job.watermark_ts)
             .map_err(|_| FhirError::Storage("bad backfill watermark".into()))?;
         let old_keys = index_keys_for_pending(db, catalog, &job.tablet)?;
@@ -248,9 +257,133 @@ pub(crate) fn publish(
     let mut loaded = Catalog::open(store)?;
     loaded.set_reference_policy(policy);
     loaded.set_sdc_archiver(archiver);
+    let stable = !loaded.has_pending_parameters();
     loaded.set_update_create(update_create);
     *catalog.write().expect("catalog") = loaded;
+    // Tell the other processes the conformance tables changed. Every change moves the revision,
+    // which a standby follows. The version, which replicas follow, moves only when no search
+    // parameter is waiting for its backfill: while one is, this publish is skipped, and the one
+    // that follows the backfill's completion bumps it. So a replica never loads a parameter whose
+    // index is not complete.
+    store.bump_catalog_revision()?;
+    if stable {
+        store.bump_catalog_version()?;
+    }
     Ok(())
+}
+
+/// Rebuild `catalog` from the store if its version moved since `loaded_version`, keeping the
+/// settings that are not stored (reference policy, archiver mode). Returns the version the
+/// catalog now reflects. A replica calls this when another process changed the catalog, and a
+/// standby calls it once more when it takes over.
+pub fn reload_catalog(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+    loaded_version: u64,
+    clock: CatalogClock,
+) -> Result<u64, FhirError> {
+    // Nothing to do, and nothing worth the seconds a full load takes, if the clock stands.
+    if clock.read(store)? == loaded_version {
+        return Ok(loaded_version);
+    }
+    let (fresh, version) = Catalog::open_consistent(store, clock)?;
+    let mut fresh = fresh;
+    {
+        let current = catalog.read().expect("catalog");
+        fresh.set_reference_policy(current.reference_policy());
+        fresh.set_sdc_archiver(current.sdc_archiver());
+        fresh.set_update_create(current.update_create());
+    }
+    *catalog.write().expect("catalog") = fresh;
+    Ok(version)
+}
+
+/// The thread that keeps a catalog in step with another process. See [`watch_catalog`].
+pub struct CatalogWatcher {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    loaded: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CatalogWatcher {
+    /// Stops watching and returns the catalog version the catalog was last loaded at. A standby
+    /// that is about to become the primary does this, then reloads once, so from then on only
+    /// its own changes touch the catalog.
+    pub fn stop(mut self) -> u64 {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.loaded.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Keep `catalog` in step with changes another process makes: poll the catalog version and
+/// reload in the background when it moves. The thread stops when the catalog is dropped or the
+/// returned watcher is stopped.
+pub fn watch_catalog(
+    store: std::sync::Arc<dyn ConformanceStore>,
+    catalog: &std::sync::Arc<RwLock<Catalog>>,
+    loaded_version: u64,
+    interval: std::time::Duration,
+    clock: CatalogClock,
+) -> CatalogWatcher {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+    let weak = Arc::downgrade(catalog);
+    let stop = Arc::new(AtomicBool::new(false));
+    let loaded = Arc::new(AtomicU64::new(loaded_version));
+    let (stopped, tracked) = (stop.clone(), loaded.clone());
+    let spawned = std::thread::Builder::new()
+        .name("refhir-catalog".into())
+        .spawn(move || loop {
+            // Sleep in slices so a stop request is honoured promptly.
+            let mut slept = std::time::Duration::ZERO;
+            while slept < interval {
+                if stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                let slice = std::time::Duration::from_millis(25).min(interval);
+                std::thread::sleep(slice);
+                slept += slice;
+            }
+            let Some(catalog) = weak.upgrade() else {
+                return;
+            };
+            let known = tracked.load(Ordering::SeqCst);
+            match clock.read(store.as_ref()) {
+                Ok(version) if version != known => {
+                    match reload_catalog(store.as_ref(), &catalog, known, clock) {
+                        Ok(now) => {
+                            tracing::info!(
+                                target: "refhir",
+                                "catalog reloaded at version {now} (was {known})"
+                            );
+                            tracked.store(now, Ordering::SeqCst);
+                        }
+                        Err(err) => {
+                            tracing::warn!(target: "refhir", "catalog reload failed: {err}")
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(target: "refhir", "catalog {clock:?} clock unreadable: {err}")
+                }
+            }
+        });
+    let thread = match spawned {
+        Ok(thread) => Some(thread),
+        Err(err) => {
+            tracing::error!(target: "refhir", "could not start the catalog watcher: {err}");
+            None
+        }
+    };
+    CatalogWatcher {
+        stop,
+        loaded,
+        thread,
+    }
 }
 
 pub(crate) fn live_ids(db: &Database, type_name: &str) -> Result<Vec<String>, FhirError> {

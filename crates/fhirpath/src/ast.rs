@@ -69,6 +69,28 @@ impl Expr {
         Self::Binary(op, Box::new(left), Box::new(right))
     }
 
+    /// Whether evaluating this expression can consult the [`Host`](crate::Host): it calls one of
+    /// [`HOST_FUNCTIONS`](crate::host::HOST_FUNCTIONS) or uses a `%variable`, which the host may
+    /// bind. Such an expression can give a different answer for the same resource at another time.
+    pub fn depends_on_host(&self) -> bool {
+        match self {
+            Self::Variable(_) => true,
+            Self::Call { name, focus, args } => {
+                crate::host::HOST_FUNCTIONS.contains(&name.as_str())
+                    || focus.as_ref().is_some_and(|focus| focus.depends_on_host())
+                    || args.iter().any(|arg| arg.depends_on_host())
+            }
+            Self::Member(focus, _)
+            | Self::Unary(_, focus)
+            | Self::Is(focus, _)
+            | Self::As(focus, _) => focus.depends_on_host(),
+            Self::Index(left, right) | Self::Binary(_, left, right) => {
+                left.depends_on_host() || right.depends_on_host()
+            }
+            _ => false,
+        }
+    }
+
     pub fn calls(&self, name: &str) -> bool {
         match self {
             Self::Call {

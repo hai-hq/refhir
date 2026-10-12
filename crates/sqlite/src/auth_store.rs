@@ -16,7 +16,7 @@ CREATE INDEX IF NOT EXISTS smart_oauth_by_exp ON smart_oauth (exp);
 
 impl AuthStore for SqlitePersistence {
     fn auth_put(&self, kind: &str, id: &str, json: &str, exp: u64) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .execute(
@@ -35,7 +35,7 @@ impl AuthStore for SqlitePersistence {
         exp: u64,
         now: u64,
     ) -> Result<bool, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let changed = guard
             .connection
             .execute(
@@ -49,7 +49,7 @@ impl AuthStore for SqlitePersistence {
     }
 
     fn auth_get(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.read()?;
         guard
             .connection
             .query_row(
@@ -62,7 +62,7 @@ impl AuthStore for SqlitePersistence {
     }
 
     fn auth_take(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let row: Option<(String, i64)> = guard
             .connection
             .query_row(
@@ -77,8 +77,20 @@ impl AuthStore for SqlitePersistence {
             .map(|(json, _)| json))
     }
 
+    fn auth_delete_if(&self, kind: &str, id: &str, json: &str) -> Result<bool, PersistError> {
+        let guard = self.inner.lock()?;
+        let deleted = guard
+            .connection
+            .execute(
+                "DELETE FROM smart_oauth WHERE kind = ?1 AND id = ?2 AND json = ?3",
+                params![kind, id, json],
+            )
+            .map_err(definite)?;
+        Ok(deleted == 1)
+    }
+
     fn auth_list(&self, kind: &str, now: u64) -> Result<Vec<String>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.read()?;
         let mut stmt = guard
             .connection
             .prepare("SELECT json FROM smart_oauth WHERE kind = ?1 AND exp > ?2 ORDER BY id")
@@ -92,7 +104,7 @@ impl AuthStore for SqlitePersistence {
     }
 
     fn auth_prune(&self, now: u64) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .execute(

@@ -51,7 +51,7 @@ impl JobStore for SqlitePersistence {
         now_ms: u64,
         lease: Option<JobLease<'_>>,
     ) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .execute(
@@ -99,7 +99,7 @@ impl JobStore for SqlitePersistence {
         values.extend(kinds.iter().map(|kind| SqlValue::Text(kind.to_string())));
         values.push(SqlValue::Integer(job_ms(now_ms)));
         values.push(SqlValue::Integer(i64::from(limit)));
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard.connection.prepare(&sql).map_err(definite)?;
         let rows = stmt
             .query_map(params_from_iter(values), read_job_row)
@@ -118,7 +118,7 @@ impl JobStore for SqlitePersistence {
         now_ms: u64,
         lease_ms: u64,
     ) -> Result<Option<StoredJob>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .query_row(
@@ -142,7 +142,7 @@ impl JobStore for SqlitePersistence {
         now_ms: u64,
         lease_ms: u64,
     ) -> Result<bool, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let changed = guard
             .connection
             .execute(
@@ -164,7 +164,7 @@ impl JobStore for SqlitePersistence {
         now_ms: u64,
     ) -> Result<bool, PersistError> {
         let end = plan_job_end(status, result, error, now_ms)?;
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let changed = guard
             .connection
             .execute(
@@ -185,7 +185,7 @@ impl JobStore for SqlitePersistence {
     }
 
     fn job_get(&self, id: &str) -> Result<Option<StoredJob>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .query_row(

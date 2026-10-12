@@ -39,7 +39,7 @@ impl JobStore for PostgresPersistence {
         lease: Option<JobLease<'_>>,
     ) -> Result<(), PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let owner = lease.map(|lease| lease.owner);
             let until = lease.map(|lease| lease_until(now_ms, lease.ms));
             guard
@@ -74,7 +74,7 @@ impl JobStore for PostgresPersistence {
             return Ok(Vec::new());
         }
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let kinds: Vec<String> = kinds.iter().map(|kind| kind.to_string()).collect();
             // The inner select locks the rows it picks and skips any another server has locked
             // in the middle of its own claim, so concurrent claimers each get different jobs
@@ -118,7 +118,7 @@ impl JobStore for PostgresPersistence {
         lease_ms: u64,
     ) -> Result<Option<StoredJob>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let row = guard
                 .client
                 .query_opt(
@@ -143,7 +143,7 @@ impl JobStore for PostgresPersistence {
         lease_ms: u64,
     ) -> Result<bool, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let changed = guard
                 .client
                 .execute(
@@ -167,7 +167,7 @@ impl JobStore for PostgresPersistence {
     ) -> Result<bool, PersistError> {
         let end = plan_job_end(status, result, error, now_ms)?;
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let changed = guard
                 .client
                 .execute(
@@ -190,7 +190,7 @@ impl JobStore for PostgresPersistence {
 
     fn clock_ms(&self) -> Result<Option<u64>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let ms: i64 = guard
                 .client
                 .query_one(
@@ -205,7 +205,7 @@ impl JobStore for PostgresPersistence {
 
     fn job_get(&self, id: &str) -> Result<Option<StoredJob>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let row = guard
                 .client
                 .query_opt(

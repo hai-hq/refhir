@@ -579,13 +579,16 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<(), FhirError> {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // Tests run in parallel and several use the same tag (`dep-example.lib-2.0.0`). A clock
+    // reading is not enough to tell them apart: two tests can read the same value, and on a
+    // virtual machine a clock can even repeat or step back, which gave two tests one directory.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = std::env::temp_dir().join(format!(
-        "refhir-{tag}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "refhir-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     ));
+    let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
 }
@@ -2886,6 +2889,967 @@ fn structure_map_translate_uses_the_installed_concept_map() {
     assert_eq!(translated["status"], "male");
 }
 
+// ---- the writer changes: a takeover, and what other processes see of a backfill ----
+
+mod takeover {
+    use super::*;
+    use refhir_persistence as rp;
+    use refhir_persistence::Persistence as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A store that behaves like the real one until it has been asked to move a backfill's
+    /// cursor `updates` times, then fails every later update: the process died there.
+    struct DiesAfter {
+        inner: SqlitePersistence,
+        updates_left: AtomicUsize,
+    }
+
+    impl rp::ConformanceStore for DiesAfter {
+        fn catalog_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.catalog_version()
+        }
+        fn bump_catalog_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.bump_catalog_version()
+        }
+        fn catalog_revision(&self) -> Result<u64, rp::PersistError> {
+            self.inner.catalog_revision()
+        }
+        fn bump_catalog_revision(&self) -> Result<u64, rp::PersistError> {
+            self.inner.bump_catalog_revision()
+        }
+        fn claim_backfill(&self, id: i64) -> Result<bool, rp::PersistError> {
+            self.inner.claim_backfill(id)
+        }
+        fn load_packages(&self) -> Result<Vec<rp::StoredPackage>, rp::PersistError> {
+            self.inner.load_packages()
+        }
+        fn load_structure_definitions(
+            &self,
+        ) -> Result<Vec<rp::StoredStructureDefinition>, rp::PersistError> {
+            self.inner.load_structure_definitions()
+        }
+        fn load_search_parameters(
+            &self,
+        ) -> Result<Vec<rp::StoredSearchParameter>, rp::PersistError> {
+            self.inner.load_search_parameters()
+        }
+        fn load_terminology(&self) -> Result<Vec<rp::StoredTerminology>, rp::PersistError> {
+            self.inner.load_terminology()
+        }
+        fn load_expansions(&self) -> Result<Vec<rp::StoredExpansion>, rp::PersistError> {
+            self.inner.load_expansions()
+        }
+        fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, rp::PersistError> {
+            self.inner.ensure_local_package(fhir_version)
+        }
+        fn upsert_search_parameter(
+            &self,
+            package_id: i64,
+            param: &rp::NewSearchParameter,
+        ) -> Result<bool, rp::PersistError> {
+            self.inner.upsert_search_parameter(package_id, param)
+        }
+        fn delete_search_parameter(
+            &self,
+            package_id: i64,
+            url: &str,
+        ) -> Result<(), rp::PersistError> {
+            self.inner.delete_search_parameter(package_id, url)
+        }
+        fn upsert_terminology(
+            &self,
+            package_id: i64,
+            row: &rp::NewTerminology,
+        ) -> Result<(), rp::PersistError> {
+            self.inner.upsert_terminology(package_id, row)
+        }
+        fn delete_terminology(&self, package_id: i64, url: &str) -> Result<(), rp::PersistError> {
+            self.inner.delete_terminology(package_id, url)
+        }
+        fn replace_expansions(
+            &self,
+            package_id: i64,
+            expansions: &[rp::NewExpansion],
+        ) -> Result<(), rp::PersistError> {
+            self.inner.replace_expansions(package_id, expansions)
+        }
+        fn load_terminology_for(
+            &self,
+            urls: &[String],
+        ) -> Result<Vec<rp::StoredTerminology>, rp::PersistError> {
+            self.inner.load_terminology_for(urls)
+        }
+        fn apply_expansions(
+            &self,
+            changes: &[rp::ExpansionChange],
+        ) -> Result<(), rp::PersistError> {
+            self.inner.apply_expansions(changes)
+        }
+        fn install_package(
+            &self,
+            package: &rp::NewPackage,
+        ) -> Result<rp::InstallOutcome, rp::InstallError> {
+            self.inner.install_package(package)
+        }
+        fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), rp::PersistError> {
+            self.inner.mark_base_ready(package_id, base)
+        }
+        fn complete_backfill(
+            &self,
+            backfill_id: i64,
+            package_id: i64,
+            base: &str,
+        ) -> Result<(), rp::PersistError> {
+            self.inner.complete_backfill(backfill_id, package_id, base)
+        }
+        fn set_search_parameter_status(
+            &self,
+            package_id: i64,
+            url: &str,
+            base: &str,
+            status: rp::ParamStatus,
+        ) -> Result<(), rp::PersistError> {
+            self.inner
+                .set_search_parameter_status(package_id, url, base, status)
+        }
+        fn insert_backfill(
+            &self,
+            package_id: i64,
+            watermark_ts: i64,
+            tablet: &str,
+            urls: &[String],
+        ) -> Result<i64, rp::PersistError> {
+            self.inner
+                .insert_backfill(package_id, watermark_ts, tablet, urls)
+        }
+        fn update_backfill(
+            &self,
+            id: i64,
+            cursor_id: Option<&str>,
+            done: bool,
+        ) -> Result<(), rp::PersistError> {
+            if self.updates_left.load(Ordering::SeqCst) == 0 {
+                return Err(rp::PersistError::Definite("the process died".into()));
+            }
+            self.updates_left.fetch_sub(1, Ordering::SeqCst);
+            self.inner.update_backfill(id, cursor_id, done)
+        }
+        fn load_backfills(&self) -> Result<Vec<rp::StoredBackfill>, rp::PersistError> {
+            self.inner.load_backfills()
+        }
+    }
+
+    fn temp_file(tag: &str) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        std::env::temp_dir().join(format!(
+            "refhir-takeover-{tag}-{}-{}.sqlite",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    fn remove(path: &Path) {
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            let _ = std::fs::remove_file(name);
+        }
+    }
+
+    fn with_birth_date(id: &str) -> Value {
+        let mut body = patient(id, true, "Ann");
+        body["birthDate"] = json!("1990-01-01");
+        body
+    }
+
+    fn search_total(db: &Database, catalog: &Catalog, args: Value) -> Result<u64, RunError> {
+        run(db, catalog, "Patient/search", &args)
+            .map(|result| result.value["total"].as_u64().unwrap())
+    }
+
+    #[test]
+    fn a_takeover_finishes_the_backfill_the_old_primary_left_half_done() {
+        let path = temp_file("resume");
+        let patients = 40;
+        let job_id = {
+            // The first primary: queues a backfill over 40 patients, runs two batches of it,
+            // then dies before the third.
+            let store = SqlitePersistence::open(&path).unwrap();
+            assert!(matches!(
+                store.try_acquire_writer_lease().unwrap(),
+                rp::Lease::Held { epoch: 1 }
+            ));
+            let db = Database::open(Arc::new(store.clone())).unwrap();
+            let catalog = std::sync::RwLock::new(Catalog::empty());
+            install_package_dir(&store, &db, &catalog, minir4_dir()).unwrap();
+            for n in 0..patients {
+                // Ids that sort in creation order, which a client's create (it assigns the id)
+                // would not give: the test reads the backfill cursor as a position among them.
+                let id = format!("p{n:03}");
+                let loaded = catalog.read().unwrap();
+                crate::import_resource(&db, &loaded, &with_birth_date(&id)).unwrap();
+            }
+            let pending = stage_package_deferred(&store, &db, &catalog, extra_dir())
+                .unwrap()
+                .expect("the package has pending search parameters");
+            publish(&store, &catalog).unwrap();
+            pending.create(&store, &db).unwrap();
+            let crashing = DiesAfter {
+                inner: store.clone(),
+                updates_left: AtomicUsize::new(2),
+            };
+            let died = run_backfills(&crashing, &db, &catalog);
+            assert!(died.is_err(), "the backfill was meant to be interrupted");
+            let jobs: Vec<_> = store
+                .load_backfills()
+                .unwrap()
+                .into_iter()
+                .filter(|job| !job.done)
+                .collect();
+            assert_eq!(jobs.len(), 1, "{jobs:?}");
+            let cursor = jobs[0]
+                .cursor_id
+                .clone()
+                .expect("two batches were recorded");
+            assert!(
+                cursor.as_str() > "p000" && cursor.as_str() < "p039",
+                "half way: {cursor}"
+            );
+            jobs[0].id
+            // Dropping the store, database and catalog here ends this process.
+        };
+
+        // The standby takes the lease and starts up as the primary: it builds its own catalog
+        // and picks the unfinished job up from the cursor.
+        let store = SqlitePersistence::open(&path).unwrap();
+        assert!(matches!(
+            store.try_acquire_writer_lease().unwrap(),
+            rp::Lease::Held { epoch: 2 }
+        ));
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let (loaded, _) = Catalog::open_consistent(&store, crate::CatalogClock::Latest).unwrap();
+        let catalog = std::sync::RwLock::new(loaded);
+        let before = search_total(
+            &db,
+            &catalog.read().unwrap(),
+            json!({"birthdate": "1990-01-01"}),
+        );
+        assert!(
+            before.is_err(),
+            "the parameter is not ready while the backfill is unfinished"
+        );
+
+        run_backfills(&store, &db, &catalog).unwrap();
+        let job = store
+            .load_backfills()
+            .unwrap()
+            .into_iter()
+            .find(|job| job.id == job_id)
+            .unwrap();
+        assert!(job.done);
+        assert_eq!(
+            job.claimed_epoch,
+            Some(2),
+            "the claim moved to the writer that finished the job"
+        );
+        let found = search_total(
+            &db,
+            &catalog.read().unwrap(),
+            json!({"birthdate": "1990-01-01"}),
+        )
+        .unwrap();
+        assert_eq!(found, patients, "every patient is indexed, none twice");
+        remove(&path);
+    }
+
+    #[test]
+    fn a_standby_that_loaded_its_catalog_while_waiting_is_current_when_it_takes_over() {
+        let primary = ready();
+        let store: Arc<dyn rp::ConformanceStore> = Arc::new(primary.store.clone());
+
+        // The standby loads the catalog while it waits, and watches it. The watcher is slow
+        // here on purpose, so it has not yet noticed what the primary does next.
+        let (loaded, version) =
+            Catalog::open_consistent(store.as_ref(), crate::CatalogClock::Latest).unwrap();
+        let warm = Arc::new(std::sync::RwLock::new(loaded));
+        let watcher = crate::package::watch_catalog(
+            store.clone(),
+            &warm,
+            version,
+            std::time::Duration::from_secs(3600),
+            crate::CatalogClock::Latest,
+        );
+        let types = |catalog: &std::sync::RwLock<Catalog>| {
+            catalog.read().unwrap().capability_statement()["rest"][0]["resource"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let before = types(&warm);
+
+        // The primary installs another package and then dies.
+        install_package_dir(&primary.store, &primary.db, &primary.catalog, extra_dir()).unwrap();
+        assert!(types(&primary.catalog) > before);
+        assert_eq!(types(&warm), before, "the standby has not seen it yet");
+
+        // Taking over: stop watching, then catch up once.
+        let seen = watcher.stop();
+        assert_eq!(seen, version, "the slow watcher never reloaded");
+        let now = crate::package::reload_catalog(
+            store.as_ref(),
+            &warm,
+            seen,
+            crate::CatalogClock::Latest,
+        )
+        .unwrap();
+        assert!(now > version);
+        assert_eq!(types(&warm), types(&primary.catalog));
+
+        // When nothing changed there is nothing to do: the same version comes back and the
+        // catalog is not rebuilt.
+        let kept = warm.read().unwrap().capability_statement();
+        let again =
+            crate::package::reload_catalog(store.as_ref(), &warm, now, crate::CatalogClock::Latest)
+                .unwrap();
+        assert_eq!(again, now);
+        assert_eq!(warm.read().unwrap().capability_statement(), kept);
+    }
+
+    #[test]
+    fn the_version_replicas_follow_moves_only_after_a_backfill_completes() {
+        use crate::CatalogClock::{Latest, Stable};
+        let db = ready();
+        for n in 0..5 {
+            apply(
+                &db,
+                "Patient/create",
+                json!({"resource": with_birth_date(&format!("p{n}"))}),
+            );
+        }
+        let version = || db.store.catalog_version().unwrap();
+        let revision = || db.store.catalog_revision().unwrap();
+        let (version_before, revision_before) = (version(), revision());
+
+        // What a replica loaded before the install: it follows the stable version.
+        let (replica_catalog, replica_at) = Catalog::open_consistent(&db.store, Stable).unwrap();
+        let replica_catalog = std::sync::RwLock::new(replica_catalog);
+        assert_eq!(replica_at, version_before);
+
+        // The package is installed and published, but its backfill has not run.
+        let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
+            .unwrap()
+            .expect("the package has pending search parameters");
+        publish(&db.store, &db.catalog).unwrap();
+        pending.create(&db.store, &db.db).unwrap();
+
+        // Writers are told: the revision moved. Replicas are not: the version did not, so a
+        // replica keeps its catalog and never loads a parameter whose index is incomplete.
+        assert!(revision() > revision_before, "a standby sees every change");
+        assert_eq!(version(), version_before, "a replica is not told yet");
+        let kept = crate::package::reload_catalog(&db.store, &replica_catalog, replica_at, Stable)
+            .unwrap();
+        assert_eq!(kept, replica_at, "nothing to reload for a replica");
+        assert!(
+            search_total(
+                &db.db,
+                &replica_catalog.read().unwrap(),
+                json!({"birthdate": "1990-01-01"})
+            )
+            .is_err(),
+            "the replica's catalog has no such parameter"
+        );
+        // A standby loading the latest sees the pending parameter, but cannot search it either.
+        let (standby, _) = Catalog::open_consistent(&db.store, Latest).unwrap();
+        assert!(standby.has_pending_parameters());
+        assert!(search_total(&db.db, &standby, json!({"birthdate": "1990-01-01"})).is_err());
+
+        // Completing the backfill publishes again, now with nothing pending, and that is what
+        // moves the version.
+        run_backfills(&db.store, &db.db, &db.catalog).unwrap();
+        assert!(
+            version() > version_before,
+            "the version moves on completion"
+        );
+        let now = crate::package::reload_catalog(&db.store, &replica_catalog, replica_at, Stable)
+            .unwrap();
+        assert_eq!(now, version());
+        assert!(!replica_catalog.read().unwrap().has_pending_parameters());
+        assert_eq!(
+            search_total(
+                &db.db,
+                &replica_catalog.read().unwrap(),
+                json!({"birthdate": "1990-01-01"})
+            )
+            .unwrap(),
+            5,
+            "the replica can search it, and its index is complete"
+        );
+    }
+
+    #[test]
+    fn a_change_with_nothing_to_backfill_moves_the_version_at_once() {
+        let db = ready();
+        let before = db.store.catalog_version().unwrap();
+        let revision = db.store.catalog_revision().unwrap();
+        // A package with no search parameters has nothing pending, so it is stable at once.
+        let plain = dep_package("example.plain", "1.0.0", &[]);
+        install_package_dir(&db.store, &db.db, &db.catalog, &plain).unwrap();
+        assert!(db.store.catalog_version().unwrap() > before);
+        assert!(db.store.catalog_revision().unwrap() > revision);
+    }
+}
+
+/// Search builds its page lazily: only the ids of the index range, only the page's documents, no
+/// second check of what the index already decided, and no copy of every match. These tests hold
+/// that to the old behaviour (the whole result, byte for byte, and the reads it records) and to an
+/// oracle that does not use either implementation, and then count the work.
+mod search_paging {
+    use super::*;
+    use crate::extract::compile_parameter;
+    use crate::search::{search_counted, search_reference, Work};
+
+    fn r4() -> Harness {
+        let harness = empty();
+        install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+        harness
+    }
+
+    const FAMILIES: [&str; 8] = [
+        "Smith",
+        "Smythe",
+        "smith",
+        "Jones",
+        "O'Neil",
+        "Müller",
+        "Smith-Jones",
+        "Nguyen",
+    ];
+
+    fn person(n: usize, family: Option<&str>) -> Value {
+        let gender = ["male", "female", "other", "unknown"][n % 4];
+        let given = ["Ann", "Bob", "Cy"][n % 3];
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": format!("p{n}"),
+            "active": n % 3 != 0,
+            "gender": gender,
+            "birthDate": format!("{}-{:02}-{:02}", 1950 + (n % 60), 1 + (n % 12), 1 + (n % 28)),
+            "identifier": [{"system": "http://hospital.example", "value": format!("mrn-{n}")}]
+        });
+        if let Some(family) = family {
+            let mut names = vec![json!({"family": family, "given": [given]})];
+            if n % 7 == 0 {
+                // Two names that both start with "Sm": the document is in the range twice.
+                names.push(json!({"family": "Smithers", "given": ["Zed"]}));
+            }
+            resource["name"] = json!(names);
+        }
+        resource
+    }
+
+    /// Patients p0..p95, some then changed or deleted, and observations about the first forty.
+    /// Returns the harness and what the patients should look like now, for the oracle.
+    fn seeded() -> (Harness, BTreeMap<String, Value>) {
+        let harness = r4();
+        let mut now = BTreeMap::new();
+        for n in 0..96 {
+            let family = (n % 11 != 0).then(|| FAMILIES[n % FAMILIES.len()]);
+            let resource = person(n, family);
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+            now.insert(format!("p{n}"), resource);
+        }
+        // Rows an index range is wider than the match for: a date on the boundary of a bound, and a
+        // family that is a prefix of a query containing a NUL, in a document whose id continues it.
+        for (id, birth, family) in [
+            ("p96", "1960-06-01", "Smith"),
+            ("p97", "1960-06-02", "Smith"),
+            ("b1", "1970-01-01", "a"),
+        ] {
+            let resource = json!({
+                "resourceType": "Patient", "id": id, "birthDate": birth,
+                "name": [{"family": family}]
+            });
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+            now.insert(id.to_string(), resource);
+        }
+        // The index has to follow a change of name and a delete, not keep the old rows.
+        for (n, family) in [(1, "Smith"), (9, "Smith"), (0, "Brown"), (5, "Smith")] {
+            let resource = person(n, Some(family));
+            apply(
+                &harness,
+                "Patient/update",
+                json!({"id": format!("p{n}"), "resource": resource}),
+            );
+            now.insert(format!("p{n}"), resource);
+        }
+        for id in ["p8", "p16"] {
+            apply(&harness, "Patient/delete", json!({"id": id}));
+            now.remove(id);
+        }
+        for n in (0..40).filter(|n| now.contains_key(&format!("p{n}"))) {
+            let code = ["8867-4", "29463-7"][n % 2];
+            apply(
+                &harness,
+                "Observation/create",
+                json!({"resource": {
+                    "resourceType": "Observation",
+                    "id": format!("o{n}"),
+                    "status": if n % 2 == 0 { "final" } else { "amended" },
+                    "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                    "subject": {"reference": format!("Patient/p{n}")},
+                    "effectiveDateTime": format!("2024-{:02}-10T08:00:00Z", 1 + (n % 12))
+                }}),
+            );
+        }
+        (harness, now)
+    }
+
+    fn params(query: &[(&str, &str)]) -> BTreeMap<String, String> {
+        query
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// Runs the query with the current search and with the reference one on the same snapshot.
+    /// They must agree on the bundle (or on the error) and on what they read.
+    fn both(harness: &Harness, type_name: &str, query: &[(&str, &str)]) -> Option<(Value, Work)> {
+        let catalog = harness.catalog.read().expect("catalog");
+        let model = catalog.get(type_name).expect("model");
+        let params = params(query);
+        let mut current_tx = harness.db.begin();
+        let current = search_counted(&mut current_tx, &catalog, model, &params);
+        let mut reference_tx = harness.db.begin();
+        let reference = search_reference(&mut reference_tx, &catalog, model, &params);
+        match (current, reference) {
+            (Ok((bundle, work)), Ok(expected)) => {
+                assert_eq!(
+                    bundle, expected,
+                    "the bundle differs for {type_name} {query:?}"
+                );
+                assert_eq!(
+                    current_tx.read_set(),
+                    reference_tx.read_set(),
+                    "the reads differ for {type_name} {query:?}"
+                );
+                Some((bundle, work))
+            }
+            (Err(current), Err(reference)) => {
+                assert_eq!(
+                    current.to_string(),
+                    reference.to_string(),
+                    "the error differs for {type_name} {query:?}"
+                );
+                None
+            }
+            (current, reference) => panic!(
+                "one succeeded and one failed for {type_name} {query:?}: {:?} / {:?}",
+                current.map(|(bundle, _)| bundle),
+                reference
+            ),
+        }
+    }
+
+    const PATIENT_QUERIES: &[&[(&str, &str)]] = &[
+        &[],
+        &[("family", "Smith")],
+        &[("family", "sm")],
+        &[("family", "SMITH")],
+        &[("family", "")],
+        &[("family", "zzz")],
+        &[("family", "Müller")],
+        &[("family", "o'n")],
+        &[("family", "a\0b")],
+        &[("given", "Ann")],
+        &[("name", "an")],
+        &[("name", "smithers")],
+        &[("gender", "male")],
+        &[("active", "true")],
+        &[("active", "false")],
+        &[("identifier", "http://hospital.example|mrn-7")],
+        &[("identifier", "mrn-7")],
+        &[("identifier", "|mrn-7")],
+        &[("identifier", "http://hospital.example|")],
+        &[("identifier", "nope")],
+        &[("family", "Sm"), ("gender", "male")],
+        &[("family", "Sm"), ("given", "Ann"), ("active", "true")],
+        &[("gender", "female"), ("birthdate", "ge1980-01-01")],
+        &[("birthdate", "ge1990-01-01")],
+        &[("birthdate", "1985")],
+        &[("birthdate", "lt1960-06-01")],
+        &[("birthdate", "le1960-06-01")],
+        &[("birthdate", "gt1960-06-01")],
+        &[("birthdate", "ge1960-06-02")],
+        &[("birthdate", "sa1960-06-01")],
+        &[("birthdate", "eb1960-06-02")],
+        &[("birthdate", "ne1960-06-01")],
+        &[("birthdate", "1960-06-01")],
+        &[("family", "a\0b")],
+        &[("family", "a")],
+        &[("family:exact", "Smith")],
+        &[("family:contains", "mit")],
+        &[("gender:not", "male")],
+        &[("family:missing", "true")],
+        &[("family:missing", "false")],
+        &[("_id", "p1")],
+        &[("_id", "p8")],
+        &[("_id", "nobody")],
+    ];
+
+    const PAGING: &[&[(&str, &str)]] = &[
+        &[],
+        &[("_count", "0")],
+        &[("_count", "1")],
+        &[("_count", "10")],
+        &[("_count", "1000")],
+        &[("_count", "7"), ("_offset", "3")],
+        &[("_count", "7"), ("_offset", "1000")],
+        &[("_offset", "5")],
+        &[("_count", "10"), ("_total", "none")],
+        &[("_count", "10"), ("_total", "estimate")],
+        &[("_total", "none")],
+        &[("_summary", "count")],
+        &[("_summary", "count"), ("_count", "5")],
+        &[("_count", "10"), ("_summary", "true")],
+        &[("_count", "5"), ("_elements", "name")],
+        &[("_sort", "family")],
+        &[("_sort", "-family"), ("_count", "10")],
+        &[
+            ("_sort", "birthdate,family"),
+            ("_count", "8"),
+            ("_offset", "2"),
+        ],
+        &[("_revinclude", "Observation:subject"), ("_count", "5")],
+    ];
+
+    #[test]
+    fn patient_searches_return_what_the_whole_result_search_returned() {
+        let (harness, _) = seeded();
+        let mut compared = 0;
+        let mut with_matches = 0;
+        for base in PATIENT_QUERIES {
+            for paging in PAGING {
+                let query: Vec<(&str, &str)> = base.iter().chain(paging.iter()).copied().collect();
+                if let Some((bundle, _)) = both(&harness, "Patient", &query) {
+                    compared += 1;
+                    if bundle["total"].as_u64().unwrap_or(0) > 0
+                        || !bundle["entry"].as_array().unwrap().is_empty()
+                    {
+                        with_matches += 1;
+                    }
+                }
+            }
+        }
+        // The comparison is only worth something if most of it compared real answers.
+        assert!(compared > 400, "only {compared} queries ran");
+        assert!(
+            with_matches > 250,
+            "only {with_matches} queries found anything"
+        );
+    }
+
+    #[test]
+    fn observation_searches_return_what_the_whole_result_search_returned() {
+        let (harness, _) = seeded();
+        let bases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("subject", "Patient/p3")],
+            &[("subject", "p3")],
+            &[("code", "http://loinc.org|8867-4")],
+            &[("code", "8867-4")],
+            &[("code", "|8867-4")],
+            &[("status", "final")],
+            &[("status", "amended"), ("subject", "Patient/p1")],
+            &[("code", "http://loinc.org|8867-4"), ("status", "final")],
+            &[("date", "ge2024-06-01")],
+            &[("_compartment", "Patient/p3")],
+            &[("subject:missing", "false")],
+        ];
+        let pagings: &[&[(&str, &str)]] = &[
+            &[],
+            &[("_count", "5")],
+            &[("_count", "5"), ("_offset", "2"), ("_total", "none")],
+            &[("_summary", "count")],
+            &[("_include", "Observation:subject"), ("_count", "4")],
+            &[("_sort", "date"), ("_count", "6")],
+        ];
+        let mut compared = 0;
+        for base in bases {
+            for paging in pagings {
+                let query: Vec<(&str, &str)> = base.iter().chain(paging.iter()).copied().collect();
+                if both(&harness, "Observation", &query).is_some() {
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 50, "only {compared} queries ran");
+    }
+
+    /// The expected ids, worked out from the data the test wrote and nothing else.
+    fn expected(now: &BTreeMap<String, Value>, wanted: impl Fn(&Value) -> bool) -> Vec<String> {
+        let mut ids: Vec<String> = now
+            .iter()
+            .filter(|(_, resource)| wanted(resource))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn found(harness: &Harness, query: &[(&str, &str)]) -> (Vec<String>, u64) {
+        let mut query = query.to_vec();
+        query.push(("_count", "1000"));
+        let (bundle, _) = both(harness, "Patient", &query).expect("the search works");
+        let mut ids: Vec<String> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        (ids, bundle["total"].as_u64().unwrap())
+    }
+
+    fn families(resource: &Value) -> Vec<String> {
+        resource["name"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name["family"].as_str())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_matches_are_the_patients_the_data_says_they_are() {
+        let (harness, now) = seeded();
+
+        // A prefix of a family name, case folded; a document with two matching names counts once;
+        // a renamed patient follows its new name; a deleted one is gone.
+        for prefix in [
+            "smith", "sm", "s", "jones", "müller", "nguyen", "brown", "zzz",
+        ] {
+            let want = expected(&now, |resource| {
+                families(resource)
+                    .iter()
+                    .any(|family| family.starts_with(prefix))
+            });
+            let (ids, total) = found(&harness, &[("family", prefix)]);
+            assert_eq!(ids, want, "family={prefix}");
+            assert_eq!(total as usize, want.len(), "total for family={prefix}");
+        }
+
+        // A token.
+        let want = expected(&now, |resource| resource["gender"] == "male");
+        assert_eq!(found(&harness, &[("gender", "male")]).0, want);
+        let want = expected(&now, |resource| resource["active"] == false);
+        assert_eq!(found(&harness, &[("active", "false")]).0, want);
+        let want = expected(&now, |resource| resource["id"] == "p7");
+        assert_eq!(
+            found(&harness, &[("identifier", "http://hospital.example|mrn-7")]).0,
+            want
+        );
+
+        // Two clauses: the index decides one and the other is checked.
+        let want = expected(&now, |resource| {
+            resource["gender"] == "male" && families(resource).iter().any(|f| f.starts_with("sm"))
+        });
+        assert_eq!(
+            found(&harness, &[("family", "sm"), ("gender", "male")]).0,
+            want
+        );
+        assert!(!want.is_empty());
+    }
+
+    fn work(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work) {
+        both(harness, "Patient", query).expect("the search works")
+    }
+
+    fn many_smiths(count: usize) -> Harness {
+        let harness = r4();
+        for n in 0..count {
+            let resource = json!({
+                "resourceType": "Patient",
+                "id": format!("s{n}"),
+                "gender": if n % 2 == 0 { "male" } else { "female" },
+                "birthDate": if n % 2 == 0 { "1990-05-05" } else { "1950-05-05" },
+                "name": [{"family": "Smith"}]
+            });
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+        }
+        harness
+    }
+
+    #[test]
+    fn a_page_of_ten_among_many_matches_reads_ten_documents() {
+        let harness = many_smiths(300);
+        let (bundle, work) = work(&harness, &[("family", "Smith"), ("_count", "10")]);
+        assert_eq!(bundle["total"], 300, "the total still counts every match");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
+        assert_eq!(work.rows, 300, "the range lists every match");
+        assert_eq!(work.fetched, 10, "but only the page's documents are read");
+        assert_eq!(work.decoded, 10);
+        assert_eq!(work.checked, 0, "and the index already decided the match");
+
+        let (bundle, work) = self::work(&harness, &[("family", "Smith"), ("_summary", "count")]);
+        assert_eq!(bundle["total"], 300);
+        assert_eq!(
+            (work.fetched, work.decoded),
+            (0, 0),
+            "a count reads no document"
+        );
+
+        // Later pages cost the same.
+        let (_, work) = self::work(
+            &harness,
+            &[("family", "Smith"), ("_count", "10"), ("_offset", "200")],
+        );
+        assert_eq!((work.fetched, work.decoded), (10, 10));
+
+        // Without a total the range is not even listed to the end: the page and one row more,
+        // which is what it takes to know there is a next page.
+        let (bundle, work) = self::work(
+            &harness,
+            &[("family", "Smith"), ("_count", "10"), ("_total", "none")],
+        );
+        assert!(bundle.get("total").is_none());
+        assert_eq!(
+            work.rows, 11,
+            "ten for the page and one to show there is more"
+        );
+        assert_eq!((work.fetched, work.decoded), (10, 10));
+        assert!(bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["relation"] == "next"));
+
+        let (bundle, work) = self::work(
+            &harness,
+            &[
+                ("family", "Smith"),
+                ("_count", "10"),
+                ("_offset", "200"),
+                ("_total", "none"),
+            ],
+        );
+        assert_eq!(work.rows, 211, "the offset, the page and one more");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
+
+        // A page that is most of the range is not read a document at a time: with no _count every
+        // match is on the page, and one joined scan beats 300 queries of one row.
+        for query in [
+            vec![("family", "Smith")],
+            vec![("family", "Smith"), ("_count", "1000")],
+        ] {
+            let (bundle, work) = self::work(&harness, &query);
+            assert_eq!(bundle["entry"].as_array().unwrap().len(), 300, "{query:?}");
+            assert_eq!(work.fetched, 0, "no point reads for {query:?}");
+            assert_eq!(work.decoded, 300);
+        }
+
+        // The last page has nothing after it, and says so.
+        let (bundle, work) = self::work(
+            &harness,
+            &[
+                ("family", "Smith"),
+                ("_count", "10"),
+                ("_offset", "295"),
+                ("_total", "none"),
+            ],
+        );
+        assert_eq!(work.rows, 300, "the range ran out");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 5);
+        assert!(!bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["relation"] == "next"));
+    }
+
+    #[test]
+    fn a_second_clause_is_checked_and_the_scan_stops_after_the_page_when_no_total_is_wanted() {
+        // The family decides the range (a string prefix ranks above a date bound); the birth date,
+        // which an index can only narrow, is checked on every row of it.
+        let harness = many_smiths(300);
+        let query = [
+            ("family", "Smith"),
+            ("birthdate", "ge1980-01-01"),
+            ("_count", "10"),
+        ];
+
+        let (bundle, work) = work(&harness, &query);
+        assert_eq!(bundle["total"], 150);
+        assert_eq!(work.rows, 300);
+        assert_eq!(work.checked, 300, "an exact total needs every row checked");
+        assert_eq!(work.decoded, 300);
+
+        let mut query = query.to_vec();
+        query.push(("_total", "none"));
+        let (bundle, work) = self::work(&harness, &query);
+        assert!(bundle.get("total").is_none());
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
+        assert!(
+            bundle["link"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|link| link["relation"] == "next"),
+            "it still knows there is a next page"
+        );
+        assert!(
+            work.checked <= 25,
+            "ten matches and one more, about every other row: {work:?}"
+        );
+        assert!(work.decoded < work.rows, "and the rest are never decoded");
+    }
+
+    #[test]
+    fn only_a_plain_string_token_reference_or_uri_parameter_read_from_a_path_is_proven_by_the_index(
+    ) {
+        let proves = |kind: &str, expression: &str, query: &str| {
+            compile_parameter(
+                &json!({"type": kind, "code": "x", "expression": expression, "base": ["Patient"]}),
+                &BTreeMap::new(),
+            )
+            .map(|extractor| extractor.index_proves(query))
+        };
+        assert_eq!(proves("string", "Patient.name.family", "sm"), Some(true));
+        assert_eq!(proves("token", "Patient.gender", "male"), Some(true));
+        assert_eq!(proves("token", "Patient.identifier", "a|b"), Some(true));
+        assert_eq!(proves("uri", "Patient.name.family", "urn:x"), Some(true));
+        assert_eq!(
+            proves("reference", "Patient.generalPractitioner", "Practitioner/1"),
+            Some(true)
+        );
+
+        // A NUL would match the one that ends every string key.
+        assert_eq!(proves("string", "Patient.name.family", "a\0b"), Some(false));
+        // Other kinds keep a second check: their range is only a coarse filter.
+        assert_eq!(proves("date", "Patient.birthDate", "ge1990"), Some(false));
+        assert_eq!(
+            proves("number", "Patient.multipleBirthInteger", "2"),
+            Some(false)
+        );
+        // Anything asked of the world when it is read can disagree with the keys saved earlier.
+        for expression in [
+            "Patient.generalPractitioner.resolve().id",
+            "Patient.gender.where(now().toString() != '')",
+            "Patient.name.family.where(today().toString() != '')",
+            "Patient.name.family.where(timeOfDay().toString() != '')",
+            "Patient.gender.where(conformsTo('http://example.org/p'))",
+        ] {
+            assert_eq!(
+                proves("token", expression, "x"),
+                Some(false),
+                "{expression}"
+            );
+        }
+    }
+}
 #[test]
 fn value_sets_that_cannot_expand_say_why() {
     let harness = empty();
@@ -3201,6 +4165,21 @@ impl WatchedStore {
 }
 
 impl ConformanceStore for WatchedStore {
+    fn catalog_version(&self) -> Result<u64, PersistError> {
+        self.inner.catalog_version()
+    }
+    fn bump_catalog_version(&self) -> Result<u64, PersistError> {
+        self.inner.bump_catalog_version()
+    }
+    fn catalog_revision(&self) -> Result<u64, PersistError> {
+        self.inner.catalog_revision()
+    }
+    fn bump_catalog_revision(&self) -> Result<u64, PersistError> {
+        self.inner.bump_catalog_revision()
+    }
+    fn claim_backfill(&self, id: i64) -> Result<bool, PersistError> {
+        self.inner.claim_backfill(id)
+    }
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         self.inner.load_packages()
     }

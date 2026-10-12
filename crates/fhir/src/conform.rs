@@ -29,6 +29,10 @@ pub fn commit_operation(
     args: &Value,
 ) -> Result<RunResult, RunError> {
     if path == "ImplementationGuide/$install" {
+        // Installing writes the conformance tables, which only the primary may do.
+        if db.is_read_only() {
+            return Err(RunError::Commit(CommitError::ReadOnly));
+        }
         return crate::npm::install_operation(store, db, catalog, args).map_err(RunError::Fhir);
     }
     preflight(store, catalog, path, args).map_err(RunError::Fhir)?;
@@ -95,8 +99,14 @@ pub fn repair_conformance(
     }
 
     if catalog.read().expect("catalog").contains("SearchParameter") {
-        let scope = SearchScope::from_store(store)?;
         let live = package::live_ids(db, "SearchParameter")?;
+        // Resolving what each custom parameter refers to means parsing every installed
+        // structure definition, which is slow and pointless when there are none.
+        let scope = if live.is_empty() {
+            SearchScope::default()
+        } else {
+            SearchScope::from_store(store)?
+        };
         let mut jobs: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut changed = false;
         for id in &live {
@@ -596,7 +606,7 @@ fn delete_orphan_terminology(
     type_name: &str,
     live: &BTreeMap<String, String>,
 ) -> Result<bool, FhirError> {
-    let stored = store.load_terminology()?;
+    let stored = store.load_terminology_of(local_id)?;
     let mut dirty = false;
     for row in stored {
         if row.package_id != local_id || row.resource_type != type_name {
@@ -624,7 +634,7 @@ fn delete_orphan_parameters(
     live: &[String],
 ) -> Result<bool, FhirError> {
     let live: BTreeSet<_> = live.iter().cloned().collect();
-    let stored = store.load_search_parameters()?;
+    let stored = store.load_search_parameters_of(local_id)?;
     let mut seen = BTreeSet::new();
     let mut dirty = false;
     for row in &stored {

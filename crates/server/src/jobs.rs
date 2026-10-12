@@ -364,7 +364,11 @@ pub(crate) fn start(
         }),
     );
     let runner = Arc::new(runner);
-    runner.recover();
+    // Only the primary runs jobs, and sweeps for the ones another primary was cut off from. A
+    // replica keeps no files of its own and hands every job request to the primary.
+    if !db.is_read_only() {
+        runner.recover();
+    }
     runner
 }
 
@@ -424,6 +428,10 @@ pub async fn accept_export(
     body: &[u8],
 ) -> Response {
     let _ = body;
+    // Export jobs are run, and their files kept, by the primary: a replica sends all of it there.
+    if app.db.is_read_only() {
+        return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE);
+    }
     // The job is in the database before the 202 goes out, so the id always resolves later.
     let request = json!({"type": type_name, "id": id});
     let job_id = match app.jobs.submit(EXPORT_KIND, request).await {
@@ -452,6 +460,10 @@ pub async fn accept_export(
 }
 
 pub async fn status(app: &AppState, job: &str) -> Response {
+    // Export jobs are run, and their files kept, by the primary: a replica sends all of it there.
+    if app.db.is_read_only() {
+        return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE);
+    }
     match export_job(app, job).await {
         Ok(job) => (StatusCode::OK, Json(status_body(&job))).into_response(),
         Err(response) => response,
@@ -459,6 +471,10 @@ pub async fn status(app: &AppState, job: &str) -> Response {
 }
 
 pub async fn file(app: &AppState, job: &str) -> Response {
+    // Export jobs are run, and their files kept, by the primary: a replica sends all of it there.
+    if app.db.is_read_only() {
+        return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE);
+    }
     let Ok(job) = export_job(app, job).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
