@@ -169,6 +169,23 @@ impl Default for ConnectOptions {
     }
 }
 
+/// Run `f` where the synchronous `postgres` client can run.
+///
+/// That client drives its own tokio runtime and blocks on it for every call, which tokio refuses
+/// from a thread that is already inside a runtime ("Cannot start a runtime from within a
+/// runtime"). The server is async, and its handlers reach these tables directly, so on such a
+/// thread the call is made on a short-lived thread of its own and the caller waits for it, as it
+/// would wait for the database anyway. Anywhere else it is called in place.
+pub(crate) fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    if tokio::runtime::Handle::try_current().is_err() {
+        return f();
+    }
+    std::thread::scope(|scope| match scope.spawn(f).join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
 #[derive(Clone)]
 pub struct PostgresPersistence {
     inner: Arc<Pool<Inner>>,
@@ -193,6 +210,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "persistence_globals",
     "packages",
     "smart_oauth",
+    "jobs",
 ];
 
 impl PostgresPersistence {
@@ -201,30 +219,32 @@ impl PostgresPersistence {
     }
 
     pub fn connect_with(url: &str, options: &ConnectOptions) -> Result<Self, PersistError> {
-        let mut client = Conn::new(connect_client(url)?);
-        if options.create_schema {
-            create_schema(&mut client)?;
-        } else {
-            wait_for_schema(&mut client)?;
-        }
-        let owned: Arc<str> = Arc::from(url);
-        let factory_url = owned.clone();
-        let pool = Pool::new(
-            options.pool_size,
-            vec![Inner { client }],
-            move || {
-                connect_client(&factory_url).map(|client| Inner {
-                    client: Conn::new(client),
-                })
-            },
-            |inner: &Inner| !inner.client.is_closed(),
-        );
-        Ok(Self {
-            inner: Arc::new(pool),
-            listener: Arc::new(std::sync::Mutex::new(None)),
-            gate: Arc::new(std::sync::Mutex::new(())),
-            lease: Arc::new(lease::LeaseState::default()),
-            url: owned,
+        off_runtime(|| {
+            let mut client = Conn::new(connect_client(url)?);
+            if options.create_schema {
+                create_schema(&mut client)?;
+            } else {
+                wait_for_schema(&mut client)?;
+            }
+            let owned: Arc<str> = Arc::from(url);
+            let factory_url = owned.clone();
+            let pool = Pool::new(
+                options.pool_size,
+                vec![Inner { client }],
+                move || {
+                    connect_client(&factory_url).map(|client| Inner {
+                        client: Conn::new(client),
+                    })
+                },
+                |inner: &Inner| !inner.client.is_closed(),
+            );
+            Ok(Self {
+                inner: Arc::new(pool),
+                listener: Arc::new(std::sync::Mutex::new(None)),
+                gate: Arc::new(std::sync::Mutex::new(())),
+                lease: Arc::new(lease::LeaseState::default()),
+                url: owned,
+            })
         })
     }
 }
@@ -248,6 +268,8 @@ const SCHEMA_OBJECTS: &[&str] = &[
     "backfill_parameter",
     "smart_oauth",
     "smart_oauth_by_exp",
+    "jobs",
+    "jobs_by_status",
 ];
 
 /// Advisory lock around building `indexes_by_ts`, which runs outside a transaction.
@@ -257,6 +279,11 @@ const INDEX_BUILD_LOCK: i64 = 7428311;
 /// version lack it, and a process that finds it missing must run the schema step.
 const HAS_CLAIM_COLUMN: &str = "EXISTS (SELECT 1 FROM information_schema.columns \
      WHERE table_name = 'index_backfills' AND column_name = 'claimed_epoch')";
+
+/// Whether `jobs` has the columns a lease is recorded in. A table made before jobs were leased
+/// lacks them, and a process that finds them missing must run the schema step.
+const HAS_JOB_LEASE_COLUMNS: &str = "(SELECT count(*) FROM information_schema.columns \
+     WHERE table_name = 'jobs' AND column_name IN ('lease_owner', 'lease_until')) = 2";
 
 /// An index that a failed concurrent build left behind exists but is not usable.
 const HAS_INVALID_INDEX: &str = "EXISTS (SELECT 1 FROM pg_index i \
@@ -279,7 +306,8 @@ fn schema_complete(client: &mut Client) -> Result<bool, PersistError> {
             &format!(
                 "SELECT COALESCE((SELECT bool_and(to_regclass(object) IS NOT NULL) \
                                   FROM unnest($1::text[]) AS object), false) \
-                        AND {HAS_CLAIM_COLUMN} AND NOT {HAS_INVALID_INDEX}"
+                        AND {HAS_CLAIM_COLUMN} AND {HAS_JOB_LEASE_COLUMNS} \
+                        AND NOT {HAS_INVALID_INDEX}"
             ),
             &[&objects],
         )
@@ -298,6 +326,7 @@ fn create_schema(client: &mut Client) -> Result<(), PersistError> {
         .map_err(definite)?;
     tx.batch_execute(SCHEMA).map_err(definite)?;
     tx.batch_execute(auth_store::AUTH_INIT).map_err(definite)?;
+    tx.batch_execute(job_store::JOBS_INIT).map_err(definite)?;
     tx.commit().map_err(definite)?;
     // A reader in another process finds what a commit wrote by scanning index rows by ts, and
     // `max_ts` looks at the newest one. Built concurrently so an existing database keeps
@@ -399,23 +428,25 @@ impl PersistenceReader for PostgresPersistence {
         range: TimestampRange,
         order: Order,
     ) -> Result<Vec<DocumentLogEntry>, PersistError> {
-        let ord = order_sql(order);
-        let sql = format!(
-            "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+        crate::off_runtime(|| {
+            let ord = order_sql(order);
+            let sql = format!(
+                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
              WHERE ts >= $1 AND ts < $2 ORDER BY ts {ord}, table_id {ord}, id {ord}"
-        );
-        let mut guard = self.inner.lock()?;
-        let rows = guard
-            .client
-            .query(
-                &sql,
-                &[
-                    &i64_ts(range.start_inclusive)?,
-                    &i64_ts(range.end_exclusive)?,
-                ],
-            )
-            .map_err(definite)?;
-        rows.iter().map(entry_from_row).collect()
+            );
+            let mut guard = self.inner.lock()?;
+            let rows = guard
+                .client
+                .query(
+                    &sql,
+                    &[
+                        &i64_ts(range.start_inclusive)?,
+                        &i64_ts(range.end_exclusive)?,
+                    ],
+                )
+                .map_err(definite)?;
+            rows.iter().map(entry_from_row).collect()
+        })
     }
 
     fn latest_document(
@@ -423,12 +454,14 @@ impl PersistenceReader for PostgresPersistence {
         id: &DocumentId,
         snapshot: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
-        self.one(
-            "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-             WHERE table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC LIMIT 1",
-            id,
-            snapshot,
-        )
+        crate::off_runtime(|| {
+            self.one(
+                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+                 WHERE table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC LIMIT 1",
+                id,
+                snapshot,
+            )
+        })
     }
 
     fn previous_revision(
@@ -436,12 +469,14 @@ impl PersistenceReader for PostgresPersistence {
         id: &DocumentId,
         at: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
-        self.one(
-            "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-             WHERE table_id = $1 AND id = $2 AND ts < $3 ORDER BY ts DESC LIMIT 1",
-            id,
-            at,
-        )
+        crate::off_runtime(|| {
+            self.one(
+                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+                 WHERE table_id = $1 AND id = $2 AND ts < $3 ORDER BY ts DESC LIMIT 1",
+                id,
+                at,
+            )
+        })
     }
 
     fn exact_revision(
@@ -449,12 +484,14 @@ impl PersistenceReader for PostgresPersistence {
         id: &DocumentId,
         ts: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
-        self.one(
-            "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-             WHERE table_id = $1 AND id = $2 AND ts = $3",
-            id,
-            ts,
-        )
+        crate::off_runtime(|| {
+            self.one(
+                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+                 WHERE table_id = $1 AND id = $2 AND ts = $3",
+                id,
+                ts,
+            )
+        })
     }
 
     fn document_history(
@@ -462,16 +499,18 @@ impl PersistenceReader for PostgresPersistence {
         id: &DocumentId,
         snapshot: Timestamp,
     ) -> Result<Vec<DocumentLogEntry>, PersistError> {
-        let mut guard = self.inner.lock()?;
-        let rows = guard
-            .client
-            .query(
-                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let rows = guard
+                .client
+                .query(
+                    "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
                  WHERE table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC",
-                &[&id.tablet.as_bytes(), &id.id, &i64_ts(snapshot)?],
-            )
-            .map_err(definite)?;
-        rows.iter().map(entry_from_row).collect()
+                    &[&id.tablet.as_bytes(), &id.id, &i64_ts(snapshot)?],
+                )
+                .map_err(definite)?;
+            rows.iter().map(entry_from_row).collect()
+        })
     }
 
     fn index_scan(
@@ -481,14 +520,15 @@ impl PersistenceReader for PostgresPersistence {
         interval: &Interval,
         order: Order,
     ) -> Result<Vec<IndexScanRow>, PersistError> {
-        let upper = if interval.end.is_some() {
-            " AND key < $4"
-        } else {
-            ""
-        };
-        let ord = order_sql(order);
-        let sql = format!(
-            r#"
+        crate::off_runtime(|| {
+            let upper = if interval.end.is_some() {
+                " AND key < $4"
+            } else {
+                ""
+            };
+            let ord = order_sql(order);
+            let sql = format!(
+                r#"
 SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
 FROM (
     SELECT index_id, key, MAX(ts) as max_ts
@@ -511,53 +551,54 @@ JOIN documents C
  )
 ORDER BY B.key {ord}
 "#
-        );
-        let mut guard = self.inner.lock()?;
-        let ts = i64_ts(read_timestamp)?;
-        let rows = if let Some(end) = &interval.end {
-            guard
-                .client
-                .query(&sql, &[&index_id.as_bytes(), &ts, &interval.start, end])
-        } else {
-            guard
-                .client
-                .query(&sql, &[&index_id.as_bytes(), &ts, &interval.start])
-        }
-        .map_err(definite)?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let key: Vec<u8> = row.get(0);
-            let row_ts: i64 = row.get(1);
-            let document_id: Vec<u8> = row.get(2);
-            let table_id: Vec<u8> = row.get(3);
-            let json_value: Option<String> = row.get(4);
-            let prev_ts: Option<i64> = row.get(5);
-            let json_value = json_value.ok_or_else(|| {
-                PersistError::Definite(format!(
-                    "index {} points at a document with no json at ts {row_ts}",
-                    index_id.as_str()
-                ))
-            })?;
-            let entry = document_from_parts(
-                document_id,
-                row_ts,
-                table_id,
-                Some(json_value),
-                false,
-                prev_ts,
-            )?;
-            let value = entry.value.expect("live document");
-            out.push(IndexScanRow {
-                key,
-                document: LatestDocument {
-                    ts: entry.ts,
-                    id: entry.id,
-                    value,
-                    prev_ts: entry.prev_ts,
-                },
-            });
-        }
-        Ok(out)
+            );
+            let mut guard = self.inner.lock()?;
+            let ts = i64_ts(read_timestamp)?;
+            let rows = if let Some(end) = &interval.end {
+                guard
+                    .client
+                    .query(&sql, &[&index_id.as_bytes(), &ts, &interval.start, end])
+            } else {
+                guard
+                    .client
+                    .query(&sql, &[&index_id.as_bytes(), &ts, &interval.start])
+            }
+            .map_err(definite)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let key: Vec<u8> = row.get(0);
+                let row_ts: i64 = row.get(1);
+                let document_id: Vec<u8> = row.get(2);
+                let table_id: Vec<u8> = row.get(3);
+                let json_value: Option<String> = row.get(4);
+                let prev_ts: Option<i64> = row.get(5);
+                let json_value = json_value.ok_or_else(|| {
+                    PersistError::Definite(format!(
+                        "index {} points at a document with no json at ts {row_ts}",
+                        index_id.as_str()
+                    ))
+                })?;
+                let entry = document_from_parts(
+                    document_id,
+                    row_ts,
+                    table_id,
+                    Some(json_value),
+                    false,
+                    prev_ts,
+                )?;
+                let value = entry.value.expect("live document");
+                out.push(IndexScanRow {
+                    key,
+                    document: LatestDocument {
+                        ts: entry.ts,
+                        id: entry.id,
+                        value,
+                        prev_ts: entry.prev_ts,
+                    },
+                });
+            }
+            Ok(out)
+        })
     }
 
     fn index_scan_ids(
@@ -568,143 +609,151 @@ ORDER BY B.key {ord}
         order: Order,
         limit: Option<usize>,
     ) -> Result<Vec<IndexScanEntry>, PersistError> {
-        if limit == Some(0) {
-            return Ok(Vec::new());
-        }
-        // The index table's primary key is (index_id, key, ts), so reading it ordered by key and
-        // ts needs no sort, no join and no grouping. Tombstones are rows too: the latest version
-        // of each key is picked in `LiveEntries`.
-        //
-        // With a limit on an ascending scan the rows are read in chunks of a few more than the
-        // limit, so a search for a page of matches does not read the whole range. A chunk can end
-        // in the middle of a key's versions, so the next one starts again from that key, and
-        // grows if one key alone fills a chunk.
-        let ts = i64_ts(read_timestamp)?;
-        let ord = order_sql(order);
-        let upper = if interval.end.is_some() {
-            " AND key < $4"
-        } else {
-            ""
-        };
-        let mut chunk = limit
-            .filter(|_| order == Order::Asc)
-            .map(|limit| limit.saturating_mul(2).saturating_add(16));
-        let mut start = interval.start.clone();
-        let mut live = LiveEntries::new(order, limit);
-        loop {
-            // `LIMIT` is a bigint, and a client's `_count` can be any usize.
-            let cap = chunk
-                .map(|rows| format!(" LIMIT {}", rows.min(i64::MAX as usize)))
-                .unwrap_or_default();
-            let sql = format!(
-                "SELECT key, deleted, table_id, document_id FROM indexes \
+        crate::off_runtime(|| {
+            if limit == Some(0) {
+                return Ok(Vec::new());
+            }
+            // The index table's primary key is (index_id, key, ts), so reading it ordered by key and
+            // ts needs no sort, no join and no grouping. Tombstones are rows too: the latest version
+            // of each key is picked in `LiveEntries`.
+            //
+            // With a limit on an ascending scan the rows are read in chunks of a few more than the
+            // limit, so a search for a page of matches does not read the whole range. A chunk can end
+            // in the middle of a key's versions, so the next one starts again from that key, and
+            // grows if one key alone fills a chunk.
+            let ts = i64_ts(read_timestamp)?;
+            let ord = order_sql(order);
+            let upper = if interval.end.is_some() {
+                " AND key < $4"
+            } else {
+                ""
+            };
+            let mut chunk = limit
+                .filter(|_| order == Order::Asc)
+                .map(|limit| limit.saturating_mul(2).saturating_add(16));
+            let mut start = interval.start.clone();
+            let mut live = LiveEntries::new(order, limit);
+            loop {
+                // `LIMIT` is a bigint, and a client's `_count` can be any usize.
+                let cap = chunk
+                    .map(|rows| format!(" LIMIT {}", rows.min(i64::MAX as usize)))
+                    .unwrap_or_default();
+                let sql = format!(
+                    "SELECT key, deleted, table_id, document_id FROM indexes \
                  WHERE index_id = $1 AND ts <= $2 AND key >= $3{upper} \
                  ORDER BY key {ord}, ts {ord}{cap}"
-            );
-            let rows = {
-                let mut guard = self.inner.lock()?;
-                if let Some(end) = &interval.end {
-                    guard
-                        .client
-                        .query(&sql, &[&index_id.as_bytes(), &ts, &start, end])
-                } else {
-                    guard
-                        .client
-                        .query(&sql, &[&index_id.as_bytes(), &ts, &start])
-                }
-                .map_err(definite)?
-            };
-            let read = rows.len();
-            for row in rows {
-                let key: Vec<u8> = row.get(0);
-                let deleted: i32 = row.get(1);
-                let id = if deleted != 0 {
-                    None
-                } else {
-                    let table_id: Option<Vec<u8>> = row.get(2);
-                    let document_id: Option<Vec<u8>> = row.get(3);
-                    match (table_id, document_id) {
-                        (Some(table_id), Some(document_id)) => {
-                            Some(index_target(table_id, document_id)?)
-                        }
-                        _ => {
-                            return Err(PersistError::Definite(format!(
-                                "index {} has a live row that points at no document",
-                                index_id.as_str()
-                            )))
-                        }
+                );
+                let rows = {
+                    let mut guard = self.inner.lock()?;
+                    if let Some(end) = &interval.end {
+                        guard
+                            .client
+                            .query(&sql, &[&index_id.as_bytes(), &ts, &start, end])
+                    } else {
+                        guard
+                            .client
+                            .query(&sql, &[&index_id.as_bytes(), &ts, &start])
                     }
+                    .map_err(definite)?
                 };
-                if live.push(key, id) {
+                let read = rows.len();
+                for row in rows {
+                    let key: Vec<u8> = row.get(0);
+                    let deleted: i32 = row.get(1);
+                    let id = if deleted != 0 {
+                        None
+                    } else {
+                        let table_id: Option<Vec<u8>> = row.get(2);
+                        let document_id: Option<Vec<u8>> = row.get(3);
+                        match (table_id, document_id) {
+                            (Some(table_id), Some(document_id)) => {
+                                Some(index_target(table_id, document_id)?)
+                            }
+                            _ => {
+                                return Err(PersistError::Definite(format!(
+                                    "index {} has a live row that points at no document",
+                                    index_id.as_str()
+                                )))
+                            }
+                        }
+                    };
+                    if live.push(key, id) {
+                        return Ok(live.finish());
+                    }
+                }
+                let Some(rows_per_chunk) = chunk else {
+                    return Ok(live.finish());
+                };
+                if read < rows_per_chunk {
                     return Ok(live.finish());
                 }
+                let Some(resume) = live.end_chunk() else {
+                    return Ok(live.finish());
+                };
+                if resume == start {
+                    chunk = Some(rows_per_chunk.saturating_mul(2));
+                }
+                start = resume;
             }
-            let Some(rows_per_chunk) = chunk else {
-                return Ok(live.finish());
-            };
-            if read < rows_per_chunk {
-                return Ok(live.finish());
-            }
-            let Some(resume) = live.end_chunk() else {
-                return Ok(live.finish());
-            };
-            if resume == start {
-                chunk = Some(rows_per_chunk.saturating_mul(2));
-            }
-            start = resume;
-        }
+        })
     }
 
     fn get_persistence_global(
         &self,
         key: PersistenceGlobalKey,
     ) -> Result<Option<JsonValue>, PersistError> {
-        let mut guard = self.inner.lock()?;
-        read_global(&mut guard.client, key)
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            read_global(&mut guard.client, key)
+        })
     }
 
     fn load_index_writes(
         &self,
         range: TimestampRange,
     ) -> Result<Vec<PersistenceIndexEntry>, PersistError> {
-        let mut guard = self.inner.lock()?;
-        let rows = guard
-            .client
-            .query(
-                "SELECT index_id, ts, key, deleted, table_id, document_id FROM indexes \
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let rows = guard
+                .client
+                .query(
+                    "SELECT index_id, ts, key, deleted, table_id, document_id FROM indexes \
                  WHERE ts >= $1 AND ts < $2 ORDER BY ts, index_id, key",
-                &[
-                    &i64_ts(range.start_inclusive)?,
-                    &i64_ts(range.end_exclusive)?,
-                ],
-            )
-            .map_err(definite)?;
-        rows.iter().map(index_entry_from_row).collect()
+                    &[
+                        &i64_ts(range.start_inclusive)?,
+                        &i64_ts(range.end_exclusive)?,
+                    ],
+                )
+                .map_err(definite)?;
+            rows.iter().map(index_entry_from_row).collect()
+        })
     }
 
     fn max_ts(&self) -> Result<Option<Timestamp>, PersistError> {
-        let mut guard = self.inner.lock()?;
-        // One statement, so the document log and the global are read from the same state. The
-        // global holds the newest index-only commit; a value that is not a number is ignored.
-        // GREATEST skips NULLs, so either side may be absent.
-        let newest: Option<i64> = guard
-            .client
-            .query_one(
-                "SELECT GREATEST(
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            // One statement, so the document log and the global are read from the same state. The
+            // global holds the newest index-only commit; a value that is not a number is ignored.
+            // GREATEST skips NULLs, so either side may be absent.
+            let newest: Option<i64> = guard
+                .client
+                .query_one(
+                    "SELECT GREATEST(
                      (SELECT MAX(ts) FROM documents),
                      (SELECT json_value::bigint FROM persistence_globals
                       WHERE key = $1 AND json_value ~ '^[0-9]+$')
                  )",
-                &[&PersistenceGlobalKey::MaxRepeatableTimestamp.as_str()],
-            )
-            .map_err(definite)?
-            .get(0);
-        newest
-            .map(|value| {
-                Timestamp::from_i64(value)
-                    .map_err(|_| PersistError::Definite(format!("bad max ts {value}")))
-            })
-            .transpose()
+                    &[&PersistenceGlobalKey::MaxRepeatableTimestamp.as_str()],
+                )
+                .map_err(definite)?
+                .get(0);
+            newest
+                .map(|value| {
+                    Timestamp::from_i64(value)
+                        .map_err(|_| PersistError::Definite(format!("bad max ts {value}")))
+                })
+                .transpose()
+        })
     }
 }
 
@@ -726,19 +775,21 @@ impl PostgresPersistence {
 
 impl Persistence for PostgresPersistence {
     fn is_fresh(&self) -> bool {
-        let Ok(mut guard) = self.inner.lock() else {
-            return false;
-        };
-        // One statement, so both counts come from the same state.
-        guard
-            .client
-            .query_one(
-                "SELECT (SELECT COUNT(*) FROM documents) = 0 \
+        crate::off_runtime(|| {
+            let Ok(mut guard) = self.inner.lock() else {
+                return false;
+            };
+            // One statement, so both counts come from the same state.
+            guard
+                .client
+                .query_one(
+                    "SELECT (SELECT COUNT(*) FROM documents) = 0 \
                  AND (SELECT COUNT(*) FROM persistence_globals) = 0",
-                &[],
-            )
-            .map(|row| row.get(0))
-            .unwrap_or(false)
+                    &[],
+                )
+                .map(|row| row.get(0))
+                .unwrap_or(false)
+        })
     }
 
     fn reader(&self) -> Arc<dyn PersistenceReader> {
@@ -751,52 +802,56 @@ impl Persistence for PostgresPersistence {
         indexes: &[PersistenceIndexEntry],
         conflict_strategy: ConflictStrategy,
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock()?;
-        let mut tx = guard.client.transaction().map_err(definite)?;
-        if let Some(epoch) = self.lease.epoch() {
-            if let Err(err) = lease::check_epoch(&mut tx, epoch) {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            if let Some(epoch) = self.lease.epoch() {
+                if let Err(err) = lease::check_epoch(&mut tx, epoch) {
+                    let _ = tx.rollback();
+                    return Err(err);
+                }
+            }
+            let written = write_in_tx(&mut tx, documents, indexes, conflict_strategy);
+            if let Err(err) = written {
                 let _ = tx.rollback();
                 return Err(err);
             }
-        }
-        let written = write_in_tx(&mut tx, documents, indexes, conflict_strategy);
-        if let Err(err) = written {
-            let _ = tx.rollback();
-            return Err(err);
-        }
-        let committed = tx.commit().map_err(uncertain);
-        if committed.is_err() {
-            guard.discard();
-        }
-        committed
+            let committed = tx.commit().map_err(uncertain);
+            if committed.is_err() {
+                guard.discard();
+            }
+            committed
+        })
     }
 
     fn try_acquire_writer_lease(&self) -> Result<Lease, PersistError> {
-        self.lease.acquire(&self.url)
+        crate::off_runtime(|| self.lease.acquire(&self.url))
     }
 
     fn advance_published_ts(&self, ts: Timestamp) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock()?;
-        // Not durable on its own commit: the watermark is rebuilt from the log on a primary
-        // restart, so a crash that loses the last few values only delays replicas. That keeps
-        // it from costing a WAL flush per commit.
-        let wrote = guard.client.batch_execute(&format!(
-            "BEGIN; SET LOCAL synchronous_commit = off; \
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            // Not durable on its own commit: the watermark is rebuilt from the log on a primary
+            // restart, so a crash that loses the last few values only delays replicas. That keeps
+            // it from costing a WAL flush per commit.
+            let wrote = guard.client.batch_execute(&format!(
+                "BEGIN; SET LOCAL synchronous_commit = off; \
                  INSERT INTO persistence_globals (key, json_value) VALUES ('{key}', '{ts}') \
                  ON CONFLICT (key) DO UPDATE SET json_value = GREATEST( \
                      persistence_globals.json_value::bigint, EXCLUDED.json_value::bigint)::text; \
                  NOTIFY {channel}; \
                  COMMIT;",
-            channel = PUBLISH_CHANNEL,
-            key = PersistenceGlobalKey::PublishedTimestamp.as_str(),
-            ts = ts.as_u64(),
-        ));
-        if let Err(err) = wrote {
-            // A failure inside the explicit transaction leaves the connection aborted.
-            guard.discard();
-            return Err(definite(err));
-        }
-        Ok(())
+                channel = PUBLISH_CHANNEL,
+                key = PersistenceGlobalKey::PublishedTimestamp.as_str(),
+                ts = ts.as_u64(),
+            ));
+            if let Err(err) = wrote {
+                // A failure inside the explicit transaction leaves the connection aborted.
+                guard.discard();
+                return Err(definite(err));
+            }
+            Ok(())
+        })
     }
 
     fn pool_stats(&self) -> Option<PoolStats> {
@@ -808,49 +863,51 @@ impl Persistence for PostgresPersistence {
     }
 
     fn wait_for_publish(&self, timeout: std::time::Duration) -> bool {
-        let mut listener = self
-            .listener
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if listener.is_none() {
-            let connected = connect_client(&self.url)
-                .map(Conn::new)
-                .and_then(|mut conn| {
-                    conn.batch_execute(&format!("LISTEN {PUBLISH_CHANNEL}"))
-                        .map_err(definite)?;
-                    Ok(conn)
-                });
-            match connected {
-                Ok(conn) => *listener = Some(conn),
-                Err(err) => {
-                    tracing::warn!(target: "refhir", "cannot listen for publishes: {err}");
-                    std::thread::sleep(timeout);
-                    return false;
+        crate::off_runtime(|| {
+            let mut listener = self
+                .listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if listener.is_none() {
+                let connected = connect_client(&self.url)
+                    .map(Conn::new)
+                    .and_then(|mut conn| {
+                        conn.batch_execute(&format!("LISTEN {PUBLISH_CHANNEL}"))
+                            .map_err(definite)?;
+                        Ok(conn)
+                    });
+                match connected {
+                    Ok(conn) => *listener = Some(conn),
+                    Err(err) => {
+                        tracing::warn!(target: "refhir", "cannot listen for publishes: {err}");
+                        std::thread::sleep(timeout);
+                        return false;
+                    }
                 }
             }
-        }
-        // Taken into an owned value first, so the connection is not borrowed through the match.
-        let outcome = {
-            let conn = listener.as_mut().expect("connected above");
-            let first = conn.notifications().timeout_iter(timeout).next();
-            if matches!(first, Ok(Some(_))) {
-                // Several publishes may have been announced; one refresh covers them all.
-                let mut pending = conn.notifications();
-                let mut drain = pending.iter();
-                while let Ok(Some(_)) = drain.next() {}
+            // Taken into an owned value first, so the connection is not borrowed through the match.
+            let outcome = {
+                let conn = listener.as_mut().expect("connected above");
+                let first = conn.notifications().timeout_iter(timeout).next();
+                if matches!(first, Ok(Some(_))) {
+                    // Several publishes may have been announced; one refresh covers them all.
+                    let mut pending = conn.notifications();
+                    let mut drain = pending.iter();
+                    while let Ok(Some(_)) = drain.next() {}
+                }
+                first
+            };
+            match outcome {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(err) => {
+                    tracing::warn!(target: "refhir", "publish listener failed, reconnecting: {err}");
+                    *listener = None;
+                    std::thread::sleep(timeout.min(std::time::Duration::from_secs(1)));
+                    false
+                }
             }
-            first
-        };
-        match outcome {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(err) => {
-                tracing::warn!(target: "refhir", "publish listener failed, reconnecting: {err}");
-                *listener = None;
-                std::thread::sleep(timeout.min(std::time::Duration::from_secs(1)));
-                false
-            }
-        }
+        })
     }
 
     fn write_persistence_global(
@@ -858,16 +915,18 @@ impl Persistence for PostgresPersistence {
         key: PersistenceGlobalKey,
         value: &JsonValue,
     ) -> Result<(), PersistError> {
-        let mut guard = self.inner.lock()?;
-        guard
-            .client
-            .execute(
-                "INSERT INTO persistence_globals (key, json_value) VALUES ($1, $2)
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            guard
+                .client
+                .execute(
+                    "INSERT INTO persistence_globals (key, json_value) VALUES ($1, $2)
                  ON CONFLICT (key) DO UPDATE SET json_value = EXCLUDED.json_value",
-                &[&key.as_str(), &value.to_string()],
-            )
-            .map_err(definite)?;
-        Ok(())
+                    &[&key.as_str(), &value.to_string()],
+                )
+                .map_err(definite)?;
+            Ok(())
+        })
     }
 }
 
@@ -1120,6 +1179,7 @@ fn uncertain(err: impl ErrorText) -> PersistError {
 
 mod auth_store;
 mod conformance_store;
+mod job_store;
 
 #[cfg(test)]
 mod tests {
@@ -1609,6 +1669,160 @@ mod tests {
         );
     }
 
+    fn unique() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    /// The server is async and its handlers reach these tables directly. The synchronous client
+    /// cannot run on a thread that is inside a tokio runtime, so every call has to get off it.
+    #[test]
+    fn postgres_works_from_inside_a_tokio_runtime_when_configured() {
+        use refhir_persistence::{AuthStore, ConformanceStore, JobStore, PersistenceReader};
+        let Some(url) = test_url("postgres inside a runtime") else {
+            return;
+        };
+        for multi_thread in [true, false] {
+            let mut builder = if multi_thread {
+                tokio::runtime::Builder::new_multi_thread()
+            } else {
+                tokio::runtime::Builder::new_current_thread()
+            };
+            let runtime = builder.enable_all().build().unwrap();
+            let url = url.clone();
+            runtime.block_on(async move {
+                // Connecting, and then every kind of table, straight from async code.
+                let persistence = PostgresPersistence::connect(&url).expect("connect in a runtime");
+                persistence.load_packages().expect("conformance store");
+                persistence
+                    .load_documents(
+                        refhir_persistence::TimestampRange {
+                            start_inclusive: refhir_types::Timestamp::ZERO,
+                            end_exclusive: refhir_types::Timestamp::ZERO,
+                        },
+                        refhir_types::Order::Asc,
+                    )
+                    .expect("document log");
+                let id = format!("rt-{}-{}-{}", multi_thread, std::process::id(), unique());
+                persistence
+                    .job_create(&id, "export", &serde_json::json!({}), 1, None)
+                    .expect("job store");
+                assert!(persistence.job_get(&id).unwrap().is_some());
+                assert_eq!(
+                    persistence.auth_get("token", "not-a-token", 1).unwrap(),
+                    None
+                );
+                // From a blocking-pool thread and from a spawned task, as the handlers do.
+                let clone = persistence.clone();
+                tokio::task::spawn_blocking(move || clone.load_packages().unwrap())
+                    .await
+                    .unwrap();
+                let clone = persistence.clone();
+                tokio::spawn(async move { clone.job_get("nothing").unwrap() })
+                    .await
+                    .unwrap();
+                // Dropping the connection in the runtime must not panic either.
+                drop(persistence);
+            });
+        }
+    }
+
+    #[test]
+    fn postgres_job_store_when_configured() {
+        let Some(url) = test_url("postgres job store") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        // Ids are unique per run, so a shared database that holds earlier runs is fine.
+        let tag = format!("pg{}-{}", std::process::id(), unique());
+        refhir_persistence::jobs::exercise(&persistence, &tag);
+    }
+
+    /// Leases are judged on the database's clock, which is not the caller's.
+    #[test]
+    fn postgres_has_a_clock_for_leases_when_configured() {
+        use refhir_persistence::JobStore;
+        let Some(url) = test_url("postgres clock") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let database = persistence.clock_ms().unwrap().expect("a database clock");
+        let local = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(database.abs_diff(local) < 60_000, "{database} vs {local}");
+    }
+
+    /// Separate connections are separate servers. Each claims in its own transaction, so this is
+    /// the `FOR UPDATE SKIP LOCKED` path under real concurrency.
+    #[test]
+    fn postgres_job_claims_do_not_overlap_when_configured() {
+        let Some(url) = test_url("postgres competing job claimers") else {
+            return;
+        };
+        let tag = format!("pgrace{}-{}", std::process::id(), unique());
+        let open = move || -> std::sync::Arc<dyn refhir_persistence::JobStore> {
+            std::sync::Arc::new(PostgresPersistence::connect(&url).expect("connect"))
+        };
+        refhir_persistence::jobs::exercise_competing_claimers(&open, &tag);
+    }
+
+    #[test]
+    fn postgres_jobs_survive_a_new_connection_when_configured() {
+        use refhir_persistence::{JobStatus, JobStore};
+        let Some(url) = test_url("postgres job durability") else {
+            return;
+        };
+        let tag = format!("pg-reopen-{}-{}", std::process::id(), unique());
+        let kind = format!("{tag}-kind");
+        let request = serde_json::json!({"type": "Patient"});
+        {
+            let first = PostgresPersistence::connect(&url).expect("connect");
+            first.job_create(&tag, &kind, &request, 10, None).unwrap();
+            let got = first
+                .job_claim("first", &[kind.as_str()], 20, 50, 1)
+                .unwrap();
+            assert_eq!(got.len(), 1);
+        }
+        // A second connection, as after a restart, sees the job still running, held by a process
+        // that is gone: it cannot be taken until that lease has run out, and then it can.
+        let second = PostgresPersistence::connect(&url).expect("reconnect");
+        let job = second.job_get(&tag).unwrap().expect("job survives");
+        assert_eq!(
+            (
+                job.status,
+                job.attempts,
+                job.request,
+                job.lease_owner.as_deref()
+            ),
+            (JobStatus::Running, 1, request, Some("first"))
+        );
+        assert!(second
+            .job_claim("second", &[kind.as_str()], 69, 50, 1)
+            .unwrap()
+            .is_empty());
+        let taken = second
+            .job_claim("second", &[kind.as_str()], 70, 50, 1)
+            .unwrap();
+        assert_eq!((taken.len(), taken[0].attempts), (1, 2));
+        assert!(!second
+            .job_finish(&tag, "first", JobStatus::Completed, None, None, 80)
+            .unwrap());
+        assert!(second
+            .job_finish(
+                &tag,
+                "second",
+                JobStatus::Completed,
+                Some(&serde_json::json!({})),
+                None,
+                90
+            )
+            .unwrap());
+    }
+
     #[test]
     fn postgres_parameter_clashes_when_configured() {
         let Some(url) = test_url("postgres parameter clashes") else {
@@ -1617,5 +1831,6 @@ mod tests {
         let persistence = PostgresPersistence::connect(&url).expect("connect");
         let tag = format!("pg{}", std::process::id());
         refhir_persistence::conformance::exercise_parameter_clashes(&persistence, &tag);
+        refhir_persistence::conformance::exercise_terminology_changes(&persistence, &tag);
     }
 }

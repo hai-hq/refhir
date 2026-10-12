@@ -156,22 +156,52 @@ pub fn install_operation(
     let (name, version) = npm_spec_from_args(args)?;
     let spec = format!("{name}@{version}");
     let fetcher = NpmRegistry::from_env()?;
+    let before = unexpandable_value_sets(catalog);
     install_with(store, db, catalog, &spec, &fetcher, &fetcher.cache_dir)?;
+    let mut issues = vec![json!({
+        "severity": "information",
+        "code": "informational",
+        "diagnostics": format!("installed {spec}")
+    })];
+    // A package can bring a ValueSet that includes content nothing here can supply. Say so now,
+    // rather than when a client first asks for the expansion.
+    let introduced: Vec<String> = unexpandable_value_sets(catalog)
+        .difference(&before)
+        .cloned()
+        .collect();
+    if !introduced.is_empty() {
+        let listed: Vec<&str> = introduced.iter().take(20).map(String::as_str).collect();
+        issues.push(json!({
+            "severity": "warning",
+            "code": "not-supported",
+            "diagnostics": format!(
+                "{} value set(s) from {spec} cannot be expanded: {}{}. Ask ValueSet/$expandability for the reasons.",
+                introduced.len(),
+                listed.join(", "),
+                if introduced.len() > listed.len() { ", ..." } else { "" }
+            )
+        }));
+    }
     Ok(RunResult {
-        value: json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{
-                "severity": "information",
-                "code": "informational",
-                "diagnostics": format!("installed {spec}")
-            }]
-        }),
+        value: json!({"resourceType": "OperationOutcome", "issue": issues}),
         ts: db.latest_ts(),
         reads: ReadSet::default(),
         wrote: false,
         writes: Vec::new(),
         status: 200,
     })
+}
+
+/// URLs of the loaded value sets that have no expansion.
+pub fn unexpandable_value_sets(catalog: &RwLock<Catalog>) -> std::collections::BTreeSet<String> {
+    catalog
+        .read()
+        .expect("catalog")
+        .terms()
+        .unexpandable()
+        .into_iter()
+        .map(|(url, _)| url)
+        .collect()
 }
 
 pub fn parse_package_spec(text: &str) -> Result<PackageSpec, FhirError> {

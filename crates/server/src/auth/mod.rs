@@ -55,6 +55,8 @@ pub struct SyncSession {
     scopes: Vec<String>,
     /// `Patient/{id}` when the token is patient-scoped.
     patient: Option<String>,
+    /// The server lets a `PUT` create the resource it names, so an update is also a create.
+    update_create: bool,
 }
 
 fn now() -> u64 {
@@ -86,11 +88,16 @@ pub fn check(
         return Some(unauthorized("token expired"));
     }
     let interaction = http_interaction(method, path);
-    if !record
-        .scopes
-        .iter()
-        .any(|scope| scope_allows(scope, resource_type, interaction))
-    {
+    // Where a PUT may create what it names, the scope that lets it update must let it create too:
+    // the request cannot be told apart beforehand from one that only updates.
+    let creates = method == "PUT" && app.catalog.read().expect("catalog").update_create();
+    let allowed = |interaction: &str| {
+        record
+            .scopes
+            .iter()
+            .any(|scope| scope_allows(scope, resource_type, interaction))
+    };
+    if !allowed(interaction) || (creates && !allowed("create")) {
         return Some(
             (
                 StatusCode::FORBIDDEN,
@@ -141,6 +148,7 @@ pub fn open_sync_session(
         return Ok(SyncSession {
             scopes: vec!["*/*.*".into()],
             patient: None,
+            update_create: false,
         });
     }
     let Some(token) = resolve_token(headers, query) else {
@@ -156,6 +164,7 @@ pub fn open_sync_session(
         return Err(unauthorized("token has no scopes"));
     }
     Ok(SyncSession {
+        update_create: app.catalog.read().expect("catalog").update_create(),
         scopes: record.scopes.clone(),
         patient: record
             .patient
@@ -194,6 +203,11 @@ impl SyncSession {
         let resource_type = if resource == "system" { "*" } else { resource };
         if !self.allows(resource_type, interaction) {
             return Err(format!("scope does not allow {path}"));
+        }
+        if op == "update" && self.update_create && !self.allows(resource_type, "create") {
+            return Err(format!(
+                "scope does not allow {path}: an update may create here, which needs create"
+            ));
         }
         if let Some(patient) = &self.patient {
             if resource == "Patient" && !patient_args_match(patient, args) {
@@ -246,7 +260,10 @@ impl SyncSession {
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
             let interaction = http_interaction(method, url);
-            if !self.allows(resource_type, interaction) {
+            let creates = method == "PUT" && self.update_create;
+            if !self.allows(resource_type, interaction)
+                || (creates && !self.allows(resource_type, "create"))
+            {
                 return Err(format!(
                     "scope does not allow {method} {resource_type} in bundle"
                 ));
@@ -642,8 +659,38 @@ mod tests {
     }
 
     #[test]
+    fn an_update_that_may_create_needs_the_create_scope_too() {
+        let session = |scopes: &[&str], update_create: bool| SyncSession {
+            update_create,
+            scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
+            patient: None,
+        };
+        let update = json!({"id": "p1"});
+        let bundle = json!({"resource": {"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"request": {"method": "PUT", "url": "Patient/p1"}, "resource": {"resourceType": "Patient"}}
+        ]}});
+        // Where a PUT only updates, update permission is enough.
+        let plain = session(&["user/Patient.u"], false);
+        assert!(plain.prepare("Patient/update", &update, false).is_ok());
+        assert!(plain.prepare("Bundle/transaction", &bundle, false).is_ok());
+        // Where it may create, update permission alone is not.
+        let update_only = session(&["user/Patient.u"], true);
+        assert!(update_only
+            .prepare("Patient/update", &update, false)
+            .is_err());
+        assert!(update_only
+            .prepare("Bundle/transaction", &bundle, false)
+            .is_err());
+        // Create and update held separately together are enough.
+        let both = session(&["user/Patient.u", "user/Patient.c"], true);
+        assert!(both.prepare("Patient/update", &update, false).is_ok());
+        assert!(both.prepare("Bundle/transaction", &bundle, false).is_ok());
+    }
+
+    #[test]
     fn sync_session_checks_each_operation() {
         let session = SyncSession {
+            update_create: false,
             scopes: vec!["user/Patient.read".into()],
             patient: None,
         };
@@ -657,6 +704,7 @@ mod tests {
         assert!(session.prepare("system/history", &json!({}), true).is_err());
 
         let writer = SyncSession {
+            update_create: false,
             scopes: vec!["user/Patient.write".into()],
             patient: None,
         };
@@ -682,6 +730,7 @@ mod tests {
             .is_err());
 
         let patient = SyncSession {
+            update_create: false,
             scopes: vec!["patient/Patient.read".into()],
             patient: Some("Patient/p1".into()),
         };
@@ -697,6 +746,7 @@ mod tests {
             .is_ok());
 
         let reader = SyncSession {
+            update_create: false,
             scopes: vec!["user/Questionnaire.read".into()],
             patient: None,
         };

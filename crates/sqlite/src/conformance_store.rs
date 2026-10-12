@@ -1,7 +1,7 @@
 use refhir_persistence::{
-    plan_search_parameter, ConformanceStore, InstallError, InstallOutcome, InstalledParam,
-    NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan, ParamStatus,
-    PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
+    plan_search_parameter, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
+    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan,
+    ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
     StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
@@ -198,6 +198,71 @@ impl ConformanceStore for SqlitePersistence {
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn load_terminology_for(
+        &self,
+        urls: &[String],
+    ) -> Result<Vec<StoredTerminology>, PersistError> {
+        let guard = self.inner.lock()?;
+        let mut rows = Vec::new();
+        // SQLite caps the number of bound parameters, so a long list goes in pieces.
+        for chunk in urls.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(", ");
+            // A row matches the URL as it is stored, or the URL without its `|version`.
+            let mut stmt = guard
+                .connection
+                .prepare(&format!(
+                    "SELECT package_id, resource_type, url, json FROM terminology \
+                     WHERE url IN ({marks}) \
+                        OR (CASE WHEN instr(url, '|') > 0 \
+                                 THEN substr(url, 1, instr(url, '|') - 1) ELSE url END) IN ({marks}) \
+                     ORDER BY package_id, url"
+                ))
+                .map_err(definite)?;
+            let found = stmt
+                .query_map(
+                    rusqlite::params_from_iter(chunk.iter().chain(chunk.iter())),
+                    |row| {
+                        Ok(StoredTerminology {
+                            package_id: row.get(0)?,
+                            resource_type: row.get(1)?,
+                            url: row.get(2)?,
+                            json: row.get(3)?,
+                        })
+                    },
+                )
+                .map_err(definite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(definite)?;
+            rows.extend(found);
+        }
+        Ok(rows)
+    }
+
+    fn apply_expansions(&self, changes: &[ExpansionChange]) -> Result<(), PersistError> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let guard = self.inner.lock()?;
+        let tx = guard.connection.unchecked_transaction().map_err(definite)?;
+        self.check_fence(&tx)?;
+        for change in changes {
+            match &change.json {
+                Some(json) => tx.execute(
+                    "INSERT INTO value_set_expansion (package_id, url, json) VALUES (?1, ?2, ?3) \
+                     ON CONFLICT (package_id, url) DO UPDATE SET json = excluded.json",
+                    params![change.package_id, change.url, json],
+                ),
+                None => tx.execute(
+                    "DELETE FROM value_set_expansion WHERE package_id = ?1 AND url = ?2",
+                    params![change.package_id, change.url],
+                ),
+            }
+            .map_err(definite)?;
+        }
+        tx.commit().map_err(definite)?;
+        Ok(())
     }
 
     fn load_terminology_of(&self, package_id: i64) -> Result<Vec<StoredTerminology>, PersistError> {
@@ -804,6 +869,12 @@ fn replace_expansions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminology_is_read_by_url_and_expansions_change_one_at_a_time() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_terminology_changes(&store, "sqlite");
+    }
 
     #[test]
     fn parameters_from_different_packages_resolve_clashes() {

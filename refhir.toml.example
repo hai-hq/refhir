@@ -25,6 +25,13 @@ sqlite_path = "/data/refhir.sqlite"
 
 [conformance]
 reference_policy = "strict" # strict | fhir
+# strict: a reference must point at a resource this server holds, of a type the element allows,
+#   however deep it sits (`Encounter.participant.individual` as much as `Observation.subject`).
+# fhir: a reference may point at something this server does not hold; the type is still checked.
+# The server assigns the id of a resource it creates, and PUT to an id that does not exist is a
+# 405. Set true to let that PUT create the resource under the id the client names (FHIR
+# "update as create"), for data that has ids of its own.
+# update_as_create = false
 # Where packages are downloaded from: a registry or mirror URL, or s3://bucket/prefix
 # (AWS S3 or any S3-compatible store; keys in REFHIR_S3_ACCESS_KEY_ID / REFHIR_S3_SECRET_ACCESS_KEY,
 # endpoint in REFHIR_S3_ENDPOINT; see deploy/production.md).

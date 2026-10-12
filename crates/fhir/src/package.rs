@@ -246,14 +246,19 @@ pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let (policy, archiver) = {
+    let (policy, archiver, update_create) = {
         let current = catalog.read().expect("catalog");
-        (current.reference_policy(), current.sdc_archiver())
+        (
+            current.reference_policy(),
+            current.sdc_archiver(),
+            current.update_create(),
+        )
     };
     let mut loaded = Catalog::open(store)?;
     loaded.set_reference_policy(policy);
     loaded.set_sdc_archiver(archiver);
     let stable = !loaded.has_pending_parameters();
+    loaded.set_update_create(update_create);
     *catalog.write().expect("catalog") = loaded;
     // Tell the other processes the conformance tables changed. Every change moves the revision,
     // which a standby follows. The version, which replicas follow, moves only when no search
@@ -287,6 +292,7 @@ pub fn reload_catalog(
         let current = catalog.read().expect("catalog");
         fresh.set_reference_policy(current.reference_policy());
         fresh.set_sdc_archiver(current.sdc_archiver());
+        fresh.set_update_create(current.update_create());
     }
     *catalog.write().expect("catalog") = fresh;
     Ok(version)

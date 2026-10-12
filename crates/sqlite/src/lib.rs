@@ -196,6 +196,8 @@ impl SqlitePersistence {
             .and_then(|_| connection.execute_batch(PERSISTENCE_GLOBALS_INIT))
             .and_then(|_| connection.execute_batch(CONFORMANCE_INIT))
             .and_then(|_| connection.execute_batch(auth_store::AUTH_INIT))
+            .and_then(|_| connection.execute_batch(job_store::JOBS_INIT))
+            .and_then(|_| job_store::migrate(&connection))
             .map_err(definite)?;
         // Databases made before a writer epoch was recorded on each backfill.
         let has_claim: bool = connection
@@ -871,6 +873,7 @@ fn uncertain(err: impl ToString) -> PersistError {
 
 mod auth_store;
 mod conformance_store;
+mod job_store;
 
 #[cfg(test)]
 mod tests {

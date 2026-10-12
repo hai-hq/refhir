@@ -13,7 +13,7 @@ use config::{
 };
 use refhir_database::Database;
 use refhir_fhir::{Catalog, CatalogClock};
-use refhir_persistence::{AuthStore, ConformanceStore, Lease, Persistence};
+use refhir_persistence::{AuthStore, ConformanceStore, JobStore, Lease, Persistence};
 use refhir_postgres::{ConnectOptions, PostgresPersistence};
 use refhir_sqlite::{SqliteOptions, SqlitePersistence};
 use std::time::Duration;
@@ -40,6 +40,15 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// One backend serves every table the server keeps: the log, the conformance tables, the
+/// SMART tables and the background jobs.
+type Stores = (
+    Arc<dyn Persistence>,
+    Arc<dyn ConformanceStore>,
+    Arc<dyn AuthStore>,
+    Arc<dyn JobStore>,
+);
 
 /// Startup runs on this thread, outside the runtime: the synchronous Postgres client refuses
 /// to block on a thread that belongs to one. The runtime only serves requests and runs the
@@ -71,6 +80,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_terminology_urls: Option<Vec<String>> = None;
     let mut cli_trace_engine = false;
     let mut cli_sdc_archiver = false;
+    let mut cli_update_as_create = false;
     let mut cli_role: Option<Role> = None;
     let mut cli_primary_url: Option<String> = None;
     let mut cli_db_pool: Option<usize> = None;
@@ -145,6 +155,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 cli_oidc_client_id = Some(required(&args, index, "--oidc-client-id")?);
             }
             "--sdc-archiver" => cli_sdc_archiver = true,
+            "--update-as-create" => cli_update_as_create = true,
             "--export-dir" => {
                 index += 1;
                 cli_export_dir = Some(required(&args, index, "--export-dir")?);
@@ -264,6 +275,9 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if cli_sdc_archiver {
         cfg.sdc_archiver = true;
     }
+    if cli_update_as_create {
+        cfg.update_as_create = true;
+    }
     if let Some(role) = cli_role {
         cfg.role = role;
     }
@@ -332,21 +346,27 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pool_size = cfg.db_pool.unwrap_or(DEFAULT_DB_POOL);
-    let (persistence, store, auth_store): (
-        Arc<dyn Persistence>,
-        Arc<dyn ConformanceStore>,
-        Arc<dyn AuthStore>,
-    ) = if let Some(url) = &cfg.postgres {
+    let (persistence, store, auth_store, job_store): Stores = if let Some(url) = &cfg.postgres {
         let options = ConnectOptions {
             pool_size,
             // A replica never runs DDL: it waits for the primary to have created the tables.
             create_schema: role != Role::Replica,
         };
         let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
-        (persistence.clone(), persistence.clone(), persistence)
+        (
+            persistence.clone(),
+            persistence.clone(),
+            persistence.clone(),
+            persistence,
+        )
     } else if cfg.memory {
         let persistence = Arc::new(SqlitePersistence::open_in_memory()?);
-        (persistence.clone(), persistence.clone(), persistence)
+        (
+            persistence.clone(),
+            persistence.clone(),
+            persistence.clone(),
+            persistence,
+        )
     } else {
         let path = cfg
             .sqlite
@@ -358,7 +378,12 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 .unwrap_or(SqliteOptions::default().read_connections),
         };
         let persistence = Arc::new(SqlitePersistence::open_with(Path::new(&path), &options)?);
-        (persistence.clone(), persistence.clone(), persistence)
+        (
+            persistence.clone(),
+            persistence.clone(),
+            persistence.clone(),
+            persistence,
+        )
     };
 
     // A standby loads the catalog now, while it waits, and keeps it current. Loading the full
@@ -448,12 +473,21 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         );
         (db, catalog, auth_store)
     };
+    let unexpandable = refhir_fhir::unexpandable_value_sets(&catalog);
+    if !unexpandable.is_empty() {
+        tracing::info!(
+            target: "refhir",
+            count = unexpandable.len(),
+            "value sets cannot be expanded with the installed terminology; POST ValueSet/$expandability lists them with the reason for each"
+        );
+    }
     let policy = refhir_fhir::ReferencePolicy::parse(&cfg.references)
         .ok_or_else(|| format!("--references must be strict or fhir"))?;
-    catalog
-        .write()
-        .expect("catalog")
-        .set_reference_policy(policy);
+    {
+        let mut current = catalog.write().expect("catalog");
+        current.set_reference_policy(policy);
+        current.set_update_create(cfg.update_as_create);
+    }
 
     let mut smart_dcr_token = cfg.smart_dcr_token;
     let mut smart_confidential_secret = cfg.smart_confidential_secret;
@@ -505,6 +539,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             primary_url: cfg.primary_url,
             max_staleness: Duration::from_secs(5),
             min_ts_wait: Duration::from_millis(250),
+            // Export jobs are rows in the same database, so they outlive a restart.
+            jobs: Some(refhir_server::SharedJobStore::new(job_store)),
         },
     ))?;
     Ok(())
@@ -749,7 +785,7 @@ fn print_help() {
         "refhir [--config path] [--sqlite path] [--memory] [--postgres url] [--bind 127.0.0.1:8080]\n\
          [--package dir|name@version] [--references strict|fhir] [--smart]\n\
          [--public-url url] [--smart-patient id] [--smart-encounter id]\n\
-         [--smart-fhir-user Resource/id] [--smart-dcr-token token]\n\
+         [--smart-fhir-user Resource/id] [--smart-dcr-token token] [--update-as-create]\n\
          [--smart-confidential-secret secret]\n\
          [--oidc-issuer url --oidc-client-id id] [--smart-demo-login]\n\
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\

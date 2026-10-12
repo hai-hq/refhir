@@ -96,6 +96,8 @@ func TestSearchFollowsMutation(t *testing.T) {
 	if !bytes.Contains(created, []byte(`"Ann"`)) {
 		t.Fatalf("create: %s", created)
 	}
+	// The server assigns the id of a resource it creates, whatever the body says.
+	id := idOf(t, created)
 	watch, err := reader.Search(ctx, "Patient", map[string]string{"active": "true"})
 	if err != nil {
 		t.Fatal(err)
@@ -105,7 +107,7 @@ func TestSearchFollowsMutation(t *testing.T) {
 		t.Fatalf("first result: %s", watch.Latest())
 	}
 
-	if _, err := writer.Update(ctx, "Patient", "p1", patientJSON("p1", "Bee"), ""); err != nil {
+	if _, err := writer.Update(ctx, "Patient", id, patientJSON(id, "Bee"), ""); err != nil {
 		t.Fatal(err)
 	}
 	nextCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
@@ -118,7 +120,7 @@ func TestSearchFollowsMutation(t *testing.T) {
 		t.Fatalf("transition: %s", next)
 	}
 
-	got, err := reader.Query(ctx, "Patient/read", map[string]any{"id": "p1"})
+	got, err := reader.Query(ctx, "Patient/read", map[string]any{"id": id})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,10 +220,20 @@ func TestTransactionAndDelete(t *testing.T) {
 			"request":{"method":"POST","url":"Patient"}
 		}]
 	}`)
-	if _, err := client.Transaction(ctx, bundle); err != nil {
+	response, err := client.Transaction(ctx, bundle)
+	if err != nil {
 		t.Fatal(err)
 	}
-	watch, err := client.Read(ctx, "Patient", "p9")
+	var created struct {
+		Entry []struct {
+			Resource json.RawMessage `json:"resource"`
+		} `json:"entry"`
+	}
+	if err := json.Unmarshal(response, &created); err != nil || len(created.Entry) != 1 {
+		t.Fatalf("transaction response: %s (%v)", response, err)
+	}
+	id := idOf(t, created.Entry[0].Resource)
+	watch, err := client.Read(ctx, "Patient", id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +241,7 @@ func TestTransactionAndDelete(t *testing.T) {
 		t.Fatalf("read: %s", watch.Latest())
 	}
 	watch.Close()
-	if _, err := client.Delete(ctx, "Patient", "p9"); err != nil {
+	if _, err := client.Delete(ctx, "Patient", id); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -239,6 +251,18 @@ func patientJSON(id, family string) json.RawMessage {
 		`{"resourceType":"Patient","id":%q,"active":true,"name":[{"family":%q}]}`,
 		id, family,
 	))
+}
+
+// idOf is the `id` of a resource the server returned.
+func idOf(t *testing.T, resource json.RawMessage) string {
+	t.Helper()
+	var parsed struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(resource, &parsed); err != nil || parsed.ID == "" {
+		t.Fatalf("no id in %s (%v)", resource, err)
+	}
+	return parsed.ID
 }
 
 func family(t *testing.T, body json.RawMessage) string {

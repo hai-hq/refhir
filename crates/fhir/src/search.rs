@@ -920,7 +920,9 @@ fn hierarchy_match(catalog: &Catalog, tokens: &[String], modifier: &str, expecte
             let (query_system, query_code) = token_parts(expected);
             let system = system.or(query_system);
             match (system, code, query_code) {
-                (Some(system), Some(code), Some(query)) => terms.subsumes(system, code, query),
+                (Some(system), Some(code), Some(query)) => {
+                    terms.subsumes(system, None, code, query)
+                }
                 _ => false,
             }
         }),
@@ -929,7 +931,9 @@ fn hierarchy_match(catalog: &Catalog, tokens: &[String], modifier: &str, expecte
             let (query_system, query_code) = token_parts(expected);
             let system = system.or(query_system);
             match (system, code, query_code) {
-                (Some(system), Some(code), Some(query)) => terms.subsumes(system, query, code),
+                (Some(system), Some(code), Some(query)) => {
+                    terms.subsumes(system, None, query, code)
+                }
                 _ => false,
             }
         }),

@@ -91,6 +91,9 @@ impl Node {
             .args(["--export-dir", dir.join("export").to_str().unwrap()])
             .args(args)
             .env("REFHIR_SKIP_DEFAULT_PACKAGES", "1")
+            // A POST gets an id of the server's choosing. These tests read their data back by
+            // an id they picked, so they create it with a PUT, which needs this.
+            .env("REFHIR_UPDATE_AS_CREATE", "true")
             .env("REFHIR_PACKAGE_CACHE", dir.join("packages"))
             .stdout(Stdio::from(log_file.try_clone().unwrap()))
             .stderr(Stdio::from(log_file))
@@ -237,7 +240,12 @@ fn patient(id: &str) -> Value {
 
 /// Creates a Patient with this id.
 fn put_patient(base: &str, id: &str) -> Result<Reply, String> {
-    request("POST", &format!("{base}/Patient"), Some(&patient(id)), &[])
+    request(
+        "PUT",
+        &format!("{base}/Patient/{id}"),
+        Some(&patient(id)),
+        &[],
+    )
 }
 
 fn get_patient(base: &str, id: &str, min_ts: Option<u64>) -> Result<Reply, String> {
@@ -586,8 +594,8 @@ fn a_replica_serves_sync_live_queries_and_sends_mutations_to_the_primary() {
     //    replica gets the new row.
     let mut writer = Sync::connect(&replica.base());
     writer.send(json!({
-        "type": "Mutation", "requestId": 7, "udfPath": "Patient/create",
-        "args": {"resource": patient("via-sync")}
+        "type": "Mutation", "requestId": 7, "udfPath": "Patient/update",
+        "args": {"id": "via-sync", "resource": patient("via-sync")}
     }));
     let reply = writer.expect("MutationResponse", 10);
     assert_eq!(reply["success"], true, "{reply}");

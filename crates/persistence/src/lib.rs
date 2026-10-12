@@ -629,6 +629,15 @@ pub struct NewExpansion {
     pub json: String,
 }
 
+/// A change to the stored expansion of one value set.
+#[derive(Clone, Debug)]
+pub struct ExpansionChange {
+    pub package_id: i64,
+    pub url: String,
+    /// The expansion document to store, or `None` to remove the stored one.
+    pub json: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct NewPackage {
     pub name: String,
@@ -732,6 +741,16 @@ pub trait ConformanceStore: Send + Sync {
             .filter(|row| row.package_id == package_id)
             .collect())
     }
+    /// The terminology rows for these URLs, from every package. A URL matches a row stored
+    /// under exactly that key, and a bare URL also matches the versions of it (`url|version`),
+    /// since two versions of a code system are two rows. A write checks one URL, so it reads a
+    /// few rows, not every code system and value set installed.
+    fn load_terminology_for(&self, urls: &[String])
+        -> Result<Vec<StoredTerminology>, PersistError>;
+
+    /// Apply changes to stored expansions in one transaction, leaving every other expansion
+    /// alone. `replace_expansions` rewrites a whole package.
+    fn apply_expansions(&self, changes: &[ExpansionChange]) -> Result<(), PersistError>;
 
     /// Package row for resources authored through the FHIR API.
     fn ensure_local_package(&self, fhir_version: &str) -> Result<i64, PersistError>;
@@ -1087,8 +1106,867 @@ pub mod auth {
     }
 }
 
+/// Where a [`StoredJob`] is in its life. `Accepted` and `Running` are unfinished; `Completed`
+/// and `Failed` are final. Which process is working on an unfinished job is not the status but
+/// the lease (see [`JobStore`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JobStatus {
+    Accepted,
+    Running,
+    Completed,
+    Failed,
+}
+
+impl JobStatus {
+    /// The text stored in the `status` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Accepted => "accepted",
+            JobStatus::Running => "running",
+            JobStatus::Completed => "completed",
+            JobStatus::Failed => "failed",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "accepted" => Some(JobStatus::Accepted),
+            "running" => Some(JobStatus::Running),
+            "completed" => Some(JobStatus::Completed),
+            "failed" => Some(JobStatus::Failed),
+            _ => None,
+        }
+    }
+
+    pub fn finished(self) -> bool {
+        matches!(self, JobStatus::Completed | JobStatus::Failed)
+    }
+}
+
+/// One row of the `jobs` table. Times are Unix milliseconds supplied by the caller.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredJob {
+    pub id: String,
+    /// What the job is, for example `export`. The runner picks a handler by this.
+    pub kind: String,
+    pub status: JobStatus,
+    /// Everything needed to run the job again from the start.
+    pub request: JsonValue,
+    /// Set when the job completes.
+    pub result: Option<JsonValue>,
+    /// Set when the job fails.
+    pub error: Option<String>,
+    /// How many times the job has been started. A job that keeps killing the process shows up
+    /// here.
+    pub attempts: u32,
+    pub created_ms: u64,
+    /// Set when the job completes or fails.
+    pub completed_ms: Option<u64>,
+    /// The process that holds the job, while it is unfinished and held.
+    pub lease_owner: Option<String>,
+    /// When that hold ends unless its owner renews it.
+    pub lease_until_ms: Option<u64>,
+}
+
+impl StoredJob {
+    /// Whether `owner` may take this job at `now_ms`: it is unfinished, and nobody holds it, or
+    /// the hold has run out.
+    pub fn claimable(&self, now_ms: u64) -> bool {
+        !self.status.finished()
+            && match (&self.lease_owner, self.lease_until_ms) {
+                (Some(_), Some(until)) => until <= now_ms,
+                _ => true,
+            }
+    }
+}
+
+/// A hold on a job: `owner` has it for `ms` from the moment it is taken.
+#[derive(Clone, Copy, Debug)]
+pub struct JobLease<'a> {
+    pub owner: &'a str,
+    pub ms: u64,
+}
+
+/// Background jobs that outlive the request that asked for them, and the process that ran them.
+///
+/// Rows live in their own `jobs` table, outside the FHIR document log. The store records state
+/// and arbitrates who may work on a job; it does not run anything and does not read the clock,
+/// so the caller passes `now_ms`.
+///
+/// **A job is worked on by whoever holds its lease.** A lease is an owner and an expiry. It is
+/// taken in a single atomic step, so of any number of servers sharing one database only one gets
+/// a job; it is kept alive by renewing it while the work goes on; and if its holder dies it
+/// simply runs out, after which another server may take the job. Only the holder can record how
+/// a job ended, so a worker that lost its lease cannot overwrite the result of the one that took
+/// over. No lock is held while the work runs.
+pub trait JobStore: Send + Sync {
+    /// Insert a job as `accepted` with no attempts. Fails if `id` is already taken. With a
+    /// `lease`, the job is held by its creator from the start, so no other server can take a job
+    /// that was just made for this one.
+    fn job_create(
+        &self,
+        id: &str,
+        kind: &str,
+        request: &JsonValue,
+        now_ms: u64,
+        lease: Option<JobLease<'_>>,
+    ) -> Result<(), PersistError>;
+
+    /// Take up to `limit` unfinished jobs of these `kinds` that nobody holds, oldest first, each
+    /// for `lease_ms`. A job whose lease has run out is held by nobody. The jobs come back as
+    /// they now are: `running`, one more attempt, leased to `owner`. Concurrent callers never
+    /// get the same job.
+    fn job_claim(
+        &self,
+        owner: &str,
+        kinds: &[&str],
+        now_ms: u64,
+        lease_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredJob>, PersistError>;
+
+    /// Start a job that `owner` already holds (one it created with a lease): `running`, one more
+    /// attempt, the lease extended by `lease_ms`. `None` if the job is unknown, finished, or
+    /// held by someone else.
+    fn job_start(
+        &self,
+        id: &str,
+        owner: &str,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<StoredJob>, PersistError>;
+
+    /// Extend the lease on a job `owner` holds to `now_ms + lease_ms`. `false` means it is no
+    /// longer held by `owner`: it finished, or the lease ran out and someone else took it.
+    fn job_renew(
+        &self,
+        id: &str,
+        owner: &str,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<bool, PersistError>;
+
+    /// Record the end of a job `owner` holds: `Completed` with a `result`, or `Failed` with an
+    /// `error`. The lease is released. `false` if the job is unknown, already finished, or held
+    /// by someone else. Any other `status` is an error.
+    fn job_finish(
+        &self,
+        id: &str,
+        owner: &str,
+        status: JobStatus,
+        result: Option<&JsonValue>,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<bool, PersistError>;
+
+    fn job_get(&self, id: &str) -> Result<Option<StoredJob>, PersistError>;
+
+    /// The store's own clock in Unix milliseconds, when it has one that every server sharing it
+    /// reads alike, such as a database server's. A lease is written by one server and judged by
+    /// another, so the caller measures lease times on this clock rather than its own, which may
+    /// not agree with the others'. `None` means the store has none, and the caller's will do.
+    fn clock_ms(&self) -> Result<Option<u64>, PersistError> {
+        Ok(None)
+    }
+}
+
+/// SQL value for a job time: Unix milliseconds, clamped to the signed 64-bit range.
+pub fn job_ms(ms: u64) -> i64 {
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+/// When a lease taken at `now_ms` for `lease_ms` runs out, as the SQL value.
+pub fn lease_until(now_ms: u64, lease_ms: u64) -> i64 {
+    job_ms(now_ms.saturating_add(lease_ms))
+}
+
+/// What [`JobStore::job_finish`] writes for the end of a job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobEnd {
+    pub status: &'static str,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub completed_ms: i64,
+}
+
+pub fn plan_job_end(
+    status: JobStatus,
+    result: Option<&JsonValue>,
+    error: Option<&str>,
+    now_ms: u64,
+) -> Result<JobEnd, PersistError> {
+    if !status.finished() {
+        return Err(PersistError::Definite(
+            "a job ends as completed or failed".into(),
+        ));
+    }
+    Ok(JobEnd {
+        status: status.as_str(),
+        result: result.map(JsonValue::to_string),
+        error: error.map(str::to_string),
+        completed_ms: job_ms(now_ms),
+    })
+}
+
+/// Build a [`StoredJob`] from the columns of a `jobs` row.
+#[allow(clippy::too_many_arguments)]
+pub fn job_from_parts(
+    id: String,
+    kind: String,
+    status: &str,
+    request: &str,
+    result: Option<String>,
+    error: Option<String>,
+    attempts: i64,
+    created_ms: i64,
+    completed_ms: Option<i64>,
+    lease_owner: Option<String>,
+    lease_until_ms: Option<i64>,
+) -> Result<StoredJob, PersistError> {
+    let bad = |what: &str| PersistError::Definite(format!("job {id}: bad {what}"));
+    let parse = |text: &str, what: &str| {
+        serde_json::from_str::<JsonValue>(text)
+            .map_err(|err| PersistError::Definite(format!("job {id}: {what} is not json: {err}")))
+    };
+    Ok(StoredJob {
+        status: JobStatus::parse(status).ok_or_else(|| bad("status"))?,
+        request: parse(request, "request")?,
+        result: result
+            .as_deref()
+            .map(|text| parse(text, "result"))
+            .transpose()?,
+        error,
+        attempts: u32::try_from(attempts).map_err(|_| bad("attempts"))?,
+        created_ms: u64::try_from(created_ms).map_err(|_| bad("created_at"))?,
+        completed_ms: completed_ms
+            .map(|ms| u64::try_from(ms).map_err(|_| bad("completed_at")))
+            .transpose()?,
+        lease_owner,
+        lease_until_ms: lease_until_ms
+            .map(|ms| u64::try_from(ms).map_err(|_| bad("lease_until")))
+            .transpose()?,
+        kind,
+        id,
+    })
+}
+
+/// [`JobStore`] held in process memory. For tests and embedders without a database: nothing
+/// in it survives the process, so it gives none of the restart recovery the real stores do.
+#[derive(Default)]
+pub struct MemoryJobStore {
+    jobs: std::sync::Mutex<std::collections::BTreeMap<String, StoredJob>>,
+}
+
+impl JobStore for MemoryJobStore {
+    fn job_create(
+        &self,
+        id: &str,
+        kind: &str,
+        request: &JsonValue,
+        now_ms: u64,
+        lease: Option<JobLease<'_>>,
+    ) -> Result<(), PersistError> {
+        let mut jobs = self.jobs.lock().expect("jobs");
+        if jobs.contains_key(id) {
+            return Err(PersistError::Definite(format!("job {id} already exists")));
+        }
+        jobs.insert(
+            id.to_string(),
+            StoredJob {
+                id: id.to_string(),
+                kind: kind.to_string(),
+                status: JobStatus::Accepted,
+                request: request.clone(),
+                result: None,
+                error: None,
+                attempts: 0,
+                created_ms: now_ms,
+                completed_ms: None,
+                lease_owner: lease.map(|lease| lease.owner.to_string()),
+                lease_until_ms: lease.map(|lease| now_ms.saturating_add(lease.ms)),
+            },
+        );
+        Ok(())
+    }
+
+    fn job_claim(
+        &self,
+        owner: &str,
+        kinds: &[&str],
+        now_ms: u64,
+        lease_ms: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredJob>, PersistError> {
+        let mut jobs = self.jobs.lock().expect("jobs");
+        let mut ids: Vec<(u64, String)> = jobs
+            .values()
+            .filter(|job| job.claimable(now_ms) && kinds.contains(&job.kind.as_str()))
+            .map(|job| (job.created_ms, job.id.clone()))
+            .collect();
+        ids.sort();
+        ids.truncate(limit as usize);
+        let mut claimed = Vec::new();
+        for (_, id) in ids {
+            let job = jobs.get_mut(&id).expect("listed above");
+            job.status = JobStatus::Running;
+            job.attempts += 1;
+            job.lease_owner = Some(owner.to_string());
+            job.lease_until_ms = Some(now_ms.saturating_add(lease_ms));
+            claimed.push(job.clone());
+        }
+        Ok(claimed)
+    }
+
+    fn job_start(
+        &self,
+        id: &str,
+        owner: &str,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<Option<StoredJob>, PersistError> {
+        let mut jobs = self.jobs.lock().expect("jobs");
+        let Some(job) = jobs
+            .get_mut(id)
+            .filter(|job| !job.status.finished() && job.lease_owner.as_deref() == Some(owner))
+        else {
+            return Ok(None);
+        };
+        job.status = JobStatus::Running;
+        job.attempts += 1;
+        job.lease_until_ms = Some(now_ms.saturating_add(lease_ms));
+        Ok(Some(job.clone()))
+    }
+
+    fn job_renew(
+        &self,
+        id: &str,
+        owner: &str,
+        now_ms: u64,
+        lease_ms: u64,
+    ) -> Result<bool, PersistError> {
+        let mut jobs = self.jobs.lock().expect("jobs");
+        let Some(job) = jobs
+            .get_mut(id)
+            .filter(|job| !job.status.finished() && job.lease_owner.as_deref() == Some(owner))
+        else {
+            return Ok(false);
+        };
+        job.lease_until_ms = Some(now_ms.saturating_add(lease_ms));
+        Ok(true)
+    }
+
+    fn job_finish(
+        &self,
+        id: &str,
+        owner: &str,
+        status: JobStatus,
+        result: Option<&JsonValue>,
+        error: Option<&str>,
+        now_ms: u64,
+    ) -> Result<bool, PersistError> {
+        plan_job_end(status, result, error, now_ms)?;
+        let mut jobs = self.jobs.lock().expect("jobs");
+        let Some(job) = jobs
+            .get_mut(id)
+            .filter(|job| !job.status.finished() && job.lease_owner.as_deref() == Some(owner))
+        else {
+            return Ok(false);
+        };
+        job.status = status;
+        job.result = result.cloned();
+        job.error = error.map(str::to_string);
+        job.completed_ms = Some(now_ms);
+        job.lease_owner = None;
+        job.lease_until_ms = None;
+        Ok(true)
+    }
+
+    fn job_get(&self, id: &str) -> Result<Option<StoredJob>, PersistError> {
+        Ok(self.jobs.lock().expect("jobs").get(id).cloned())
+    }
+}
+
+/// Shared checks every [`JobStore`] backend must pass.
+pub mod jobs {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{JobLease, JobStatus, JobStore, StoredJob};
+
+    /// The lifecycle of a job and its lease. `tag` keeps this run's jobs apart on a database
+    /// that already holds others: every job here has a kind of its own, and only that kind is
+    /// ever claimed.
+    pub fn exercise(store: &dyn JobStore, tag: &str) {
+        let id = |name: &str| format!("{tag}-{name}");
+        let kind = format!("{tag}-kind");
+        let other = format!("{tag}-other");
+        let kinds = [kind.as_str()];
+        let claim = |owner: &str, now: u64, lease: u64, limit: u32| {
+            store.job_claim(owner, &kinds, now, lease, limit).unwrap()
+        };
+
+        // A new job is accepted, unheld, with nothing recorded yet.
+        let request = json!({"type": "Patient", "id": null, "nested": {"n": [1, 2.5, "\u{e9}"]}});
+        store
+            .job_create(&id("a"), &kind, &request, 1000, None)
+            .unwrap();
+        let job = store.job_get(&id("a")).unwrap().expect("created");
+        assert_eq!(job.kind, kind);
+        assert_eq!(job.status, JobStatus::Accepted);
+        assert_eq!(job.request, request);
+        assert_eq!((job.result.clone(), job.error.clone()), (None, None));
+        assert_eq!((job.attempts, job.created_ms), (0, 1000));
+        assert_eq!(
+            (job.completed_ms, job.lease_owner, job.lease_until_ms),
+            (None, None, None)
+        );
+        assert!(
+            store
+                .job_create(&id("a"), &kind, &json!({}), 1001, None)
+                .is_err(),
+            "ids are unique"
+        );
+        assert_eq!(store.job_get(&id("nope")).unwrap(), None);
+
+        // Claiming takes it: running, one attempt, held until the lease runs out.
+        let got = claim("A", 1000, 100, 10);
+        assert_eq!(got.len(), 1);
+        let job = &got[0];
+        assert_eq!(job.id, id("a"));
+        assert_eq!((job.status, job.attempts), (JobStatus::Running, 1));
+        assert_eq!(job.lease_owner.as_deref(), Some("A"));
+        assert_eq!(job.lease_until_ms, Some(1100));
+        assert_eq!(store.job_get(&id("a")).unwrap().unwrap(), *job);
+
+        // While A holds it nobody else can take it, up to the moment the lease runs out.
+        assert!(claim("B", 1000, 100, 10).is_empty(), "held");
+        assert!(
+            claim("B", 1099, 100, 10).is_empty(),
+            "held until the last millisecond"
+        );
+        assert!(
+            claim("A", 1050, 100, 10).is_empty(),
+            "not even by its own holder again"
+        );
+        let got = claim("B", 1100, 100, 10);
+        assert_eq!(got.len(), 1, "an expired lease is nobody's");
+        assert_eq!(
+            (got[0].attempts, got[0].lease_owner.as_deref()),
+            (2, Some("B"))
+        );
+
+        // Only the holder renews, and only the holder can end it.
+        assert!(
+            !store.job_renew(&id("a"), "A", 1120, 100).unwrap(),
+            "A lost it"
+        );
+        assert!(store.job_renew(&id("a"), "B", 1150, 100).unwrap());
+        assert_eq!(
+            store.job_get(&id("a")).unwrap().unwrap().lease_until_ms,
+            Some(1250)
+        );
+        assert!(
+            claim("A", 1200, 100, 10).is_empty(),
+            "renewing kept it from A"
+        );
+        let result = json!({"file": "a.ndjson"});
+        assert!(
+            !store
+                .job_finish(
+                    &id("a"),
+                    "A",
+                    JobStatus::Completed,
+                    Some(&result),
+                    None,
+                    1300
+                )
+                .unwrap(),
+            "a worker that lost its lease cannot record an outcome"
+        );
+        assert_eq!(
+            store.job_get(&id("a")).unwrap().unwrap().status,
+            JobStatus::Running
+        );
+        assert!(store
+            .job_finish(
+                &id("a"),
+                "B",
+                JobStatus::Completed,
+                Some(&result),
+                None,
+                1300
+            )
+            .unwrap());
+        let job = store.job_get(&id("a")).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.result, Some(result.clone()));
+        assert_eq!(
+            (job.error.clone(), job.attempts, job.completed_ms),
+            (None, 2, Some(1300))
+        );
+        assert_eq!(
+            (job.lease_owner.clone(), job.lease_until_ms),
+            (None, None),
+            "released"
+        );
+
+        // A finished job is never changed, renewed, started or claimed again.
+        assert!(!store
+            .job_finish(&id("a"), "B", JobStatus::Failed, None, Some("late"), 1400)
+            .unwrap());
+        assert!(!store.job_renew(&id("a"), "B", 1400, 100).unwrap());
+        assert_eq!(store.job_start(&id("a"), "B", 1400, 100).unwrap(), None);
+        assert!(claim("A", 10_000, 100, 10).is_empty());
+        let job = store.job_get(&id("a")).unwrap().unwrap();
+        assert_eq!(
+            (job.status, job.result, job.attempts),
+            (JobStatus::Completed, Some(result), 2)
+        );
+
+        // A job made for its creator is held from the start and only the creator starts it.
+        store
+            .job_create(
+                &id("b"),
+                &kind,
+                &json!({}),
+                2000,
+                Some(JobLease { owner: "C", ms: 50 }),
+            )
+            .unwrap();
+        let made = store.job_get(&id("b")).unwrap().unwrap();
+        assert_eq!((made.status, made.attempts), (JobStatus::Accepted, 0));
+        assert_eq!(
+            (made.lease_owner.as_deref(), made.lease_until_ms),
+            (Some("C"), Some(2050))
+        );
+        assert!(
+            claim("A", 2010, 100, 10).is_empty(),
+            "nobody takes a job made for another"
+        );
+        assert_eq!(store.job_start(&id("b"), "A", 2010, 100).unwrap(), None);
+        let started = store
+            .job_start(&id("b"), "C", 2020, 100)
+            .unwrap()
+            .expect("C started it");
+        assert_eq!((started.status, started.attempts), (JobStatus::Running, 1));
+        assert_eq!(started.lease_until_ms, Some(2120));
+        // If its creator never gets to it, the lease runs out and another server does.
+        let got = claim("A", 2200, 100, 10);
+        assert_eq!(
+            (got.len(), got[0].attempts, got[0].lease_owner.as_deref()),
+            (1, 2, Some("A"))
+        );
+
+        // Failing keeps the error and no result; other statuses are refused.
+        assert!(store
+            .job_finish(&id("b"), "A", JobStatus::Failed, None, Some("boom"), 2300)
+            .unwrap());
+        let job = store.job_get(&id("b")).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Failed);
+        assert_eq!(
+            (job.error.as_deref(), job.result, job.completed_ms),
+            (Some("boom"), None, Some(2300))
+        );
+        store
+            .job_create(&id("c"), &kind, &json!({}), 3000, None)
+            .unwrap();
+        assert!(claim("A", 3000, 100, 10).len() == 1);
+        for status in [JobStatus::Running, JobStatus::Accepted] {
+            assert!(store
+                .job_finish(&id("c"), "A", status, None, None, 3001)
+                .is_err());
+        }
+        assert!(store
+            .job_finish(&id("c"), "A", JobStatus::Failed, None, Some("done"), 3002)
+            .unwrap());
+
+        // Unknown ids change nothing.
+        assert!(!store.job_renew(&id("nope"), "A", 1, 1).unwrap());
+        assert_eq!(store.job_start(&id("nope"), "A", 1, 1).unwrap(), None);
+        assert!(!store
+            .job_finish(&id("nope"), "A", JobStatus::Failed, None, Some("x"), 1)
+            .unwrap());
+
+        // Only the kinds asked for are taken, oldest first, up to the limit.
+        store
+            .job_create(&id("x"), &other, &json!({}), 3100, None)
+            .unwrap();
+        for (name, at) in [("d1", 4000), ("d2", 4001), ("d3", 4002)] {
+            store
+                .job_create(&id(name), &kind, &json!({}), at, None)
+                .unwrap();
+        }
+        let first: Vec<String> = claim("D", 5000, 100, 2)
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(first, vec![id("d1"), id("d2")]);
+        let rest: Vec<String> = claim("D", 5000, 100, 2)
+            .into_iter()
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(rest, vec![id("d3")]);
+        assert_eq!(
+            store.job_get(&id("x")).unwrap().unwrap().status,
+            JobStatus::Accepted
+        );
+        let got = store
+            .job_claim("E", &[other.as_str()], 5000, 100, 10)
+            .unwrap();
+        assert_eq!(
+            got.iter().map(|job| job.id.clone()).collect::<Vec<_>>(),
+            vec![id("x")]
+        );
+
+        // Leave nothing unfinished behind on a shared database.
+        for (name, owner) in [("d1", "D"), ("d2", "D"), ("d3", "D")] {
+            assert!(store
+                .job_finish(
+                    &id(name),
+                    owner,
+                    JobStatus::Failed,
+                    None,
+                    Some("cleanup"),
+                    9000
+                )
+                .unwrap());
+        }
+        assert!(store
+            .job_finish(
+                &id("x"),
+                "E",
+                JobStatus::Failed,
+                None,
+                Some("cleanup"),
+                9000
+            )
+            .unwrap());
+    }
+
+    /// Several servers claiming from one table at once: every job goes to exactly one of them.
+    /// `open` makes a separate handle to the same table each time it is called, as a second
+    /// server would have; for a database with row locking, that is what exercises `SKIP LOCKED`.
+    pub fn exercise_competing_claimers(open: &(dyn Fn() -> Arc<dyn JobStore> + Sync), tag: &str) {
+        const JOBS: usize = 40;
+        const SERVERS: usize = 6;
+        let kind = format!("{tag}-race");
+        {
+            let store = open();
+            for index in 0..JOBS {
+                store
+                    .job_create(
+                        &format!("{tag}-race-{index:03}"),
+                        &kind,
+                        &json!({"n": index}),
+                        index as u64,
+                        None,
+                    )
+                    .unwrap();
+            }
+        }
+        let taken: Vec<(String, Vec<StoredJob>)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..SERVERS)
+                .map(|server| {
+                    let kind = kind.clone();
+                    scope.spawn(move || {
+                        let store = open();
+                        let owner = format!("{tag}-server-{server}");
+                        let mut mine = Vec::new();
+                        loop {
+                            let got = store
+                                .job_claim(&owner, &[kind.as_str()], 1_000_000, 1_000_000, 3)
+                                .unwrap();
+                            if got.is_empty() {
+                                break;
+                            }
+                            mine.extend(got);
+                        }
+                        (owner, mine)
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        let mut owners: BTreeMap<String, String> = BTreeMap::new();
+        for (owner, jobs) in &taken {
+            for job in jobs {
+                assert_eq!(job.attempts, 1, "{} was claimed more than once", job.id);
+                assert!(
+                    owners.insert(job.id.clone(), owner.clone()).is_none(),
+                    "{} went to two servers",
+                    job.id
+                );
+            }
+        }
+        assert_eq!(owners.len(), JOBS, "every job went to one server");
+        assert!(
+            taken.iter().filter(|(_, jobs)| !jobs.is_empty()).count() >= 1,
+            "at least one server took work"
+        );
+        // And the table agrees about who has each.
+        let store = open();
+        for (id, owner) in &owners {
+            let row = store.job_get(id).unwrap().unwrap();
+            assert_eq!(row.lease_owner.as_deref(), Some(owner.as_str()), "{id}");
+            assert!(store
+                .job_finish(id, owner, JobStatus::Completed, None, None, 2_000_000)
+                .unwrap());
+        }
+    }
+
+    #[test]
+    fn memory_store() {
+        exercise(&super::MemoryJobStore::default(), "memory");
+    }
+
+    #[test]
+    fn memory_store_competing_claimers() {
+        let store: Arc<dyn JobStore> = Arc::new(super::MemoryJobStore::default());
+        exercise_competing_claimers(&|| store.clone(), "memory");
+    }
+}
+
 pub mod conformance {
     use super::*;
+
+    /// Reading terminology by URL and changing one stored expansion at a time. `tag` keeps this
+    /// run's URLs and package names apart on a database that already holds earlier runs.
+    pub fn exercise_terminology_changes(store: &dyn ConformanceStore, tag: &str) {
+        let url = |name: &str| format!("http://example.org/{tag}/{name}");
+        let row = |name: &str, kind: &str| NewTerminology {
+            resource_type: kind.into(),
+            url: url(name),
+            json: format!(r#"{{"resourceType":"{kind}","url":"{}"}}"#, url(name)),
+        };
+        let package = |name: &str, terminology: Vec<NewTerminology>| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: Vec::new(),
+            terminology,
+            expansions: Vec::new(),
+        };
+        let first = store
+            .install_package(&package(
+                "one",
+                vec![
+                    row("alpha", "ValueSet"),
+                    row("beta", "CodeSystem"),
+                    row("gamma|1", "CodeSystem"),
+                    row("gamma|2", "CodeSystem"),
+                ],
+            ))
+            .unwrap();
+        assert!(first.inserted);
+        let first = first.package_id;
+        let second = store
+            .install_package(&package("two", vec![row("alpha", "ValueSet")]))
+            .unwrap();
+        assert!(second.inserted);
+        let second = second.package_id;
+
+        // Only the URLs asked for, from every package that holds them, and none that do not exist.
+        let found = store
+            .load_terminology_for(&[url("alpha"), url("beta"), url("nowhere")])
+            .unwrap();
+        let mut got: Vec<(i64, String)> = found
+            .iter()
+            .map(|stored| (stored.package_id, stored.url.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (first, url("alpha")),
+                (first, url("beta")),
+                (second, url("alpha"))
+            ]
+        );
+        assert_eq!(found[0].json, row("alpha", "ValueSet").json);
+        // A bare URL finds every version of it; a versioned one finds that version only.
+        let versions = |urls: &[String]| -> Vec<String> {
+            store
+                .load_terminology_for(urls)
+                .unwrap()
+                .into_iter()
+                .map(|stored| stored.url)
+                .collect()
+        };
+        assert_eq!(
+            versions(&[url("gamma")]),
+            vec![url("gamma|1"), url("gamma|2")]
+        );
+        assert_eq!(versions(&[url("gamma|2")]), vec![url("gamma|2")]);
+        assert!(versions(&[url("gamma|3")]).is_empty());
+        assert!(store.load_terminology_for(&[]).unwrap().is_empty());
+        // A long list is fine: one query cannot take an unbounded number of parameters.
+        let many: Vec<String> = (0..1200)
+            .map(|index| url(&format!("filler-{index}")))
+            .chain([url("beta")])
+            .collect();
+        let found = store.load_terminology_for(&many).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].url, url("beta"));
+
+        // Expansion changes: store, replace, remove, and leave the rest alone.
+        let mine = |store: &dyn ConformanceStore| -> Vec<(i64, String, String)> {
+            store
+                .load_expansions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{tag}/")))
+                .map(|row| (row.package_id, row.url, row.json))
+                .collect()
+        };
+        assert!(mine(store).is_empty());
+        let change = |package_id: i64, name: &str, json: Option<&str>| ExpansionChange {
+            package_id,
+            url: url(name),
+            json: json.map(str::to_string),
+        };
+        store.apply_expansions(&[]).unwrap();
+        store
+            .apply_expansions(&[
+                change(first, "alpha", Some("one")),
+                change(second, "alpha", Some("two")),
+                change(first, "gamma", Some("three")),
+            ])
+            .unwrap();
+        let mut rows = mine(store);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (first, url("alpha"), "one".to_string()),
+                (first, url("gamma"), "three".to_string()),
+                (second, url("alpha"), "two".to_string()),
+            ]
+        );
+        // The same key is replaced, not duplicated; a removal takes only its own package's row;
+        // removing what is not there is not an error.
+        store
+            .apply_expansions(&[
+                change(first, "alpha", Some("replaced")),
+                change(second, "alpha", None),
+                change(first, "never-stored", None),
+            ])
+            .unwrap();
+        let mut rows = mine(store);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                (first, url("alpha"), "replaced".to_string()),
+                (first, url("gamma"), "three".to_string()),
+            ]
+        );
+    }
 
     /// Search parameters that meet in different packages: a draft yields to a real definition
     /// in either install order, and two real ones that disagree are refused. `tag` keeps

@@ -96,6 +96,9 @@ pub struct ConformanceSection {
     /// Optional implementation guides for `[fhir].version`, installed after release defaults.
     pub packages: Option<Vec<String>>,
     pub reference_policy: Option<String>,
+    /// Let `PUT [type]/[id]` create a resource under an id the client names. Off by default: the
+    /// server assigns ids and a PUT to an unknown id is a 405.
+    pub update_as_create: Option<bool>,
     pub package_registry: Option<String>,
     pub package_cache: Option<String>,
 }
@@ -160,6 +163,7 @@ pub struct ResolvedConfig {
     pub packages: PackagePlan,
     pub bind: String,
     pub references: String,
+    pub update_as_create: bool,
     pub auth: bool,
     pub public_url: Option<String>,
     pub smart_patient: Option<String>,
@@ -188,6 +192,7 @@ impl ResolvedConfig {
             packages: PackagePlan::Bundled(FhirRelease::R4, Vec::new()),
             bind: "127.0.0.1:8080".to_string(),
             references: "strict".to_string(),
+            update_as_create: false,
             auth: false,
             public_url: None,
             smart_patient: None,
@@ -271,6 +276,9 @@ impl ResolvedConfig {
 
         if let Some(v) = &file.conformance.reference_policy {
             self.references = v.clone();
+        }
+        if let Some(v) = file.conformance.update_as_create {
+            self.update_as_create = v;
         }
         // The environment wins over the file (file < env < CLI), so only fill gaps.
         if let Some(v) = &file.conformance.package_registry {
@@ -458,6 +466,9 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     }
     if let Some(url) = env_value("REFHIR_PUBLIC_URL") {
         cfg.public_url = Some(url);
+    }
+    if let Some(value) = env_value("REFHIR_UPDATE_AS_CREATE") {
+        cfg.update_as_create = matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
     if let Some(token) = env_value("REFHIR_SMART_DCR_TOKEN") {
         cfg.smart_dcr_token = Some(token);

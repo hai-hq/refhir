@@ -30,8 +30,8 @@ pub use catalog::{Catalog, CatalogClock, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
 pub use npm::{
-    install_package, install_with, packages_installed, parse_package_spec, NpmRegistry,
-    PackageFetcher, PackageSpec,
+    install_package, install_with, packages_installed, parse_package_spec, unexpandable_value_sets,
+    NpmRegistry, PackageFetcher, PackageSpec,
 };
 pub use package::{
     default_r4_registry_specs, expression_clash_dir, extra_dir, install_package_dir, minir4_dir,
@@ -39,5 +39,7 @@ pub use package::{
     watch_catalog, CatalogWatcher, R4_CORE_PACKAGE, SDC_PACKAGE,
 };
 pub use refhir_persistence::ConformanceStore;
-pub use run::{dispatch, run, stamp_stored_json, RunError, RunResult, MAX_OCC_FAILURES};
+pub use run::{
+    dispatch, import_resource, run, stamp_stored_json, RunError, RunResult, MAX_OCC_FAILURES,
+};
 pub use search::resource_in_compartment;

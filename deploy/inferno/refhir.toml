@@ -13,6 +13,9 @@ sqlite_path = "/data/refhir.sqlite"
 
 [conformance]
 reference_policy = "strict"
+# seed.sh creates Patient/p1, the patient smart.patient names below, so the id must be the
+# client's to choose.
+update_as_create = true
 package_cache = "/data/package-cache"
 
 [smart]

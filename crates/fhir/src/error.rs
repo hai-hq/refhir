@@ -14,6 +14,11 @@ pub enum FhirError {
     Storage(String),
     /// The caller is not allowed to perform the interaction.
     Forbidden(String),
+    /// The request is well formed but the server cannot act on it (HTTP 422). The value is the
+    /// OperationOutcome that says why, with one issue per cause.
+    Unprocessable(Value),
+    /// The interaction is not supported for this request (HTTP 405).
+    MethodNotAllowed(String),
 }
 
 impl std::fmt::Display for FhirError {
@@ -27,8 +32,9 @@ impl std::fmt::Display for FhirError {
             | FhirError::UnknownResource(message)
             | FhirError::Unsupported(message)
             | FhirError::Storage(message)
-            | FhirError::Forbidden(message) => write!(f, "{message}"),
-            FhirError::Outcome(value) => {
+            | FhirError::Forbidden(message)
+            | FhirError::MethodNotAllowed(message) => write!(f, "{message}"),
+            FhirError::Outcome(value) | FhirError::Unprocessable(value) => {
                 let diagnostics = value
                     .pointer("/issue/0/diagnostics")
                     .and_then(|item| item.as_str())
@@ -55,5 +61,7 @@ pub fn outcome_code(err: &FhirError) -> &'static str {
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => "invalid",
         FhirError::Storage(_) => "exception",
         FhirError::Forbidden(_) => "forbidden",
+        FhirError::Unprocessable(_) => "not-supported",
+        FhirError::MethodNotAllowed(_) => "not-supported",
     }
 }

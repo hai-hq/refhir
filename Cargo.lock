@@ -1493,6 +1493,7 @@ dependencies = [
  "refhir-persistence",
  "refhir-types",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

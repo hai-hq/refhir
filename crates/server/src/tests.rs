@@ -19,7 +19,20 @@ use tower::ServiceExt;
 
 use crate::app;
 
+/// A server over the minimal R4 package. Most tests need resources with ids they know in
+/// advance, so update-as-create is on here (a PUT to a new id creates it); `strict()` is the
+/// default configuration.
 fn memory() -> (
+    Arc<Database>,
+    Arc<RwLock<Catalog>>,
+    Arc<dyn ConformanceStore>,
+) {
+    let (db, catalog, store) = strict();
+    catalog.write().unwrap().set_update_create(true);
+    (db, catalog, store)
+}
+
+fn strict() -> (
     Arc<Database>,
     Arc<RwLock<Catalog>>,
     Arc<dyn ConformanceStore>,
@@ -74,6 +87,16 @@ async fn send(
     }
 }
 
+/// Create `resource` under the id it names: `PUT [type]/[id]`, which `memory()` allows.
+async fn put(app: &axum::Router, resource: Value) -> Reply {
+    let uri = format!(
+        "/{}/{}",
+        resource["resourceType"].as_str().unwrap(),
+        resource["id"].as_str().unwrap()
+    );
+    send(app, "PUT", &uri, Some(resource), None).await
+}
+
 fn patient(id: &str) -> Value {
     json!({
         "resourceType": "Patient",
@@ -98,7 +121,7 @@ async fn http_crud_search_history_and_bundle() {
         .collect();
     assert_eq!(types, ["Observation", "Patient"]);
 
-    let created = send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
+    let created = put(&app, patient("p1")).await;
     assert_eq!(created.status, StatusCode::CREATED);
     assert_eq!(created.body["meta"]["versionId"], "1");
     assert_eq!(created.location.as_deref(), Some("Patient/p1/_history/1"));
@@ -160,6 +183,7 @@ async fn http_crud_search_history_and_bundle() {
             "type": "transaction",
             "entry": [
                 {
+                    "fullUrl": "urn:uuid:5b1d1b0e-0000-4000-8000-000000000001",
                     "request": {"method": "POST", "url": "Patient"},
                     "resource": patient("p2")
                 },
@@ -167,8 +191,7 @@ async fn http_crud_search_history_and_bundle() {
                     "request": {"method": "POST", "url": "Observation"},
                     "resource": {
                         "resourceType": "Observation",
-                        "id": "o1",
-                        "subject": {"reference": "Patient/p2"},
+                        "subject": {"reference": "urn:uuid:5b1d1b0e-0000-4000-8000-000000000001"},
                         "code": {"coding": [{"code": "8480-6"}]},
                         "effectiveDateTime": "2020-01-02"
                     }
@@ -180,15 +203,130 @@ async fn http_crud_search_history_and_bundle() {
     .await;
     assert_eq!(bundle.status, StatusCode::OK);
     assert_eq!(bundle.body["type"], "transaction-response");
-    let found = send(&app, "GET", "/Observation?subject=Patient/p2", None, None).await;
+    let new_id = bundle.body["entry"][0]["resource"]["id"].as_str().unwrap();
+    assert_ne!(
+        new_id, "p2",
+        "the server assigns the id of a created resource"
+    );
+    let found = send(
+        &app,
+        "GET",
+        &format!("/Observation?subject=Patient/{new_id}"),
+        None,
+        None,
+    )
+    .await;
     assert_eq!(found.body["total"], 1);
+}
+
+#[tokio::test]
+async fn the_server_assigns_ids_and_put_to_a_new_id_is_off_by_default() {
+    let (db, catalog, store) = strict();
+    let app = app(db, catalog, store);
+
+    // POST ignores the id and the version a client names.
+    let mut body = patient("chosen");
+    body["meta"] = json!({"versionId": "99"});
+    let created = send(&app, "POST", "/Patient", Some(body), None).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let id = created.body["id"].as_str().unwrap().to_string();
+    assert_ne!(id, "chosen");
+    assert_eq!(created.body["meta"]["versionId"], "1");
+    assert_eq!(
+        created.location.as_deref(),
+        Some(format!("Patient/{id}/_history/1").as_str())
+    );
+    assert_eq!(
+        send(&app, "GET", "/Patient/chosen", None, None)
+            .await
+            .status,
+        StatusCode::NOT_FOUND
+    );
+
+    // PUT to an id that does not exist is a 405 that says why and what to do instead.
+    let refused = send(
+        &app,
+        "PUT",
+        "/Patient/chosen",
+        Some(patient("chosen")),
+        None,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(refused.body["resourceType"], "OperationOutcome");
+    assert_eq!(refused.body["issue"][0]["severity"], "error");
+    let text = refused.body["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(
+        text.contains("update-as-create") && text.contains("POST to Patient"),
+        "{text}"
+    );
+    // A 405 must say which methods the resource does take.
+    let allow = {
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/Patient/chosen")
+            .header("content-type", "application/fhir+json")
+            .body(Body::from(patient("chosen").to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        response
+            .headers()
+            .get("allow")
+            .map(|value| value.to_str().unwrap().to_string())
+    };
+    assert_eq!(allow.as_deref(), Some("GET, HEAD, PATCH, DELETE"));
+
+    // An update to the id the server did assign still works.
+    let updated = send(
+        &app,
+        "PUT",
+        &format!("/Patient/{id}"),
+        Some(patient(&id)),
+        None,
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::OK);
+
+    // The capability statement says all of this.
+    let metadata = send(&app, "GET", "/metadata", None, None).await;
+    for resource in metadata.body["rest"][0]["resource"].as_array().unwrap() {
+        assert_eq!(resource["updateCreate"], false);
+        assert_eq!(resource["conditionalCreate"], true);
+    }
+}
+
+#[tokio::test]
+async fn put_to_a_new_id_creates_it_when_the_deployment_allows() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    let metadata = send(&app, "GET", "/metadata", None, None).await;
+    assert!(metadata.body["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|resource| resource["updateCreate"] == true));
+    let created = put(&app, patient("mine")).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    assert_eq!(created.location.as_deref(), Some("Patient/mine/_history/1"));
+    let again = put(&app, patient("mine")).await;
+    assert_eq!(again.status, StatusCode::OK);
+    // If-Match on an id that is not there is a failed precondition, not a create.
+    let missing = send(
+        &app,
+        "PUT",
+        "/Patient/other",
+        Some(patient("other")),
+        Some("W/\"1\""),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::PRECONDITION_FAILED);
 }
 
 #[tokio::test]
 async fn occ_retries_then_conflict() {
     let (db, catalog, store) = memory();
     let app = app(db.clone(), catalog, store);
-    let created = send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
+    let created = put(&app, patient("p1")).await;
     assert_eq!(created.status, StatusCode::CREATED);
 
     db.testing_fail_next_commits(1);
@@ -205,7 +343,7 @@ async fn occ_retries_then_conflict() {
 async fn concurrent_puts_both_commit() {
     let (db, catalog, store) = memory();
     let app = app(db, catalog, store);
-    send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
+    put(&app, patient("p1")).await;
     let first = patient("p1");
     let mut second = patient("p1");
     second["birthDate"] = json!("2001-01-01");
@@ -228,13 +366,7 @@ async fn sync_subscription_transitions_after_mutation() {
     let (db, catalog, store) = memory();
     {
         let loaded = catalog.read().expect("catalog");
-        refhir_fhir::run(
-            &db,
-            &loaded,
-            "Patient/create",
-            &json!({"resource": patient("p1")}),
-        )
-        .unwrap();
+        refhir_fhir::import_resource(&db, &loaded, &patient("p1")).unwrap();
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -472,6 +604,121 @@ async fn terminology_operations_are_http_routes() {
 }
 
 #[tokio::test]
+async fn a_value_set_that_cannot_expand_is_a_422_that_says_why() {
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-http-unexpandable-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.http.unexpandable","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("CodeSystem-sample.json"),
+        r#"{"resourceType":"CodeSystem","url":"http://example.org/sample","content":"example","concept":[{"code":"a"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-whole.json"),
+        r#"{"resourceType":"ValueSet","url":"http://example.org/whole","compose":{"include":[{"system":"http://example.org/sample"}]}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-fine.json"),
+        r#"{"resourceType":"ValueSet","url":"http://example.org/fine","compose":{"include":[{"system":"http://example.org/sample","concept":[{"code":"a"}]}]}}"#,
+    )
+    .unwrap();
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let app = app(db, catalog, store);
+
+    let refused = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": "http://example.org/whole"})),
+        None,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(refused.body["resourceType"], "OperationOutcome");
+    let issue = &refused.body["issue"][0];
+    assert_eq!(issue["severity"], "error");
+    assert_eq!(issue["expression"][0], "ValueSet.compose.include[0]");
+    let text = issue["diagnostics"].as_str().unwrap();
+    assert!(
+        text.contains("http://example.org/sample") && text.contains("'example'"),
+        "{text}"
+    );
+
+    // The same server still expands what it can.
+    let fine = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": "http://example.org/fine"})),
+        None,
+    )
+    .await;
+    assert_eq!(fine.status, StatusCode::OK);
+
+    // The preflight: named value sets, in a plain body and as Parameters, and the unnamed form.
+    let named = send(
+        &app,
+        "POST",
+        "/ValueSet/$expandability",
+        Some(json!({"url": ["http://example.org/whole", "http://example.org/fine"]})),
+        None,
+    )
+    .await;
+    assert_eq!(named.status, StatusCode::OK);
+    let report = named.body["parameter"].as_array().unwrap();
+    assert_eq!(report.len(), 2);
+    let flag = |entry: &Value| entry["part"][1]["valueBoolean"].as_bool().unwrap();
+    assert!(!flag(&report[0]));
+    assert!(flag(&report[1]));
+    assert!(report[0]["part"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|part| { part["name"] == "reason" && part["valueCode"] == "code-system-incomplete" }));
+    let as_parameters = send(
+        &app,
+        "POST",
+        "/ValueSet/$expandability",
+        Some(json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": "http://example.org/whole"}
+        ]})),
+        None,
+    )
+    .await;
+    assert_eq!(as_parameters.body["parameter"].as_array().unwrap().len(), 1);
+    let everything = send(
+        &app,
+        "POST",
+        "/ValueSet/$expandability",
+        Some(json!({})),
+        None,
+    )
+    .await;
+    let urls: Vec<&str> = everything.body["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["part"][0]["valueUri"].as_str().unwrap())
+        .collect();
+    assert_eq!(urls, ["http://example.org/whole"]);
+}
+
+#[tokio::test]
 async fn implementation_guide_install_is_an_http_route() {
     let (db, catalog, store) = memory();
     let app = app(db, catalog, store);
@@ -581,8 +828,8 @@ async fn xml_graphql_smart_export_and_subscription() {
         r#"<Patient xmlns="http://hl7.org/fhir"><id value="x1"/><active value="true"/></Patient>"#;
     let created = send_text(
         &app,
-        "POST",
-        "/Patient",
+        "PUT",
+        "/Patient/x1",
         xml,
         &[("content-type", "application/fhir+xml")],
     )
@@ -611,7 +858,12 @@ async fn xml_graphql_smart_export_and_subscription() {
     )
     .await;
     assert_eq!(created_gql.status, StatusCode::OK, "{}", created_gql.body);
-    assert_eq!(created_gql.body["data"]["PatientCreate"]["id"], "g1");
+    // GraphQL create is the create interaction too: the server assigns the id.
+    let graphql_id = created_gql.body["data"]["PatientCreate"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(graphql_id, "g1");
     let listed = send(
         &app,
         "POST",
@@ -625,7 +877,7 @@ async fn xml_graphql_smart_export_and_subscription() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "g1"));
+        .any(|item| item["id"] == graphql_id.as_str()));
 
     let exported = send(&app, "POST", "/$export", Some(json!({})), None).await;
     assert_eq!(exported.status, StatusCode::ACCEPTED);
@@ -772,13 +1024,7 @@ async fn smart_app_launch_covers_discovery_pkce_oidc_and_backend() {
     let (db, catalog, store) = memory();
     {
         let cat = catalog.read().expect("catalog");
-        refhir_fhir::run(
-            &db,
-            &cat,
-            "Patient/create",
-            &json!({"resource": patient("p1")}),
-        )
-        .expect("seed patient");
+        refhir_fhir::import_resource(&db, &cat, &patient("p1")).expect("seed patient");
     }
     let app = crate::app_with(
         db,
@@ -1394,13 +1640,7 @@ async fn smart_dcr_launch_issuer_and_code_are_locked_down() {
     let (db, catalog, store) = memory();
     {
         let cat = catalog.read().expect("catalog");
-        refhir_fhir::run(
-            &db,
-            &cat,
-            "Patient/create",
-            &json!({"resource": patient("p1")}),
-        )
-        .expect("seed patient");
+        refhir_fhir::import_resource(&db, &cat, &patient("p1")).expect("seed patient");
     }
     let app = crate::app_with(
         db,
@@ -1732,23 +1972,16 @@ async fn patient_scope_cannot_leave_its_compartment() {
     {
         let loaded = catalog.read().expect("catalog");
         for (id, subject) in [("o1", "p1"), ("o2", "p2")] {
-            refhir_fhir::run(
+            refhir_fhir::import_resource(&db, &loaded, &patient(subject)).unwrap();
+            refhir_fhir::import_resource(
                 &db,
                 &loaded,
-                "Patient/create",
-                &json!({"resource": patient(subject)}),
-            )
-            .unwrap();
-            refhir_fhir::run(
-                &db,
-                &loaded,
-                "Observation/create",
-                &json!({"resource": {
+                &json!({
                     "resourceType": "Observation",
                     "id": id,
                     "subject": {"reference": format!("Patient/{subject}")},
                     "code": {"coding": [{"code": "8480-6"}]}
-                }}),
+                }),
             )
             .unwrap();
         }
@@ -1850,23 +2083,16 @@ async fn include_search_invalidates_when_the_included_patient_changes() {
     let (db, catalog, store) = memory();
     {
         let loaded = catalog.read().expect("catalog");
-        refhir_fhir::run(
+        refhir_fhir::import_resource(&db, &loaded, &patient("p1")).unwrap();
+        refhir_fhir::import_resource(
             &db,
             &loaded,
-            "Patient/create",
-            &json!({"resource": patient("p1")}),
-        )
-        .unwrap();
-        refhir_fhir::run(
-            &db,
-            &loaded,
-            "Observation/create",
-            &json!({"resource": {
+            &json!({
                 "resourceType": "Observation",
                 "id": "o1",
                 "subject": {"reference": "Patient/p1"},
                 "code": {"coding": [{"code": "8480-6"}]}
-            }}),
+            }),
         )
         .unwrap();
     }
@@ -1951,6 +2177,7 @@ async fn subscription_rest_hook_runs_after_commit() {
     install_package_dir(store.as_ref(), &db, &catalog, minir4_dir()).unwrap();
     install_package_dir(store.as_ref(), &db, &catalog, &package).unwrap();
     let _ = std::fs::remove_dir_all(&package);
+    catalog.write().unwrap().set_update_create(true);
 
     let hook = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = hook.local_addr().unwrap().port();
@@ -1993,7 +2220,7 @@ async fn subscription_rest_hook_runs_after_commit() {
     )
     .await;
     assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
-    let patient = send(&app, "POST", "/Patient", Some(patient("p9")), None).await;
+    let patient = put(&app, patient("p9")).await;
     assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
     let body = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(8)))
         .await
@@ -2052,12 +2279,12 @@ async fn patient_export_keeps_the_compartment() {
             ..Default::default()
         },
     );
-    send(&app, "POST", "/Patient", Some(patient("p1")), None).await;
-    send(&app, "POST", "/Patient", Some(patient("p2")), None).await;
+    put(&app, patient("p1")).await;
+    put(&app, patient("p2")).await;
     send(
         &app,
-        "POST",
-        "/Observation",
+        "PUT",
+        "/Observation/o1",
         Some(json!({
             "resourceType": "Observation",
             "id": "o1",
@@ -2069,8 +2296,8 @@ async fn patient_export_keeps_the_compartment() {
     .await;
     send(
         &app,
-        "POST",
-        "/Observation",
+        "PUT",
+        "/Observation/o2",
         Some(json!({
             "resourceType": "Observation",
             "id": "o2",
@@ -2176,6 +2403,7 @@ async fn rest_hook_retries_after_a_failure() {
     install_package_dir(store.as_ref(), &db, &catalog, minir4_dir()).unwrap();
     install_package_dir(store.as_ref(), &db, &catalog, &package).unwrap();
     let _ = std::fs::remove_dir_all(&package);
+    catalog.write().unwrap().set_update_create(true);
     let app = app(db, catalog, store);
     let created = send(
         &app,
@@ -2192,7 +2420,7 @@ async fn rest_hook_retries_after_a_failure() {
     )
     .await;
     assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
-    let patient = send(&app, "POST", "/Patient", Some(patient("retry1")), None).await;
+    let patient = put(&app, patient("retry1")).await;
     assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
     let body = tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(8)))
         .await
@@ -2456,8 +2684,8 @@ async fn populate_respects_observation_scopes() {
     let admin = token(&app, "user/*.*").await;
     send_text(
         &app,
-        "POST",
-        "/Patient",
+        "PUT",
+        "/Patient/p1",
         &json!({
             "resourceType": "Patient",
             "id": "p1",
@@ -2586,8 +2814,8 @@ async fn bundle_and_graphql_keep_read_scopes() {
     let admin = token(&app, "user/*.*").await;
     let created = send_text(
         &app,
-        "POST",
-        "/Patient",
+        "PUT",
+        "/Patient/p1",
         &json!({
             "resourceType": "Patient",
             "id": "p1",
@@ -3406,16 +3634,12 @@ mod cluster {
     }
 
     fn create_on_primary(pair: &Pair, id: &str) -> u64 {
+        // `import_resource` keeps the id, which a client's create no longer does.
         let loaded = pair.primary_catalog.read().unwrap();
-        refhir_fhir::run(
-            &pair.primary_db,
-            &loaded,
-            "Patient/create",
-            &json!({"resource": patient(id)}),
-        )
-        .unwrap()
-        .ts
-        .as_u64()
+        refhir_fhir::import_resource(&pair.primary_db, &loaded, &patient(id))
+            .unwrap()
+            .ts
+            .as_u64()
     }
 
     #[tokio::test]
@@ -3501,9 +3725,11 @@ mod cluster {
         let ts: u64 = header(&created, "x-refhir-commit-ts").parse().unwrap();
         assert_eq!(created.body["meta"]["versionId"], ts.to_string());
         assert_eq!(header(&created, "x-refhir-role"), "primary");
+        // The server picks the id of a created resource.
+        let id = created.body["id"].as_str().unwrap().to_string();
 
         // A read reports the snapshot it ran at, so a client's reads never go backwards.
-        let read = call(&primary, "GET", "/Patient/p1", None, &[]).await;
+        let read = call(&primary, "GET", &format!("/Patient/{id}"), None, &[]).await;
         let read_ts: u64 = header(&read, "x-refhir-commit-ts").parse().unwrap();
         assert!(read_ts >= ts);
 
@@ -3526,7 +3752,7 @@ mod cluster {
         assert_eq!(bundle.status, StatusCode::OK, "{}", bundle.body);
         let bundle_ts: u64 = header(&bundle, "x-refhir-commit-ts").parse().unwrap();
         assert!(bundle_ts > ts);
-        let deleted = call(&primary, "DELETE", "/Patient/p1", None, &[]).await;
+        let deleted = call(&primary, "DELETE", &format!("/Patient/{id}"), None, &[]).await;
         assert_eq!(deleted.status, StatusCode::NO_CONTENT);
         let delete_ts: u64 = header(&deleted, "x-refhir-commit-ts").parse().unwrap();
         assert!(delete_ts > bundle_ts);
@@ -3558,6 +3784,7 @@ mod cluster {
         assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
         assert_eq!(header(&created, "x-refhir-role"), "primary");
         let ts: u64 = header(&created, "x-refhir-commit-ts").parse().unwrap();
+        let id = created.body["id"].as_str().unwrap().to_string();
 
         // The write is in the shared database, and the primary has it.
         let loaded = cluster.primary_catalog.read().unwrap();
@@ -3565,10 +3792,10 @@ mod cluster {
             &cluster.primary_db,
             &loaded,
             "Patient/read",
-            &json!({"id": "via-replica"}),
+            &json!({"id": id}),
         )
         .unwrap();
-        assert_eq!(result.value["id"], "via-replica");
+        assert_eq!(result.value["id"], id.as_str());
         assert!(cluster.primary_db.latest_ts().as_u64() >= ts);
         // The replica itself has not moved, which is why the header exists.
         assert!(cluster.replica_db.latest_ts().as_u64() < ts);
@@ -3783,6 +4010,9 @@ mod cluster {
             config: ServerConfig::default(),
             smart: Arc::new(crate::SmartStore::with_defaults()),
             oidc: None,
+            jobs: Arc::new(crate::jobs::JobRunner::new(Arc::new(
+                refhir_persistence::MemoryJobStore::default(),
+            ))),
         };
         assert!(
             !crate::auth::patient_exists(&app, "fresh-patient"),
@@ -3984,5 +4214,265 @@ mod cluster {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+}
+
+mod durable_jobs {
+    use std::path::{Path, PathBuf};
+
+    use refhir_persistence::{JobStatus, JobStore};
+
+    use super::*;
+
+    fn unique(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "refhir-jobs-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn remove_sqlite(path: &Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(name));
+        }
+    }
+
+    /// What `refhir` builds from a database file at start-up. `first` installs the FHIR
+    /// package into a new file; a restart loads the catalog back from it.
+    struct Boot {
+        persistence: Arc<SqlitePersistence>,
+        app: axum::Router,
+    }
+
+    fn boot(sqlite: &Path, export_dir: &Path, first: bool) -> Boot {
+        let persistence = Arc::new(SqlitePersistence::open(sqlite).unwrap());
+        let db = Arc::new(Database::open(persistence.clone()).unwrap());
+        let catalog = if first {
+            let catalog = Arc::new(RwLock::new(Catalog::empty()));
+            install_package_dir(persistence.as_ref(), &db, &catalog, minir4_dir()).unwrap();
+            catalog
+        } else {
+            Arc::new(RwLock::new(Catalog::open(persistence.as_ref()).unwrap()))
+        };
+        // A reopened catalog starts from the stored definitions, which hold no deployment
+        // settings, so the setting is applied on every boot as the server does.
+        catalog.write().unwrap().set_update_create(true);
+        let job_store: Arc<dyn JobStore> = persistence.clone();
+        let store: Arc<dyn ConformanceStore> = persistence.clone();
+        let app = crate::app_with(
+            db,
+            catalog,
+            store,
+            crate::ServerConfig {
+                export_dir: export_dir.display().to_string(),
+                jobs: Some(crate::SharedJobStore::new(job_store)),
+                ..Default::default()
+            },
+        );
+        Boot { persistence, app }
+    }
+
+    /// Poll the status endpoint until the job is `completed` or `error`.
+    async fn finished(app: &axum::Router, job: &str) -> Value {
+        for _ in 0..200 {
+            let polled = send(app, "GET", &format!("/export/{job}"), None, None).await;
+            if matches!(polled.body["status"].as_str(), Some("completed" | "error")) {
+                return polled.body;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("export job {job} never finished");
+    }
+
+    #[tokio::test]
+    async fn an_export_accepted_before_a_restart_is_still_there_after_it() {
+        let sqlite = unique("restart.sqlite");
+        let export_dir = unique("restart-export");
+        let first = boot(&sqlite, &export_dir, true);
+        let created = put(&first.app, patient("kept")).await;
+        assert_eq!(created.status, StatusCode::CREATED);
+
+        let accepted = send(&first.app, "POST", "/$export", Some(json!({})), None).await;
+        assert_eq!(accepted.status, StatusCode::ACCEPTED);
+        let job = accepted
+            .location
+            .expect("content-location")
+            .trim_start_matches("/export/")
+            .to_string();
+        // The row exists by the time the 202 is back, before anything has been polled.
+        let row = first.persistence.job_get(&job).unwrap().expect("job row");
+        assert_eq!(row.kind, "export");
+        assert_eq!(row.request, json!({"type": null, "id": null}));
+
+        let before = finished(&first.app, &job).await;
+        assert_eq!(before["status"], "completed", "{before}");
+        assert_eq!(before["kind"], "export");
+        drop(first);
+
+        // A new app on the same file: nothing in this process remembers the job.
+        let second = boot(&sqlite, &export_dir, false);
+        let after = send(&second.app, "GET", &format!("/export/{job}"), None, None).await;
+        assert_eq!(after.status, StatusCode::OK);
+        assert_eq!(after.body["id"], job.as_str());
+        assert_eq!(after.body["status"], "completed");
+        assert_eq!(after.body["error"], Value::Null);
+        assert_eq!(after.body["kind"], "export");
+        assert_eq!(after.body["createdAt"], before["createdAt"]);
+        assert!(after.body["completedAt"].as_str().unwrap().ends_with('Z'));
+        let file = send_text(&second.app, "GET", &format!("/export/{job}/file"), "", &[]).await;
+        assert_eq!(file.0, StatusCode::OK);
+        assert!(file.1.contains("\"id\":\"kept\""), "{}", file.1);
+
+        // A completed job is not run again by the restart.
+        let row = second.persistence.job_get(&job).unwrap().unwrap();
+        assert_eq!(row.attempts, 1);
+
+        let unknown = send(&second.app, "GET", "/export/no-such-job", None, None).await;
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown.body["resourceType"], "OperationOutcome");
+        let unknown_file = send_text(&second.app, "GET", "/export/no-such-job/file", "", &[]).await;
+        assert_eq!(unknown_file.0, StatusCode::NOT_FOUND);
+
+        drop(second);
+        let _ = std::fs::remove_dir_all(&export_dir);
+        remove_sqlite(&sqlite);
+    }
+
+    #[tokio::test]
+    async fn jobs_left_running_are_run_again_when_the_server_starts() {
+        let sqlite = unique("recover.sqlite");
+        let export_dir = unique("recover-export");
+        let first = boot(&sqlite, &export_dir, true);
+        put(&first.app, patient("again")).await;
+
+        // What a process killed mid-export leaves behind, plus rows that must not be rerun. The
+        // dead server's leases ran out long ago.
+        let store = &first.persistence;
+        let request = json!({"type": "Patient", "id": null});
+        let dead = refhir_persistence::JobLease {
+            owner: "dead-server",
+            ms: 1,
+        };
+        store
+            .job_create("was-running", "export", &request, 1, Some(dead))
+            .unwrap();
+        assert!(store
+            .job_start("was-running", "dead-server", 2, 1)
+            .unwrap()
+            .is_some());
+        store
+            .job_create("never-started", "export", &request, 3, None)
+            .unwrap();
+        store
+            .job_create("stuck-in-a-loop", "export", &request, 4, Some(dead))
+            .unwrap();
+        for at in 5..8 {
+            store
+                .job_start("stuck-in-a-loop", "dead-server", at, 1)
+                .unwrap();
+        }
+        store
+            .job_create("from-the-future", "mystery", &json!({}), 9, None)
+            .unwrap();
+        store
+            .job_create("already-failed", "export", &request, 10, Some(dead))
+            .unwrap();
+        store
+            .job_finish(
+                "already-failed",
+                "dead-server",
+                JobStatus::Failed,
+                None,
+                Some("disk full"),
+                11,
+            )
+            .unwrap();
+        drop(first);
+
+        let second = boot(&sqlite, &export_dir, false);
+        for job in ["was-running", "never-started"] {
+            let done = finished(&second.app, job).await;
+            assert_eq!(done["status"], "completed", "{job}: {done}");
+            let file = send_text(&second.app, "GET", &format!("/export/{job}/file"), "", &[]).await;
+            assert_eq!(file.0, StatusCode::OK, "{job}");
+            assert!(file.1.contains("\"id\":\"again\""), "{job}: {}", file.1);
+        }
+        let running = second.persistence.job_get("was-running").unwrap().unwrap();
+        assert_eq!(running.attempts, 2, "once before the restart, once after");
+        assert!(running.completed_ms.is_some());
+
+        // A job that keeps being interrupted is given up on instead of looping forever.
+        let looped = finished(&second.app, "stuck-in-a-loop").await;
+        assert_eq!(looped["status"], "error");
+        assert!(
+            looped["error"].as_str().unwrap().contains("gave up"),
+            "{looped}"
+        );
+        // A kind this server has no handler for is left alone, unheld, for a server that has:
+        // an older server in a rolling deploy must not fail a job it has never heard of.
+        let mystery = second
+            .persistence
+            .job_get("from-the-future")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (mystery.status, mystery.attempts, mystery.lease_owner),
+            (JobStatus::Accepted, 0, None)
+        );
+        // Other kinds of job are not served by the export routes.
+        let hidden = send(&second.app, "GET", "/export/from-the-future", None, None).await;
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+
+        // A job that had already failed stays as it was.
+        let failed = send(&second.app, "GET", "/export/already-failed", None, None).await;
+        assert_eq!(failed.body["status"], "error");
+        assert_eq!(failed.body["error"], "disk full");
+        let failed_file =
+            send_text(&second.app, "GET", "/export/already-failed/file", "", &[]).await;
+        assert_eq!(failed_file.0, StatusCode::NOT_FOUND);
+        let untouched = second
+            .persistence
+            .job_get("already-failed")
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.attempts, 0);
+
+        drop(second);
+        let _ = std::fs::remove_dir_all(&export_dir);
+        remove_sqlite(&sqlite);
+    }
+
+    #[tokio::test]
+    async fn a_failed_export_is_recorded_with_its_error() {
+        let sqlite = unique("failed.sqlite");
+        // A regular file where the export directory should be.
+        let blocker = unique("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let first = boot(&sqlite, &blocker, true);
+        let accepted = send(&first.app, "POST", "/$export", Some(json!({})), None).await;
+        assert_eq!(accepted.status, StatusCode::ACCEPTED);
+        let job = accepted
+            .location
+            .unwrap()
+            .trim_start_matches("/export/")
+            .to_string();
+        let done = finished(&first.app, &job).await;
+        assert_eq!(done["status"], "error", "{done}");
+        assert!(done["error"].as_str().is_some_and(|text| !text.is_empty()));
+        assert!(done["completedAt"].is_string());
+        let file = send_text(&first.app, "GET", &format!("/export/{job}/file"), "", &[]).await;
+        assert_eq!(file.0, StatusCode::NOT_FOUND);
+        let row = first.persistence.job_get(&job).unwrap().unwrap();
+        assert_eq!(row.status, JobStatus::Failed);
+
+        drop(first);
+        let _ = std::fs::remove_file(&blocker);
+        remove_sqlite(&sqlite);
     }
 }

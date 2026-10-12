@@ -26,6 +26,12 @@ describe("seed/load", () => {
     expect(bundle.resourceType).toBe("Bundle");
     expect(bundle.type).toBe("transaction");
     expect((bundle as { entry: unknown[] }).entry).toHaveLength(2);
+    // The data names its own ids, so each resource is an upsert at that id.
+    const entries = (bundle as { entry: { request: { method: string; url: string } }[] }).entry;
+    for (const [index, entry] of entries.entries()) {
+      expect(entry.request.method).toBe("PUT");
+      expect(entry.request.url).toBe(`${resources[index].resourceType}/${resources[index].id}`);
+    }
   });
 
   it("names the file when JSON is invalid or an id is missing", async () => {

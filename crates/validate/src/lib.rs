@@ -7,7 +7,10 @@ mod walk;
 
 pub use outcome::{Issue, Outcome, Severity};
 pub use schema::Schema;
-pub use terminology::{MemoryTerminology, TermAnswer, Terminology};
+pub use terminology::{
+    code_system_key, code_system_row_key, ExpansionFailure, ExpansionUpdate, IncludeAt,
+    MemoryTerminology, TermAnswer, Terminology, TerminologyChange,
+};
 pub use walk::validate;
 
 use refhir_fhirpath::Host;
@@ -63,6 +66,49 @@ mod tests {
 
     fn check(instance: serde_json::Value, terms: &MemoryTerminology) -> Outcome {
         validate_resource(&instance, &patient_schema(), terms, &NoHost)
+    }
+
+    #[test]
+    fn a_profile_that_redefines_an_inherited_key_is_still_checked() {
+        let profile = "http://example.org/StructureDefinition/strict-patient";
+        let definition = |url: &str, derivation: &str, severity: &str, human: &str| {
+            json!({
+                "resourceType": "StructureDefinition", "url": url, "name": "Patient",
+                "type": "Patient", "kind": "resource", "derivation": derivation,
+                "snapshot": {"element": [
+                    {"path": "Patient", "min": 0, "max": "*", "constraint": [
+                        {"key": "pat-w", "severity": severity, "human": human, "expression": "name.exists()"}
+                    ]},
+                    {"path": "Patient.name", "min": 0, "max": "*", "type": [{"code": "HumanName"}]}
+                ]}
+            })
+        };
+        let schema = Schema::from_definitions(&[
+            definition(
+                "http://hl7.org/fhir/StructureDefinition/Patient",
+                "specialization",
+                "warning",
+                "should have a name",
+            ),
+            definition(profile, "constraint", "error", "must have a name"),
+        ]);
+        let outcome = validate_resource(
+            &json!({"resourceType": "Patient", "meta": {"profile": [profile]}}),
+            &schema,
+            &MemoryTerminology::default(),
+            &NoHost,
+        );
+        // The base states the rule as a warning; the profile states it again as an error, and
+        // both are reported rather than the second being taken for a repeat of the first.
+        assert!(
+            outcome
+                .issues
+                .iter()
+                .any(|issue| issue.severity == Severity::Error
+                    && issue.diagnostics.contains("must have a name")),
+            "{:?}",
+            outcome.issues
+        );
     }
 
     #[test]
@@ -151,6 +197,32 @@ mod tests {
             &terms,
         );
         assert!(!good.has_errors(), "{:?}", good.issues);
+    }
+
+    #[test]
+    fn a_binding_to_a_value_set_that_cannot_expand_warns_with_the_reason() {
+        let terms = MemoryTerminology::from_resources(&[
+            json!({"resourceType": "CodeSystem", "url": "http://hl7.org/fhir/administrative-gender",
+                   "content": "fragment", "concept": [{"code": "male"}]}),
+            json!({"resourceType": "ValueSet", "url": "http://hl7.org/fhir/ValueSet/administrative-gender",
+                   "compose": {"include": [{"system": "http://hl7.org/fhir/administrative-gender"}]}}),
+        ]);
+        let outcome = check(
+            json!({"resourceType": "Patient", "gender": "male", "generalPractitioner": {"reference": "Organization/1"}}),
+            &terms,
+        );
+        assert!(!outcome.has_errors(), "{:?}", outcome.issues);
+        let warning = outcome
+            .issues
+            .iter()
+            .find(|issue| issue.code == "not-supported")
+            .expect("a warning");
+        assert!(
+            warning.diagnostics.contains("cannot be expanded"),
+            "{warning:?}"
+        );
+        assert!(warning.diagnostics.contains("'fragment'"), "{warning:?}");
+        assert_eq!(warning.expression, "Patient.gender");
     }
 
     #[test]

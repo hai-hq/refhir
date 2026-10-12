@@ -111,7 +111,7 @@ After a dropped socket the client redials with backoff (50 ms doubling to 1 s, w
 
 ## Mock data
 
-Seed JSON from `fixtures/mock-fhir/library` while the server is running:
+Seed JSON from `fixtures/mock-fhir/library` while the server is running. The data names its own ids, so each resource is sent as `PUT [type]/[id]`, which needs a server started with `--update-as-create`:
 
 ```bash
 cd clients/ts && npm run seed -- -url http://127.0.0.1:8080

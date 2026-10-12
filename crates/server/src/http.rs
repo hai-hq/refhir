@@ -51,6 +51,9 @@ pub struct ServerConfig {
     pub max_staleness: std::time::Duration,
     /// How long a replica waits for `X-Refhir-Min-Ts` before sending the request to the primary.
     pub min_ts_wait: std::time::Duration,
+    /// Table of background jobs such as `$export`. `refhir` passes the database's own, so jobs
+    /// outlive a restart. Without one they live in memory and end with the process.
+    pub jobs: Option<crate::jobs::SharedJobStore>,
 }
 
 impl Default for ServerConfig {
@@ -72,6 +75,7 @@ impl Default for ServerConfig {
             primary_url: None,
             max_staleness: std::time::Duration::from_secs(5),
             min_ts_wait: std::time::Duration::from_millis(250),
+            jobs: None,
         }
     }
 }
@@ -84,6 +88,7 @@ pub struct AppState {
     pub config: ServerConfig,
     pub smart: Arc<crate::auth::SmartStore>,
     pub oidc: Option<Arc<crate::auth::Oidc>>,
+    pub jobs: Arc<crate::jobs::JobRunner>,
 }
 
 /// Delete expired OAuth rows once a minute. Reads ignore expired rows, so this only reclaims
@@ -165,6 +170,7 @@ pub fn app_with(
         .route("/:resource_type/$extract", post(extract_type))
         .route("/:resource_type/$install", post(install_op))
         .route("/:resource_type/$expand", post(expand_op))
+        .route("/:resource_type/$expandability", post(expandability_op))
         .route("/:resource_type/$validate-code", post(validate_code_op))
         .route("/:resource_type/$lookup", post(lookup_op))
         .route("/:resource_type/$translate", post(translate_op))
@@ -203,6 +209,7 @@ pub fn app_with(
     if !db.is_read_only() {
         prune_in_background(&smart);
     }
+    let jobs = crate::jobs::start(&db, &catalog, &config);
     let state = AppState {
         db: db.clone(),
         catalog: catalog.clone(),
@@ -212,6 +219,7 @@ pub fn app_with(
         oidc: config.oidc.clone().map(|cfg| {
             Arc::new(crate::auth::Oidc::new(cfg).expect("oidc config is validated at startup"))
         }),
+        jobs,
     };
     let router = router
         .layer(middleware::from_fn_with_state(
@@ -869,6 +877,14 @@ async fn expand_op(
     terminology_op(app, resource_type, "$expand", body).await
 }
 
+async fn expandability_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    terminology_op(app, resource_type, "$expandability", body).await
+}
+
 async fn validate_code_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
@@ -969,8 +985,13 @@ async fn update(
     {
         Ok(result) => {
             let location = format!("{resource_type}/{id}/_history/{}", result.ts);
+            let status = if result.status == 201 {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            };
             resource_response(
-                StatusCode::OK,
+                status,
                 result.value,
                 Some(location),
                 prefer_xml(&headers, &[]),
@@ -1500,11 +1521,11 @@ async fn export_instance(
 }
 
 async fn export_status(State(app): State<AppState>, Path(job): Path<String>) -> Response {
-    crate::jobs::status(&app, &job)
+    crate::jobs::status(&app, &job).await
 }
 
 async fn export_file(State(app): State<AppState>, Path(job): Path<String>) -> Response {
-    crate::jobs::file(&app, &job)
+    crate::jobs::file(&app, &job).await
 }
 
 async fn run_read(app: &AppState, path: &str, args: Value) -> Response {
@@ -1640,6 +1661,21 @@ pub(crate) fn error_response(err: RunError) -> Response {
         tracing::warn!(diagnostics = %value, "fhir operation failed");
         return fhir_json(StatusCode::BAD_REQUEST, value.clone());
     }
+    if let RunError::Fhir(FhirError::Unprocessable(value)) = &err {
+        tracing::warn!(diagnostics = %value, "fhir operation failed");
+        return fhir_json(StatusCode::UNPROCESSABLE_ENTITY, value.clone());
+    }
+    if let RunError::Fhir(FhirError::MethodNotAllowed(message)) = &err {
+        tracing::warn!(diagnostics = %message, "fhir operation failed");
+        let mut response = outcome(StatusCode::METHOD_NOT_ALLOWED, "not-supported", message);
+        // RFC 9110 requires an Allow header on a 405. These are the methods that act on an
+        // existing instance; creating one with a chosen id is not among them.
+        response.headers_mut().insert(
+            header::ALLOW,
+            axum::http::HeaderValue::from_static("GET, HEAD, PATCH, DELETE"),
+        );
+        return response;
+    }
     let (status, code, diagnostics) = match &err {
         RunError::Fhir(fhir) => (fhir_status(fhir), outcome_code(fhir), fhir.to_string()),
         RunError::Commit(CommitError::Occ(_)) => (
@@ -1670,7 +1706,7 @@ fn other_read_only() -> String {
 }
 
 pub(crate) fn outcome_value(err: &RunError) -> Value {
-    if let RunError::Fhir(FhirError::Outcome(value)) = err {
+    if let RunError::Fhir(FhirError::Outcome(value) | FhirError::Unprocessable(value)) = err {
         return value.clone();
     }
     let (code, diagnostics) = match err {
@@ -1729,6 +1765,8 @@ fn fhir_status(err: &FhirError) -> StatusCode {
         FhirError::Precondition(_) => StatusCode::PRECONDITION_FAILED,
         FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         FhirError::Forbidden(_) => StatusCode::FORBIDDEN,
+        FhirError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        FhirError::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
         FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
             StatusCode::BAD_REQUEST
         }
