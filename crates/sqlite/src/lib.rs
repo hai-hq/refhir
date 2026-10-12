@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use refhir_persistence::{
-    document_from_parts, ConflictStrategy, DocumentLogEntry, IndexScanRow, LatestDocument, Lease,
-    PersistError, Persistence, PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader,
-    Pool, PoolGuard, PoolStats, TimestampRange,
+    document_from_parts, index_target, ConflictStrategy, DocumentLogEntry, IndexScanEntry,
+    IndexScanRow, LatestDocument, Lease, LiveEntries, PersistError, Persistence,
+    PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader, Pool, PoolGuard, PoolStats,
+    TimestampRange,
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use rusqlite::{
@@ -448,6 +449,72 @@ ORDER BY B.key {ord}
         Ok(out)
     }
 
+    fn index_scan_ids(
+        &self,
+        index_id: &IndexId,
+        read_timestamp: Timestamp,
+        interval: &Interval,
+        order: Order,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexScanEntry>, PersistError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        // The index table's primary key is (index_id, key, ts), so reading it ordered by key and
+        // ts needs no sort, no join and no grouping, and the rows can be taken as they come and
+        // the rest left unread once `limit` entries are settled. Tombstones are rows too: the
+        // latest version of each key is picked in `LiveEntries`.
+        let upper = if interval.end.is_some() {
+            " AND key < ?4"
+        } else {
+            ""
+        };
+        let ord = match order {
+            Order::Asc => "ASC",
+            Order::Desc => "DESC",
+        };
+        let sql = format!(
+            "SELECT key, deleted, table_id, document_id FROM indexes \
+             WHERE index_id = ?1 AND ts <= ?2 AND key >= ?3{upper} \
+             ORDER BY key {ord}, ts {ord}"
+        );
+        let guard = self.read()?;
+        let mut stmt = guard.connection.prepare(&sql).map_err(definite)?;
+        let ts = i64_ts(read_timestamp)?;
+        let index_bytes = index_id.as_bytes();
+        let mut args: Vec<&dyn rusqlite::ToSql> = vec![&index_bytes, &ts, &interval.start];
+        if let Some(end) = &interval.end {
+            args.push(end);
+        }
+        let mut rows = stmt.query(args.as_slice()).map_err(definite)?;
+        let mut live = LiveEntries::new(order, limit);
+        while let Some(row) = rows.next().map_err(definite)? {
+            let key: Vec<u8> = row.get(0).map_err(definite)?;
+            let deleted: i64 = row.get(1).map_err(definite)?;
+            let id = if deleted == 0 {
+                let table_id: Option<Vec<u8>> = row.get(2).map_err(definite)?;
+                let document_id: Option<Vec<u8>> = row.get(3).map_err(definite)?;
+                match (table_id, document_id) {
+                    (Some(table_id), Some(document_id)) => {
+                        Some(index_target(table_id, document_id)?)
+                    }
+                    _ => {
+                        return Err(PersistError::Definite(format!(
+                            "index {} has a live row that points at no document",
+                            index_id.as_str()
+                        )))
+                    }
+                }
+            } else {
+                None
+            };
+            if live.push(key, id) {
+                break;
+            }
+        }
+        Ok(live.finish())
+    }
+
     fn get_persistence_global(
         &self,
         key: PersistenceGlobalKey,
@@ -815,6 +882,7 @@ mod tests {
     fn memory_log_roundtrip() {
         let persistence = SqlitePersistence::open_in_memory().unwrap();
         conformance::exercise(&persistence);
+        conformance::exercise_index_scan_ids(&persistence);
     }
 
     fn temp_db(tag: &str) -> PathBuf {

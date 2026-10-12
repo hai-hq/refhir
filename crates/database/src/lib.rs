@@ -53,7 +53,8 @@ fn write_keys_summary(keys: &[(IndexId, Vec<u8>)], limit: usize) -> String {
 pub use reads::ReadSet;
 pub use subscription::{Invalidation, SubToken};
 pub use transaction::{
-    Delete, DocumentWrite, IndexPut, Put, Revision, Scanned, Stored, Transaction, WrittenId,
+    Delete, DocumentWrite, IndexPut, Put, Revision, Scanned, ScannedEntry, ScannedRow, ScannedText,
+    Stored, Transaction, WrittenId,
 };
 
 /// OCC conflict. Convex `ConflictingRead` reduced to the index key and write ts.

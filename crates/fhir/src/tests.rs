@@ -3205,3 +3205,543 @@ mod takeover {
         assert!(db.store.catalog_revision().unwrap() > revision);
     }
 }
+
+/// Search builds its page lazily: only the ids of the index range, only the page's documents, no
+/// second check of what the index already decided, and no copy of every match. These tests hold
+/// that to the old behaviour (the whole result, byte for byte, and the reads it records) and to an
+/// oracle that does not use either implementation, and then count the work.
+mod search_paging {
+    use super::*;
+    use crate::extract::compile_parameter;
+    use crate::search::{search_counted, search_reference, Work};
+
+    fn r4() -> Harness {
+        let harness = empty();
+        install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+        harness
+    }
+
+    const FAMILIES: [&str; 8] = [
+        "Smith",
+        "Smythe",
+        "smith",
+        "Jones",
+        "O'Neil",
+        "Müller",
+        "Smith-Jones",
+        "Nguyen",
+    ];
+
+    fn person(n: usize, family: Option<&str>) -> Value {
+        let gender = ["male", "female", "other", "unknown"][n % 4];
+        let given = ["Ann", "Bob", "Cy"][n % 3];
+        let mut resource = json!({
+            "resourceType": "Patient",
+            "id": format!("p{n}"),
+            "active": n % 3 != 0,
+            "gender": gender,
+            "birthDate": format!("{}-{:02}-{:02}", 1950 + (n % 60), 1 + (n % 12), 1 + (n % 28)),
+            "identifier": [{"system": "http://hospital.example", "value": format!("mrn-{n}")}]
+        });
+        if let Some(family) = family {
+            let mut names = vec![json!({"family": family, "given": [given]})];
+            if n % 7 == 0 {
+                // Two names that both start with "Sm": the document is in the range twice.
+                names.push(json!({"family": "Smithers", "given": ["Zed"]}));
+            }
+            resource["name"] = json!(names);
+        }
+        resource
+    }
+
+    /// Patients p0..p95, some then changed or deleted, and observations about the first forty.
+    /// Returns the harness and what the patients should look like now, for the oracle.
+    fn seeded() -> (Harness, BTreeMap<String, Value>) {
+        let harness = r4();
+        let mut now = BTreeMap::new();
+        for n in 0..96 {
+            let family = (n % 11 != 0).then(|| FAMILIES[n % FAMILIES.len()]);
+            let resource = person(n, family);
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+            now.insert(format!("p{n}"), resource);
+        }
+        // Rows an index range is wider than the match for: a date on the boundary of a bound, and a
+        // family that is a prefix of a query containing a NUL, in a document whose id continues it.
+        for (id, birth, family) in [
+            ("p96", "1960-06-01", "Smith"),
+            ("p97", "1960-06-02", "Smith"),
+            ("b1", "1970-01-01", "a"),
+        ] {
+            let resource = json!({
+                "resourceType": "Patient", "id": id, "birthDate": birth,
+                "name": [{"family": family}]
+            });
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+            now.insert(id.to_string(), resource);
+        }
+        // The index has to follow a change of name and a delete, not keep the old rows.
+        for (n, family) in [(1, "Smith"), (9, "Smith"), (0, "Brown"), (5, "Smith")] {
+            let resource = person(n, Some(family));
+            apply(
+                &harness,
+                "Patient/update",
+                json!({"id": format!("p{n}"), "resource": resource}),
+            );
+            now.insert(format!("p{n}"), resource);
+        }
+        for id in ["p8", "p16"] {
+            apply(&harness, "Patient/delete", json!({"id": id}));
+            now.remove(id);
+        }
+        for n in (0..40).filter(|n| now.contains_key(&format!("p{n}"))) {
+            let code = ["8867-4", "29463-7"][n % 2];
+            apply(
+                &harness,
+                "Observation/create",
+                json!({"resource": {
+                    "resourceType": "Observation",
+                    "id": format!("o{n}"),
+                    "status": if n % 2 == 0 { "final" } else { "amended" },
+                    "code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                    "subject": {"reference": format!("Patient/p{n}")},
+                    "effectiveDateTime": format!("2024-{:02}-10T08:00:00Z", 1 + (n % 12))
+                }}),
+            );
+        }
+        (harness, now)
+    }
+
+    fn params(query: &[(&str, &str)]) -> BTreeMap<String, String> {
+        query
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// Runs the query with the current search and with the reference one on the same snapshot.
+    /// They must agree on the bundle (or on the error) and on what they read.
+    fn both(harness: &Harness, type_name: &str, query: &[(&str, &str)]) -> Option<(Value, Work)> {
+        let catalog = harness.catalog.read().expect("catalog");
+        let model = catalog.get(type_name).expect("model");
+        let params = params(query);
+        let mut current_tx = harness.db.begin();
+        let current = search_counted(&mut current_tx, &catalog, model, &params);
+        let mut reference_tx = harness.db.begin();
+        let reference = search_reference(&mut reference_tx, &catalog, model, &params);
+        match (current, reference) {
+            (Ok((bundle, work)), Ok(expected)) => {
+                assert_eq!(
+                    bundle, expected,
+                    "the bundle differs for {type_name} {query:?}"
+                );
+                assert_eq!(
+                    current_tx.read_set(),
+                    reference_tx.read_set(),
+                    "the reads differ for {type_name} {query:?}"
+                );
+                Some((bundle, work))
+            }
+            (Err(current), Err(reference)) => {
+                assert_eq!(
+                    current.to_string(),
+                    reference.to_string(),
+                    "the error differs for {type_name} {query:?}"
+                );
+                None
+            }
+            (current, reference) => panic!(
+                "one succeeded and one failed for {type_name} {query:?}: {:?} / {:?}",
+                current.map(|(bundle, _)| bundle),
+                reference
+            ),
+        }
+    }
+
+    const PATIENT_QUERIES: &[&[(&str, &str)]] = &[
+        &[],
+        &[("family", "Smith")],
+        &[("family", "sm")],
+        &[("family", "SMITH")],
+        &[("family", "")],
+        &[("family", "zzz")],
+        &[("family", "Müller")],
+        &[("family", "o'n")],
+        &[("family", "a\0b")],
+        &[("given", "Ann")],
+        &[("name", "an")],
+        &[("name", "smithers")],
+        &[("gender", "male")],
+        &[("active", "true")],
+        &[("active", "false")],
+        &[("identifier", "http://hospital.example|mrn-7")],
+        &[("identifier", "mrn-7")],
+        &[("identifier", "|mrn-7")],
+        &[("identifier", "http://hospital.example|")],
+        &[("identifier", "nope")],
+        &[("family", "Sm"), ("gender", "male")],
+        &[("family", "Sm"), ("given", "Ann"), ("active", "true")],
+        &[("gender", "female"), ("birthdate", "ge1980-01-01")],
+        &[("birthdate", "ge1990-01-01")],
+        &[("birthdate", "1985")],
+        &[("birthdate", "lt1960-06-01")],
+        &[("birthdate", "le1960-06-01")],
+        &[("birthdate", "gt1960-06-01")],
+        &[("birthdate", "ge1960-06-02")],
+        &[("birthdate", "sa1960-06-01")],
+        &[("birthdate", "eb1960-06-02")],
+        &[("birthdate", "ne1960-06-01")],
+        &[("birthdate", "1960-06-01")],
+        &[("family", "a\0b")],
+        &[("family", "a")],
+        &[("family:exact", "Smith")],
+        &[("family:contains", "mit")],
+        &[("gender:not", "male")],
+        &[("family:missing", "true")],
+        &[("family:missing", "false")],
+        &[("_id", "p1")],
+        &[("_id", "p8")],
+        &[("_id", "nobody")],
+    ];
+
+    const PAGING: &[&[(&str, &str)]] = &[
+        &[],
+        &[("_count", "0")],
+        &[("_count", "1")],
+        &[("_count", "10")],
+        &[("_count", "1000")],
+        &[("_count", "7"), ("_offset", "3")],
+        &[("_count", "7"), ("_offset", "1000")],
+        &[("_offset", "5")],
+        &[("_count", "10"), ("_total", "none")],
+        &[("_count", "10"), ("_total", "estimate")],
+        &[("_total", "none")],
+        &[("_summary", "count")],
+        &[("_summary", "count"), ("_count", "5")],
+        &[("_count", "10"), ("_summary", "true")],
+        &[("_count", "5"), ("_elements", "name")],
+        &[("_sort", "family")],
+        &[("_sort", "-family"), ("_count", "10")],
+        &[
+            ("_sort", "birthdate,family"),
+            ("_count", "8"),
+            ("_offset", "2"),
+        ],
+        &[("_revinclude", "Observation:subject"), ("_count", "5")],
+    ];
+
+    #[test]
+    fn patient_searches_return_what_the_whole_result_search_returned() {
+        let (harness, _) = seeded();
+        let mut compared = 0;
+        let mut with_matches = 0;
+        for base in PATIENT_QUERIES {
+            for paging in PAGING {
+                let query: Vec<(&str, &str)> = base.iter().chain(paging.iter()).copied().collect();
+                if let Some((bundle, _)) = both(&harness, "Patient", &query) {
+                    compared += 1;
+                    if bundle["total"].as_u64().unwrap_or(0) > 0
+                        || !bundle["entry"].as_array().unwrap().is_empty()
+                    {
+                        with_matches += 1;
+                    }
+                }
+            }
+        }
+        // The comparison is only worth something if most of it compared real answers.
+        assert!(compared > 400, "only {compared} queries ran");
+        assert!(
+            with_matches > 250,
+            "only {with_matches} queries found anything"
+        );
+    }
+
+    #[test]
+    fn observation_searches_return_what_the_whole_result_search_returned() {
+        let (harness, _) = seeded();
+        let bases: &[&[(&str, &str)]] = &[
+            &[],
+            &[("subject", "Patient/p3")],
+            &[("subject", "p3")],
+            &[("code", "http://loinc.org|8867-4")],
+            &[("code", "8867-4")],
+            &[("code", "|8867-4")],
+            &[("status", "final")],
+            &[("status", "amended"), ("subject", "Patient/p1")],
+            &[("code", "http://loinc.org|8867-4"), ("status", "final")],
+            &[("date", "ge2024-06-01")],
+            &[("_compartment", "Patient/p3")],
+            &[("subject:missing", "false")],
+        ];
+        let pagings: &[&[(&str, &str)]] = &[
+            &[],
+            &[("_count", "5")],
+            &[("_count", "5"), ("_offset", "2"), ("_total", "none")],
+            &[("_summary", "count")],
+            &[("_include", "Observation:subject"), ("_count", "4")],
+            &[("_sort", "date"), ("_count", "6")],
+        ];
+        let mut compared = 0;
+        for base in bases {
+            for paging in pagings {
+                let query: Vec<(&str, &str)> = base.iter().chain(paging.iter()).copied().collect();
+                if both(&harness, "Observation", &query).is_some() {
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 50, "only {compared} queries ran");
+    }
+
+    /// The expected ids, worked out from the data the test wrote and nothing else.
+    fn expected(now: &BTreeMap<String, Value>, wanted: impl Fn(&Value) -> bool) -> Vec<String> {
+        let mut ids: Vec<String> = now
+            .iter()
+            .filter(|(_, resource)| wanted(resource))
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    fn found(harness: &Harness, query: &[(&str, &str)]) -> (Vec<String>, u64) {
+        let mut query = query.to_vec();
+        query.push(("_count", "1000"));
+        let (bundle, _) = both(harness, "Patient", &query).expect("the search works");
+        let mut ids: Vec<String> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        (ids, bundle["total"].as_u64().unwrap())
+    }
+
+    fn families(resource: &Value) -> Vec<String> {
+        resource["name"]
+            .as_array()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name["family"].as_str())
+                    .map(str::to_lowercase)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_matches_are_the_patients_the_data_says_they_are() {
+        let (harness, now) = seeded();
+
+        // A prefix of a family name, case folded; a document with two matching names counts once;
+        // a renamed patient follows its new name; a deleted one is gone.
+        for prefix in [
+            "smith", "sm", "s", "jones", "müller", "nguyen", "brown", "zzz",
+        ] {
+            let want = expected(&now, |resource| {
+                families(resource)
+                    .iter()
+                    .any(|family| family.starts_with(prefix))
+            });
+            let (ids, total) = found(&harness, &[("family", prefix)]);
+            assert_eq!(ids, want, "family={prefix}");
+            assert_eq!(total as usize, want.len(), "total for family={prefix}");
+        }
+
+        // A token.
+        let want = expected(&now, |resource| resource["gender"] == "male");
+        assert_eq!(found(&harness, &[("gender", "male")]).0, want);
+        let want = expected(&now, |resource| resource["active"] == false);
+        assert_eq!(found(&harness, &[("active", "false")]).0, want);
+        let want = expected(&now, |resource| resource["id"] == "p7");
+        assert_eq!(
+            found(&harness, &[("identifier", "http://hospital.example|mrn-7")]).0,
+            want
+        );
+
+        // Two clauses: the index decides one and the other is checked.
+        let want = expected(&now, |resource| {
+            resource["gender"] == "male" && families(resource).iter().any(|f| f.starts_with("sm"))
+        });
+        assert_eq!(
+            found(&harness, &[("family", "sm"), ("gender", "male")]).0,
+            want
+        );
+        assert!(!want.is_empty());
+    }
+
+    fn work(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work) {
+        both(harness, "Patient", query).expect("the search works")
+    }
+
+    fn many_smiths(count: usize) -> Harness {
+        let harness = r4();
+        for n in 0..count {
+            let resource = json!({
+                "resourceType": "Patient",
+                "id": format!("s{n}"),
+                "gender": if n % 2 == 0 { "male" } else { "female" },
+                "birthDate": if n % 2 == 0 { "1990-05-05" } else { "1950-05-05" },
+                "name": [{"family": "Smith"}]
+            });
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+        }
+        harness
+    }
+
+    #[test]
+    fn a_page_of_ten_among_many_matches_reads_ten_documents() {
+        let harness = many_smiths(300);
+        let (bundle, work) = work(&harness, &[("family", "Smith"), ("_count", "10")]);
+        assert_eq!(bundle["total"], 300, "the total still counts every match");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
+        assert_eq!(work.rows, 300, "the range lists every match");
+        assert_eq!(work.fetched, 10, "but only the page's documents are read");
+        assert_eq!(work.decoded, 10);
+        assert_eq!(work.checked, 0, "and the index already decided the match");
+
+        let (bundle, work) = self::work(&harness, &[("family", "Smith"), ("_summary", "count")]);
+        assert_eq!(bundle["total"], 300);
+        assert_eq!(
+            (work.fetched, work.decoded),
+            (0, 0),
+            "a count reads no document"
+        );
+
+        // Later pages cost the same.
+        let (_, work) = self::work(
+            &harness,
+            &[("family", "Smith"), ("_count", "10"), ("_offset", "200")],
+        );
+        assert_eq!((work.fetched, work.decoded), (10, 10));
+
+        // Without a total the range is not even listed to the end: the page and one row more,
+        // which is what it takes to know there is a next page.
+        let (bundle, work) = self::work(
+            &harness,
+            &[("family", "Smith"), ("_count", "10"), ("_total", "none")],
+        );
+        assert!(bundle.get("total").is_none());
+        assert_eq!(
+            work.rows, 11,
+            "ten for the page and one to show there is more"
+        );
+        assert_eq!((work.fetched, work.decoded), (10, 10));
+        assert!(bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["relation"] == "next"));
+
+        let (bundle, work) = self::work(
+            &harness,
+            &[
+                ("family", "Smith"),
+                ("_count", "10"),
+                ("_offset", "200"),
+                ("_total", "none"),
+            ],
+        );
+        assert_eq!(work.rows, 211, "the offset, the page and one more");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
+
+        // The last page has nothing after it, and says so.
+        let (bundle, work) = self::work(
+            &harness,
+            &[
+                ("family", "Smith"),
+                ("_count", "10"),
+                ("_offset", "295"),
+                ("_total", "none"),
+            ],
+        );
+        assert_eq!(work.rows, 300, "the range ran out");
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 5);
+        assert!(!bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["relation"] == "next"));
+    }
+
+    #[test]
+    fn a_second_clause_is_checked_and_the_scan_stops_after_the_page_when_no_total_is_wanted() {
+        // The family decides the range (a string prefix ranks above a date bound); the birth date,
+        // which an index can only narrow, is checked on every row of it.
+        let harness = many_smiths(300);
+        let query = [
+            ("family", "Smith"),
+            ("birthdate", "ge1980-01-01"),
+            ("_count", "10"),
+        ];
+
+        let (bundle, work) = work(&harness, &query);
+        assert_eq!(bundle["total"], 150);
+        assert_eq!(work.rows, 300);
+        assert_eq!(work.checked, 300, "an exact total needs every row checked");
+        assert_eq!(work.decoded, 300);
+
+        let mut query = query.to_vec();
+        query.push(("_total", "none"));
+        let (bundle, work) = self::work(&harness, &query);
+        assert!(bundle.get("total").is_none());
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
+        assert!(
+            bundle["link"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|link| link["relation"] == "next"),
+            "it still knows there is a next page"
+        );
+        assert!(
+            work.checked <= 25,
+            "ten matches and one more, about every other row: {work:?}"
+        );
+        assert!(work.decoded < work.rows, "and the rest are never decoded");
+    }
+
+    #[test]
+    fn only_a_plain_string_token_reference_or_uri_parameter_read_from_a_path_is_proven_by_the_index(
+    ) {
+        let proves = |kind: &str, expression: &str, query: &str| {
+            compile_parameter(
+                &json!({"type": kind, "code": "x", "expression": expression, "base": ["Patient"]}),
+                &BTreeMap::new(),
+            )
+            .map(|extractor| extractor.index_proves(query))
+        };
+        assert_eq!(proves("string", "Patient.name.family", "sm"), Some(true));
+        assert_eq!(proves("token", "Patient.gender", "male"), Some(true));
+        assert_eq!(proves("token", "Patient.identifier", "a|b"), Some(true));
+        assert_eq!(proves("uri", "Patient.name.family", "urn:x"), Some(true));
+        assert_eq!(
+            proves("reference", "Patient.generalPractitioner", "Practitioner/1"),
+            Some(true)
+        );
+
+        // A NUL would match the one that ends every string key.
+        assert_eq!(proves("string", "Patient.name.family", "a\0b"), Some(false));
+        // Other kinds keep a second check: their range is only a coarse filter.
+        assert_eq!(proves("date", "Patient.birthDate", "ge1990"), Some(false));
+        assert_eq!(
+            proves("number", "Patient.multipleBirthInteger", "2"),
+            Some(false)
+        );
+        // Anything asked of the world when it is read can disagree with the keys saved earlier.
+        for expression in [
+            "Patient.generalPractitioner.resolve().id",
+            "Patient.gender.where(now().toString() != '')",
+            "Patient.name.family.where(today().toString() != '')",
+            "Patient.name.family.where(timeOfDay().toString() != '')",
+            "Patient.gender.where(conformsTo('http://example.org/p'))",
+        ] {
+            assert_eq!(
+                proves("token", expression, "x"),
+                Some(false),
+                "{expression}"
+            );
+        }
+    }
+}

@@ -52,6 +52,21 @@ struct Controls {
     compartment: Option<(String, String)>,
 }
 
+impl Controls {
+    /// Whether the response states how many resources match.
+    fn needs_total(&self) -> bool {
+        self.total != "none" || self.summary.as_deref() == Some("count")
+    }
+
+    /// Whether the resources of the page are used at all: `_summary=count` shows none, unless
+    /// `_include` or `_revinclude` follow references out of them.
+    fn needs_documents(&self) -> bool {
+        self.summary.as_deref() != Some("count")
+            || !self.include.is_empty()
+            || !self.revinclude.is_empty()
+    }
+}
+
 struct IncludeSpec {
     /// Resource type named before the parameter, when the token has one.
     source: Option<String>,
@@ -83,7 +98,231 @@ enum Clause {
     },
 }
 
+/// A page of matches (each with its id), how many matches there are, and the work it took.
+type Page = (Vec<(String, Value)>, usize, Work);
+
+/// What a row must satisfy to be a match: the clauses, which of them the index range it was found
+/// through has already settled, and the ids that the chain and `_has` clauses resolved to.
+struct Checks<'a> {
+    clauses: &'a [Clause],
+    proven: Option<usize>,
+    chain_ids: &'a [BTreeSet<String>],
+    has_ids: &'a [BTreeSet<String>],
+}
+
+/// What a search did, so a test can see that the work follows the page, not the matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Work {
+    /// Rows the index range returned.
+    pub rows: usize,
+    /// Documents decoded from JSON text.
+    pub decoded: usize,
+    /// Documents read from storage one by one, for the page.
+    pub fetched: usize,
+    /// Rows the search parameters were evaluated against.
+    pub checked: usize,
+}
+
 pub fn search(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+) -> Result<Value, FhirError> {
+    search_counted(tx, catalog, model, params).map(|(bundle, _)| bundle)
+}
+
+pub(crate) fn search_counted(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+) -> Result<(Value, Work), FhirError> {
+    catalog.deny_response_read(&model.name)?;
+    if let Some(query) = params.get("_query") {
+        return Err(FhirError::Invalid(format!("unknown query {query}")));
+    }
+    let controls = controls_from(params)?;
+    let clauses = clauses_from(model, params)?;
+    let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
+    let has_ids = has_sets(tx, catalog, model, &clauses)?;
+    let scan = choose_index(model, &clauses);
+    // Three costs used to grow with the number of matches, whatever `_count` asked for: reading and
+    // decoding every document in the index range, checking the parameter against each one again,
+    // and building and sorting the whole result before cutting it to the page. When the range
+    // already decides every clause, only the ids are read and only the page's documents are
+    // fetched; otherwise rows are decoded and checked one at a time (the clause the range decided
+    // is not checked again), only the page is kept, and the scan stops once nothing more is needed.
+    let (page, total, work) =
+        if scan.decides_all(&clauses) && controls.compartment.is_none() && controls.sort.is_empty()
+        {
+            page_from_index(tx, &scan, &controls)?
+        } else {
+            page_by_checking(
+                tx,
+                catalog,
+                model,
+                &scan,
+                &Checks {
+                    clauses: &clauses,
+                    proven: scan.proven,
+                    chain_ids: &chain_ids,
+                    has_ids: &has_ids,
+                },
+                &controls,
+            )?
+        };
+    let bundle = assemble(tx, catalog, model, params, &controls, page, total)?;
+    Ok((bundle, work))
+}
+
+/// The page of matches and how many there are, when the index range already decides every clause:
+/// the range lists exactly the matching documents, in the order they are returned.
+fn page_from_index(
+    tx: &mut Transaction,
+    scan: &Scan,
+    controls: &Controls,
+) -> Result<Page, FhirError> {
+    let offset = controls.offset;
+    // An exact total needs every row of the range counted. Without one, and with a page size, the
+    // first rows past the page are enough (one more shows there is a next page), so the read stops
+    // there instead of listing the whole range.
+    let (rows, total) = match controls.count {
+        Some(count) if !controls.needs_total() => {
+            let (rows, more) = tx.index_range_first(
+                &scan.index,
+                scan.interval.clone(),
+                offset.saturating_add(count),
+            )?;
+            let total = rows.len() + usize::from(more);
+            (rows, total)
+        }
+        _ => {
+            let rows = tx.index_range_entries(&scan.index, scan.interval.clone())?;
+            let total = rows.len();
+            (rows, total)
+        }
+    };
+    // `total` is what the read listed: every row, or the page and the one that shows there is more.
+    let mut work = Work {
+        rows: total,
+        ..Work::default()
+    };
+    let start = offset.min(rows.len());
+    let end = offset
+        .saturating_add(controls.count.unwrap_or(usize::MAX))
+        .min(rows.len());
+    let documents = controls.needs_documents();
+    let mut page = Vec::with_capacity(end - start);
+    for row in &rows[start..end] {
+        let id = row.id.id_str().unwrap_or("").to_string();
+        // `_summary=count` shows no resource, so there is nothing to fetch.
+        let (json, ts) = if documents {
+            work.fetched += 1;
+            work.decoded += 1;
+            tx.entry_json(row)?
+        } else {
+            (Value::Null, None)
+        };
+        page.push((id.clone(), decorate(json, &id, ts)));
+    }
+    Ok((page, total, work))
+}
+
+/// The page of matches and how many there are, checking the rows of the index range one by one.
+///
+/// Without `_sort` only the page is kept. Without a wanted total the scan ends one match after the
+/// page, which is all `links` needs to know whether there is a next page.
+fn page_by_checking(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    scan: &Scan,
+    checks: &Checks<'_>,
+    controls: &Controls,
+) -> Result<Page, FhirError> {
+    let rows = tx.index_range_text(&scan.index, scan.interval.clone())?;
+    let mut work = Work {
+        rows: rows.len(),
+        ..Work::default()
+    };
+    let host = TxHost::new(tx, catalog);
+    let sorted = !controls.sort.is_empty();
+    let limit = controls.count.unwrap_or(usize::MAX);
+    let stop_at = if sorted || controls.needs_total() {
+        usize::MAX
+    } else {
+        controls.offset.saturating_add(limit).saturating_add(1)
+    };
+    let mut kept = Vec::new();
+    let mut total = 0usize;
+    for row in &rows {
+        let json = row.json()?;
+        work.decoded += 1;
+        work.checked += 1;
+        if !row_matches(catalog, model, &json, checks, controls, &host) {
+            continue;
+        }
+        if sorted || (total >= controls.offset && kept.len() < limit) {
+            let id = row.id.id_str().unwrap_or("").to_string();
+            kept.push((id.clone(), decorate(json, &id, row.ts)));
+        }
+        total += 1;
+        if total >= stop_at {
+            break;
+        }
+    }
+    if sorted {
+        sort_matches(catalog, model, &mut kept, &controls.sort);
+        let page = kept.into_iter().skip(controls.offset).take(limit).collect();
+        return Ok((page, total, work));
+    }
+    Ok((kept, total, work))
+}
+
+/// The search bundle for a page of matches.
+fn assemble(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+    controls: &Controls,
+    page: Vec<(String, Value)>,
+    total: usize,
+) -> Result<Value, FhirError> {
+    let mut entries = Vec::new();
+    for (id, resource) in &page {
+        entries.push(json!({
+            "resource": project_resource(resource, controls),
+            "search": {"mode": "match"}
+        }));
+        let _ = id;
+    }
+    let included = include_entries(tx, catalog, model, &page, controls)?;
+    entries.extend(included);
+    let mut bundle = json!({
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "entry": entries,
+        "link": links(model, params, controls, page_len(&entries), total)
+    });
+    if controls.summary.as_deref() != Some("count") && controls.total != "none" {
+        bundle["total"] = json!(total);
+    } else if controls.summary.as_deref() == Some("count") {
+        bundle["total"] = json!(total);
+        bundle["entry"] = json!([]);
+    }
+    if controls.total == "none" && controls.summary.as_deref() != Some("count") {
+        bundle.as_object_mut().expect("object").remove("total");
+    }
+    Ok(bundle)
+}
+
+/// The search as it was before the page was built lazily: every row decoded, every parameter
+/// checked, every match copied and sorted, then cut to the page. Kept so tests can check that the
+/// current search returns the same bundle and records the same reads.
+#[cfg(test)]
+pub(crate) fn search_reference(
     tx: &mut Transaction,
     catalog: &Catalog,
     model: &ResourceModel,
@@ -97,14 +336,18 @@ pub fn search(
     let clauses = clauses_from(model, params)?;
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
-    let (index, interval) = choose_index(model, &clauses);
-    let rows = tx.index_range(&index, interval)?;
+    let scan = choose_index(model, &clauses);
+    let rows = tx.index_range(&scan.index, scan.interval.clone())?;
     let host = TxHost::new(tx, catalog);
     let mut matched = Vec::new();
     for row in rows {
-        if !row_matches(
-            catalog, model, &row.json, &clauses, &chain_ids, &has_ids, &controls, &host,
-        ) {
+        let checks = Checks {
+            clauses: &clauses,
+            proven: None,
+            chain_ids: &chain_ids,
+            has_ids: &has_ids,
+        };
+        if !row_matches(catalog, model, &row.json, &checks, &controls, &host) {
             continue;
         }
         let id = row.id.id_str().unwrap_or("").to_string();
@@ -120,32 +363,7 @@ pub fn search(
         .skip(controls.offset)
         .take(controls.count.unwrap_or(usize::MAX))
         .collect();
-    let mut entries = Vec::new();
-    for (id, resource) in &page {
-        entries.push(json!({
-            "resource": project_resource(resource, &controls),
-            "search": {"mode": "match"}
-        }));
-        let _ = id;
-    }
-    let included = include_entries(tx, catalog, model, &page, &controls)?;
-    entries.extend(included);
-    let mut bundle = json!({
-        "resourceType": "Bundle",
-        "type": "searchset",
-        "entry": entries,
-        "link": links(model, params, &controls, page_len(&entries), total)
-    });
-    if controls.summary.as_deref() != Some("count") && controls.total != "none" {
-        bundle["total"] = json!(total);
-    } else if controls.summary.as_deref() == Some("count") {
-        bundle["total"] = json!(total);
-        bundle["entry"] = json!([]);
-    }
-    if controls.total == "none" && controls.summary.as_deref() != Some("count") {
-        bundle.as_object_mut().expect("object").remove("total");
-    }
-    Ok(bundle)
+    assemble(tx, catalog, model, params, &controls, page, total)
 }
 
 fn page_len(entries: &[Value]) -> usize {
@@ -379,14 +597,33 @@ fn split_modifier(name: &str) -> (String, Option<String>) {
     (name.to_string(), None)
 }
 
-fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> (IndexId, Interval) {
+/// Where `search` reads, and what that read already settles.
+struct Scan {
+    index: IndexId,
+    interval: Interval,
+    /// The clause whose match every row of `interval` already proves, if there is one.
+    proven: Option<usize>,
+}
+
+impl Scan {
+    /// Whether the range decides every clause, so no row needs checking.
+    fn decides_all(&self, clauses: &[Clause]) -> bool {
+        (0..clauses.len()).all(|position| self.proven == Some(position))
+    }
+}
+
+fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
     for clause in clauses {
         if let Clause::Id(id) = clause {
-            return (model.by_id(), Interval::point(exact_key(id)));
+            return Scan {
+                index: model.by_id(),
+                interval: Interval::point(exact_key(id)),
+                proven: None,
+            };
         }
     }
-    let mut chosen: Option<(u8, String, Interval)> = None;
-    for clause in clauses {
+    let mut chosen: Option<(u8, String, Interval, usize, bool)> = None;
+    for (position, clause) in clauses.iter().enumerate() {
         let Clause::Param {
             name,
             modifier,
@@ -412,16 +649,26 @@ fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> (IndexId, Interval
         };
         let replace = chosen
             .as_ref()
-            .map(|(prev, _, _)| rank < *prev)
+            .map(|(prev, _, _, _, _)| rank < *prev)
             .unwrap_or(true);
         if replace {
-            chosen = Some((rank, name.clone(), interval));
+            // A modifier changes what a match is, so only a plain parameter can be proven.
+            let proven = modifier.is_none() && param.extractor.index_proves(value);
+            chosen = Some((rank, name.clone(), interval, position, proven));
         }
     }
-    if let Some((_, name, interval)) = chosen {
-        return (model.search_index(&name), interval);
+    if let Some((_, name, interval, position, proven)) = chosen {
+        return Scan {
+            index: model.search_index(&name),
+            interval,
+            proven: proven.then_some(position),
+        };
     }
-    (model.by_id(), Interval::all())
+    Scan {
+        index: model.by_id(),
+        interval: Interval::all(),
+        proven: None,
+    }
 }
 
 fn chain_sets(
@@ -555,61 +802,67 @@ fn target_types(
         .collect()
 }
 
+/// Whether `resource` satisfies every clause, except the one at `proven` (if any), which the index
+/// range the resource was found through has already settled.
 fn row_matches(
     catalog: &Catalog,
     model: &ResourceModel,
     resource: &Value,
-    clauses: &[Clause],
-    chain_ids: &[BTreeSet<String>],
-    has_ids: &[BTreeSet<String>],
+    checks: &Checks<'_>,
     controls: &Controls,
     host: &TxHost<'_>,
 ) -> bool {
+    let Checks {
+        clauses,
+        proven,
+        chain_ids,
+        has_ids,
+    } = *checks;
     if let Some((type_name, id)) = &controls.compartment {
         if !in_compartment(catalog, model, resource, type_name, id, host) {
             return false;
         }
     }
-    clauses
-        .iter()
-        .enumerate()
-        .all(|(index, clause)| match clause {
-            Clause::Id(id) => resource.get("id").and_then(|item| item.as_str()) == Some(id),
-            Clause::Filter(value) => eval_filter(value, catalog, model, resource, host),
-            Clause::Param {
-                name,
-                modifier,
-                value,
-            } => param_matches(
-                catalog,
-                model,
-                resource,
-                name,
-                modifier.as_deref(),
-                value,
-                host,
-            ),
-            Clause::Chain { param, .. } => {
-                let Some(search) = model.ready_param(param) else {
-                    return false;
-                };
-                let ids = &chain_ids[index];
-                search
-                    .extractor
-                    .indexed(resource, catalog.path_model(), host)
-                    .iter()
-                    .any(|reference| {
-                        ids.contains(reference)
-                            || reference
-                                .rsplit_once('/')
-                                .is_some_and(|(_, id)| ids.contains(id))
-                    })
+    clauses.iter().enumerate().all(|(index, clause)| {
+        proven == Some(index)
+            || match clause {
+                Clause::Id(id) => resource.get("id").and_then(|item| item.as_str()) == Some(id),
+                Clause::Filter(value) => eval_filter(value, catalog, model, resource, host),
+                Clause::Param {
+                    name,
+                    modifier,
+                    value,
+                } => param_matches(
+                    catalog,
+                    model,
+                    resource,
+                    name,
+                    modifier.as_deref(),
+                    value,
+                    host,
+                ),
+                Clause::Chain { param, .. } => {
+                    let Some(search) = model.ready_param(param) else {
+                        return false;
+                    };
+                    let ids = &chain_ids[index];
+                    search
+                        .extractor
+                        .indexed(resource, catalog.path_model(), host)
+                        .iter()
+                        .any(|reference| {
+                            ids.contains(reference)
+                                || reference
+                                    .rsplit_once('/')
+                                    .is_some_and(|(_, id)| ids.contains(id))
+                        })
+                }
+                Clause::Has { .. } => resource
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .is_some_and(|id| has_ids[index].contains(id)),
             }
-            Clause::Has { .. } => resource
-                .get("id")
-                .and_then(|item| item.as_str())
-                .is_some_and(|id| has_ids[index].contains(id)),
-        })
+    })
 }
 
 fn param_matches(

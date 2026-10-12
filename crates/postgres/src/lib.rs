@@ -10,9 +10,10 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
 use refhir_persistence::{
-    document_from_parts, ConflictStrategy, DocumentLogEntry, IndexScanRow, LatestDocument, Lease,
-    PersistError, Persistence, PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader,
-    Pool, PoolStats, TimestampRange,
+    document_from_parts, index_target, ConflictStrategy, DocumentLogEntry, IndexScanEntry,
+    IndexScanRow, LatestDocument, Lease, LiveEntries, PersistError, Persistence,
+    PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader, Pool, PoolStats,
+    TimestampRange,
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 
@@ -568,6 +569,100 @@ ORDER BY B.key {ord}
         Ok(out)
     }
 
+    fn index_scan_ids(
+        &self,
+        index_id: &IndexId,
+        read_timestamp: Timestamp,
+        interval: &Interval,
+        order: Order,
+        limit: Option<usize>,
+    ) -> Result<Vec<IndexScanEntry>, PersistError> {
+        if limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        // The index table's primary key is (index_id, key, ts), so reading it ordered by key and
+        // ts needs no sort, no join and no grouping. Tombstones are rows too: the latest version
+        // of each key is picked in `LiveEntries`.
+        //
+        // With a limit on an ascending scan the rows are read in chunks of a few more than the
+        // limit, so a search for a page of matches does not read the whole range. A chunk can end
+        // in the middle of a key's versions, so the next one starts again from that key, and
+        // grows if one key alone fills a chunk.
+        let ts = i64_ts(read_timestamp)?;
+        let ord = order_sql(order);
+        let upper = if interval.end.is_some() {
+            " AND key < $4"
+        } else {
+            ""
+        };
+        let mut chunk = limit
+            .filter(|_| order == Order::Asc)
+            .map(|limit| limit.saturating_mul(2).saturating_add(16));
+        let mut start = interval.start.clone();
+        let mut live = LiveEntries::new(order, limit);
+        loop {
+            let cap = chunk
+                .map(|rows| format!(" LIMIT {rows}"))
+                .unwrap_or_default();
+            let sql = format!(
+                "SELECT key, deleted, table_id, document_id FROM indexes \
+                 WHERE index_id = $1 AND ts <= $2 AND key >= $3{upper} \
+                 ORDER BY key {ord}, ts {ord}{cap}"
+            );
+            let rows = {
+                let mut guard = self.inner.lock()?;
+                if let Some(end) = &interval.end {
+                    guard
+                        .client
+                        .query(&sql, &[&index_id.as_bytes(), &ts, &start, end])
+                } else {
+                    guard
+                        .client
+                        .query(&sql, &[&index_id.as_bytes(), &ts, &start])
+                }
+                .map_err(definite)?
+            };
+            let read = rows.len();
+            for row in rows {
+                let key: Vec<u8> = row.get(0);
+                let deleted: i32 = row.get(1);
+                let id = if deleted != 0 {
+                    None
+                } else {
+                    let table_id: Option<Vec<u8>> = row.get(2);
+                    let document_id: Option<Vec<u8>> = row.get(3);
+                    match (table_id, document_id) {
+                        (Some(table_id), Some(document_id)) => {
+                            Some(index_target(table_id, document_id)?)
+                        }
+                        _ => {
+                            return Err(PersistError::Definite(format!(
+                                "index {} has a live row that points at no document",
+                                index_id.as_str()
+                            )))
+                        }
+                    }
+                };
+                if live.push(key, id) {
+                    return Ok(live.finish());
+                }
+            }
+            let Some(rows_per_chunk) = chunk else {
+                return Ok(live.finish());
+            };
+            if read < rows_per_chunk {
+                return Ok(live.finish());
+            }
+            let Some(resume) = live.end_chunk() else {
+                return Ok(live.finish());
+            };
+            if resume == start {
+                chunk = Some(rows_per_chunk.saturating_mul(2));
+            }
+            start = resume;
+        }
+    }
+
     fn get_persistence_global(
         &self,
         key: PersistenceGlobalKey,
@@ -1071,6 +1166,7 @@ mod tests {
                 .expect("clean");
         }
         conformance::exercise(&persistence);
+        conformance::exercise_index_scan_ids(&persistence);
     }
 
     #[test]
