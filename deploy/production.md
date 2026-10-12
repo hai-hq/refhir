@@ -163,8 +163,8 @@ Things to know before relying on it:
   sends `X-Refhir-Min-Ts` like any other: `/oauth/*` goes through the same gate, so a replica that
   is behind hands the request to the primary. A replica with no `--primary-url` cannot hand it
   over, so it answers `503` with `Retry-After: 1` instead of an older snapshot.
-- **Database connections.** Each process opens up to `REFHIR_DB_POOL` (default 8), and a writer
-  keeps one more for its lease. Size Postgres `max_connections` for all of them.
+- **Database connections.** Each process opens up to `REFHIR_DB_POOL` (default 8) Postgres
+  connections, and a writer keeps one more for its lease. Size Postgres `max_connections` for all of them.
 - **Failure behaviour.** A writer that loses its lease, or finds a newer writer in the database,
   exits (codes 70 and 71) rather than risk a second writer. Run it under a supervisor that
   restarts it; it comes back as a standby if started with `--standby`.

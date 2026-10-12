@@ -34,8 +34,10 @@ pub const ROLE: &str = "x-refhir-role";
 /// Set on a request a replica forwarded, so a misconfigured pair cannot bounce it forever.
 pub const FORWARDED: &str = "x-refhir-forwarded";
 
-/// How much of a request body a replica buffers so it can replay it.
-const MAX_BUFFERED_BODY: usize = 128 * 1024 * 1024;
+/// How much of a request body a replica buffers so it can replay it: what the primary's handlers
+/// accept, which is axum's default body limit (the server sets none of its own). A replica holding
+/// more would only be holding what the primary then refuses.
+const MAX_BUFFERED_BODY: usize = 2 * 1024 * 1024;
 
 tokio::task_local! {
     /// The highest timestamp an operation reported while serving this request.
@@ -122,13 +124,15 @@ pub(crate) async fn healthz(
             Some(age) => json!(age.as_millis() as u64),
             None => Value::Null,
         };
-        // How far behind the writer's watermark, in timestamps. Read in a blocking task: it
-        // is a database query.
-        let db = app.db.clone();
-        let lag = tokio::task::spawn_blocking(move || db.published_lag()).await;
-        if let Ok(Ok(Some(lag))) = lag {
+        // How far behind the writer's watermark, in timestamps, as of the last refresh. From
+        // memory: this endpoint is open, so it must not cost a database query per call.
+        if let Ok(Some(lag)) = app.db.published_lag() {
             body["lag_ts"] = json!(lag);
         }
+    } else if app.db.watermark_failing() {
+        // It is committing but cannot tell the readers, who fall behind without knowing it.
+        healthy = false;
+        body["detail"] = json!("cannot record the published watermark");
     }
     body["status"] = json!(if healthy { "ok" } else { "unhealthy" });
     if verbose {
@@ -271,6 +275,10 @@ pub(crate) async fn cluster_layer(
         parts.headers.clone(),
     );
     let forwardable = app.config.primary_url.is_some() && !headers.contains_key(FORWARDED);
+    // Running a write here only to learn the commit is refused would validate it twice.
+    if forwardable && is_resource_write(&app, &method, uri.path()) {
+        return forward(&app, method, uri, headers, bytes).await;
+    }
 
     if let Some(min) = min_ts {
         let reached = Timestamp::from_u64(min)
@@ -309,6 +317,23 @@ pub(crate) async fn cluster_layer(
         return forward(&app, method, uri, headers, bytes).await;
     }
     response
+}
+
+/// A request that can only write a FHIR resource: PUT, PATCH or DELETE of `/{Type}` or
+/// `/{Type}/{id}`, or POST of `/{Type}` (a create). Searches by POST, operations, batches and
+/// the auth endpoints are not, and a replica may answer those itself.
+fn is_resource_write(app: &AppState, method: &Method, path: &str) -> bool {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let shape = match *method {
+        Method::PUT | Method::PATCH | Method::DELETE => matches!(parts.len(), 1 | 2),
+        Method::POST => parts.len() == 1,
+        _ => false,
+    };
+    shape
+        && app
+            .catalog
+            .read()
+            .is_ok_and(|catalog| catalog.get(parts[0]).is_ok())
 }
 
 /// Runs the inner service and attaches the timestamp it reported, if any.

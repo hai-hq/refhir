@@ -83,7 +83,8 @@ start_server() { # pool size
 }
 
 # CPU seconds the server process has used so far.
-server_cpu() { ps -o cputime= -p "$SERVER_PID" | awk -F'[:.]' '{ if (NF==3) print $1*60+$2+$3/100; else print $1*3600+$2*60+$3+$4/100 }'; }
+# `ps -o cputime` prints M:SS.cc or H:MM:SS.cc on macOS and [DD-]HH:MM:SS on Linux.
+server_cpu() { ps -o cputime= -p "$SERVER_PID" | awk '{ t = $1; d = 0; if (index(t, "-")) { split(t, x, "-"); d = x[1]; t = x[2] } n = split(t, p, ":"); s = 0; for (i = 1; i <= n; i++) s = s * 60 + p[i]; print d * 86400 + s }'; }
 
 # measure LABEL POOL MIX SEED CLIENTS METRIC -> sets RESULT (METRIC "total": all ops/s; "readsearch":
 # read + search ops/s; "split": read + search ops/s of READERS clients that run beside WRITERS

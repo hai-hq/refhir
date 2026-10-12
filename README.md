@@ -348,7 +348,7 @@ curl -s http://127.0.0.1:8080/metadata
 | `--role primary\|standby\|replica` | What this process does next to others on one database (default `primary`; or `REFHIR_ROLE`). See [Several processes](#several-processes-on-one-database) |
 | `--standby` | Same as `--role standby` |
 | `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
-| `--db-pool n` | Most database connections (default 8; or `REFHIR_DB_POOL`) |
+| `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
 
 ### Several processes on one database
 

@@ -6,7 +6,6 @@
 //! write (and the notice that goes with it). Run with:
 //! `cargo test -p refhir --test bench_watermark -- --ignored --nocapture`
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,6 +17,9 @@ use refhir_persistence::{
 use refhir_postgres::{ConnectOptions, PostgresPersistence};
 use refhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use serde_json::json;
+
+mod common;
+use common::fresh_database;
 
 /// Delegates everything, and drops the watermark write.
 struct WithoutWatermark(Arc<PostgresPersistence>);
@@ -117,39 +119,6 @@ impl Persistence for WithoutWatermark {
     }
 }
 
-fn fresh_database(admin: &str) -> (String, String) {
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-    let name = format!(
-        "refhir_w_{}_{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::SeqCst)
-    );
-    let mut client = postgres::Client::connect(admin, postgres::NoTls).expect("admin connection");
-    client
-        .batch_execute(&format!("CREATE DATABASE {name}"))
-        .expect("create database");
-    let url = if admin.contains("://") {
-        let (head, tail) = match admin.split_once('?') {
-            Some((head, query)) => (head, format!("?{query}")),
-            None => (admin, String::new()),
-        };
-        format!("{}/{name}{tail}", &head[..head.rfind('/').unwrap()])
-    } else {
-        let kept: Vec<&str> = admin
-            .split_whitespace()
-            .filter(|p| !p.starts_with("dbname="))
-            .collect();
-        format!("{} dbname={name}", kept.join(" "))
-    };
-    (name, url)
-}
-
-fn drop_database(admin: &str, name: &str) {
-    if let Ok(mut client) = postgres::Client::connect(admin, postgres::NoTls) {
-        let _ = client.batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"));
-    }
-}
-
 fn commit_one(db: &Database, id: &str) {
     let key = (IndexId::new("t/by_id"), exact_key(id));
     let mut tx = db.begin();
@@ -167,12 +136,13 @@ fn commit_one(db: &Database, id: &str) {
 
 /// Commits per second for `threads` writers making `per_thread` commits each.
 fn run(admin: &str, with_watermark: bool, threads: usize, per_thread: usize) -> (f64, u64) {
-    let (name, url) = fresh_database(admin);
+    // Declared first, so it is dropped last: after the store has let go of the lease.
+    let database = fresh_database(admin, "bench");
     let options = ConnectOptions {
         pool_size: 8,
         create_schema: true,
     };
-    let store = Arc::new(PostgresPersistence::connect_with(&url, &options).unwrap());
+    let store = Arc::new(PostgresPersistence::connect_with(&database.url, &options).unwrap());
     store.try_acquire_writer_lease().unwrap();
     let persistence: Arc<dyn Persistence> = if with_watermark {
         store.clone()
@@ -202,7 +172,6 @@ fn run(admin: &str, with_watermark: bool, threads: usize, per_thread: usize) -> 
     store.release_writer_lease();
     std::thread::sleep(std::time::Duration::from_millis(400));
     drop(store);
-    drop_database(admin, &name);
     ((threads * per_thread) as f64 / secs, watermark_ns)
 }
 

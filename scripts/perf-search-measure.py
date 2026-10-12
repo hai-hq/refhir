@@ -12,13 +12,20 @@ def get(path):
     with urllib.request.urlopen(base + path, timeout=120) as r:
         return json.load(r)
 
+def cputime_seconds(text):
+    """`ps -o cputime` is M:SS.cc or H:MM:SS.cc on macOS and [DD-]HH:MM:SS on Linux."""
+    days = 0
+    if "-" in text:
+        day_text, text = text.split("-", 1)
+        days = int(day_text)
+    seconds = 0.0
+    for part in text.split(":"):
+        seconds = seconds * 60 + float(part)
+    return days * 86400 + seconds
+
 def cpu():
     out = subprocess.run(["ps", "-o", "cputime=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
-    parts = out.replace(".", ":").split(":")
-    nums = [int(x) for x in parts]
-    if len(nums) == 3:   # mm:ss.cc
-        return nums[0] * 60 + nums[1] + nums[2] / 100
-    return nums[0] * 3600 + nums[1] * 60 + nums[2] + nums[3] / 100
+    return cputime_seconds(out)
 
 # The family with the most matches among those of the first few hundred patients.
 sample = get("/Patient?_count=300&_total=none")["entry"]

@@ -441,7 +441,15 @@ async fn smart_guard(
 ) -> Response {
     if app.config.auth {
         let path = request.uri().path().to_string();
-        let open = path == "/healthz"
+        // `/healthz` stays open for a load balancer. Its `verbose` form shows commit counts,
+        // timings and pool use, and takes a token like any other path.
+        let verbose_health = path == "/healthz"
+            && request.uri().query().is_some_and(|query| {
+                query
+                    .split('&')
+                    .any(|pair| pair.split('=').next() == Some("verbose"))
+            });
+        let open = (path == "/healthz" && !verbose_health)
             || path == "/metadata"
             || path.starts_with("/.well-known")
             || path.starts_with("/oauth/");

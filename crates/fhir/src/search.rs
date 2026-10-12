@@ -52,10 +52,21 @@ struct Controls {
     compartment: Option<(String, String)>,
 }
 
+/// Most documents a page may have for the index-only path to read them one query each.
+const MAX_POINT_READS: usize = 100;
+
 impl Controls {
     /// Whether the response states how many resources match.
     fn needs_total(&self) -> bool {
         self.total != "none" || self.summary.as_deref() == Some("count")
+    }
+
+    /// Whether the page is small enough to fetch document by document. The index-only path reads
+    /// each page document with a query of its own, which beats decoding a whole range when the
+    /// page is a few rows of it, and loses to one joined scan when the page is most of the range
+    /// (a request with no `_count` pages every match). A page with no documents is free.
+    fn page_is_cheap_to_fetch(&self) -> bool {
+        !self.needs_documents() || self.count.is_some_and(|count| count <= MAX_POINT_READS)
     }
 
     /// Whether the resources of the page are used at all: `_summary=count` shows none, unless
@@ -153,25 +164,27 @@ pub(crate) fn search_counted(
     // already decides every clause, only the ids are read and only the page's documents are
     // fetched; otherwise rows are decoded and checked one at a time (the clause the range decided
     // is not checked again), only the page is kept, and the scan stops once nothing more is needed.
-    let (page, total, work) =
-        if scan.decides_all(&clauses) && controls.compartment.is_none() && controls.sort.is_empty()
-        {
-            page_from_index(tx, &scan, &controls)?
-        } else {
-            page_by_checking(
-                tx,
-                catalog,
-                model,
-                &scan,
-                &Checks {
-                    clauses: &clauses,
-                    proven: scan.proven,
-                    chain_ids: &chain_ids,
-                    has_ids: &has_ids,
-                },
-                &controls,
-            )?
-        };
+    let (page, total, work) = if scan.decides_all(&clauses)
+        && controls.compartment.is_none()
+        && controls.sort.is_empty()
+        && controls.page_is_cheap_to_fetch()
+    {
+        page_from_index(tx, &scan, &controls)?
+    } else {
+        page_by_checking(
+            tx,
+            catalog,
+            model,
+            &scan,
+            &Checks {
+                clauses: &clauses,
+                proven: scan.proven,
+                chain_ids: &chain_ids,
+                has_ids: &has_ids,
+            },
+            &controls,
+        )?
+    };
     let bundle = assemble(tx, catalog, model, params, &controls, page, total)?;
     Ok((bundle, work))
 }

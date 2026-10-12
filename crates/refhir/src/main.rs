@@ -774,8 +774,8 @@ fn print_help() {
          database. --standby (--role standby) waits for that lease and takes over when the\n\
          primary is gone. --role replica reads what the primary publishes and sends writes, and\n\
          reads that need a newer snapshot, to --primary-url. /healthz is 200 when a process can\n\
-         take traffic and 503 when it cannot. --db-pool sets the most database connections\n\
-         (default 8)."
+         take traffic and 503 when it cannot. --db-pool sets the most Postgres connections\n\
+         (default 8), or, on SQLite, the read connections next to the one writer (default 4)."
     );
 }
 
@@ -794,6 +794,12 @@ fn fill_smart_credentials(
     if !generated_dcr && !generated_secret {
         return Ok(());
     }
+    // `--role primary` is also the single-process default, so this is a warning and not a refusal.
+    // A standby refuses to start without pinned values, because the one that takes over writes its
+    // own over the stored ones: generated here, they stop working at the first failover.
+    tracing::warn!(
+        "the SMART DCR token or confidential client secret was generated at startup and changes on          every restart. Before running a standby or replica, set REFHIR_SMART_DCR_TOKEN and          REFHIR_SMART_CONFIDENTIAL_SECRET to the same values on every process, this one included"
+    );
     if !std::io::stderr().is_terminal() {
         return Ok(());
     }

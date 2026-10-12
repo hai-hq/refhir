@@ -191,7 +191,9 @@ impl Catalog {
 
     /// The catalog and the value of `clock` it reflects. `open` reads five tables one after
     /// another, so a change made in between could give a catalog that mixes two states; this
-    /// reads the clock before and after and tries again if it moved.
+    /// reads the clock before and after and tries again if it moved. If it never holds still the
+    /// catalog is returned with the *older* reading, so a caller that watches the clock sees it
+    /// differ and loads again, rather than trusting a catalog that may mix two states.
     pub fn open_consistent(
         store: &dyn ConformanceStore,
         clock: CatalogClock,
@@ -203,7 +205,7 @@ impl Catalog {
             let after = clock.read(store)?;
             attempts += 1;
             if before == after || attempts >= 5 {
-                return Ok((catalog, after));
+                return Ok((catalog, before));
             }
         }
     }

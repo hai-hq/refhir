@@ -121,7 +121,7 @@ pub(crate) struct Inner {
 pub(crate) struct Conn(Option<Client>);
 
 impl Conn {
-    fn new(client: Client) -> Self {
+    pub(crate) fn new(client: Client) -> Self {
         Self(Some(client))
     }
 }
@@ -255,40 +255,36 @@ const INDEX_BUILD_LOCK: i64 = 7428311;
 
 /// Whether `index_backfills` has the column a claim is recorded in. Tables made by an earlier
 /// version lack it, and a process that finds it missing must run the schema step.
+const HAS_CLAIM_COLUMN: &str = "EXISTS (SELECT 1 FROM information_schema.columns \
+     WHERE table_name = 'index_backfills' AND column_name = 'claimed_epoch')";
+
+/// An index that a failed concurrent build left behind exists but is not usable.
+const HAS_INVALID_INDEX: &str = "EXISTS (SELECT 1 FROM pg_index i \
+     JOIN pg_class c ON c.oid = i.indexrelid \
+     WHERE c.relname = 'indexes_by_ts' AND NOT i.indisvalid)";
+
 fn has_claim_column(client: &mut Client) -> Result<bool, PersistError> {
     Ok(client
-        .query_one(
-            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
-             WHERE table_name = 'index_backfills' AND column_name = 'claimed_epoch')",
-            &[],
-        )
+        .query_one(&format!("SELECT {HAS_CLAIM_COLUMN}"), &[])
         .map_err(definite)?
         .get(0))
 }
 
+/// Whether every table and index exists, the claim column is there and the timestamp index is
+/// usable: one query, not one round trip per object, because this runs whenever a process connects.
 fn schema_complete(client: &mut Client) -> Result<bool, PersistError> {
-    for name in SCHEMA_OBJECTS {
-        let exists: bool = client
-            .query_one("SELECT to_regclass($1) IS NOT NULL", &[name])
-            .map_err(definite)?
-            .get(0);
-        if !exists {
-            return Ok(false);
-        }
-    }
-    if !has_claim_column(client)? {
-        return Ok(false);
-    }
-    // An index that a failed concurrent build left behind exists but is not usable.
-    let invalid: bool = client
+    let objects: Vec<&str> = SCHEMA_OBJECTS.to_vec();
+    Ok(client
         .query_one(
-            "SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
-             WHERE c.relname = 'indexes_by_ts' AND NOT i.indisvalid)",
-            &[],
+            &format!(
+                "SELECT COALESCE((SELECT bool_and(to_regclass(object) IS NOT NULL) \
+                                  FROM unnest($1::text[]) AS object), false) \
+                        AND {HAS_CLAIM_COLUMN} AND NOT {HAS_INVALID_INDEX}"
+            ),
+            &[&objects],
         )
         .map_err(definite)?
-        .get(0);
-    Ok(!invalid)
+        .get(0))
 }
 
 fn create_schema(client: &mut Client) -> Result<(), PersistError> {
@@ -332,11 +328,7 @@ fn create_schema(client: &mut Client) -> Result<(), PersistError> {
     }
     let built = (|| {
         let invalid: bool = client
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
-                 WHERE c.relname = 'indexes_by_ts' AND NOT i.indisvalid)",
-                &[],
-            )
+            .query_one(&format!("SELECT {HAS_INVALID_INDEX}"), &[])
             .map_err(definite)?
             .get(0);
         if invalid {
@@ -376,18 +368,17 @@ impl PostgresPersistence {
 fn wait_for_schema(client: &mut Client) -> Result<(), PersistError> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
-        let mut missing = Vec::new();
-        for table in REQUIRED_TABLES {
-            let exists: bool = client
-                .query_one("SELECT to_regclass($1) IS NOT NULL", &[table])
-                .map_err(definite)?
-                .get(0);
-            if !exists {
-                missing.push(*table);
-            }
-        }
+        let tables: Vec<&str> = REQUIRED_TABLES.to_vec();
+        let mut missing: Vec<String> = client
+            .query_one(
+                "SELECT COALESCE(array_agg(object), ARRAY[]::text[]) \
+                 FROM unnest($1::text[]) AS object WHERE to_regclass(object) IS NULL",
+                &[&tables],
+            )
+            .map_err(definite)?
+            .get(0);
         if !has_claim_column(client)? {
-            missing.push("index_backfills.claimed_epoch");
+            missing.push("index_backfills.claimed_epoch".to_string());
         }
         if missing.is_empty() {
             return Ok(());
@@ -601,8 +592,9 @@ ORDER BY B.key {ord}
         let mut start = interval.start.clone();
         let mut live = LiveEntries::new(order, limit);
         loop {
+            // `LIMIT` is a bigint, and a client's `_count` can be any usize.
             let cap = chunk
-                .map(|rows| format!(" LIMIT {rows}"))
+                .map(|rows| format!(" LIMIT {}", rows.min(i64::MAX as usize)))
                 .unwrap_or_default();
             let sql = format!(
                 "SELECT key, deleted, table_id, document_id FROM indexes \

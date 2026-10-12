@@ -21,7 +21,7 @@ sqlite_path = "/data/refhir.sqlite"
 # Several processes on one Postgres database (see README, "Several processes on one database").
 # role = "primary"   # primary | standby | replica; REFHIR_ROLE
 # primary_url = "http://primary:8080"   # replicas send writes here; REFHIR_PRIMARY_URL
-# db_pool = 8        # most database connections; REFHIR_DB_POOL
+# db_pool = 8        # most Postgres connections (SQLite: read connections, default 4); REFHIR_DB_POOL
 
 [conformance]
 reference_policy = "strict" # strict | fhir

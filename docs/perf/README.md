@@ -20,8 +20,9 @@ cargo build --release -p refhir
   --bind 127.0.0.1:8080
 ```
 
-- `--db-pool 1` reproduces the old single connection, which is the baseline in `baseline.md`.
-  The default is 8.
+- With Postgres, `--db-pool 1` reproduces the old single connection, which is the baseline in
+  `baseline.md`. The default is 8. (On SQLite `--db-pool` sizes the read connections that sit next
+  to the single writer, so 1 is not the old behaviour there.)
 - Without network access, install the bundled fixture instead of downloading the R4 packages:
   `REFHIR_SKIP_DEFAULT_PACKAGES=1 ./target/release/refhir ... --package crates/fhir/fixtures/r4`.
   (The `minir4` fixture is too small for the Observation writes the load generator makes.)

@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use postgres::{Client, Transaction};
+use postgres::Transaction;
 use refhir_persistence::{Lease, PersistError, PersistenceGlobalKey};
 
-use crate::definite;
+use crate::{definite, Conn};
 
 /// `pg_try_advisory_lock` key for the writer lease.
 const LEASE_KEY: i64 = 0x7265_6668_6972_0001;
@@ -45,7 +45,10 @@ impl LeaseState {
         if let Some(epoch) = self.epoch() {
             return Ok(Lease::Held { epoch });
         }
-        let mut client = crate::connect_client(url)?;
+        // A `Conn`, so that giving it up (when another process holds the lease) closes it on a
+        // thread of its own: dropping a bare `Client` blocks on a runtime, which a thread that
+        // belongs to another runtime may not do.
+        let mut client = Conn::new(crate::connect_client(url)?);
         let got: bool = client
             .query_one("SELECT pg_try_advisory_lock($1)", &[&LEASE_KEY])
             .map_err(definite)?
@@ -89,7 +92,7 @@ impl LeaseState {
     }
 }
 
-fn keepalive(mut client: Client, epoch: u64, release: Arc<AtomicBool>) {
+fn keepalive(mut client: Conn, epoch: u64, release: Arc<AtomicBool>) {
     let key = PersistenceGlobalKey::WriterEpoch.as_str();
     loop {
         // Sleep in slices so a release request is honoured quickly.

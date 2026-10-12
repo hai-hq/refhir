@@ -1388,7 +1388,15 @@ pub mod conformance {
                         .into_iter()
                         .map(|row| (row.key, row.document.id))
                         .collect();
-                    for limit in [None, Some(0), Some(1), Some(3), Some(25), Some(1000)] {
+                    for limit in [
+                        None,
+                        Some(0),
+                        Some(1),
+                        Some(3),
+                        Some(25),
+                        Some(1000),
+                        Some(usize::MAX),
+                    ] {
                         let ids: Vec<(Vec<u8>, DocumentId)> = p
                             .index_scan_ids(&index, at(read_at), interval, order, limit)
                             .unwrap()

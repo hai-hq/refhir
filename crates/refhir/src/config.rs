@@ -34,7 +34,8 @@ pub struct ClusterSection {
     pub role: Option<String>,
     /// Where a replica sends writes and reads that need a newer snapshot than it has.
     pub primary_url: Option<String>,
-    /// Most database connections to open. Defaults to 8.
+    /// Most Postgres connections to open (default 8). On SQLite, the read connections opened
+    /// next to the one writer (default 4).
     pub db_pool: Option<usize>,
 }
 
@@ -213,8 +214,11 @@ impl ResolvedConfig {
         if file.cluster.primary_url.is_some() {
             self.primary_url = file.cluster.primary_url.clone();
         }
-        if file.cluster.db_pool.is_some() {
-            self.db_pool = file.cluster.db_pool;
+        if let Some(size) = file.cluster.db_pool {
+            if size == 0 {
+                return Err("cluster.db_pool must be a positive number".into());
+            }
+            self.db_pool = Some(size);
         }
         if let Some(v) = &file.server.bind {
             self.bind = v.clone();

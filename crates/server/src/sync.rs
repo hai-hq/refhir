@@ -351,7 +351,9 @@ async fn handle_text(
                     .await;
                 }
             };
-            let response = match execute(db, catalog, store, &udf_path, args.clone()).await {
+            // Only a replica that can reach a primary may need the arguments again, to forward.
+            let replay = upstream.map(|_| args.clone());
+            let response = match execute(db, catalog, store, &udf_path, args).await {
                 Ok(result) => json!({
                     "type": "MutationResponse",
                     "requestId": request_id,
@@ -360,8 +362,8 @@ async fn handle_text(
                     "ts": result.ts.to_string()
                 }),
                 // A replica cannot commit. The primary can, so ask it.
-                Err(RunError::Commit(CommitError::ReadOnly)) if upstream.is_some() => {
-                    let upstream = upstream.expect("checked");
+                Err(RunError::Commit(CommitError::ReadOnly)) if replay.is_some() => {
+                    let (upstream, args) = (upstream.expect("checked"), replay.expect("checked"));
                     forwarded_response(db, upstream, request_id, &udf_path, &args).await
                 }
                 Err(err) => json!({

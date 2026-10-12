@@ -3646,6 +3646,18 @@ mod search_paging {
         assert_eq!(work.rows, 211, "the offset, the page and one more");
         assert_eq!(bundle["entry"].as_array().unwrap().len(), 10);
 
+        // A page that is most of the range is not read a document at a time: with no _count every
+        // match is on the page, and one joined scan beats 300 queries of one row.
+        for query in [
+            vec![("family", "Smith")],
+            vec![("family", "Smith"), ("_count", "1000")],
+        ] {
+            let (bundle, work) = self::work(&harness, &query);
+            assert_eq!(bundle["entry"].as_array().unwrap().len(), 300, "{query:?}");
+            assert_eq!(work.fetched, 0, "no point reads for {query:?}");
+            assert_eq!(work.decoded, 300);
+        }
+
         // The last page has nothing after it, and says so.
         let (bundle, work) = self::work(
             &harness,

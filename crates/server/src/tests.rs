@@ -3457,6 +3457,42 @@ mod cluster {
     }
 
     #[tokio::test]
+    async fn the_verbose_health_report_needs_a_token_when_smart_is_on() {
+        let smart = std::sync::Arc::new(crate::auth::SmartStore::with_defaults());
+        smart.install_token("system-tok", &["system/*.cruds"], None);
+        let (db, catalog, store) = memory();
+        let app = crate::app_with(
+            db,
+            catalog,
+            store,
+            crate::ServerConfig {
+                auth: true,
+                smart: Some(smart),
+                ..Default::default()
+            },
+        );
+        // A load balancer needs no token.
+        let plain = call(&app, "GET", "/healthz", None, &[]).await;
+        assert_eq!(plain.status, StatusCode::OK);
+        assert!(plain.body.get("pool").is_none());
+        // The counters and timings do.
+        for uri in ["/healthz?verbose=1", "/healthz?verbose"] {
+            let anonymous = call(&app, "GET", uri, None, &[]).await;
+            assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED, "{uri}");
+        }
+        let with_token = call(
+            &app,
+            "GET",
+            "/healthz?verbose=1",
+            None,
+            &[("authorization", "Bearer system-tok")],
+        )
+        .await;
+        assert_eq!(with_token.status, StatusCode::OK, "{}", with_token.body);
+        assert!(with_token.body["pool"]["max"].as_u64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
     async fn responses_carry_the_timestamp_a_client_echoes_back() {
         let cluster = pair(|_| {}).await;
         let primary = cluster_primary_app(&cluster);
@@ -3536,6 +3572,33 @@ mod cluster {
         assert!(cluster.primary_db.latest_ts().as_u64() >= ts);
         // The replica itself has not moved, which is why the header exists.
         assert!(cluster.replica_db.latest_ts().as_u64() < ts);
+
+        // A write is not run on the replica to find out it is refused: the primary validates it,
+        // so even a rejection comes from there.
+        let mut invalid = patient("invalid");
+        invalid["birthDate"] = json!("yesterday");
+        let rejected = call(&cluster.replica_app, "POST", "/Patient", Some(invalid), &[]).await;
+        assert_eq!(
+            rejected.status,
+            StatusCode::BAD_REQUEST,
+            "{}",
+            rejected.body
+        );
+        assert_eq!(header(&rejected, "x-refhir-role"), "primary");
+
+        // Reads and the searches and operations sent by POST are still the replica's to answer.
+        let read = call(&cluster.replica_app, "GET", "/Patient/nobody", None, &[]).await;
+        assert_eq!(header(&read, "x-refhir-role"), "replica");
+
+        // A replica buffers no more of a request than the primary's handlers would take.
+        let mut big = patient("big");
+        big["text"] = json!({"status": "generated", "div": "x".repeat(3 * 1024 * 1024)});
+        let refused = call(&cluster.replica_app, "POST", "/Patient", Some(big), &[]).await;
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(
+            refused.headers.get("x-refhir-role").is_none(),
+            "the replica refused it itself, without forwarding"
+        );
     }
 
     #[tokio::test]

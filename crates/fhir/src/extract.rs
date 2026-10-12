@@ -125,15 +125,7 @@ impl Extractor {
         let Source::Path(expr) = &self.source else {
             return false;
         };
-        const ASKS_THE_WORLD: [&str; 6] = [
-            "resolve",
-            "conformsTo",
-            "memberOf",
-            "now",
-            "today",
-            "timeOfDay",
-        ];
-        if ASKS_THE_WORLD.iter().any(|function| expr.calls(function)) {
+        if expr.depends_on_host() {
             return false;
         }
         match self.kind {

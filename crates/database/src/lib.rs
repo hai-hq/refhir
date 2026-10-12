@@ -14,7 +14,7 @@ mod write_log;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -304,6 +304,43 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
+/// The published watermark and its recording. Shared with the thread that retries a write that
+/// failed, which must not keep the whole database alive.
+#[derive(Default)]
+struct Watermark {
+    /// Highest timestamp that wants to be recorded as published.
+    target: AtomicU64,
+    /// Highest timestamp actually recorded. The lock makes concurrent publishers share one
+    /// write: whoever gets it records the newest target, the rest find it already covered.
+    written: Mutex<u64>,
+    /// The last attempt to record it failed, and nothing has recorded it since.
+    failing: AtomicBool,
+    /// A thread is retrying a failed write.
+    retrying: AtomicBool,
+}
+
+impl Watermark {
+    /// Records the newest target unless `covering` is already recorded.
+    fn flush(&self, persistence: &dyn Persistence, covering: u64) -> Result<(), PersistError> {
+        let mut written = self.written.lock().expect("published");
+        if *written >= covering {
+            return Ok(());
+        }
+        let target = self.target.load(Ordering::SeqCst);
+        let result = Timestamp::from_u64(target)
+            .map_err(|_| PersistError::Definite(format!("bad timestamp {target}")))
+            .and_then(|target| persistence.advance_published_ts(target));
+        match &result {
+            Ok(()) => {
+                *written = target;
+                self.failing.store(false, Ordering::SeqCst);
+            }
+            Err(_) => self.failing.store(true, Ordering::SeqCst),
+        }
+        result
+    }
+}
+
 pub struct Database {
     persistence: Arc<dyn Persistence>,
     reader: Arc<dyn PersistenceReader>,
@@ -312,11 +349,10 @@ pub struct Database {
     commit_listeners: Mutex<Vec<UnboundedSender<Timestamp>>>,
     mode: Mode,
     counters: Counters,
-    /// Highest timestamp that wants to be recorded as published.
-    published_target: AtomicU64,
-    /// Highest timestamp actually recorded. The lock makes concurrent publishers share one
-    /// write: whoever gets it records the newest target, the rest find it already covered.
-    published_written: Mutex<u64>,
+    watermark: Arc<Watermark>,
+    /// The writer's watermark as of the last refresh (or when the reader opened), so asking how
+    /// far behind a reader is does not query the database. `u64::MAX` before one is known.
+    seen_published: AtomicU64,
     /// Serializes `refresh` so two threads never apply the same commits twice.
     refresh_lock: Mutex<()>,
     /// Woken when the snapshot moves, for `wait_for_ts`.
@@ -331,9 +367,9 @@ impl Database {
     pub fn open(persistence: Arc<dyn Persistence>) -> Result<Self, PersistError> {
         let latest = persistence.max_ts()?.unwrap_or(Timestamp::ZERO);
         persistence.advance_published_ts(latest)?;
-        let mut db = Self::new(persistence, latest, Mode::Writer);
-        *db.published_written.get_mut().expect("published") = latest.as_u64();
-        db.published_target = AtomicU64::new(latest.as_u64());
+        let db = Self::new(persistence, latest, Mode::Writer);
+        *db.watermark.written.lock().expect("published") = latest.as_u64();
+        db.watermark.target.store(latest.as_u64(), Ordering::SeqCst);
         Ok(db)
     }
 
@@ -346,7 +382,10 @@ impl Database {
                 "the writer has not published a timestamp yet; start the primary first".into(),
             )
         })?;
-        Ok(Self::new(persistence, published, Mode::Reader))
+        let db = Self::new(persistence, published, Mode::Reader);
+        db.seen_published
+            .store(published.as_u64(), Ordering::SeqCst);
+        Ok(db)
     }
 
     fn new(persistence: Arc<dyn Persistence>, latest: Timestamp, mode: Mode) -> Self {
@@ -359,8 +398,8 @@ impl Database {
             commit_listeners: Mutex::new(Vec::new()),
             mode,
             counters: Counters::default(),
-            published_target: AtomicU64::new(0),
-            published_written: Mutex::new(0),
+            watermark: Arc::new(Watermark::default()),
+            seen_published: AtomicU64::new(u64::MAX),
             refresh_lock: Mutex::new(()),
             advanced: (Mutex::new(()), Condvar::new()),
             refreshed_at: Mutex::new((mode == Mode::Reader).then(Instant::now)),
@@ -376,14 +415,19 @@ impl Database {
             .map(|at| at.elapsed())
     }
 
-    /// Reader side: how many timestamps the writer's watermark is ahead of this snapshot.
+    /// Reader side: how many timestamps the writer's watermark was ahead of this snapshot when the
+    /// reader last looked at it. From memory, so a health check can call it freely.
     pub fn published_lag(&self) -> Result<Option<u64>, PersistError> {
-        let Some(published) = read_published(self.persistence.as_ref())? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            published.as_u64().saturating_sub(self.latest_ts().as_u64()),
-        ))
+        match self.seen_published.load(Ordering::SeqCst) {
+            u64::MAX => Ok(None),
+            published => Ok(Some(published.saturating_sub(self.latest_ts().as_u64()))),
+        }
+    }
+
+    /// Writer side: the last attempt to record the published watermark failed and none has
+    /// succeeded since, so readers are not being told about the newest commits.
+    pub fn watermark_failing(&self) -> bool {
+        self.watermark.failing.load(Ordering::SeqCst)
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -543,25 +587,65 @@ impl Database {
     /// Writes the published watermark. Concurrent publishers share one write.
     fn record_published(&self, ts: Timestamp) {
         let started = Instant::now();
-        self.published_target
+        self.watermark
+            .target
             .fetch_max(ts.as_u64(), Ordering::SeqCst);
-        let mut written = self.published_written.lock().expect("published");
-        if *written >= ts.as_u64() {
-            return;
-        }
-        let target = self.published_target.load(Ordering::SeqCst);
-        let result = Timestamp::from_u64(target)
-            .map_err(|_| PersistError::Definite(format!("bad timestamp {target}")))
-            .and_then(|target| self.persistence.advance_published_ts(target));
-        match result {
-            Ok(()) => *written = target,
-            // A reader falls behind until the next commit. The commit itself is durable.
-            Err(err) => tracing::warn!(
+        if let Err(err) = self.watermark.flush(self.persistence.as_ref(), ts.as_u64()) {
+            // The commit itself is durable; readers just have not been told. Without another
+            // commit nothing would tell them, so keep trying.
+            tracing::warn!(
                 target: ENGINE,
-                "could not record the published watermark {target}: {err}"
-            ),
+                "could not record the published watermark {}: {err}",
+                self.watermark.target.load(Ordering::SeqCst)
+            );
+            self.retry_published();
         }
         add_ns(&self.counters.watermark_ns, started);
+    }
+
+    /// Retries a failed watermark write in the background, backing off, until it is recorded.
+    fn retry_published(&self) {
+        if self.watermark.retrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let watermark = self.watermark.clone();
+        let persistence = self.persistence.clone();
+        let spawned = std::thread::Builder::new()
+            .name("refhir-watermark".into())
+            .spawn(move || {
+                let mut wait = Duration::from_millis(100);
+                loop {
+                    std::thread::sleep(wait);
+                    // Only this thread holds it once the database is gone.
+                    if Arc::strong_count(&watermark) == 1 {
+                        return;
+                    }
+                    let target = watermark.target.load(Ordering::SeqCst);
+                    match watermark.flush(persistence.as_ref(), target) {
+                        Ok(()) => {
+                            watermark.retrying.store(false, Ordering::SeqCst);
+                            // A commit that failed to record just after this one succeeded saw
+                            // `retrying` still set and left the retry to this thread.
+                            if !watermark.failing.load(Ordering::SeqCst)
+                                || watermark.retrying.swap(true, Ordering::SeqCst)
+                            {
+                                return;
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                target: ENGINE,
+                                "still cannot record the published watermark: {err}"
+                            );
+                            wait = (wait * 2).min(Duration::from_secs(2));
+                        }
+                    }
+                }
+            });
+        if let Err(err) = spawned {
+            tracing::error!(target: ENGINE, "could not start the watermark retry thread: {err}");
+            self.watermark.retrying.store(false, Ordering::SeqCst);
+        }
     }
 
     fn notify_advanced(&self) {
@@ -583,6 +667,7 @@ impl Database {
         let Some(target) = read_published(self.persistence.as_ref())? else {
             return Ok(self.latest_ts());
         };
+        self.seen_published.store(target.as_u64(), Ordering::SeqCst);
         let from = self.latest_ts();
         if target <= from {
             return Ok(from);
@@ -884,6 +969,7 @@ mod tests {
             block_until: usize::MAX,
             entered: entered.clone(),
             release,
+            fail_published: AtomicUsize::new(0),
         });
         let db = Arc::new(Database::open(persistence).unwrap());
         let mut seed = db.begin();
@@ -1001,6 +1087,7 @@ mod tests {
             block_until: 2,
             entered: entered.clone(),
             release,
+            fail_published: AtomicUsize::new(0),
         });
         let db = Arc::new(Database::open(persistence).unwrap());
         assert_eq!(
@@ -1039,6 +1126,42 @@ mod tests {
         assert!(slow_ts < quick_ts);
         assert_eq!(published(&db), Some(quick_ts.as_u64()));
         assert_eq!(db.latest_ts(), quick_ts);
+    }
+
+    #[test]
+    fn a_watermark_that_could_not_be_recorded_is_retried_without_another_commit() {
+        let persistence = Arc::new(GatedPersistence {
+            inner: SqlitePersistence::open_in_memory().unwrap(),
+            writes: AtomicUsize::new(0),
+            block_from: usize::MAX,
+            block_until: usize::MAX,
+            entered: Arc::new(Gate::new()),
+            release: Arc::new(Gate::new()),
+            fail_published: AtomicUsize::new(0),
+        });
+        let db = Arc::new(Database::open(persistence.clone()).unwrap());
+        assert!(!db.watermark_failing());
+
+        // The next two attempts to record it fail: the commit's own, and the first retry.
+        persistence.fail_published.store(2, Ordering::SeqCst);
+        let mut tx = db.begin();
+        put_doc(&mut tx, "a", "v1", None);
+        let ts = db
+            .commit(tx)
+            .expect("the commit is durable and acknowledged");
+        assert!(db.watermark_failing(), "readers are not being told");
+        assert_eq!(published(&db), Some(0), "the watermark did not move");
+
+        // No further commit arrives, and the watermark is recorded anyway.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while published(&db) != Some(ts.as_u64()) {
+            assert!(
+                Instant::now() < deadline,
+                "the watermark was never recorded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!db.watermark_failing());
     }
 
     #[test]
@@ -1367,6 +1490,8 @@ mod tests {
         block_until: usize,
         entered: Arc<Gate>,
         release: Arc<Gate>,
+        /// The next this many `advance_published_ts` calls fail.
+        fail_published: AtomicUsize,
     }
 
     impl PersistenceReader for GatedPersistence {
@@ -1462,6 +1587,15 @@ mod tests {
             self.inner.write_persistence_global(key, value)
         }
         fn advance_published_ts(&self, ts: Timestamp) -> Result<(), PersistError> {
+            if self
+                .fail_published
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(PersistError::Definite("watermark write failed".into()));
+            }
             self.inner.advance_published_ts(ts)
         }
     }
