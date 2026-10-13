@@ -40,6 +40,17 @@ client_id = "refhir"
 scopes = ["openid", "profile"]
 # ID token claim carrying the user's FHIR identity, e.g. "Practitioner/123".
 fhir_user_claim = "fhirUser"
+# Off unless set: accept only some of the people the provider signs in (see deploy/production.md).
+# allowed_claims = { organization_id = ["org_abc123"] }
+# allowed_email_domains = ["example.com"]
+# Use the signed-in Patient as the launch patient instead of the patient picker.
+# patient_from_fhir_user = true
+# When the ID token has no fhirUser claim, find the person by searching your own data:
+# Practitioner?identifier=<system>|<sub>
+# [smart.oidc.fhir_user_lookup]
+# resource_type = "Practitioner"
+# claim = "sub"
+# system = "https://idp.example.com/sub"
 
 [export]
 # Bulk $export writes NDJSON here, then clients download via GET /export/{job}/file.

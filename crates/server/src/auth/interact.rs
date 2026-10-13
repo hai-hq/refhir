@@ -12,7 +12,9 @@ use super::oauth::{
     issuer, now, oauth_error, parse_authorize_form, query_encode, redirect_with,
     scopes_need_patient, storage_unavailable,
 };
-use super::oidc::{constant_time_eq, cookie_value, Oidc};
+use super::oidc::{
+    constant_time_eq, cookie_value, FhirUserLookup, Identity, Oidc, OidcConfig, SignInError,
+};
 use super::store::{code_ttl, launch_ttl, normalize_patient_id, AuthCode, PendingSession};
 use crate::http::AppState;
 
@@ -210,14 +212,15 @@ pub fn oidc_callback(app: &AppState, headers: &HeaderMap, raw_query: &str) -> Re
     };
     let flow = session.oidc.take().expect("checked above");
     let clear = clear_browser_cookie(session_id);
+    let (client_redirect, client_state) = (session.redirect_uri.clone(), session.state.clone());
     let refuse = |code: &str, description: &str| {
         with_cookie(
             redirect_with(
-                &session.redirect_uri,
+                &client_redirect,
                 &[
                     ("error", code),
                     ("error_description", description),
-                    ("state", &session.state),
+                    ("state", &client_state),
                 ],
             ),
             clear.clone(),
@@ -230,7 +233,16 @@ pub fn oidc_callback(app: &AppState, headers: &HeaderMap, raw_query: &str) -> Re
         return refuse("invalid_request", "the identity provider returned no code");
     };
     match oidc.complete(code, &flow, &callback_uri(app, headers, oidc)) {
-        Ok(identity) => {
+        Ok(mut identity) => {
+            if let Err(description) =
+                bind_identity(app, headers, oidc.config(), &mut identity, &mut session)
+            {
+                tracing::warn!(
+                    "openid connect sign-in refused for {}: {description}",
+                    identity.sub
+                );
+                return refuse("access_denied", description);
+            }
             session.identity = Some(identity);
             // The cookie stays set: the consent POST must come from this same browser.
             session.browser = Some(flow.binder);
@@ -243,9 +255,146 @@ pub fn oidc_callback(app: &AppState, headers: &HeaderMap, raw_query: &str) -> Re
             }
             redirect_to_interact(session_id)
         }
-        Err(err) => {
+        Err(SignInError::NotPermitted(reason)) => {
+            tracing::warn!("openid connect sign-in not permitted: {reason}");
+            refuse(
+                "access_denied",
+                "this account is not permitted to sign in to this server",
+            )
+        }
+        Err(SignInError::Failed(err)) => {
             tracing::warn!("openid connect sign-in failed: {err}");
             refuse("access_denied", "sign-in failed")
+        }
+    }
+}
+
+/// Work out which FHIR resource the signed-in person is, and what that means for the session.
+///
+/// The ID token's own claim wins when it is usable. Otherwise, when the launch has not named a
+/// person either, a configured lookup searches for one. A `Patient` binding can then fix the
+/// launch patient, so the picker never offers anyone else. `Err` is shown to the client.
+fn bind_identity(
+    app: &AppState,
+    headers: &HeaderMap,
+    cfg: &OidcConfig,
+    identity: &mut Identity,
+    session: &mut PendingSession,
+) -> Result<(), &'static str> {
+    identity.fhir_user = identity
+        .fhir_user
+        .take()
+        .filter(|reference| reference.contains("://") || valid_fhir_reference(reference));
+    // Used here and nowhere after: it is not kept on the stored session.
+    let lookup_key = identity.lookup_key.take();
+    let wants_user = session.scopes.iter().any(|scope| scope == "fhirUser");
+    let wants_patient = cfg.patient_from_fhir_user && scopes_need_patient(&session.scopes);
+    if identity.fhir_user.is_none() && session.fhir_user.is_none() && (wants_user || wants_patient)
+    {
+        if let (Some(lookup), Some(key)) = (&cfg.fhir_user_lookup, &lookup_key) {
+            identity.fhir_user = lookup_fhir_user(app, lookup, key);
+        }
+    }
+    if !wants_patient {
+        return Ok(());
+    }
+    let iss = issuer(app, headers);
+    let Some(bound) = identity
+        .fhir_user
+        .as_deref()
+        .and_then(|reference| bound_patient(&iss, reference))
+    else {
+        return Ok(());
+    };
+    if session
+        .patient
+        .as_deref()
+        .is_some_and(|launched| normalize_patient_id(launched) != bound)
+    {
+        return Err("the signed-in user is not the patient this launch is for");
+    }
+    if !patient_exists(app, &bound) {
+        return Err("the patient bound to the signed-in user does not exist");
+    }
+    session.patient = Some(bound);
+    session.needs_patient_pick = false;
+    Ok(())
+}
+
+/// The id of `reference` when it names a `Patient` on this server (relative, or under the issuer).
+pub(crate) fn bound_patient(iss: &str, reference: &str) -> Option<String> {
+    let relative = match reference.contains("://") {
+        true => reference
+            .strip_prefix(iss.trim_end_matches('/'))?
+            .trim_start_matches('/'),
+        false => reference,
+    };
+    let (kind, id) = relative.split_once('/')?;
+    (kind == "Patient" && valid_fhir_reference(relative)).then(|| id.to_string())
+}
+
+/// The search value for `lookup`, or `None` when `key` cannot be put in a search safely.
+///
+/// `,` `$` `\` are search syntax (OR, composite, escape) and `|` splits system from code; the
+/// engine does not unescape, so a key holding them is refused rather than escaped, which keeps
+/// a person from matching more than their own resource. `|` is fine after a system.
+pub(crate) fn lookup_query(lookup: &FhirUserLookup, key: &str) -> Option<String> {
+    let reserved = |c: char| matches!(c, ',' | '$' | '\\');
+    if key.is_empty() || key.contains(reserved) {
+        return None;
+    }
+    match &lookup.system {
+        Some(system) if !system.contains(reserved) && !system.contains('|') => {
+            Some(format!("{system}|{key}"))
+        }
+        Some(_) => None,
+        None => (!key.contains('|')).then(|| key.to_string()),
+    }
+}
+
+/// `Type/id` of the one resource the lookup finds for `key`. No hit, several hits, or a failed
+/// search all bind nobody.
+fn lookup_fhir_user(app: &AppState, lookup: &FhirUserLookup, key: &str) -> Option<String> {
+    let Some(value) = lookup_query(lookup, key) else {
+        tracing::warn!(
+            "fhir_user_lookup: the {} claim value cannot be searched",
+            lookup.claim
+        );
+        return None;
+    };
+    let catalog = app.catalog.read().expect("catalog");
+    let path = format!("{}/search", lookup.resource_type);
+    let args = json!({ lookup.search_param.as_str(): value, "_count": "2" });
+    let result = match run(&app.db, &catalog, &path, &args) {
+        Ok(result) => result,
+        Err(err) => {
+            tracing::warn!("fhir_user_lookup: {path} failed: {err}");
+            return None;
+        }
+    };
+    let ids: Vec<&str> = result
+        .value
+        .get("entry")
+        .and_then(|entries| entries.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.pointer("/resource/id").and_then(|id| id.as_str()))
+        .collect();
+    match ids.as_slice() {
+        [id] => Some(format!("{}/{id}", lookup.resource_type)),
+        [] => {
+            tracing::info!(
+                "fhir_user_lookup: no {} matches the signed-in user",
+                lookup.resource_type
+            );
+            None
+        }
+        _ => {
+            tracing::warn!(
+                "fhir_user_lookup: more than one {} matches the signed-in user; binding nobody",
+                lookup.resource_type
+            );
+            None
         }
     }
 }
@@ -398,7 +547,7 @@ pub fn interact_post(
                     ("error", "invalid_request"),
                     (
                         "error_description",
-                        "the identity provider did not supply a valid fhirUser claim",
+                        "the identity provider did not supply a valid fhirUser claim, and no FHIR resource is bound to this user",
                     ),
                     ("state", &session.state),
                 ],
@@ -578,7 +727,12 @@ pub(crate) fn patient_exists(app: &AppState, id: &str) -> bool {
 
 fn list_patients(app: &AppState) -> Vec<(String, String)> {
     let catalog = app.catalog.read().expect("catalog");
-    let Ok(result) = run(&app.db, &catalog, "Patient/search", &json!({"_count": 100})) else {
+    let Ok(result) = run(
+        &app.db,
+        &catalog,
+        "Patient/search",
+        &json!({"_count": "100"}),
+    ) else {
         return Vec::new();
     };
     let mut out = Vec::new();
@@ -659,6 +813,40 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(!valid_username(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_bound_patient_is_a_patient_on_this_server() {
+        let iss = "http://h/fhir";
+        assert_eq!(bound_patient(iss, "Patient/p1").as_deref(), Some("p1"));
+        assert_eq!(
+            bound_patient(iss, "http://h/fhir/Patient/p1").as_deref(),
+            Some("p1")
+        );
+        for other in [
+            "Practitioner/p1",
+            "http://elsewhere/fhir/Patient/p1",
+            "Patient/../Patient/p1",
+            "Patient/",
+        ] {
+            assert_eq!(bound_patient(iss, other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn lookup_values_cannot_widen_the_search() {
+        let mut lookup = FhirUserLookup::new("Practitioner");
+        assert_eq!(lookup_query(&lookup, "u-1").as_deref(), Some("u-1"));
+        assert_eq!(lookup_query(&lookup, "a|b"), None);
+        lookup.system = Some("urn:idp".into());
+        assert_eq!(lookup_query(&lookup, "u-1").as_deref(), Some("urn:idp|u-1"));
+        assert_eq!(
+            lookup_query(&lookup, "auth0|u1").as_deref(),
+            Some("urn:idp|auth0|u1")
+        );
+        for bad in ["", "a,b", "a$b", "a\\b"] {
+            assert_eq!(lookup_query(&lookup, bad), None, "{bad}");
         }
     }
 

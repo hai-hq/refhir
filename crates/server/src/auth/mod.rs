@@ -22,7 +22,7 @@ use crate::http::AppState;
 use scopes::{interaction_for, scope_allows};
 use store::normalize_patient_id;
 
-pub use oidc::{Oidc, OidcConfig};
+pub use oidc::{FhirUserLookup, Oidc, OidcConfig};
 pub use store::SmartStore;
 
 #[cfg(test)]

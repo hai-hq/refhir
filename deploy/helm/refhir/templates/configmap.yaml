@@ -53,6 +53,37 @@ data:
     client_id = "{{ .Values.smart.oidc.clientId }}"
     fhir_user_claim = "{{ .Values.smart.oidc.fhirUserClaim }}"
     scopes = [{{ range $i, $s := .Values.smart.oidc.scopes }}{{ if $i }}, {{ end }}"{{ $s }}"{{ end }}]
+    {{- if .Values.smart.oidc.allowedEmailDomains }}
+    allowed_email_domains = [{{ range $i, $d := .Values.smart.oidc.allowedEmailDomains }}{{ if $i }}, {{ end }}{{ $d | quote }}{{ end }}]
+    {{- end }}
+    {{- if .Values.smart.oidc.patientFromFhirUser }}
+    patient_from_fhir_user = true
+    {{- end }}
+    {{- if .Values.smart.oidc.allowedClaims }}
+
+    [smart.oidc.allowed_claims]
+    {{- range $name, $values := .Values.smart.oidc.allowedClaims }}
+    {{ $name | quote }} = [{{ range $i, $v := $values }}{{ if $i }}, {{ end }}{{ $v | quote }}{{ end }}]
+    {{- end }}
+    {{- end }}
+    {{- if .Values.smart.oidc.fhirUserLookup }}
+
+    [smart.oidc.fhir_user_lookup]
+    {{- with .Values.smart.oidc.fhirUserLookup }}
+    {{- if .resourceType }}
+    resource_type = {{ .resourceType | quote }}
+    {{- end }}
+    {{- if .claim }}
+    claim = {{ .claim | quote }}
+    {{- end }}
+    {{- if .searchParam }}
+    search_param = {{ .searchParam | quote }}
+    {{- end }}
+    {{- if .system }}
+    system = {{ .system | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
     {{- end }}
 
     [export]

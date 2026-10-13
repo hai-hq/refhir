@@ -59,6 +59,14 @@ enabled = false
 # client_secret via REFHIR_OIDC_CLIENT_SECRET
 # scopes = ["openid", "profile"]
 # fhir_user_claim = "fhirUser"
+# Optional, all off by default (see deploy/production.md):
+# allowed_claims = { organization_id = ["org_abc123"] }   # only these users may sign in
+# allowed_email_domains = ["example.com"]                  # ... or only these email domains
+# patient_from_fhir_user = true    # a Patient-bound user skips the patient picker
+# [smart.oidc.fhir_user_lookup]    # bind a person by search when the token has no fhirUser claim
+# resource_type = "Practitioner"
+# claim = "sub"
+# system = "https://idp.example.com/sub"
 # Or, for testing only (accepts any username, verifies nothing):
 # demo_login = true
 

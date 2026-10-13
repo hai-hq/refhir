@@ -3090,6 +3090,10 @@ mod oidc {
         flow: Option<(String, String)>,
         wrong_nonce: bool,
         used_basic_auth: bool,
+        /// Claims added to (or replacing those in) the ID token.
+        claims: Value,
+        /// Leave `fhirUser` out of the ID token, as an IdP that knows nothing about FHIR does.
+        omit_fhir_user: bool,
     }
 
     struct Idp {
@@ -3163,13 +3167,19 @@ mod oidc {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap()
                                 .as_secs();
-                            let claims = json!({
+                            let mut claims = json!({
                                 "iss": mock.base, "aud": CLIENT, "sub": "idp-user-1",
                                 "exp": now + 300, "iat": now,
                                 "nonce": if mock.wrong_nonce { "other".to_string() } else { nonce },
                                 "preferred_username": "Dr One",
                                 "fhirUser": "Practitioner/dr-1",
                             });
+                            if mock.omit_fhir_user {
+                                claims.as_object_mut().unwrap().remove("fhirUser");
+                            }
+                            for (name, value) in mock.claims.as_object().into_iter().flatten() {
+                                claims[name.as_str()] = value.clone();
+                            }
                             let mut header =
                                 jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
                             header.kid = Some("k1".into());
@@ -3239,11 +3249,20 @@ mod oidc {
     /// Authorize, then follow `/oauth/interact` to the provider. Returns the client session id,
     /// the provider `state` and the browser cookie.
     async fn start_login(app: &axum::Router, idp: &Idp) -> (String, String, String) {
+        start_login_with(app, idp, "openid fhirUser user/Patient.read", "").await
+    }
+
+    async fn start_login_with(
+        app: &axum::Router,
+        idp: &Idp,
+        scope: &str,
+        extra_query: &str,
+    ) -> (String, String, String) {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(VERIFIER.as_bytes()));
         let query = format!(
-            "response_type=code&client_id=public&redirect_uri={}&scope={}&aud=http%3A%2F%2F127.0.0.1&code_challenge={challenge}&code_challenge_method=S256&state=s1",
+            "response_type=code&client_id=public&redirect_uri={}&scope={}&aud=http%3A%2F%2F127.0.0.1&code_challenge={challenge}&code_challenge_method=S256&state=s1{extra_query}",
             encode_query("http://127.0.0.1/cb"),
-            encode_query("openid fhirUser user/Patient.read"),
+            encode_query(scope),
         );
         let (status, headers, body) =
             raw(app, "GET", &format!("/oauth/authorize?{query}"), &[], "").await;
@@ -3485,6 +3504,645 @@ mod oidc {
         )
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // ---- who may sign in, who they are, and who a token was for ----
+
+    fn identified_patient(id: &str, system: &str, value: &str) -> Value {
+        let mut resource = patient(id);
+        resource["identifier"] = json!([{"system": system, "value": value}]);
+        resource
+    }
+
+    /// A server in front of `idp` with `seed` loaded, `tweak` applied to the OIDC settings, and
+    /// secrets a gateway can use.
+    fn app_with_oidc(
+        idp: &Idp,
+        seed: &[Value],
+        tweak: impl FnOnce(&mut crate::OidcConfig),
+    ) -> axum::Router {
+        let (db, catalog, store) = memory();
+        {
+            let cat = catalog.read().expect("catalog");
+            for resource in seed {
+                refhir_fhir::import_resource(&db, &cat, resource).expect("seed");
+            }
+        }
+        let mut cfg = crate::OidcConfig::new(idp.base.clone(), CLIENT);
+        cfg.client_secret = Some("idp-secret".into());
+        tweak(&mut cfg);
+        crate::app_with(
+            db,
+            catalog,
+            store,
+            crate::ServerConfig {
+                auth: true,
+                public_url: Some("http://127.0.0.1".into()),
+                smart_patient: Some("p1".into()),
+                smart_dcr_token: Some("dcr-test".into()),
+                smart_confidential_secret: Some("gw-secret".into()),
+                oidc: Some(cfg),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Sign in at the provider and come back: where the browser is sent after the callback.
+    async fn after_callback(
+        app: &axum::Router,
+        idp: &Idp,
+        scope: &str,
+    ) -> (String, String, String) {
+        let (session, state, cookie) = start_login_with(app, idp, scope, "").await;
+        let (status, headers, body) =
+            raw(app, "GET", &callback(&state), &[("cookie", &cookie)], "").await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        (session, cookie, location(&headers))
+    }
+
+    /// Sign in and reach the consent page.
+    async fn to_consent(app: &axum::Router, idp: &Idp, scope: &str) -> (String, String) {
+        let (session, cookie, back) = after_callback(app, idp, scope).await;
+        assert!(back.starts_with("/oauth/interact"), "{back}");
+        (session, cookie)
+    }
+
+    async fn consent_page(app: &axum::Router, session: &str) -> String {
+        let uri = format!("/oauth/interact?session={}", encode_query(session));
+        let (status, _, body) = raw(app, "GET", &uri, &[], "").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// Approve as the browser that signed in; `extra` is more form fields.
+    async fn approve(
+        app: &axum::Router,
+        session: &str,
+        cookie: &str,
+        extra: &str,
+    ) -> (StatusCode, HeaderMap, String) {
+        raw(
+            app,
+            "POST",
+            "/oauth/interact",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", cookie),
+            ],
+            &format!("session={}&action=approve{extra}", encode_query(session)),
+        )
+        .await
+    }
+
+    async fn redeem(app: &axum::Router, back: &str) -> Value {
+        let code = query_value(back, "code").unwrap_or_else(|| panic!("no code in {back}"));
+        let (status, _, body) = raw(
+            app,
+            "POST",
+            "/oauth/token",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            &format!(
+                "grant_type=authorization_code&code={code}&redirect_uri={}&client_id=public&code_verifier={VERIFIER}",
+                encode_query("http://127.0.0.1/cb")
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    fn denied(back: &str) -> String {
+        assert!(back.starts_with("http://127.0.0.1/cb"), "{back}");
+        assert!(query_value(back, "code").is_none(), "{back}");
+        assert_eq!(query_value(back, "state").as_deref(), Some("s1"));
+        assert_eq!(
+            query_value(back, "error").as_deref(),
+            Some("access_denied"),
+            "{back}"
+        );
+        query_value(back, "error_description").unwrap_or_default()
+    }
+
+    const OPEN_SCOPE: &str = "openid fhirUser user/Patient.read";
+
+    #[tokio::test]
+    async fn anyone_the_provider_signs_in_is_accepted_unless_an_allowlist_is_set() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().claims = json!({"organization_id": "org_other"});
+        let app = app_with_oidc(&idp, &[], |_| {});
+        to_consent(&app, &idp, OPEN_SCOPE).await;
+    }
+
+    #[tokio::test]
+    async fn allowed_claims_turn_other_organizations_away_before_consent() {
+        let idp = start_idp().await;
+        let app = app_with_oidc(&idp, &[], |cfg| {
+            cfg.allowed_claims.insert(
+                "organization_id".into(),
+                vec!["org_ok".into(), "org_two".into()],
+            );
+        });
+
+        idp.mock.lock().unwrap().claims = json!({"organization_id": "org_other"});
+        let (session, cookie, back) = after_callback(&app, &idp, OPEN_SCOPE).await;
+        let reason = denied(&back);
+        assert!(reason.contains("not permitted"), "{reason}");
+        // The reason says nothing about which organizations are let in.
+        assert!(!reason.contains("org_"), "{reason}");
+        // The login is over: there is no consent page and nothing to approve.
+        let uri = format!("/oauth/interact?session={}", encode_query(&session));
+        assert_eq!(
+            raw(&app, "GET", &uri, &[], "").await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let (status, headers, _) = approve(&app, &session, &cookie, "").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(headers.get("location").is_none());
+
+        // No such claim at all is refused too.
+        idp.mock.lock().unwrap().claims = json!({});
+        let (_, _, back) = after_callback(&app, &idp, OPEN_SCOPE).await;
+        denied(&back);
+
+        // A member of a listed organization, whether the claim is a string or a list.
+        idp.mock.lock().unwrap().claims = json!({"organization_id": "org_two"});
+        to_consent(&app, &idp, OPEN_SCOPE).await;
+        idp.mock.lock().unwrap().claims = json!({"organization_id": ["org_x", "org_ok"]});
+        to_consent(&app, &idp, OPEN_SCOPE).await;
+    }
+
+    #[tokio::test]
+    async fn allowed_email_domains_need_a_verified_address_in_the_domain() {
+        let idp = start_idp().await;
+        let app = app_with_oidc(&idp, &[], |cfg| {
+            cfg.allowed_email_domains = vec!["boolbyte.com".into()];
+        });
+        for (claims, admitted) in [
+            (
+                json!({"email": "ada@boolbyte.com", "email_verified": true}),
+                true,
+            ),
+            (
+                json!({"email": "Ada@BoolByte.com", "email_verified": true}),
+                true,
+            ),
+            // The provider does not say the address is verified.
+            (json!({"email": "ada@boolbyte.com"}), false),
+            (json!({"email": "ada@elsewhere.com"}), false),
+            (json!({"email": "ada@mail.boolbyte.com"}), false),
+            (
+                json!({"email": "ada@boolbyte.com", "email_verified": false}),
+                false,
+            ),
+            (json!({}), false),
+        ] {
+            idp.mock.lock().unwrap().claims = claims.clone();
+            let (_, _, back) = after_callback(&app, &idp, OPEN_SCOPE).await;
+            if admitted {
+                assert!(back.starts_with("/oauth/interact"), "{claims}: {back}");
+            } else {
+                let reason = denied(&back);
+                assert!(reason.contains("not permitted"), "{claims}: {reason}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_fhir_user_claim_or_a_lookup_the_fhir_user_scope_is_refused() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().omit_fhir_user = true;
+        let app = app_with_oidc(
+            &idp,
+            &[identified_patient("pr1", "urn:idp", "idp-user-1")],
+            |_| {},
+        );
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (status, headers, _) = approve(&app, &session, &cookie, "").await;
+        assert_eq!(status, StatusCode::FOUND);
+        let back = location(&headers);
+        assert_eq!(
+            query_value(&back, "error").as_deref(),
+            Some("invalid_request")
+        );
+        assert!(query_value(&back, "error_description")
+            .unwrap()
+            .contains("did not supply a valid fhirUser claim"));
+    }
+
+    fn patient_lookup(system: Option<&str>) -> crate::FhirUserLookup {
+        crate::FhirUserLookup {
+            system: system.map(str::to_string),
+            ..crate::FhirUserLookup::new("Patient")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_binds_the_subject_to_the_resource_that_carries_it() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().omit_fhir_user = true;
+        let app = app_with_oidc(
+            &idp,
+            &[
+                identified_patient("other", "urn:idp", "someone-else"),
+                identified_patient("pr1", "urn:idp", "idp-user-1"),
+                // Same value under another system is somebody else's identifier.
+                identified_patient("wrong-system", "urn:elsewhere", "idp-user-1"),
+            ],
+            |cfg| cfg.fhir_user_lookup = Some(patient_lookup(Some("urn:idp"))),
+        );
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (status, headers, body) = approve(&app, &session, &cookie, "").await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["fhirUser"], "http://127.0.0.1/Patient/pr1");
+        let payload = tokens["id_token"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        let claims: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert_eq!(claims["sub"], "idp-user-1");
+        assert_eq!(claims["fhirUser"], "http://127.0.0.1/Patient/pr1");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_can_search_on_another_claim() {
+        let idp = start_idp().await;
+        {
+            let mut mock = idp.mock.lock().unwrap();
+            mock.omit_fhir_user = true;
+            mock.claims = json!({"email": "ada@boolbyte.com", "email_verified": true});
+        }
+        let app = app_with_oidc(
+            &idp,
+            &[identified_patient("pr1", "urn:email", "ada@boolbyte.com")],
+            |cfg| {
+                cfg.fhir_user_lookup = Some(crate::FhirUserLookup {
+                    claim: "email".into(),
+                    ..patient_lookup(Some("urn:email"))
+                })
+            },
+        );
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["fhirUser"], "http://127.0.0.1/Patient/pr1");
+
+        // An address the provider has not verified binds nobody.
+        idp.mock.lock().unwrap().claims =
+            json!({"email": "ada@boolbyte.com", "email_verified": false});
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+        assert_eq!(
+            query_value(&location(&headers), "error").as_deref(),
+            Some("invalid_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_binds_nobody_when_it_finds_nothing_or_several() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().omit_fhir_user = true;
+        let lookup = |cfg: &mut crate::OidcConfig| {
+            cfg.fhir_user_lookup = Some(patient_lookup(Some("urn:idp")))
+        };
+        let nothing = app_with_oidc(
+            &idp,
+            &[identified_patient("pr1", "urn:idp", "not-this-user")],
+            lookup,
+        );
+        let several = app_with_oidc(
+            &idp,
+            &[
+                identified_patient("pr1", "urn:idp", "idp-user-1"),
+                identified_patient("pr2", "urn:idp", "idp-user-1"),
+            ],
+            lookup,
+        );
+        for app in [&nothing, &several] {
+            let (session, cookie) = to_consent(app, &idp, OPEN_SCOPE).await;
+            let (_, headers, _) = approve(app, &session, &cookie, "").await;
+            let back = location(&headers);
+            assert_eq!(
+                query_value(&back, "error").as_deref(),
+                Some("invalid_request"),
+                "{back}"
+            );
+            assert!(query_value(&back, "code").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_does_not_run_when_the_token_names_the_person() {
+        let idp = start_idp().await;
+        // The token says Practitioner/dr-1; the lookup would say Patient/pr1.
+        let app = app_with_oidc(
+            &idp,
+            &[identified_patient("pr1", "urn:idp", "idp-user-1")],
+            |cfg| cfg.fhir_user_lookup = Some(patient_lookup(Some("urn:idp"))),
+        );
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["fhirUser"], "http://127.0.0.1/Practitioner/dr-1");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_replaces_an_unusable_claim() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().claims = json!({"fhirUser": "Patient/../Patient/x"});
+        let app = app_with_oidc(
+            &idp,
+            &[identified_patient("pr1", "urn:idp", "idp-user-1")],
+            |cfg| cfg.fhir_user_lookup = Some(patient_lookup(Some("urn:idp"))),
+        );
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["fhirUser"], "http://127.0.0.1/Patient/pr1");
+    }
+
+    const PATIENT_SCOPE: &str = "openid fhirUser patient/Patient.rs";
+
+    #[tokio::test]
+    async fn the_picker_stays_open_to_every_patient_unless_binding_is_turned_on() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().claims = json!({"fhirUser": "Patient/p1"});
+        let app = app_with_oidc(&idp, &[patient("p1"), patient("p2")], |_| {});
+        let (session, cookie) = to_consent(&app, &idp, PATIENT_SCOPE).await;
+        let page = consent_page(&app, &session).await;
+        assert!(page.contains("name=\"patient_id\""), "{page}");
+        let (_, headers, _) = approve(&app, &session, &cookie, "&patient_id=p2").await;
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["patient"], "p2");
+    }
+
+    #[tokio::test]
+    async fn the_picker_lists_the_patients_on_the_server() {
+        let idp = start_idp().await;
+        let app = app_with_oidc(&idp, &[patient("p1"), patient("p2")], |_| {});
+        let (session, _) = to_consent(&app, &idp, PATIENT_SCOPE).await;
+        let page = consent_page(&app, &session).await;
+        for id in ["p1", "p2"] {
+            assert!(page.contains(&format!("<option value=\"{id}\">")), "{page}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bound_patient_is_the_launch_patient_and_the_picker_is_gone() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().claims = json!({"fhirUser": "Patient/p1"});
+        let app = app_with_oidc(&idp, &[patient("p1"), patient("p2")], |cfg| {
+            cfg.patient_from_fhir_user = true;
+        });
+        let (session, cookie) = to_consent(&app, &idp, PATIENT_SCOPE).await;
+        let page = consent_page(&app, &session).await;
+        assert!(!page.contains("name=\"patient_id\""), "{page}");
+        assert!(!page.contains("p2"), "{page}");
+        assert!(page.contains("patient p1"), "{page}");
+        // A patient named in the form is not a way around it.
+        let (status, headers, body) = approve(&app, &session, &cookie, "&patient_id=p2").await;
+        assert_eq!(status, StatusCode::FOUND, "{body}");
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["patient"], "p1");
+        assert_eq!(tokens["fhirUser"], "http://127.0.0.1/Patient/p1");
+    }
+
+    #[tokio::test]
+    async fn a_patient_bound_by_lookup_is_the_launch_patient_too() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().omit_fhir_user = true;
+        let app = app_with_oidc(
+            &idp,
+            &[
+                identified_patient("p1", "urn:idp", "someone-else"),
+                identified_patient("p2", "urn:idp", "idp-user-1"),
+            ],
+            |cfg| {
+                cfg.fhir_user_lookup = Some(patient_lookup(Some("urn:idp")));
+                cfg.patient_from_fhir_user = true;
+            },
+        );
+        // No fhirUser scope is requested: the binding is still found for the patient context.
+        let (session, cookie) = to_consent(&app, &idp, "openid patient/Patient.rs").await;
+        assert!(!consent_page(&app, &session)
+            .await
+            .contains("name=\"patient_id\""));
+        let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+        let tokens = redeem(&app, &location(&headers)).await;
+        assert_eq!(tokens["patient"], "p2");
+    }
+
+    #[tokio::test]
+    async fn only_patient_bindings_fix_the_patient() {
+        let idp = start_idp().await;
+        // The default token claim is Practitioner/dr-1: the picker stays.
+        let app = app_with_oidc(&idp, &[patient("p1")], |cfg| {
+            cfg.patient_from_fhir_user = true
+        });
+        let (session, _) = to_consent(&app, &idp, PATIENT_SCOPE).await;
+        assert!(consent_page(&app, &session)
+            .await
+            .contains("name=\"patient_id\""));
+
+        // A Patient on some other server is not a patient here.
+        idp.mock.lock().unwrap().claims =
+            json!({"fhirUser": "https://other.example/fhir/Patient/p1"});
+        let (session, _) = to_consent(&app, &idp, PATIENT_SCOPE).await;
+        assert!(consent_page(&app, &session)
+            .await
+            .contains("name=\"patient_id\""));
+    }
+
+    #[tokio::test]
+    async fn a_bound_patient_that_does_not_exist_ends_the_login() {
+        let idp = start_idp().await;
+        idp.mock.lock().unwrap().claims = json!({"fhirUser": "Patient/ghost"});
+        let app = app_with_oidc(&idp, &[patient("p1")], |cfg| {
+            cfg.patient_from_fhir_user = true
+        });
+        let (_, _, back) = after_callback(&app, &idp, PATIENT_SCOPE).await;
+        let reason = denied(&back);
+        assert!(reason.contains("does not exist"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_bound_patient_must_be_the_patient_the_launch_is_for() {
+        let idp = start_idp().await;
+        let launch_scope = "launch openid fhirUser patient/Patient.rs";
+        for (bound, same_patient) in [("Patient/p1", true), ("Patient/p2", false)] {
+            idp.mock.lock().unwrap().claims = json!({ "fhirUser": bound });
+            // The launch is for the configured patient, p1.
+            let app = app_with_oidc(&idp, &[patient("p1"), patient("p2")], |cfg| {
+                cfg.patient_from_fhir_user = true;
+            });
+            let (status, headers, body) = raw(
+                &app,
+                "GET",
+                "/oauth/ehr-launch?client_id=public&launch_uri=http://127.0.0.1/app",
+                &[],
+                "",
+            )
+            .await;
+            assert_eq!(status, StatusCode::FOUND, "{body}");
+            let launch = query_value(&location(&headers), "launch").expect("launch");
+            let extra = format!("&launch={}", encode_query(&launch));
+            let (session, state, cookie) = start_login_with(&app, &idp, launch_scope, &extra).await;
+            let (status, headers, body) =
+                raw(&app, "GET", &callback(&state), &[("cookie", &cookie)], "").await;
+            assert_eq!(status, StatusCode::FOUND, "{body}");
+            let back = location(&headers);
+            if same_patient {
+                assert!(back.starts_with("/oauth/interact"), "{back}");
+                let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+                assert_eq!(redeem(&app, &location(&headers)).await["patient"], "p1");
+            } else {
+                // The person who signed in is not the patient the EHR launched for.
+                let reason = denied(&back);
+                assert!(reason.contains("not the patient"), "{reason}");
+            }
+        }
+    }
+
+    // ---- token introspection for a resource gateway ----
+
+    const FORM: (&str, &str) = ("content-type", "application/x-www-form-urlencoded");
+
+    async fn introspect(
+        app: &axum::Router,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, Value) {
+        let (status, _, text) = raw(app, "POST", "/oauth/introspect", headers, body).await;
+        (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn a_gateway_learns_who_a_token_was_issued_to() {
+        let idp = start_idp().await;
+        let app = app_with_oidc(&idp, &[], |_| {});
+        let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
+        let (_, headers, _) = approve(&app, &session, &cookie, "").await;
+        let tokens = redeem(&app, &location(&headers)).await;
+        let access = tokens["access_token"].as_str().unwrap().to_string();
+        assert!(access.starts_with("tok-"));
+        let body = format!("token={access}");
+
+        let check = |intro: &Value| {
+            assert_eq!(intro["active"], true, "{intro}");
+            assert_eq!(intro["sub"], "idp-user-1");
+            assert_eq!(intro["client_id"], "public");
+            assert_eq!(intro["scope"], "openid fhirUser user/Patient.read");
+            assert!(intro["exp"].as_u64().unwrap() > 0);
+        };
+
+        // The built-in confidential client, with its secret in HTTP Basic or in the form.
+        let basic = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("confidential:gw-secret")
+        );
+        let (status, intro) = introspect(&app, &[FORM, ("authorization", &basic)], &body).await;
+        assert_eq!(status, StatusCode::OK);
+        check(&intro);
+        let (status, intro) = introspect(
+            &app,
+            &[FORM],
+            &format!("{body}&client_id=confidential&client_secret=gw-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        check(&intro);
+
+        // A registered backend service, with a signed assertion addressed to either endpoint.
+        let (encoding, jwks) = backend_client_keys();
+        let (status, _, registered) = raw(
+            &app,
+            "POST",
+            "/oauth/register",
+            &[
+                ("content-type", "application/json"),
+                ("authorization", "Bearer dcr-test"),
+            ],
+            &json!({
+                "token_endpoint_auth_method": "private_key_jwt",
+                "grant_types": ["client_credentials"],
+                "jwks": jwks,
+                "scope": "system/*.rs"
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{registered}");
+        let gateway = serde_json::from_str::<Value>(&registered).unwrap()["client_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for aud in [
+            "http://127.0.0.1/oauth/introspect",
+            "http://127.0.0.1/oauth/token",
+        ] {
+            let assertion = backend_assertion(&encoding, &gateway, aud);
+            let (status, intro) = introspect(
+                &app,
+                &[FORM],
+                &format!(
+                    "{body}&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}"
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{aud}: {intro}");
+            check(&intro);
+        }
+        // An assertion addressed to somewhere else, or to the issuer alone, is not accepted.
+        for aud in [
+            "http://127.0.0.1",
+            "http://127.0.0.1/oauth/revoke",
+            "https://evil.example/oauth/introspect",
+        ] {
+            let assertion = backend_assertion(&encoding, &gateway, aud);
+            let (status, _) = introspect(
+                &app,
+                &[FORM],
+                &format!(
+                    "{body}&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}"
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{aud}");
+        }
+        // An assertion made for introspection cannot be replayed at the token endpoint.
+        let assertion = backend_assertion(&encoding, &gateway, "http://127.0.0.1/oauth/introspect");
+        let (status, _, body_text) = raw(
+            &app,
+            "POST",
+            "/oauth/token",
+            &[FORM],
+            &format!(
+                "grant_type=client_credentials&scope=system/*.rs&client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer&client_assertion={assertion}"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body_text}");
+
+        // Nobody else gets to ask: no credentials, a wrong secret, or a public client.
+        let (status, _) = introspect(&app, &[FORM], &body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = introspect(
+            &app,
+            &[FORM],
+            &format!("{body}&client_id=confidential&client_secret=wrong"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = introspect(&app, &[FORM], &format!("{body}&client_id=public")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // A token that is gone is reported inactive, with nothing about who it was for.
+        let basic = [FORM, ("authorization", &basic)];
+        let (status, intro) = introspect(&app, &basic, "token=tok-unknown").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(intro, json!({"active": false}));
     }
 }
 

@@ -78,6 +78,80 @@ How it works: `/oauth/authorize` sends the browser to the provider (authorizatio
 
 The issuer must be `https` (plain `http` only on a loopback host). Provider metadata and keys are fetched at login time and cached for an hour.
 
+### Restrict who can sign in
+
+By default anyone the provider authenticates is accepted. If the provider cannot be limited to your people, say so here; both settings are off until set, and when both are set a user must pass both.
+
+```toml
+[smart.oidc]
+# Every named claim must carry at least one of its listed values. A claim holding an array
+# matches if any element is listed. A missing claim does not match.
+allowed_claims = { organization_id = ["org_abc123"] }
+# Or by the domain of a verified `email` claim (exact domain, not subdomains; case-insensitive).
+allowed_email_domains = ["boolbyte.com"]
+```
+
+The check runs on the verified ID token straight after the code exchange, before the consent page: a refused user never sees a consent page and no code is issued. The client application is sent back with `error=access_denied` and `error_description=this account is not permitted to sign in to this server`. Which claim failed, and what values are allowed, is written to the server log (at `warn`) and not to the user. Notes:
+
+- Only ID token claims are checked. If the provider puts `organization_id` in its userinfo response but not the ID token, ask it to add the claim to the ID token (or request the scope that does).
+- `allowed_email_domains` needs `email` and `email_verified: true` in the ID token (add `email` to `[smart.oidc].scopes`). An address with no `email_verified` claim, or one that is not `true`, is refused.
+- An entry with no values, or an empty domain, is a startup error rather than a lock-out.
+
+### Bind people to FHIR resources
+
+A client that asks for the `fhirUser` scope needs to know which `Practitioner`, `Patient`, `RelatedPerson` or `Person` the signed-in person is. In order:
+
+1. the ID token claim named by `fhir_user_claim` (default `fhirUser`), when it holds a relative `Type/id` or an absolute URL;
+2. the `fhirUser` of an EHR launch, when there is one;
+3. a lookup, when configured: ReFHIR searches its own data for the person.
+
+```toml
+[smart.oidc.fhir_user_lookup]
+resource_type = "Practitioner"   # Practitioner (default), Patient, RelatedPerson or Person
+claim = "sub"                    # ID token claim to search for: sub (default), email, or any other claim
+search_param = "identifier"      # default
+system = "https://idp.example.com/sub"   # sent as system|value (identifier only); leave out to send the value alone
+```
+
+With these settings a login by `sub` `u-123` runs `Practitioner?identifier=https://idp.example.com/sub|u-123`, and the person is bound only if **exactly one** resource comes back. No match, more than one match, a failed search, or a value that cannot be searched safely (it contains `,` `$` or `\`, or `|` when no `system` is set) binds nobody, and a `fhirUser` request then fails as it does without a lookup (`the identity provider did not supply a valid fhirUser claim, and no FHIR resource is bound to this user`); the reason is in the log. The identifier has to be put on the resource by whatever manages your practitioners, and a lookup on `email` is only used when the ID token has `email_verified: true`.
+
+**Write access to this resource type is the trust boundary.** A lookup binds a person to whichever single resource carries the identifier, and an identifier is ordinary data: anyone who can create or edit that type (an app with `user/Practitioner.write`, say, for a Practitioner lookup) can plant a resource with someone else's identifier, which binds that person to it, or, if their own resource already exists, makes two matches and locks them out. Keep write access to the looked-up type with the system that manages your people. The search runs on the process that handles the sign-in, so on a replica a resource created in the last moments may not be visible yet and the login fails until the replica catches up (see [Several processes](../README.md#several-processes-on-one-database)). The lookup only runs when the app asked for `fhirUser`, or when `patient_from_fhir_user` is on and the app needs a patient.
+
+```toml
+[smart.oidc]
+# When the person is bound to a Patient on this server, that patient is the launch patient:
+# the consent page does not offer a patient picker, and a patient_id in the form is ignored.
+patient_from_fhir_user = true
+```
+
+`patient_from_fhir_user` is off by default, so existing deployments keep the picker. Turn it on when patients sign in as themselves. It applies to a Patient binding from the claim as well as from the lookup, to apps that ask for `patient/` or `launch` scopes. It does not apply to a practitioner (the picker stays), and an EHR launch for a different patient than the one who signed in ends the login with `access_denied`.
+
+### Token introspection for a resource gateway
+
+`POST /oauth/introspect` (RFC 7662) tells a gateway who a SMART access token was issued to, without giving it the token's internals. For an unexpired `tok-` access token it returns:
+
+```json
+{"active": true, "client_id": "my-app", "sub": "<OIDC subject>", "scope": "openid fhirUser patient/Patient.rs",
+ "exp": 1760000000, "token_type": "Bearer", "iss": "https://fhir.example.com",
+ "fhirUser": "https://fhir.example.com/Practitioner/dr-1", "patient": "p1"}
+```
+
+`sub` is the `sub` of the ID token the user signed in with, `client_id` the application, and `fhirUser`, `patient` and `encounter` appear when the token has them. A token that is unknown, expired or revoked gets `{"active": false}` and nothing else. (A token from the `client_credentials` grant has `sub` `backend`.)
+
+The caller must authenticate with one of:
+
+- a confidential client's credentials: the built-in `confidential` client (`--smart-confidential-secret` / `REFHIR_SMART_CONFIDENTIAL_SECRET`) with HTTP Basic or `client_id` and `client_secret` in the form;
+- a backend client registered at `POST /oauth/register` (`private_key_jwt`), with `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and a `client_assertion` RS256 JWT whose `aud` is `<public_url>/oauth/introspect` (or `<public_url>/oauth/token`). An assertion addressed to introspection is accepted only here, never at `/oauth/token`;
+- a valid SMART access token as a `Bearer` header.
+
+Anything else, and every public client, gets `401 invalid_client`. Give the gateway its own registered backend client rather than the built-in secret, so its access can be rotated or revoked alone, and keep it off the network paths apps use.
+
+```bash
+curl -s https://fhir.example.com/oauth/introspect \
+  -u confidential:$REFHIR_SMART_CONFIDENTIAL_SECRET \
+  -d token=tok-...
+```
+
 **`demo_login = true` (or `--smart-demo-login`) is for testing only.** It accepts any username and verifies nothing, so anyone who can reach the server can sign in as anyone and read patient data. It cannot be combined with `[smart.oidc]`, and the server refuses to start with it on a non-loopback bind unless `REFHIR_ALLOW_REMOTE_DEMO_LOGIN=1` is set. The Inferno profile sets that; production must not.
 
 ## FHIR version and Implementation Guides
