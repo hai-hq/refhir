@@ -4013,6 +4013,7 @@ mod cluster {
             jobs: Arc::new(crate::jobs::JobRunner::new(Arc::new(
                 refhir_persistence::MemoryJobStore::default(),
             ))),
+            ready_probe: Default::default(),
         };
         assert!(
             !crate::auth::patient_exists(&app, "fresh-patient"),

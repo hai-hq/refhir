@@ -331,23 +331,21 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     let role = cfg.role;
     let addr: SocketAddr = cfg.bind.parse()?;
-    // A standby or replica starts answering `/healthz` (503) at once, on the port the real
-    // server will use, so a load balancer sees it as not ready instead of refusing connections.
-    let mut early_listener = None;
-    let mut bootstrap = None;
-    if role != Role::Primary {
-        let std_listener = std::net::TcpListener::bind(addr)?;
-        std_listener.set_nonblocking(true)?;
-        let probe = std_listener.try_clone()?;
-        let detail = if role == Role::Standby {
-            "waiting for the writer lease"
-        } else {
-            "waiting for the primary's schema and catalog"
-        };
-        bootstrap = Some(refhir_server::serve_bootstrap(probe, role.name(), detail)?);
-        early_listener = Some(TcpListener::from_std(std_listener)?);
-        tracing::info!("{} listening on http://{addr}, not ready yet", role.name());
-    }
+    // Every role starts answering at once, on the port the real server will use: `/livez` says
+    // the process is up, and `/readyz` and `/healthz` say 503 until it can take traffic. A
+    // primary would otherwise refuse connections while it installs packages and backfills, which
+    // a probe cannot tell from a crash.
+    let std_listener = std::net::TcpListener::bind(addr)?;
+    std_listener.set_nonblocking(true)?;
+    let probe = std_listener.try_clone()?;
+    let detail = match role {
+        Role::Primary => "opening the database, installing packages and backfilling search indexes",
+        Role::Standby => "waiting for the writer lease",
+        Role::Replica => "waiting for the primary's schema and catalog",
+    };
+    let bootstrap = refhir_server::serve_bootstrap(probe, role.name(), detail)?;
+    let listener = TcpListener::from_std(std_listener)?;
+    tracing::info!("{} listening on http://{addr}, not ready yet", role.name());
 
     let pool_size = cfg.db_pool.unwrap_or(DEFAULT_DB_POOL);
     let (persistence, store, auth_store, job_store): Stores = if let Some(url) = &cfg.postgres {
@@ -512,13 +510,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         };
         smart = Some(Arc::new(tables));
     }
-    let listener = match early_listener {
-        Some(listener) => listener,
-        None => runtime.block_on(TcpListener::bind(addr))?,
-    };
-    if let Some(bootstrap) = bootstrap {
-        runtime.block_on(bootstrap.stop());
-    }
+    runtime.block_on(bootstrap.stop());
     let local = listener.local_addr()?;
     tracing::info!("listening on http://{local}");
     runtime.block_on(refhir_server::serve(
@@ -542,6 +534,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             smart,
             primary_url: cfg.primary_url,
             max_staleness: Duration::from_secs(5),
+            ready_timeout: Duration::from_secs(2),
+            ready_cache: Duration::from_secs(1),
             min_ts_wait: Duration::from_millis(250),
             // Export jobs are rows in the same database, so they outlive a restart.
             jobs: Some(refhir_server::SharedJobStore::new(job_store)),
@@ -815,8 +809,14 @@ fn print_help() {
          database. --standby (--role standby) waits for that lease and takes over when the\n\
          primary is gone. --role replica reads what the primary publishes and sends writes, and\n\
          reads that need a newer snapshot, to --primary-url. /healthz is 200 when a process can\n\
-         take traffic and 503 when it cannot. --db-pool sets the most Postgres connections\n\
-         (default 8), or, on SQLite, the read connections next to the one writer (default 4)."
+         take traffic and 503 when it cannot.\n\
+         \n\
+         Probes, open under --smart: GET /livez is 200 while the process is up (use it for\n\
+         liveness; /healthz is 503 on a standby). GET /readyz is 200 when startup is over and the\n\
+         database answers, and 503 {{\"status\":\"starting\"|\"unavailable\",\"reason\":...}} otherwise.\n\
+         \n\
+         --db-pool sets the most Postgres connections (default 8), or, on SQLite, the read\n\
+         connections next to the one writer (default 4)."
     );
 }
 
