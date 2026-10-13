@@ -89,7 +89,7 @@ Start by observing: leave `[rate_limit]` and `[quota]` off, run for a week, and 
 
 ### The database
 
-Usage, the request log and the audit trail are three tables (`usage_daily`, `request_log`, `audit_log`) in the same database as the clinical data, created on first start. Writes are batched every two seconds, so they cost a transaction every two seconds and not one per request.
+Usage, the request log and the audit trail are three tables (`usage_daily`, `request_log`, `audit_log`) in the same database as the clinical data, with the table the servers count one another in (`governance_members`). Schema migration 2 creates them the first time a version of ReFHIR that has them starts on a database (see [docs/migrations.md](../docs/migrations.md)), so back the database up before that upgrade, as for any other. Writes are batched every two seconds, so they cost a transaction every two seconds and not one per request.
 
 - `audit_log` grows by about a row per resource touched (a few hundred bytes). It is kept forever unless `[audit] retention_days` is set; set it to what your regulations require (6 years is 2190). **Back it up with the rest of the database**, and do not truncate it.
 - `request_log` is pruned to `[request_log] retention_hours` every minute. At a sustained 50 requests a second, 72 hours is about 13 million rows; shorten it, or set `store = false` and keep only the structured log lines, if you ship logs elsewhere.
@@ -249,6 +249,14 @@ Things to know before relying on it:
   takes over claims the job and continues from where it stopped. Replicas do not see the
   parameter until the job is complete.
 - **Export jobs and Subscription delivery** belong to the primary.
+
+## Upgrading
+
+The database schema is versioned and the server migrates it when it starts. **Migrations are not
+reversible: back up the database first**, and use one ReFHIR version for every process that shares
+a database (a database from a newer version makes an older server refuse to start). Restore the
+backup into a scratch database and run `refhir migrate --dry-run` against it with the new binary
+before you upgrade. Details: [docs/migrations.md](../docs/migrations.md).
 
 ## Install the binary without Docker
 

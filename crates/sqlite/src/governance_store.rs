@@ -8,86 +8,6 @@ use rusqlite::{params, params_from_iter, OptionalExtension, Row, TransactionBeha
 
 use crate::{definite, SqlitePersistence};
 
-pub(crate) const GOVERNANCE_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS usage_daily (
-    period_day INTEGER NOT NULL,
-    principal TEXT NOT NULL,
-    request_class TEXT NOT NULL,
-    requests INTEGER NOT NULL DEFAULT 0,
-    client_errors INTEGER NOT NULL DEFAULT 0,
-    server_errors INTEGER NOT NULL DEFAULT 0,
-    throttled INTEGER NOT NULL DEFAULT 0,
-    bytes_in INTEGER NOT NULL DEFAULT 0,
-    bytes_out INTEGER NOT NULL DEFAULT 0,
-    duration_ms INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (period_day, principal, request_class)
-);
-CREATE INDEX IF NOT EXISTS usage_daily_by_principal ON usage_daily (principal, period_day);
-CREATE TABLE IF NOT EXISTS request_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    request_id TEXT NOT NULL,
-    principal TEXT NOT NULL,
-    remote_ip TEXT,
-    method TEXT NOT NULL,
-    path TEXT NOT NULL,
-    params TEXT NOT NULL,
-    request_class TEXT NOT NULL,
-    status INTEGER NOT NULL,
-    duration_ms INTEGER NOT NULL,
-    bytes_in INTEGER NOT NULL,
-    bytes_out INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS request_log_by_ts ON request_log (ts);
-CREATE INDEX IF NOT EXISTS request_log_by_principal ON request_log (principal, id);
-CREATE INDEX IF NOT EXISTS request_log_by_request ON request_log (request_id);
-CREATE TABLE IF NOT EXISTS governance_members (
-    owner TEXT NOT NULL PRIMARY KEY,
-    seen_ms INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS audit_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    request_id TEXT NOT NULL,
-    source TEXT NOT NULL,
-    action TEXT NOT NULL,
-    subtype TEXT NOT NULL,
-    outcome INTEGER NOT NULL,
-    status INTEGER NOT NULL,
-    principal TEXT NOT NULL,
-    client_id TEXT,
-    user_id TEXT,
-    fhir_user TEXT,
-    remote_ip TEXT,
-    resource_type TEXT,
-    resource_id TEXT,
-    patient TEXT,
-    query TEXT,
-    detail TEXT,
-    prev_hash BLOB,
-    hash BLOB
-);
-CREATE INDEX IF NOT EXISTS audit_log_by_ts ON audit_log (ts);
-CREATE INDEX IF NOT EXISTS audit_log_by_resource ON audit_log (resource_type, resource_id, id);
-CREATE INDEX IF NOT EXISTS audit_log_by_patient ON audit_log (patient, id);
-CREATE INDEX IF NOT EXISTS audit_log_by_principal ON audit_log (principal, id);
-CREATE INDEX IF NOT EXISTS audit_log_by_request ON audit_log (request_id);
-"#;
-
-/// An `audit_log` made before the chain has no hash columns.
-pub(crate) fn migrate(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let columns: Vec<String> = connection
-        .prepare("SELECT name FROM pragma_table_info('audit_log')")?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    for name in ["prev_hash", "hash"] {
-        if !columns.iter().any(|column| column == name) {
-            connection.execute_batch(&format!("ALTER TABLE audit_log ADD COLUMN {name} BLOB"))?;
-        }
-    }
-    Ok(())
-}
-
 const AUDIT_COLUMNS: &str = "id, ts, request_id, source, action, subtype, outcome, status, \
      principal, client_id, user_id, fhir_user, remote_ip, resource_type, resource_id, patient, \
      query, detail";
@@ -617,31 +537,25 @@ mod tests {
     }
 
     #[test]
-    fn an_audit_table_from_before_the_chain_gains_the_columns_and_its_rows_are_not_a_fault() {
-        let path = temp_path("legacy");
-        remove(&path);
-        {
-            let connection = rusqlite::Connection::open(&path).unwrap();
-            connection
-                .execute_batch(
-                    "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
-                     request_id TEXT NOT NULL, source TEXT NOT NULL, action TEXT NOT NULL, \
-                     subtype TEXT NOT NULL, outcome INTEGER NOT NULL, status INTEGER NOT NULL, \
-                     principal TEXT NOT NULL, client_id TEXT, user_id TEXT, fhir_user TEXT, \
-                     remote_ip TEXT, resource_type TEXT, resource_id TEXT, patient TEXT, query TEXT, \
-                     detail TEXT); \
-                     INSERT INTO audit_log (ts, request_id, source, action, subtype, outcome, status, principal) \
-                     VALUES (1, 'old-1', 'http', 'R', 'read', 0, 200, 'client:a'), \
-                            (2, 'old-2', 'http', 'R', 'read', 0, 200, 'client:a');",
-                )
-                .unwrap();
-        }
-        let store = SqlitePersistence::open(&path).unwrap();
+    fn rows_with_no_hash_before_the_chain_starts_are_not_a_fault() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .connection
+            .execute_batch(
+                "INSERT INTO audit_log (ts, request_id, source, action, subtype, outcome, status, principal) \
+                 VALUES (1, 'old-1', 'http', 'R', 'read', 0, 200, 'client:a'), \
+                        (2, 'old-2', 'http', 'R', 'read', 0, 200, 'client:a');",
+            )
+            .unwrap();
         let before = report(&store);
         assert_eq!(
             (before.checked, before.unchained, before.breaks_total),
             (0, 2, 0)
         );
+        assert!(!before.intact(), "nothing in it has been verified");
         store
             .audit_append(&[audit_row(10), audit_row(11)], Some(&chain_key()))
             .unwrap();
@@ -658,12 +572,6 @@ mod tests {
             scanned[0].prev_hash.as_deref(),
             Some(&refhir_persistence::CHAIN_GENESIS[..])
         );
-        drop(store);
-        // Opening it again changes nothing.
-        let again = SqlitePersistence::open(&path).unwrap();
-        assert!(report(&again).intact());
-        drop(again);
-        remove(&path);
     }
 
     #[test]

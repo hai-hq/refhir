@@ -7,25 +7,6 @@ use serde_json::Value as JsonValue;
 
 use crate::{definite, PostgresPersistence};
 
-pub(crate) const JOBS_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT NOT NULL PRIMARY KEY,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL,
-    request TEXT NOT NULL,
-    result TEXT,
-    error TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    created_at BIGINT NOT NULL,
-    completed_at BIGINT,
-    lease_owner TEXT,
-    lease_until BIGINT
-);
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_owner TEXT;
-ALTER TABLE jobs ADD COLUMN IF NOT EXISTS lease_until BIGINT;
-CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs (status, created_at);
-"#;
-
 const JOB_COLUMNS: &str = "id, kind, status, request, result, error, attempts, created_at, \
      completed_at, lease_owner, lease_until";
 

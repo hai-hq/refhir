@@ -2,17 +2,6 @@ use refhir_persistence::{auth_exp, AuthStore, PersistError};
 
 use crate::{definite, PostgresPersistence};
 
-pub(crate) const AUTH_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS smart_oauth (
-    kind TEXT NOT NULL,
-    id TEXT NOT NULL,
-    json TEXT NOT NULL,
-    exp BIGINT NOT NULL,
-    PRIMARY KEY (kind, id)
-);
-CREATE INDEX IF NOT EXISTS smart_oauth_by_exp ON smart_oauth (exp);
-"#;
-
 impl AuthStore for PostgresPersistence {
     fn auth_put(&self, kind: &str, id: &str, json: &str, exp: u64) -> Result<(), PersistError> {
         crate::off_runtime(|| {

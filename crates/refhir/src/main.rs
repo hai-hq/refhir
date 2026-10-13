@@ -1,4 +1,5 @@
 mod config;
+mod migrate;
 
 use std::env;
 use std::io::IsTerminal;
@@ -34,6 +35,9 @@ const CATALOG_POLL: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("migrate") {
+        return migrate::run(&args[1..]);
+    }
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -830,6 +834,7 @@ fn print_help() {
          [--oidc-issuer url --oidc-client-id id] [--smart-demo-login]\n\
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
          [--role primary|standby|replica] [--standby] [--primary-url url] [--db-pool n]\n\
+         refhir migrate --status | --dry-run   (schema versions; see refhir migrate --help)\n\
          \n\
          Config file (optional): refhir.toml in the working directory, /etc/refhir/refhir.toml,\n\
          or REFHIR_CONFIG. CLI flags override the file. See refhir.toml.example.\n\
