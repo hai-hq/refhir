@@ -1,0 +1,7 @@
+{
+  "name": "hl7.terminology.r4",
+  "version": "7.1.0",
+  "fhirVersions": ["4.0.1"],
+  "type": "IG",
+  "description": "A terminology package for the same FHIR release as hl7.fhir.r4.core that carries a newer copy of a code system the core package also carries: v3-MaritalStatus 4.0.0, which adds the code C."
+}

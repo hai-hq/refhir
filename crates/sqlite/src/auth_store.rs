@@ -3,17 +3,6 @@ use rusqlite::{params, OptionalExtension};
 
 use crate::{definite, SqlitePersistence};
 
-pub(crate) const AUTH_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS smart_oauth (
-    kind TEXT NOT NULL,
-    id TEXT NOT NULL,
-    json TEXT NOT NULL,
-    exp INTEGER NOT NULL,
-    PRIMARY KEY (kind, id)
-);
-CREATE INDEX IF NOT EXISTS smart_oauth_by_exp ON smart_oauth (exp);
-"#;
-
 impl AuthStore for SqlitePersistence {
     fn auth_put(&self, kind: &str, id: &str, json: &str, exp: u64) -> Result<(), PersistError> {
         let guard = self.inner.lock()?;

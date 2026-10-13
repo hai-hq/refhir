@@ -15,8 +15,9 @@ use crate::conform::{commit_operation, repair_conformance};
 use crate::error::FhirError;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
-    expression_clash_dir, extra_dir, install_package_dir, minir4_dir, publish, r4_dir,
-    run_backfills, sdc_dir, stage_package_deferred, stage_package_dir, version_clash_dir,
+    cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
+    minir4_dir, newer_terminology_dir, publish, r4_dir, run_backfills, sdc_dir,
+    stage_package_deferred, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
 
@@ -4397,16 +4398,378 @@ fn assert_untouched(store: &dyn ConformanceStore, before: &BTreeMap<String, Valu
 
 /// url -> expansion document, as a full rebuild of everything stored would make it.
 fn rebuilt_expansions(store: &dyn ConformanceStore) -> BTreeMap<String, Value> {
-    let resources: Vec<Value> = store
-        .load_terminology()
-        .unwrap()
-        .into_iter()
+    let rows = store.load_terminology().unwrap();
+    let resources: Vec<Value> = rows
+        .iter()
         .map(|row| serde_json::from_str::<Value>(&row.json).unwrap())
         .collect();
-    refhir_validate::MemoryTerminology::expansion_documents(&resources)
+    // Each value set is read with the code systems of its own package first, as the server's
+    // rebuild reads it.
+    let scoped: Vec<(i64, &Value)> = rows
+        .iter()
+        .map(|row| row.package_id)
+        .zip(&resources)
+        .collect();
+    // A rebuild reads an unversioned reference as the server's release does.
+    let release = store
+        .load_packages()
+        .unwrap()
+        .first()
+        .map(|package| package.fhir_version.clone());
+    refhir_validate::MemoryTerminology::expansion_documents_scoped(&scoped, release.as_deref())
         .into_iter()
         .map(|document| (document["url"].as_str().unwrap().to_string(), document))
         .collect()
+}
+
+/// The `contains` entries of the expansion of `url`.
+fn expansion_of(harness: &Harness, url: &str) -> Vec<Value> {
+    let expanded = apply(harness, "ValueSet/$expand", json!({"url": url}));
+    expanded["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// Write `resource` with the incremental update made to fail, which falls back to rebuilding every
+/// stored expansion from all the packages at once.
+fn force_full_rebuild(harness: &Harness, watched: &WatchedStore, resource: Value) {
+    watched.fail_apply_expansions.store(1, Ordering::SeqCst);
+    watched.reset();
+    watched_commit(
+        harness,
+        watched,
+        "ValueSet/create",
+        json!({ "resource": resource }),
+    )
+    .unwrap();
+    assert!(
+        WatchedStore::count(&watched.full_terminology_loads) > 0,
+        "the rebuild ran"
+    );
+}
+
+#[test]
+fn a_cross_version_package_does_not_change_what_the_release_value_sets_mean() {
+    // `hl7.fhir.uv.xver-r5.r4` is a default dependency of SDC. It carries 5.0.0 of R4's own
+    // `encounter-status` code system, under the same URL as the one in the R4 core package.
+    let (harness, watched) = watched_r4();
+    install_package_dir(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        cross_version_dir(),
+    )
+    .unwrap();
+    let status_codes = || -> Vec<String> {
+        expansion_of(&harness, "http://hl7.org/fhir/ValueSet/encounter-status")
+            .iter()
+            .filter_map(|item| item["code"].as_str().map(str::to_string))
+            .collect()
+    };
+    let is_r4 = |codes: &[String]| {
+        let has = |code: &str| codes.iter().any(|item| item == code);
+        has("arrived") && has("finished") && !has("completed")
+    };
+    let check_in = |status: &str| {
+        run_op(
+            &harness,
+            "Encounter/create",
+            &json!({"resource": encounter(json!({"status": status}))}),
+        )
+    };
+
+    // As installed, an Encounter can arrive and finish.
+    assert!(is_r4(&status_codes()), "{:?}", status_codes());
+    check_in("arrived").unwrap();
+    check_in("finished").unwrap();
+
+    // A rebuild of every stored expansion must read the same code system version install did.
+    force_full_rebuild(
+        &harness,
+        &watched,
+        color_value_set("ops-colors", &["a"], "http://example.org/s"),
+    );
+    assert!(is_r4(&status_codes()), "{:?}", status_codes());
+    check_in("arrived").unwrap();
+    check_in("finished").unwrap();
+    assert_expansions_match(&watched.inner, "after the rebuild");
+}
+
+#[test]
+fn a_package_that_carries_another_releases_copy_of_a_value_set_does_not_replace_the_releases() {
+    // The R4 package's value set is at 4.0.1 over `terminology.hl7.org`'s code system.
+    // `hl7.fhir.uv.extensions.r4`, installed later, has a 5.3.0-ballot-tc1 copy over R5's
+    // `hl7.org/fhir` one. A server for R4 means the first, whichever package was installed last.
+    let (harness, watched) = watched_r4();
+    install_package_dir(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        extension_copies_dir(),
+    )
+    .unwrap();
+    let url = "http://hl7.org/fhir/ValueSet/allerg-intol-substance-exp-risk";
+    let r4_system = "http://terminology.hl7.org/CodeSystem/allerg-intol-substance-exp-risk";
+    let r5_system = "http://hl7.org/fhir/allerg-intol-substance-exp-risk";
+    let systems = || -> std::collections::BTreeSet<String> {
+        expansion_of(&harness, url)
+            .iter()
+            .filter_map(|item| item["system"].as_str().map(str::to_string))
+            .collect()
+    };
+    let accepts = |system: &str| -> bool {
+        let answer = apply(
+            &harness,
+            "ValueSet/$validate-code",
+            json!({"url": url, "system": system, "code": "known-reaction-risk"}),
+        );
+        answer["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|parameter| parameter["name"] == "result")
+            .unwrap()["valueBoolean"]
+            .as_bool()
+            .unwrap()
+    };
+    let r4_only = std::collections::BTreeSet::from([r4_system.to_string()]);
+
+    // As installed: the start reads the R4 package's expansion, not the later package's.
+    assert_eq!(systems(), r4_only);
+    assert!(accepts(r4_system) && !accepts(r5_system));
+
+    force_full_rebuild(
+        &harness,
+        &watched,
+        color_value_set("ops-colors", &["a"], "http://example.org/s"),
+    );
+    assert_eq!(
+        systems(),
+        r4_only,
+        "the rebuild changed the value set in use"
+    );
+    assert!(accepts(r4_system) && !accepts(r5_system));
+    assert_expansions_match(&watched.inner, "after the rebuild");
+
+    // The rebuild stores the expansion under the package whose definition is in use, so a start
+    // reads it from there.
+    let core = package_id(&harness, "hl7.fhir.r4.core");
+    let rows = stored_rows(&harness, url);
+    assert_eq!(rows.len(), 1, "one expansion is stored for it");
+    assert_eq!(rows[0].package_id, core);
+    // And a start from what is stored reads the same.
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert_eq!(systems(), r4_only, "after a restart");
+    assert!(accepts(r4_system) && !accepts(r5_system));
+}
+
+fn package_id(harness: &Harness, name: &str) -> i64 {
+    harness
+        .store
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .find(|package| package.name == name)
+        .unwrap()
+        .id
+}
+
+/// The stored expansion rows of `url`, one per package that holds one.
+fn stored_rows(harness: &Harness, url: &str) -> Vec<StoredExpansion> {
+    harness
+        .store
+        .load_expansions()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.url == url)
+        .collect()
+}
+
+#[test]
+fn a_rebuild_gives_each_package_the_expansions_installing_it_gave() {
+    // The R4 package's `marital-status` includes its own copy of v3-MaritalStatus (10 codes).
+    // `hl7.terminology.r4` carries a newer copy that adds `C`. Installing the first expanded
+    // the value set with its own copy, and a rebuild over both packages must do the same.
+    let (harness, watched) = watched_r4();
+    install_package_dir(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        newer_terminology_dir(),
+    )
+    .unwrap();
+    let marital = "http://hl7.org/fhir/ValueSet/marital-status";
+    let codes = |url: &str| -> Vec<String> {
+        expansion_of(&harness, url)
+            .iter()
+            .filter_map(|item| item["code"].as_str().map(str::to_string))
+            .collect()
+    };
+    let before = codes(marital);
+    assert_eq!(before.len(), 11, "ten statuses and UNK: {before:?}");
+    assert!(!before.contains(&"C".to_string()), "{before:?}");
+
+    // A value set written through the API belongs to no package, so it reads the newest copy of
+    // a system it names without a version.
+    force_full_rebuild(
+        &harness,
+        &watched,
+        including(
+            "http://example.org/ops-marital",
+            "http://terminology.hl7.org/CodeSystem/v3-MaritalStatus",
+            None,
+        ),
+    );
+    // The package's value set is what it was; the local one reads the newer copy.
+    assert_eq!(
+        codes(marital),
+        before,
+        "the rebuild changed what installing gave"
+    );
+    assert!(codes("http://example.org/ops-marital").contains(&"C".to_string()));
+    assert_expansions_match(&watched.inner, "after the rebuild");
+}
+
+#[test]
+fn expansions_stored_under_other_rules_are_rebuilt_once_at_the_next_start() {
+    // A database the previous version rebuilt holds one row per URL under the first package that
+    // defines it, read from one pool: here the extensions package's R5-style expansion, under
+    // core, with no rules number. Nothing but this rebuild would ever replace it.
+    let (harness, _watched) = watched_r4();
+    install_package_dir(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        extension_copies_dir(),
+    )
+    .unwrap();
+    let url = "http://hl7.org/fhir/ValueSet/allerg-intol-substance-exp-risk";
+    let r4_system = "http://terminology.hl7.org/CodeSystem/allerg-intol-substance-exp-risk";
+    let r5_system = "http://hl7.org/fhir/allerg-intol-substance-exp-risk";
+    let (core, ext) = (
+        package_id(&harness, "hl7.fhir.r4.core"),
+        package_id(&harness, "hl7.fhir.uv.extensions.r4"),
+    );
+    let mut legacy: Value = serde_json::from_str(
+        &stored_rows(&harness, url)
+            .into_iter()
+            .find(|row| row.package_id == ext)
+            .unwrap()
+            .json,
+    )
+    .unwrap();
+    legacy.as_object_mut().unwrap().remove("rules");
+    let change = |package_id, json: Option<String>| refhir_persistence::ExpansionChange {
+        package_id,
+        url: url.to_string(),
+        json,
+    };
+    harness
+        .store
+        .apply_expansions(&[change(core, Some(legacy.to_string())), change(ext, None)])
+        .unwrap();
+    let systems = || -> std::collections::BTreeSet<String> {
+        expansion_of(&harness, url)
+            .iter()
+            .filter_map(|item| item["system"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    // A start reads what is stored, and the database says its expansions are out of date.
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(harness.catalog.read().unwrap().expansions_stale());
+    assert_eq!(
+        systems(),
+        std::collections::BTreeSet::from([r5_system.to_string()])
+    );
+
+    // The repair that runs at every start rebuilds them once, under the current rules.
+    repair_conformance(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert!(!harness.catalog.read().unwrap().expansions_stale());
+    assert_eq!(
+        systems(),
+        std::collections::BTreeSet::from([r4_system.to_string()])
+    );
+    let rows = stored_rows(&harness, url);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].package_id, core);
+    assert_eq!(
+        serde_json::from_str::<Value>(&rows[0].json).unwrap()["rules"],
+        2
+    );
+    assert_expansions_match(&harness.store, "after the repair");
+    // A second start finds nothing to do: the repair is not repeated.
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(!harness.catalog.read().unwrap().expansions_stale());
+}
+
+#[test]
+fn a_write_stores_a_waiting_value_set_under_the_package_in_use_and_removing_it_clears_every_holder()
+{
+    // Two packages define one value set that includes a code system nothing carries, so
+    // installing either cannot expand it. The second is the one in use.
+    let (harness, _watched) = watched_r4();
+    let (set, system) = (
+        "http://example.org/ValueSet/shared",
+        "http://example.org/shared-system",
+    );
+    let package = |name: &str, version: &str| {
+        let dir = dep_package(name, version, &[]);
+        std::fs::write(
+            dir.join("ValueSet-shared.json"),
+            json!({"resourceType": "ValueSet", "url": set, "version": version, "status": "active",
+                   "compose": {"include": [{"system": system}]}})
+            .to_string(),
+        )
+        .unwrap();
+        install_package_dir(&harness.store, &harness.db, &harness.catalog, &dir).unwrap();
+        dir
+    };
+    let first = package("example.shared.a", "1.0.0");
+    let second = package("example.shared.b", "2.0.0");
+    let (a, b) = (
+        package_id(&harness, "example.shared.a"),
+        package_id(&harness, "example.shared.b"),
+    );
+    assert!(run_op(&harness, "ValueSet/$expand", &json!({"url": set})).is_err());
+
+    // A code system written through the API is what both were waiting for. The incremental update
+    // expands the one in use and stores it under that package, not the first that defined it.
+    let written = commit(
+        &harness,
+        "CodeSystem/create",
+        json!({"resource": {"resourceType": "CodeSystem", "url": system, "status": "active",
+                            "content": "complete", "concept": [{"code": "x"}, {"code": "y"}]}}),
+    )
+    .unwrap();
+    let codes: Vec<_> = expansion_of(&harness, set)
+        .iter()
+        .filter_map(|item| item["code"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(codes, ["x", "y"]);
+    let rows = stored_rows(&harness, set);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].package_id, b);
+
+    // An expansion the other package still holds from before (what an earlier version left) is a
+    // candidate a start would fall back to; removing the code system must clear it as well.
+    harness
+        .store
+        .apply_expansions(&[refhir_persistence::ExpansionChange {
+            package_id: a,
+            url: set.to_string(),
+            json: Some(
+                json!({"url": set, "systems": [], "contains": [{"code": "stale"}]}).to_string(),
+            ),
+        }])
+        .unwrap();
+    commit(&harness, "CodeSystem/delete", json!({"id": written["id"]})).unwrap();
+    assert!(stored_rows(&harness, set).is_empty());
+    assert!(run_op(&harness, "ValueSet/$expand", &json!({"url": set})).is_err());
+    for dir in [first, second] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]

@@ -7,38 +7,6 @@ use serde_json::Value as JsonValue;
 
 use crate::{definite, SqlitePersistence};
 
-pub(crate) const JOBS_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS jobs (
-    id TEXT NOT NULL PRIMARY KEY,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL,
-    request TEXT NOT NULL,
-    result TEXT,
-    error TEXT,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER NOT NULL,
-    completed_at INTEGER,
-    lease_owner TEXT,
-    lease_until INTEGER
-);
-CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs (status, created_at);
-"#;
-
-/// A `jobs` table made before leases existed has no lease columns.
-pub(crate) fn migrate(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
-    let columns: Vec<String> = connection
-        .prepare("SELECT name FROM pragma_table_info('jobs')")?
-        .query_map([], |row| row.get(0))?
-        .collect::<Result<_, _>>()?;
-    for (name, definition) in [("lease_owner", "TEXT"), ("lease_until", "INTEGER")] {
-        if !columns.iter().any(|column| column == name) {
-            connection
-                .execute_batch(&format!("ALTER TABLE jobs ADD COLUMN {name} {definition}"))?;
-        }
-    }
-    Ok(())
-}
-
 const JOB_COLUMNS: &str = "id, kind, status, request, result, error, attempts, created_at, \
      completed_at, lease_owner, lease_until";
 

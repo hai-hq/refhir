@@ -43,7 +43,13 @@ pub trait Terminology {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+/// Where a resource came from: the id of the package that holds it. A value set is read against
+/// the code systems its own package holds before any other, because that is what it was written
+/// for, and what installing the package expanded it with. Terminology built from plain resources
+/// (`from_resources`) is all one scope.
+pub type Scope = i64;
+
+#[derive(Clone, Debug, Default, PartialEq)]
 struct Concept {
     display: Option<String>,
     definition: Option<String>,
@@ -52,7 +58,7 @@ struct Concept {
     properties: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SystemIndex {
     /// A complete system is closed. A missing code is really absent.
     closed: bool,
@@ -121,47 +127,131 @@ fn version_order(left: &str, right: &str) -> std::cmp::Ordering {
     }
 }
 
+/// One content of a code system version, and the packages that hold exactly it. Two packages
+/// that carry the same version of a system almost always carry the same content (`core` and
+/// `examples`), and then they share one copy; when they differ, each content is kept.
+#[derive(Clone, Debug)]
+struct Variant {
+    scopes: BTreeSet<Scope>,
+    index: SystemIndex,
+}
+
 /// Code systems by URL and version. Every version that is installed is kept, so a reference that
 /// names one gets that one, whatever order they were loaded in.
 #[derive(Clone, Debug, Default)]
 struct Systems {
-    by_url: BTreeMap<String, BTreeMap<String, SystemIndex>>,
+    by_url: BTreeMap<String, BTreeMap<String, Vec<Variant>>>,
+    /// The FHIR release the server serves (`4.0.1`). A reference that names no version means the
+    /// version of that release when one is installed, not the highest version: a cross-version
+    /// package such as `hl7.fhir.uv.xver-r5.r4` carries `5.0.0` copies of R4's own code systems,
+    /// and a value set written for R4 does not mean R5's codes.
+    release: Option<String>,
+}
+
+/// The content `scope` holds, or the one loaded last when it holds none.
+fn variant_for(variants: &[Variant], scope: Option<Scope>) -> Option<&SystemIndex> {
+    scope
+        .and_then(|scope| variants.iter().rev().find(|v| v.scopes.contains(&scope)))
+        .or_else(|| variants.last())
+        .map(|variant| &variant.index)
+}
+
+fn held_by(variants: &[Variant], scope: Scope) -> bool {
+    variants
+        .iter()
+        .any(|variant| variant.scopes.contains(&scope))
 }
 
 impl Systems {
-    fn insert(&mut self, url: &str, version: &str, index: SystemIndex) {
-        self.by_url
+    /// What `scope` held under this URL and version is replaced by `index`.
+    fn insert(&mut self, scope: Scope, url: &str, version: &str, index: SystemIndex) {
+        let variants = self
+            .by_url
             .entry(url.to_string())
             .or_default()
-            .insert(version.to_string(), index);
+            .entry(version.to_string())
+            .or_default();
+        for variant in variants.iter_mut() {
+            variant.scopes.remove(&scope);
+        }
+        variants.retain(|variant| !variant.scopes.is_empty());
+        // The variant loaded last answers a lookup that names no package, so one that matches
+        // moves to the end rather than staying where it was.
+        let mut variant = match variants.iter().position(|held| held.index == index) {
+            Some(position) => variants.remove(position),
+            None => Variant {
+                scopes: BTreeSet::new(),
+                index,
+            },
+        };
+        variant.scopes.insert(scope);
+        variants.push(variant);
     }
 
-    /// Remove one version, or every version when `version` is `None`.
-    fn remove(&mut self, url: &str, version: Option<&str>) {
+    /// Remove what `scope` holds of one version, or of every version when `version` is `None`.
+    /// A copy that another package also holds stays for that package.
+    fn remove(&mut self, scope: Scope, url: &str, version: Option<&str>) {
         let Some(versions) = self.by_url.get_mut(url) else {
             return;
         };
-        match version {
-            Some(version) => {
-                versions.remove(version);
+        for (held, variants) in versions.iter_mut() {
+            if version.is_some_and(|version| version != held) {
+                continue;
             }
-            None => versions.clear(),
+            for variant in variants.iter_mut() {
+                variant.scopes.remove(&scope);
+            }
+            variants.retain(|variant| !variant.scopes.is_empty());
         }
+        versions.retain(|_, variants| !variants.is_empty());
         if versions.is_empty() {
             self.by_url.remove(url);
         }
     }
 
-    /// The version asked for, or, when none is, the latest installed. Returns the version found.
+    /// The version asked for, or, when none is, the installed version that is the server's
+    /// release, or else the latest installed. Returns the version found.
     fn resolve(&self, url: &str, version: Option<&str>) -> Option<(&str, &SystemIndex)> {
+        self.resolve_in(None, false, url, version)
+    }
+
+    /// Like [`Self::resolve`], for a value set that came from `scope`. With no version named,
+    /// the versions that package holds come first, the release's among them first of all:
+    /// installing the package expanded its value sets with exactly those, and a copy of the same
+    /// system that another package carries (another release's, an older snapshot's) is not what
+    /// the value set meant. Only a system the package does not hold is read from the others,
+    /// unless `strict`: then only what the package holds is installed, as when it is installed
+    /// alone.
+    fn resolve_in(
+        &self,
+        scope: Option<Scope>,
+        strict: bool,
+        url: &str,
+        version: Option<&str>,
+    ) -> Option<(&str, &SystemIndex)> {
         let versions = self.by_url.get(url)?;
         let found = match version.filter(|version| !version.is_empty()) {
-            Some(version) => versions.get_key_value(version),
-            None => versions
-                .iter()
-                .max_by(|left, right| version_order(left.0, right.0)),
+            Some(version) => versions.get_key_value(version).filter(|(_, variants)| {
+                !strict || scope.is_none_or(|scope| held_by(variants, scope))
+            }),
+            None => {
+                let own = scope.filter(|scope| versions.values().any(|v| held_by(v, *scope)));
+                if strict && scope.is_some() && own.is_none() {
+                    return None;
+                }
+                let pool = || {
+                    versions.iter().filter(move |(_, variants)| {
+                        own.is_none_or(|scope| held_by(variants, scope))
+                    })
+                };
+                self.release
+                    .as_deref()
+                    .and_then(|release| pool().find(|(version, _)| version.as_str() == release))
+                    .or_else(|| pool().max_by(|left, right| version_order(left.0, right.0)))
+            }
         };
-        found.map(|(version, index)| (version.as_str(), index))
+        found
+            .and_then(|(version, variants)| Some((version.as_str(), variant_for(variants, scope)?)))
     }
 
     /// `system` or `system|version` as a reference, resolved the same way.
@@ -183,6 +273,9 @@ impl Systems {
 struct Expansion {
     systems: BTreeSet<(String, String)>,
     codes: BTreeMap<(String, String), Option<String>>,
+    /// The package whose definition of the value set this was expanded from, when known. It says
+    /// which content of a code system version two packages hold differently the codes came from.
+    scope: Option<Scope>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,7 +293,7 @@ pub struct MemoryTerminology {
     /// Source system and code to translation targets.
     maps: BTreeMap<(String, String), Vec<Target>>,
     /// Value sets that have no expansion, kept so a refusal can say why.
-    unexpanded: BTreeMap<String, Json>,
+    unexpanded: Definitions,
     /// Why each of those has none. Worked out when the terminology is built or changed, so that
     /// a check against one of them is a lookup, not an expansion.
     reasons: BTreeMap<String, Vec<ExpansionFailure>>,
@@ -209,19 +302,41 @@ pub struct MemoryTerminology {
     uses: BTreeMap<String, BTreeSet<String>>,
 }
 
+/// An expansion on offer for a value set: the one inside its definition, or a stored document.
+enum Offer<'a> {
+    Inline(&'a [Json]),
+    Stored(&'a Json),
+}
+
+/// Every definition of each value set URL, with the package it came from, ordered for use (see
+/// `order_for_use`): the one in use is last, which is the one at the server's release, or with
+/// none the one loaded last. It answers a reference that comes from nowhere in particular; a
+/// reference from a package prefers that package's own definition, as installing the package did.
+type Definitions = BTreeMap<String, Vec<(Scope, Json)>>;
+
 impl MemoryTerminology {
     pub fn from_resources(resources: &[Json]) -> Self {
-        let (mut terms, value_sets) = index_resources(resources);
+        Self::from_resources_scoped(&unscoped(resources), None)
+    }
+
+    /// Like [`Self::from_resources`], for a server that serves FHIR `release` and resources that
+    /// each come from a package. A value set is expanded with the versions of a code system that
+    /// its own package holds; only a system it does not hold is read from the others. With no
+    /// version named, the release's version comes first.
+    pub fn from_resources_scoped(resources: &[(Scope, &Json)], release: Option<&str>) -> Self {
+        let (mut terms, value_sets) = index_resources(resources, release);
         let known = BTreeMap::new();
         let mut expander = Expander {
             systems: &terms.systems,
             value_sets: &value_sets,
+            scope: None,
+            strict: false,
             known: &known,
             cache: BTreeMap::new(),
             stack: Vec::new(),
         };
         for url in value_sets.keys() {
-            if let Ok(expansion) = expander.expand(url) {
+            if let Ok(expansion) = expander.expand_in_use(url) {
                 terms.expansions.insert(url.clone(), expansion);
             }
         }
@@ -229,7 +344,7 @@ impl MemoryTerminology {
         terms
     }
 
-    fn keep_unexpanded(&mut self, value_sets: BTreeMap<String, Json>) {
+    fn keep_unexpanded(&mut self, value_sets: Definitions) {
         self.record_references(&value_sets);
         self.unexpanded = value_sets
             .into_iter()
@@ -248,11 +363,13 @@ impl MemoryTerminology {
         let mut expander = Expander {
             systems: &self.systems,
             value_sets: &self.unexpanded,
+            scope: None,
+            strict: false,
             known: &self.expansions,
             cache: BTreeMap::new(),
             stack: Vec::new(),
         };
-        match expander.expand(url) {
+        match expander.expand_in_use(url) {
             Ok(_) => vec![ExpansionFailure::NotExpanded {
                 value_set: url.to_string(),
             }],
@@ -262,8 +379,24 @@ impl MemoryTerminology {
 
     /// Membership comes from `expansions`. Code systems and concept maps still come from `resources`.
     pub fn from_stored(resources: &[Json], expansions: &[Json]) -> Self {
-        let (mut terms, value_sets) = index_resources(resources);
-        for resource in resources {
+        Self::from_stored_scoped(&unscoped(resources), &unscoped(expansions), None)
+    }
+
+    /// Like [`Self::from_stored`], for a server that serves FHIR `release` and resources and
+    /// stored expansions that each come from a package. A value set that several packages define, and expand, is answered by the
+    /// expansion of the definition in use (see [`winning_scope`]), or of the next one that has
+    /// one: not by whichever package was installed last.
+    pub fn from_stored_scoped(
+        resources: &[(Scope, &Json)],
+        expansions: &[(Scope, &Json)],
+        release: Option<&str>,
+    ) -> Self {
+        let (mut terms, value_sets) = index_resources(resources, release);
+        // Every expansion on offer for each value set, with the package it came from, in the
+        // order loaded: those inside the value sets, then the stored ones. They are only borrowed
+        // here; the one that is chosen is read once.
+        let mut offered: BTreeMap<String, Vec<(Scope, Offer<'_>)>> = BTreeMap::new();
+        for (scope, resource) in resources {
             if resource
                 .get("resourceType")
                 .and_then(|value| value.as_str())
@@ -271,31 +404,51 @@ impl MemoryTerminology {
             {
                 continue;
             }
-            if let Some((url, expansion)) = resource
+            let Some(contains) = resource
                 .pointer("/expansion/contains")
                 .and_then(|value| value.as_array())
-                .map(|contains| {
-                    (
-                        resource
-                            .get("url")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        expansion_from_contains(contains),
-                    )
-                })
-            {
-                if !url.is_empty() {
-                    terms
-                        .expansions
-                        .insert(canonical(&url).to_string(), expansion);
-                }
+            else {
+                continue;
+            };
+            let Some(url) = resource
+                .get("url")
+                .and_then(|value| value.as_str())
+                .filter(|url| !url.is_empty())
+            else {
+                continue;
+            };
+            offered
+                .entry(canonical(url).to_string())
+                .or_default()
+                .push((*scope, Offer::Inline(contains)));
+        }
+        for (scope, document) in expansions {
+            if let Some(url) = document.get("url").and_then(|value| value.as_str()) {
+                offered
+                    .entry(canonical(url).to_string())
+                    .or_default()
+                    .push((*scope, Offer::Stored(document)));
             }
         }
-        for document in expansions {
-            if let Some((url, expansion)) = expansion_from_document(document) {
-                terms.expansions.insert(url, expansion);
-            }
+        for (url, candidates) in offered {
+            let chosen = value_sets
+                .get(&url)
+                .and_then(|definitions| {
+                    definitions.iter().rev().find_map(|(owner, _)| {
+                        candidates.iter().rposition(|(scope, _)| scope == owner)
+                    })
+                })
+                .unwrap_or(candidates.len() - 1);
+            let (scope, offer) = &candidates[chosen];
+            let mut expansion = match offer {
+                Offer::Inline(contains) => expansion_from_contains(contains),
+                Offer::Stored(document) => match expansion_from_document(document) {
+                    Some((_, expansion)) => expansion,
+                    None => continue,
+                },
+            };
+            expansion.scope = Some(*scope);
+            terms.expansions.insert(url, expansion);
         }
         terms.keep_unexpanded(value_sets);
         terms
@@ -332,7 +485,30 @@ impl MemoryTerminology {
     }
 
     pub fn expansion_documents(resources: &[Json]) -> Vec<Json> {
-        Self::from_resources(resources).documents()
+        Self::expansion_documents_scoped(&unscoped(resources), None)
+    }
+
+    /// The expansions of every value set in `resources`, each read with the code system versions
+    /// its own package holds. A rebuild over every package at once gives each value set the
+    /// expansion installing its package gave it, not one that depends on what else is installed.
+    pub fn expansion_documents_scoped(
+        resources: &[(Scope, &Json)],
+        release: Option<&str>,
+    ) -> Vec<Json> {
+        Self::from_resources_scoped(resources, release).documents()
+    }
+
+    /// The FHIR release this terminology is read for, when it was told.
+    pub fn release(&self) -> Option<&str> {
+        self.systems.release.as_deref()
+    }
+
+    /// Set the FHIR release the server serves, for terminology built without it. Later lookups
+    /// and incremental changes then resolve an unversioned reference the same way.
+    pub fn set_release(&mut self, release: Option<&str>) {
+        self.systems.release = release
+            .filter(|release| !release.is_empty())
+            .map(str::to_string);
     }
 
     /// The expansion document of every value set that has an expansion, ordered by URL.
@@ -673,20 +849,21 @@ impl MemoryTerminology {
         code: &str,
     ) -> Option<CodeDescription> {
         let url = canonical(split_system(system).0);
-        let version = self
-            .expansions
-            .get(canonical(value_set))
-            .and_then(|expansion| {
-                expansion
-                    .systems
-                    .iter()
-                    .find(|(used, _)| used == url)
-                    .map(|(_, version)| version.as_str())
-            });
+        let expansion = self.expansions.get(canonical(value_set));
+        let version = expansion.and_then(|expansion| {
+            expansion
+                .systems
+                .iter()
+                .find(|(used, _)| used == url)
+                .map(|(_, version)| version.as_str())
+        });
+        let made_from = expansion.and_then(|expansion| expansion.scope);
         match version
             .filter(|version| !version.is_empty())
-            .and_then(|version| self.systems.resolve(url, Some(version)))
-        {
+            .and_then(|version| {
+                self.systems
+                    .resolve_in(made_from, false, url, Some(version))
+            }) {
             Some((_, index)) => describe_index(index, code),
             None => self.describe(system, code),
         }
@@ -921,6 +1098,15 @@ pub struct ExpansionUpdate {
 }
 
 /// The canonical URLs a value set's `compose` draws on: code systems and other value sets.
+/// What any definition of a value set includes: whichever one answers for it, a change to
+/// something it includes can alter the answer.
+fn references_of(definitions: &[(Scope, Json)]) -> BTreeSet<String> {
+    definitions
+        .iter()
+        .flat_map(|(_, definition)| compose_references(definition))
+        .collect()
+}
+
 fn compose_references(value_set: &Json) -> BTreeSet<String> {
     let mut references = BTreeSet::new();
     for section in ["include", "exclude"] {
@@ -949,10 +1135,10 @@ fn compose_references(value_set: &Json) -> BTreeSet<String> {
 }
 
 impl MemoryTerminology {
-    fn record_references(&mut self, value_sets: &BTreeMap<String, Json>) {
+    fn record_references(&mut self, value_sets: &Definitions) {
         self.uses = value_sets
             .iter()
-            .map(|(url, value_set)| (url.clone(), compose_references(value_set)))
+            .map(|(url, definitions)| (url.clone(), references_of(definitions)))
             .collect();
     }
 
@@ -991,7 +1177,24 @@ impl MemoryTerminology {
         change: &TerminologyChange,
         dependents: &[Json],
     ) -> Vec<ExpansionUpdate> {
-        let mut value_sets: BTreeMap<String, Json> = BTreeMap::new();
+        self.apply_scoped(change, 0, &unscoped(dependents))
+    }
+
+    /// Like [`Self::apply`], for terminology whose resources come from packages: `scope` is the
+    /// package the change is written to, and each dependent comes with the package that defines
+    /// it, once for every package that defines it. Those value sets are read as
+    /// [`Self::from_resources_scoped`] reads them, and which definition is in use is decided as
+    /// it decides it. A value set they include that is not among them is read from the
+    /// expansions that exist, which is the definition in use for it and not necessarily the one
+    /// the including package defines.
+    pub fn apply_scoped(
+        &mut self,
+        change: &TerminologyChange,
+        scope: Scope,
+        dependents: &[(Scope, &Json)],
+    ) -> Vec<ExpansionUpdate> {
+        // Every definition of each value set that is read again, with its package.
+        let mut changed = Definitions::new();
         let mut gone: BTreeSet<String> = BTreeSet::new();
         for (type_name, key) in &change.removed {
             match type_name.as_str() {
@@ -999,7 +1202,8 @@ impl MemoryTerminology {
                     // The key a code system is stored under is `url` or `url|version`, which
                     // says which version went. Without a version, the unversioned one did.
                     let (base, version) = split_system(key);
-                    self.systems.remove(base, Some(version.unwrap_or("")));
+                    self.systems
+                        .remove(scope, base, Some(version.unwrap_or("")));
                 }
                 "ConceptMap" => self.remove_map(canonical(key)),
                 "ValueSet" => {
@@ -1020,53 +1224,60 @@ impl MemoryTerminology {
                 .get("resourceType")
                 .and_then(|value| value.as_str())
             {
-                Some("CodeSystem") => self.add_system(resource),
+                Some("CodeSystem") => self.add_system(resource, scope),
                 Some("ConceptMap") => {
                     self.remove_map(&url);
                     self.add_map(resource);
                 }
                 Some("ValueSet") => {
                     gone.remove(&url);
-                    value_sets.insert(url, resource.clone());
+                    let definitions = changed.entry(url).or_default();
+                    definitions.retain(|(owner, _)| *owner != scope);
+                    definitions.push((scope, resource.clone()));
                 }
                 _ => {}
             }
         }
-        for resource in dependents {
+        for (owner, resource) in dependents {
             if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
-                value_sets
-                    .entry(canonical(url).to_string())
-                    .or_insert_with(|| resource.clone());
+                let definitions = changed.entry(canonical(url).to_string()).or_default();
+                definitions.retain(|(held, _)| held != owner);
+                definitions.push((*owner, (*resource).clone()));
             }
         }
-        for url in value_sets.keys().chain(gone.iter()) {
+        let release = self.systems.release.clone();
+        for definitions in changed.values_mut() {
+            prefer_release(definitions, release.as_deref());
+        }
+        for url in changed.keys().chain(gone.iter()) {
             self.expansions.remove(url);
             self.unexpanded.remove(url);
             self.reasons.remove(url);
             self.uses.remove(url);
         }
-        for (url, value_set) in &value_sets {
-            self.uses.insert(url.clone(), compose_references(value_set));
+        for (url, definitions) in &changed {
+            self.uses.insert(url.clone(), references_of(definitions));
         }
         // A value set that cannot be expanded may be what a changed one includes, and its own
         // reasons are worked out from its resource, so those are in scope too.
-        let mut scope = value_sets.clone();
-        for (url, value_set) in &self.unexpanded {
-            scope
-                .entry(url.clone())
-                .or_insert_with(|| value_set.clone());
+        let mut pool: Definitions = changed.clone();
+        for (url, definitions) in &self.unexpanded {
+            pool.entry(url.clone())
+                .or_insert_with(|| definitions.clone());
         }
         let results: Vec<(String, Result<Expansion, Failures>)> = {
             let mut expander = Expander {
                 systems: &self.systems,
-                value_sets: &scope,
+                value_sets: &pool,
+                scope: None,
+                strict: false,
                 known: &self.expansions,
                 cache: BTreeMap::new(),
                 stack: Vec::new(),
             };
-            value_sets
+            changed
                 .keys()
-                .map(|url| (url.clone(), expander.expand(url)))
+                .map(|url| (url.clone(), expander.expand_in_use(url)))
                 .collect()
         };
         let mut updates = Vec::new();
@@ -1080,8 +1291,8 @@ impl MemoryTerminology {
                     self.expansions.insert(url, expansion);
                 }
                 Err(failures) => {
-                    if let Some(value_set) = value_sets.get(&url) {
-                        self.unexpanded.insert(url.clone(), value_set.clone());
+                    if let Some(definitions) = changed.get(&url) {
+                        self.unexpanded.insert(url.clone(), definitions.clone());
                         self.reasons.insert(url.clone(), failures);
                     }
                     updates.push(ExpansionUpdate {
@@ -1119,32 +1330,110 @@ type Failures = Vec<ExpansionFailure>;
 
 struct Expander<'a> {
     systems: &'a Systems,
-    value_sets: &'a BTreeMap<String, Json>,
+    value_sets: &'a Definitions,
+    /// The scope of the value set being expanded, which says whose code system versions and
+    /// value set definitions come first. At the top level, where it is not known, it is `None`.
+    scope: Option<Scope>,
+    /// Read each value set against what its own package holds and nothing else, as installing
+    /// the package alone did. Expansions that already exist are not used either.
+    strict: bool,
     /// Expansions that already exist. They are used as they are rather than recomputed.
     known: &'a BTreeMap<String, Expansion>,
-    cache: BTreeMap<String, Result<Expansion, Failures>>,
+    cache: BTreeMap<(String, Scope, bool), Result<Expansion, Failures>>,
     stack: Vec<String>,
 }
 
 impl Expander<'_> {
+    /// A system, read as the value set being expanded reads it.
+    fn resolve(&self, system: &str, version: Option<&str>) -> Option<(&str, &SystemIndex)> {
+        self.systems
+            .resolve_in(self.scope, self.strict, system, version)
+    }
+
+    /// A value set asked for by its URL alone: the definition in use, or, when that cannot be
+    /// expanded, the next one that can. Each is tried first as installing its own package tried
+    /// it, against what that package holds alone, so that a start (which reads what installing
+    /// each package stored) and a rebuild name the same definition. Only when none can be
+    /// expanded that way does the rest of the store come in, which is how a value set that waits
+    /// on another package's code system gets its expansion. When none can be expanded at all, it
+    /// is the definition in use that is explained.
+    fn expand_in_use(&mut self, url: &str) -> Result<Expansion, Failures> {
+        let url = canonical(url).to_string();
+        let owners: Vec<Scope> = self
+            .value_sets
+            .get(&url)
+            .map(|definitions| definitions.iter().rev().map(|(owner, _)| *owner).collect())
+            .unwrap_or_default();
+        let outer_strict = self.strict;
+        let mut first = None;
+        for strict in [true, false] {
+            self.strict = strict;
+            for &owner in &owners {
+                let outer = self.scope.replace(owner);
+                let result = self.expand(&url);
+                self.scope = outer;
+                match result {
+                    Ok(expansion) => {
+                        self.strict = outer_strict;
+                        return Ok(expansion);
+                    }
+                    Err(failures) if !strict => {
+                        first.get_or_insert(failures);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        self.strict = outer_strict;
+        match first {
+            Some(failures) => Err(failures),
+            None => self.expand(&url),
+        }
+    }
+
     fn expand(&mut self, url: &str) -> Result<Expansion, Failures> {
         let url = canonical(url).to_string();
-        if let Some(cached) = self.cache.get(&url) {
-            return cached.clone();
+        if !self.strict {
+            if let Some(known) = self.known.get(&url) {
+                return Ok(known.clone());
+            }
         }
-        if let Some(known) = self.known.get(&url) {
-            return Ok(known.clone());
+        // The definition of a value set named from a package is that package's own, when it has
+        // one; otherwise the one in use, which is the last. A package read alone has only its
+        // own. The definitions are borrowed from the data, not from `self`, so they are not
+        // copied to be read.
+        let value_sets = self.value_sets;
+        let definition = value_sets.get(&url).and_then(|definitions| {
+            let own = self
+                .scope
+                .and_then(|scope| definitions.iter().rev().find(|(owner, _)| *owner == scope));
+            if self.strict && self.scope.is_some() {
+                own
+            } else {
+                own.or_else(|| definitions.last())
+            }
+        });
+        let Some((owner, value_set)) = definition else {
+            return Err(vec![ExpansionFailure::NotLoaded { value_set: url }]);
+        };
+        let owner = *owner;
+        let key = (url.clone(), owner, self.strict);
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
         }
         if self.stack.iter().any(|item| item == &url) {
             return Err(vec![ExpansionFailure::Cycle { value_set: url }]);
         }
-        let Some(value_set) = self.value_sets.get(&url).cloned() else {
-            return Err(vec![ExpansionFailure::NotLoaded { value_set: url }]);
-        };
         self.stack.push(url.clone());
-        let expansion = expand_value_set(self, &url, &value_set);
+        // Its own includes are read as its own package reads them.
+        let outer = self.scope.replace(owner);
+        let mut expansion = expand_value_set(self, &url, value_set);
+        self.scope = outer;
         self.stack.pop();
-        self.cache.insert(url, expansion.clone());
+        if let Ok(expansion) = &mut expansion {
+            expansion.scope = Some(owner);
+        }
+        self.cache.insert(key, expansion.clone());
         expansion
     }
 }
@@ -1294,7 +1583,6 @@ fn expand_include(
                 .or_else(|| {
                     system.as_ref().and_then(|system| {
                         expander
-                            .systems
                             .resolve(system, version.as_deref())
                             .and_then(|(_, index)| index.codes.get(code))
                             .and_then(|concept| concept.display.clone())
@@ -1323,7 +1611,7 @@ fn expand_include(
     let Some(system) = system else {
         return Ok(expansion);
     };
-    let Some((_, index)) = expander.systems.resolve(&system, version.as_deref()) else {
+    let Some((_, index)) = expander.resolve(&system, version.as_deref()) else {
         // A version that is not installed is not the same as a system that is not: the others
         // that are installed are named, because they are what a fix would add to or pick from.
         let installed = expander.systems.versions(&system);
@@ -1400,7 +1688,6 @@ fn note_system(
     requested: Option<&str>,
 ) {
     let version = expander
-        .systems
         .resolve(system, requested)
         .map(|(version, _)| version.to_string())
         .unwrap_or_else(|| requested.unwrap_or("").to_string());
@@ -1501,29 +1788,113 @@ fn merge_expansion(into: &mut Expansion, other: Expansion) {
     into.codes.extend(other.codes);
 }
 
-fn index_resources(resources: &[Json]) -> (MemoryTerminology, BTreeMap<String, Json>) {
+/// Plain resources as one scope: terminology that does not track packages.
+fn unscoped(resources: &[Json]) -> Vec<(Scope, &Json)> {
+    resources.iter().map(|resource| (0, resource)).collect()
+}
+
+/// Whether a definition is at `release`: the version a server for that release means by a
+/// canonical. Other packages carry other releases' copies of a release's own value sets (the
+/// extensions package has `5.3.0-ballot-tc1` copies of R4's, pointing at R5's code system URLs),
+/// and those are not what an R4 server's value sets mean.
+fn at_release(definition: &Json, release: Option<&str>) -> bool {
+    release.is_some() && definition.get("version").and_then(|value| value.as_str()) == release
+}
+
+/// Order the definitions of one canonical so that the one in use is last: those not at the
+/// release first, then those at the release, each in the order loaded. The one in use is then the
+/// last at the release, or with none the last loaded, and when it cannot be expanded the ones
+/// before it are tried in turn, those at the release ahead of those that are not. Versions are
+/// not compared. They come in styles that do not order against each other (core's `2018-08-12`
+/// and `2.9` against terminology's `3.0.0`, and in one case `1.0.0`), so a rule that took the
+/// highest would be wrong about some of them, where the install order is not.
+fn order_for_use<T>(definitions: &mut Vec<(Scope, T)>, at_release: impl Fn(&T) -> bool) {
+    let (mut rest, at): (Vec<_>, Vec<_>) = std::mem::take(definitions)
+        .into_iter()
+        .partition(|(_, definition)| !at_release(definition));
+    rest.extend(at);
+    *definitions = rest;
+}
+
+fn prefer_release(definitions: &mut Vec<(Scope, Json)>, release: Option<&str>) {
+    order_for_use(definitions, |definition| at_release(definition, release));
+}
+
+/// Of the definitions of one canonical, in the order loaded, the scope of the one in use. It is
+/// the rule the index orders by, so everything that stores or reads an expansion of the value set
+/// agrees on this one and what a rebuild stores is what a start loads. A package that has more
+/// than one is counted by the last, as the index keeps it.
+pub fn winning_scope(definitions: &[(Scope, &Json)], release: Option<&str>) -> Option<Scope> {
+    let mut held: Vec<(Scope, &Json)> = Vec::new();
+    for (scope, definition) in definitions {
+        held.retain(|(owner, _)| owner != scope);
+        held.push((*scope, definition));
+    }
+    order_for_use(&mut held, |definition| at_release(definition, release));
+    held.last().map(|(scope, _)| *scope)
+}
+
+/// [`winning_scope`] for every value set in `resources`, by canonical URL.
+pub fn winning_scopes(
+    resources: &[(Scope, &Json)],
+    release: Option<&str>,
+) -> BTreeMap<String, Scope> {
+    let mut by_url: BTreeMap<String, Vec<(Scope, &Json)>> = BTreeMap::new();
+    for (scope, resource) in resources {
+        if resource
+            .get("resourceType")
+            .and_then(|value| value.as_str())
+            != Some("ValueSet")
+        {
+            continue;
+        }
+        if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
+            by_url
+                .entry(canonical(url).to_string())
+                .or_default()
+                .push((*scope, resource));
+        }
+    }
+    by_url
+        .into_iter()
+        .filter_map(|(url, held)| Some((url, winning_scope(&held, release)?)))
+        .collect()
+}
+
+fn index_resources(
+    resources: &[(Scope, &Json)],
+    release: Option<&str>,
+) -> (MemoryTerminology, Definitions) {
     let mut terms = MemoryTerminology::default();
-    let mut value_sets = BTreeMap::new();
-    for resource in resources {
+    terms.set_release(release);
+    let mut value_sets = Definitions::new();
+    for (scope, resource) in resources {
         match resource
             .get("resourceType")
             .and_then(|value| value.as_str())
         {
-            Some("CodeSystem") => terms.add_system(resource),
+            Some("CodeSystem") => terms.add_system(resource, *scope),
             Some("ConceptMap") => terms.add_map(resource),
             Some("ValueSet") => {
                 if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
-                    value_sets.insert(canonical(url).to_string(), resource.clone());
+                    // What this package defined before is replaced; the definition loaded last
+                    // stays last.
+                    let definitions = value_sets.entry(canonical(url).to_string()).or_default();
+                    definitions.retain(|(owner, _)| owner != scope);
+                    definitions.push((*scope, (*resource).clone()));
                 }
             }
             _ => {}
         }
     }
+    for definitions in value_sets.values_mut() {
+        prefer_release(definitions, release);
+    }
     (terms, value_sets)
 }
 
 impl MemoryTerminology {
-    fn add_system(&mut self, resource: &Json) {
+    fn add_system(&mut self, resource: &Json, scope: Scope) {
         let Some((url, version)) = code_system_key(resource) else {
             return;
         };
@@ -1541,6 +1912,7 @@ impl MemoryTerminology {
             collect_concepts(concepts, None, &mut codes);
         }
         self.systems.insert(
+            scope,
             &url,
             &version,
             SystemIndex {
@@ -1744,6 +2116,16 @@ fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
     Some((canonical(url).to_string(), expansion))
 }
 
+/// The rules stored expansions are made under. A document without this number, or with another,
+/// was made by code that chose a code system version or a value set definition differently (one
+/// pool for every package, the package installed last), so it is rebuilt once rather than read.
+pub const EXPANSION_RULES: u32 = 2;
+
+/// Whether a stored expansion document was made under the current [`EXPANSION_RULES`].
+pub fn expansion_is_current(document: &Json) -> bool {
+    document.get("rules").and_then(|rules| rules.as_u64()) == Some(u64::from(EXPANSION_RULES))
+}
+
 fn expansion_document(url: &str, expansion: &Expansion) -> Json {
     let systems: Vec<Json> = expansion
         .systems
@@ -1764,7 +2146,7 @@ fn expansion_document(url: &str, expansion: &Expansion) -> Json {
             entry
         })
         .collect();
-    json!({"url": url, "systems": systems, "contains": contains})
+    json!({"url": url, "systems": systems, "contains": contains, "rules": EXPANSION_RULES})
 }
 
 fn display_of_bound(
@@ -2354,6 +2736,746 @@ mod tests {
                 &[],
             ),
         );
+    }
+
+    const STATUS: &str = "http://hl7.org/fhir/encounter-status";
+    const STATUS_SET: &str = "http://hl7.org/fhir/ValueSet/encounter-status";
+
+    fn versioned_system(url: &str, version: &str, codes: &[&str]) -> serde_json::Value {
+        json!({
+            "resourceType": "CodeSystem", "url": url, "version": version, "content": "complete",
+            "concept": codes.iter().map(|code| json!({"code": code})).collect::<Vec<_>>()
+        })
+    }
+
+    /// R4's `encounter-status`, and the `5.0.0` copy of it that `hl7.fhir.uv.xver-r5.r4` carries.
+    fn encounter_status() -> Vec<serde_json::Value> {
+        vec![
+            versioned_system(
+                STATUS,
+                "4.0.1",
+                &["planned", "arrived", "in-progress", "finished"],
+            ),
+            versioned_system(
+                STATUS,
+                "5.0.0",
+                &["planned", "in-progress", "completed", "discharged"],
+            ),
+            value_set(STATUS_SET, json!({"include": [{"system": STATUS}]})),
+        ]
+    }
+
+    fn admits(terms: &MemoryTerminology, value_set: &str, code: &str) -> bool {
+        terms.contains(value_set, Some(STATUS), code) == TermAnswer::Yes
+    }
+
+    #[test]
+    fn an_unversioned_reference_means_the_servers_release_when_it_is_installed() {
+        let resources = encounter_status();
+
+        // With no release the highest version answers, as it did before.
+        let latest = MemoryTerminology::from_resources(&resources);
+        assert!(admits(&latest, STATUS_SET, "completed"));
+        assert!(!admits(&latest, STATUS_SET, "arrived"));
+
+        // An R4 server reads R4's codes: `arrived` and `finished` are in, R5's `completed` is not.
+        let r4 = flat_for(&resources, Some("4.0.1"));
+        assert!(admits(&r4, STATUS_SET, "arrived"));
+        assert!(admits(&r4, STATUS_SET, "finished"));
+        assert!(!admits(&r4, STATUS_SET, "completed"));
+        // Neither does load order matter.
+        let mut reversed = resources.clone();
+        reversed.reverse();
+        let r4 = flat_for(&reversed, Some("4.0.1"));
+        assert!(admits(&r4, STATUS_SET, "arrived") && !admits(&r4, STATUS_SET, "completed"));
+
+        // The same reading applies to lookups that name no version.
+        assert!(r4.lookup(STATUS, None, "arrived").is_some());
+        assert!(r4.lookup(STATUS, None, "completed").is_none());
+        // A version that is named still gets exactly that one, by either spelling.
+        assert!(r4.lookup(STATUS, Some("5.0.0"), "completed").is_some());
+        assert!(r4
+            .lookup(&format!("{STATUS}|5.0.0"), None, "completed")
+            .is_some());
+        let mut pinned = resources.clone();
+        pinned.push(value_set(
+            "http://example.org/r5-status",
+            json!({"include": [{"system": STATUS, "version": "5.0.0"}]}),
+        ));
+        let pinned = flat_for(&pinned, Some("4.0.1"));
+        assert!(admits(&pinned, "http://example.org/r5-status", "completed"));
+        assert!(!admits(&pinned, "http://example.org/r5-status", "arrived"));
+    }
+
+    #[test]
+    fn a_release_that_is_not_installed_falls_back_to_the_latest_version() {
+        let terms = flat_for(&encounter_status(), Some("4.3.0"));
+        assert!(admits(&terms, STATUS_SET, "completed"));
+        assert!(!admits(&terms, STATUS_SET, "arrived"));
+        // An empty release is no release.
+        let terms = flat_for(&encounter_status(), Some(""));
+        assert!(admits(&terms, STATUS_SET, "completed"));
+    }
+
+    #[test]
+    fn the_release_holds_for_stored_expansions_rebuilds_and_incremental_changes() {
+        let resources = encounter_status();
+
+        // What install stores: each package expands on its own, so `4.0.1` meets only R4's
+        // package. Loading it back for an R4 server reads the same.
+        let r4_package = [resources[0].clone(), resources[2].clone()];
+        let r5_copy = [resources[1].clone()];
+        let mut stored = MemoryTerminology::expansion_documents(&r4_package);
+        stored.extend(MemoryTerminology::expansion_documents(&r5_copy));
+        let booted = {
+            let tagged: Vec<(super::Scope, &serde_json::Value)> =
+                resources.iter().map(|resource| (0, resource)).collect();
+            let stored: Vec<(super::Scope, &serde_json::Value)> =
+                stored.iter().map(|document| (0, document)).collect();
+            MemoryTerminology::from_stored_scoped(&tagged, &stored, Some("4.0.1"))
+        };
+        assert!(admits(&booted, STATUS_SET, "arrived"));
+
+        // What a rebuild over every package makes of it agrees with that.
+        let documents = flat_documents(&resources, Some("4.0.1"));
+        let document = documents
+            .iter()
+            .find(|document| document["url"] == STATUS_SET)
+            .expect("the value set expands");
+        let codes: Vec<&str> = document["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item["code"].as_str())
+            .collect();
+        assert_eq!(codes, ["arrived", "finished", "in-progress", "planned"]);
+        // The expansion says which version it read.
+        assert_eq!(
+            document["systems"],
+            json!([{"url": STATUS, "version": "4.0.1"}])
+        );
+
+        // And a value set written afterwards resolves the same way, through `apply`.
+        let mut live = booted;
+        live.apply(
+            &super::TerminologyChange {
+                upserted: vec![value_set(
+                    "http://example.org/ops-status",
+                    json!({"include": [{"system": STATUS}]}),
+                )],
+                removed: Vec::new(),
+            },
+            &[],
+        );
+        assert!(admits(&live, "http://example.org/ops-status", "arrived"));
+        assert!(!admits(&live, "http://example.org/ops-status", "completed"));
+        // The release can also be set on terminology that was built without it.
+        let mut late = MemoryTerminology::from_resources(&resources);
+        late.set_release(Some("4.0.1"));
+        assert!(late.lookup(STATUS, None, "arrived").is_some());
+    }
+
+    const SYS: &str = "http://example.org/s";
+    const SET: &str = "http://example.org/vs";
+
+    /// `resources` as one package's: each tagged with the package's scope.
+    fn package(
+        scope: super::Scope,
+        resources: Vec<serde_json::Value>,
+    ) -> Vec<(super::Scope, serde_json::Value)> {
+        resources
+            .into_iter()
+            .map(|resource| (scope, resource))
+            .collect()
+    }
+
+    fn together(
+        packages: &[&[(super::Scope, serde_json::Value)]],
+    ) -> Vec<(super::Scope, serde_json::Value)> {
+        packages
+            .iter()
+            .flat_map(|package| package.iter().cloned())
+            .collect()
+    }
+
+    fn scoped(all: &[(super::Scope, serde_json::Value)]) -> MemoryTerminology {
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        MemoryTerminology::from_resources_scoped(&tagged, None)
+    }
+
+    fn has(terms: &MemoryTerminology, value_set: &str, system: &str, code: &str) -> bool {
+        terms.contains(value_set, Some(system), code) == TermAnswer::Yes
+    }
+
+    #[test]
+    fn a_value_set_reads_the_code_systems_of_its_own_package_first() {
+        // One package carries version 1 of a system and a value set that includes it; another
+        // carries version 2, which is newer.
+        let own = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a", "b"]),
+                value_set(SET, json!({"include": [{"system": SYS}]})),
+            ],
+        );
+        let newer = package(2, vec![versioned_system(SYS, "2", &["c"])]);
+        // The value set means its own package's version, whichever was installed first.
+        for all in [together(&[&own, &newer]), together(&[&newer, &own])] {
+            let terms = scoped(&all);
+            assert!(has(&terms, SET, SYS, "a") && has(&terms, SET, SYS, "b"));
+            assert!(!has(&terms, SET, SYS, "c"));
+        }
+        // The expansion says which version it read.
+        let all = together(&[&own, &newer]);
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        let documents = MemoryTerminology::expansion_documents_scoped(&tagged, None);
+        let document = documents.iter().find(|d| d["url"] == SET).unwrap();
+        assert_eq!(document["systems"], json!([{"url": SYS, "version": "1"}]));
+        // Terminology that is not told where its resources came from has one pool, and its value
+        // sets read the latest version, as they always did.
+        let flat: Vec<serde_json::Value> = all.iter().map(|(_, r)| r.clone()).collect();
+        let flat = MemoryTerminology::from_resources(&flat);
+        assert!(has(&flat, SET, SYS, "c") && !has(&flat, SET, SYS, "a"));
+    }
+
+    #[test]
+    fn a_system_the_package_does_not_hold_is_read_from_the_others() {
+        let other = "http://example.org/t";
+        let waiting = package(
+            1,
+            vec![value_set(SET, json!({"include": [{"system": other}]}))],
+        );
+        // Nothing holds it yet: the value set cannot be expanded.
+        let terms = scoped(&waiting);
+        assert_eq!(terms.contains(SET, None, "x"), TermAnswer::Unknown);
+        // Another package brings it, in two versions: the latest answers, and the release's
+        // when the server has one.
+        let held = package(
+            2,
+            vec![
+                versioned_system(other, "1", &["x"]),
+                versioned_system(other, "2", &["y"]),
+            ],
+        );
+        let terms = scoped(&together(&[&waiting, &held]));
+        assert!(has(&terms, SET, other, "y") && !has(&terms, SET, other, "x"));
+        let all = together(&[&waiting, &held]);
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        let terms = MemoryTerminology::from_resources_scoped(&tagged, Some("1"));
+        assert!(has(&terms, SET, other, "x") && !has(&terms, SET, other, "y"));
+    }
+
+    #[test]
+    fn packages_that_hold_one_version_with_different_content_each_keep_their_own() {
+        let one = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a", "b"]),
+                value_set(SET, json!({"include": [{"system": SYS}]})),
+            ],
+        );
+        let two = package(
+            2,
+            vec![
+                versioned_system(SYS, "1", &["c"]),
+                value_set(
+                    "http://example.org/vs2",
+                    json!({"include": [{"system": SYS}]}),
+                ),
+            ],
+        );
+        // A third package holds the same content as the first, and shares its copy.
+        let copy = package(3, vec![versioned_system(SYS, "1", &["a", "b"])]);
+        let terms = scoped(&together(&[&one, &two, &copy]));
+        assert!(has(&terms, SET, SYS, "a") && !has(&terms, SET, SYS, "c"));
+        assert!(has(&terms, "http://example.org/vs2", SYS, "c"));
+        assert!(!has(&terms, "http://example.org/vs2", SYS, "a"));
+    }
+
+    #[test]
+    fn an_included_value_set_is_the_requesting_packages_own_definition() {
+        let inner = "http://example.org/inner";
+        let with = |scope, code: &str| {
+            package(
+                scope,
+                vec![
+                    versioned_system(SYS, "1", &[code]),
+                    value_set(inner, json!({"include": [{"system": SYS}]})),
+                ],
+            )
+        };
+        let first = with(1, "a");
+        let second = with(2, "b");
+        // `outer` is in the first package and includes `inner`, which both packages define
+        // (differently). The second is loaded last, so it is the one a plain reference means.
+        let outer = package(
+            1,
+            vec![value_set(SET, json!({"include": [{"valueSet": [inner]}]}))],
+        );
+        let terms = scoped(&together(&[&first, &outer, &second]));
+        assert!(has(&terms, SET, SYS, "a") && !has(&terms, SET, SYS, "b"));
+        assert!(has(&terms, inner, SYS, "b") && !has(&terms, inner, SYS, "a"));
+    }
+
+    #[test]
+    fn an_incremental_change_reads_value_sets_as_a_rebuild_does() {
+        // Two packages: one holds version 1 of a system and a value set that includes it, the
+        // other a value set that includes it and holds none.
+        let holder = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a", "b"]),
+                value_set(SET, json!({"include": [{"system": SYS}]})),
+            ],
+        );
+        let bare_set = "http://example.org/bare";
+        let bare = package(
+            4,
+            vec![value_set(bare_set, json!({"include": [{"system": SYS}]}))],
+        );
+        let base = together(&[&holder, &bare]);
+        let mut live = scoped(&base);
+        assert!(has(&live, bare_set, SYS, "a"));
+
+        // Version 3 of the system is written to the local package.
+        let newest = versioned_system(SYS, "3", &["d"]);
+        let local_set = "http://example.org/local";
+        let local = value_set(local_set, json!({"include": [{"system": SYS}]}));
+        let sets = [holder[1].1.clone(), bare[0].1.clone()];
+        live.apply_scoped(
+            &super::TerminologyChange {
+                upserted: vec![newest.clone(), local.clone()],
+                removed: Vec::new(),
+            },
+            3,
+            &[(1, &sets[0]), (4, &sets[1])],
+        );
+        let rebuilt = scoped(&together(&[
+            &holder,
+            &bare,
+            &package(3, vec![newest, local]),
+        ]));
+        for (set, code, expected) in [
+            (SET, "a", true), // its own package's version, still
+            (SET, "d", false),
+            (bare_set, "d", true), // holds none: the latest, which is now version 3
+            (bare_set, "a", false),
+            (local_set, "d", true),
+        ] {
+            assert_eq!(
+                has(&live, set, SYS, code),
+                expected,
+                "{set} {code}, incremental"
+            );
+            assert_eq!(
+                has(&rebuilt, set, SYS, code),
+                expected,
+                "{set} {code}, rebuilt"
+            );
+        }
+        // What the local package wrote goes again, and the other packages keep their copies.
+        live.apply_scoped(
+            &super::TerminologyChange {
+                upserted: Vec::new(),
+                removed: vec![("CodeSystem".into(), format!("{SYS}|3"))],
+            },
+            3,
+            &[(1, &sets[0]), (4, &sets[1])],
+        );
+        assert!(has(&live, SET, SYS, "a"));
+        assert!(has(&live, bare_set, SYS, "a") && !has(&live, bare_set, SYS, "d"));
+    }
+
+    const R4_SYSTEM: &str = "http://terminology.hl7.org/CodeSystem/x";
+    const R5_SYSTEM: &str = "http://hl7.org/fhir/x";
+
+    fn versioned_set(url: &str, version: &str, system: &str) -> serde_json::Value {
+        json!({"resourceType": "ValueSet", "url": url, "version": version,
+               "compose": {"include": [{"system": system}]}})
+    }
+
+    /// Resources that are not told where they came from, read for `release`.
+    fn flat_for(resources: &[serde_json::Value], release: Option<&str>) -> MemoryTerminology {
+        let tagged: Vec<(super::Scope, &serde_json::Value)> =
+            resources.iter().map(|resource| (0, resource)).collect();
+        MemoryTerminology::from_resources_scoped(&tagged, release)
+    }
+
+    fn flat_documents(
+        resources: &[serde_json::Value],
+        release: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let tagged: Vec<(super::Scope, &serde_json::Value)> =
+            resources.iter().map(|resource| (0, resource)).collect();
+        MemoryTerminology::expansion_documents_scoped(&tagged, release)
+    }
+
+    fn scoped_for(
+        all: &[(super::Scope, serde_json::Value)],
+        release: Option<&str>,
+    ) -> MemoryTerminology {
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        MemoryTerminology::from_resources_scoped(&tagged, release)
+    }
+
+    /// The R4 package and a package that carries an R5-style copy of the same value set: another
+    /// version, over another code system URL (as `hl7.fhir.uv.extensions.r4` does).
+    fn r4_and_its_r5_style_copy() -> (
+        Vec<(super::Scope, serde_json::Value)>,
+        Vec<(super::Scope, serde_json::Value)>,
+    ) {
+        (
+            package(
+                1,
+                vec![
+                    versioned_system(R4_SYSTEM, "4.0.1", &["a", "b"]),
+                    versioned_set(SET, "4.0.1", R4_SYSTEM),
+                ],
+            ),
+            package(
+                2,
+                vec![
+                    versioned_system(R5_SYSTEM, "5.3.0-ballot-tc1", &["a", "b", "c"]),
+                    versioned_set(SET, "5.3.0-ballot-tc1", R5_SYSTEM),
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn the_definition_at_the_release_is_the_one_in_use() {
+        let (r4, copy) = r4_and_its_r5_style_copy();
+        // Whichever package was installed last, an R4 server means R4's value set: its code
+        // system URL, not the copy's.
+        for all in [together(&[&r4, &copy]), together(&[&copy, &r4])] {
+            let terms = scoped_for(&all, Some("4.0.1"));
+            assert!(has(&terms, SET, R4_SYSTEM, "a") && has(&terms, SET, R4_SYSTEM, "b"));
+            assert!(!has(&terms, SET, R5_SYSTEM, "c"));
+        }
+        // With no release to go by, the definition loaded last is in use, as it always was.
+        let terms = scoped_for(&together(&[&r4, &copy]), None);
+        assert!(has(&terms, SET, R5_SYSTEM, "c") && !has(&terms, SET, R4_SYSTEM, "a"));
+        // The same when the release matches none of them.
+        let terms = scoped_for(&together(&[&r4, &copy]), Some("4.3.0"));
+        assert!(has(&terms, SET, R5_SYSTEM, "c"));
+
+        // Of the definitions at the release, the one loaded last is in use.
+        let again = package(
+            3,
+            vec![
+                versioned_system(R4_SYSTEM, "4.0.1", &["a", "b", "z"]),
+                versioned_set(SET, "4.0.1", R4_SYSTEM),
+            ],
+        );
+        let terms = scoped_for(&together(&[&r4, &again, &copy]), Some("4.0.1"));
+        assert!(has(&terms, SET, R4_SYSTEM, "z"));
+
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = vec![(1, &r4[1].1), (2, &copy[1].1)];
+        assert_eq!(super::winning_scope(&tagged, Some("4.0.1")), Some(1));
+        assert_eq!(super::winning_scope(&tagged, None), Some(2));
+        assert_eq!(super::winning_scope(&[], Some("4.0.1")), None);
+    }
+
+    #[test]
+    fn versions_that_do_not_name_the_release_are_not_compared() {
+        // Core's `2018-08-12` and terminology's `1.0.0` do not order against each other (a text
+        // comparison puts the date first), and `1.0.0` is the later publication. Neither names
+        // the release, so what was installed last is in use, which is right here.
+        let older = package(
+            1,
+            vec![
+                versioned_system(R4_SYSTEM, "2018-08-12", &["old"]),
+                versioned_set(SET, "2018-08-12", R4_SYSTEM),
+            ],
+        );
+        let newer = package(
+            2,
+            vec![
+                versioned_system(R5_SYSTEM, "1.0.0", &["new"]),
+                versioned_set(SET, "1.0.0", R5_SYSTEM),
+            ],
+        );
+        let terms = scoped_for(&together(&[&older, &newer]), Some("4.0.1"));
+        assert!(has(&terms, SET, R5_SYSTEM, "new") && !has(&terms, SET, R4_SYSTEM, "old"));
+        let terms = scoped_for(&together(&[&newer, &older]), Some("4.0.1"));
+        assert!(has(&terms, SET, R4_SYSTEM, "old"));
+    }
+
+    #[test]
+    fn a_start_loads_the_expansion_of_the_definition_in_use() {
+        let (r4, copy) = r4_and_its_r5_style_copy();
+        let all = together(&[&r4, &copy]);
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        // What installing each package stored: each expanded on its own, the copy's last.
+        let r4_resources: Vec<serde_json::Value> = r4.iter().map(|(_, r)| r.clone()).collect();
+        let copy_resources: Vec<serde_json::Value> = copy.iter().map(|(_, r)| r.clone()).collect();
+        let r4_docs = MemoryTerminology::expansion_documents(&r4_resources);
+        let copy_docs = MemoryTerminology::expansion_documents(&copy_resources);
+        let stored: Vec<(super::Scope, &serde_json::Value)> = r4_docs
+            .iter()
+            .map(|d| (1, d))
+            .chain(copy_docs.iter().map(|d| (2, d)))
+            .collect();
+        let terms = MemoryTerminology::from_stored_scoped(&tagged, &stored, Some("4.0.1"));
+        assert!(has(&terms, SET, R4_SYSTEM, "a") && !has(&terms, SET, R5_SYSTEM, "c"));
+        // With no release it is the package installed last, as before.
+        let terms = MemoryTerminology::from_stored_scoped(&tagged, &stored, None);
+        assert!(has(&terms, SET, R5_SYSTEM, "c") && !has(&terms, SET, R4_SYSTEM, "a"));
+
+        // When the definition in use has no stored expansion, the next one that has one answers.
+        let only_copy: Vec<(super::Scope, &serde_json::Value)> =
+            copy_docs.iter().map(|d| (2, d)).collect();
+        let terms = MemoryTerminology::from_stored_scoped(&tagged, &only_copy, Some("4.0.1"));
+        assert!(has(&terms, SET, R5_SYSTEM, "c"));
+        // And an expansion stored for no package at all still answers.
+        let unowned: Vec<(super::Scope, &serde_json::Value)> =
+            r4_docs.iter().map(|d| (9, d)).collect();
+        let terms = MemoryTerminology::from_stored_scoped(&tagged, &unowned, Some("4.0.1"));
+        assert!(has(&terms, SET, R4_SYSTEM, "a"));
+    }
+
+    #[test]
+    fn an_incremental_change_uses_the_definition_a_rebuild_uses() {
+        let (r4, copy) = r4_and_its_r5_style_copy();
+        let all = together(&[&r4, &copy]);
+        let rebuilt = scoped_for(&all, Some("4.0.1"));
+        let sets = [r4[1].1.clone(), copy[1].1.clone()];
+        let nothing = super::TerminologyChange {
+            upserted: Vec::new(),
+            removed: Vec::new(),
+        };
+        // The value set is read again from the stored rows of every package that defines it, in
+        // either order.
+        for dependents in [
+            [(1, &sets[0]), (2, &sets[1])],
+            [(2, &sets[1]), (1, &sets[0])],
+        ] {
+            let mut live = scoped_for(&all, Some("4.0.1"));
+            live.apply_scoped(&nothing, 3, &dependents);
+            for (system, code, expected) in [
+                (R4_SYSTEM, "a", true),
+                (R5_SYSTEM, "c", false),
+                (R5_SYSTEM, "a", false),
+            ] {
+                assert_eq!(has(&live, SET, system, code), expected, "{system} {code}");
+                assert_eq!(has(&rebuilt, SET, system, code), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_definition_that_cannot_expand_leaves_the_answer_to_the_next_one() {
+        // An older package's value set expands. A newer package's, which is the one in use,
+        // includes a code system nothing carries (terminology's `v2-0227` includes
+        // `hl7.org/fhir/sid/mvx`), so it cannot.
+        let older = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a", "b"]),
+                versioned_set(SET, "1", SYS),
+            ],
+        );
+        let missing = "http://example.org/not-installed";
+        let newer = package(2, vec![versioned_set(SET, "2", missing)]);
+        let all = together(&[&older, &newer]);
+
+        // A rebuild answers with the older definition's expansion, as a start does.
+        let rebuilt = scoped_for(&all, None);
+        assert!(has(&rebuilt, SET, SYS, "a") && has(&rebuilt, SET, SYS, "b"));
+        assert!(rebuilt.why_not_expanded(SET).is_none());
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        let older_resources: Vec<serde_json::Value> =
+            older.iter().map(|(_, r)| r.clone()).collect();
+        let stored = MemoryTerminology::expansion_documents(&older_resources);
+        let stored: Vec<(super::Scope, &serde_json::Value)> =
+            stored.iter().map(|d| (1, d)).collect();
+        let started = MemoryTerminology::from_stored_scoped(&tagged, &stored, None);
+        assert!(has(&started, SET, SYS, "a") && started.why_not_expanded(SET).is_none());
+
+        // And so does a change that reads it again.
+        let sets = [older[1].1.clone(), newer[0].1.clone()];
+        let nothing = super::TerminologyChange {
+            upserted: Vec::new(),
+            removed: Vec::new(),
+        };
+        let mut live = scoped_for(&all, None);
+        live.apply_scoped(&nothing, 3, &[(1, &sets[0]), (2, &sets[1])]);
+        assert!(has(&live, SET, SYS, "a") && live.why_not_expanded(SET).is_none());
+
+        // When no definition can expand, the one in use is the one that is explained.
+        let alone = scoped_for(&package(2, vec![versioned_set(SET, "2", missing)]), None);
+        let reasons = alone.why_not_expanded(SET).unwrap();
+        assert!(messages(&reasons)[0].contains(missing), "{reasons:?}");
+    }
+
+    #[test]
+    fn every_definition_at_the_release_is_tried_before_one_that_is_not() {
+        // The release's value set is in two packages. The first holds its code system. The second
+        // (an examples package) is only a copy of the value set, so it cannot be expanded alone.
+        // A third carries an R5-style copy that can. When the one in use cannot be expanded, the
+        // one at the release that can must answer, not the R5-style copy.
+        let core = package(
+            1,
+            vec![
+                versioned_system(R4_SYSTEM, "4.0.1", &["a", "b"]),
+                versioned_set(SET, "4.0.1", R4_SYSTEM),
+            ],
+        );
+        let examples = package(2, vec![versioned_set(SET, "4.0.1", R4_SYSTEM)]);
+        let ext = package(
+            3,
+            vec![
+                versioned_system(R5_SYSTEM, "5.3.0-ballot-tc1", &["a", "b", "c"]),
+                versioned_set(SET, "5.3.0-ballot-tc1", R5_SYSTEM),
+            ],
+        );
+        let terms = scoped_for(&together(&[&core, &examples, &ext]), Some("4.0.1"));
+        assert!(has(&terms, SET, R4_SYSTEM, "a") && !has(&terms, SET, R5_SYSTEM, "c"));
+    }
+
+    #[test]
+    fn a_definition_is_tried_alone_before_the_rest_of_the_store_is_read() {
+        // An older package holds a code system and a value set over all of it. A newer package's
+        // value set filters it down to one code, and the system is not its own: installing it alone
+        // could not expand it, so a start serves the older package's expansion. A rebuild must
+        // agree, not expand the newer definition through the older package's code system.
+        let older = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a", "b"]),
+                versioned_set(SET, "1", SYS),
+            ],
+        );
+        let newer = package(
+            2,
+            vec![
+                json!({"resourceType": "ValueSet", "url": SET, "version": "2",
+                        "compose": {"include": [{"system": SYS, "filter": [
+                            {"property": "concept", "op": "is-a", "value": "a"}]}]}}),
+            ],
+        );
+        let all = together(&[&older, &newer]);
+        let rebuilt = scoped_for(&all, None);
+        assert!(has(&rebuilt, SET, SYS, "a") && has(&rebuilt, SET, SYS, "b"));
+        // What a start has to go on is what installing the older package stored.
+        let older_resources: Vec<serde_json::Value> =
+            older.iter().map(|(_, r)| r.clone()).collect();
+        let stored = MemoryTerminology::expansion_documents(&older_resources);
+        let stored: Vec<(super::Scope, &serde_json::Value)> =
+            stored.iter().map(|d| (1, d)).collect();
+        let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+            .iter()
+            .map(|(scope, resource)| (*scope, resource))
+            .collect();
+        let started = MemoryTerminology::from_stored_scoped(&tagged, &stored, None);
+        assert!(has(&started, SET, SYS, "b"));
+        // With no older definition that expands, the rest of the store is read: it is how a
+        // value set that waits on another package's code system gets its expansion.
+        let alone = scoped_for(
+            &together(&[
+                &newer,
+                &package(3, vec![versioned_system(SYS, "1", &["a", "b"])]),
+            ]),
+            None,
+        );
+        assert!(has(&alone, SET, SYS, "a") && !has(&alone, SET, SYS, "b"));
+    }
+
+    #[test]
+    fn a_code_is_described_from_the_content_its_expansion_was_made_from() {
+        // Two packages hold one version of a system with different content, and each has a value
+        // set that includes it.
+        let named = |scope, display: &str, set: &str| {
+            package(
+                scope,
+                vec![
+                    json!({"resourceType": "CodeSystem", "url": SYS, "version": "1",
+                           "content": "complete", "concept": [{"code": "a", "display": display}]}),
+                    versioned_set(set, "1", SYS),
+                ],
+            )
+        };
+        let one = named(1, "One", "http://example.org/vs1");
+        let two = named(2, "Two", "http://example.org/vs2");
+        let terms = scoped_for(&together(&[&one, &two]), None);
+        let display = |set: &str| {
+            terms
+                .describe_bound(set, Some(SYS), "a")
+                .and_then(|described| described.display)
+        };
+        assert_eq!(display("http://example.org/vs1").as_deref(), Some("One"));
+        assert_eq!(display("http://example.org/vs2").as_deref(), Some("Two"));
+    }
+
+    #[test]
+    fn a_change_to_what_any_definition_includes_makes_the_value_set_a_dependent() {
+        // The definition in use includes one system, an older one another. Whichever answers, a
+        // change to either can alter the answer.
+        let other = "http://example.org/other";
+        let older = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a"]),
+                versioned_set(SET, "1", SYS),
+            ],
+        );
+        let newer = package(2, vec![versioned_set(SET, "2", other)]);
+        let terms = scoped_for(&together(&[&older, &newer]), None);
+        assert_eq!(terms.dependents_of(&[SYS.to_string()]), [SET.to_string()]);
+        assert_eq!(terms.dependents_of(&[other.to_string()]), [SET.to_string()]);
+    }
+
+    #[test]
+    fn the_winner_rule_counts_a_package_by_its_last_definition() {
+        // Package 1 holds two definitions of the URL (a version and a later one); only the last
+        // is what the index keeps, so only it can be at the release.
+        let at = versioned_set(SET, "4.0.1", SYS);
+        let later = versioned_set(SET, "5.0.0", SYS);
+        let other = versioned_set(SET, "5.3.0", SYS);
+        let held: Vec<(super::Scope, &serde_json::Value)> =
+            vec![(1, &at), (1, &later), (2, &other)];
+        assert_eq!(super::winning_scope(&held, Some("4.0.1")), Some(2));
+        // The same grouped by URL, ignoring what is not a value set.
+        let system = versioned_system(SYS, "4.0.1", &["a"]);
+        let all: Vec<(super::Scope, &serde_json::Value)> =
+            vec![(1, &at), (1, &later), (2, &other), (3, &system)];
+        let winners = super::winning_scopes(&all, Some("4.0.1"));
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners.get(SET), Some(&2));
+    }
+
+    #[test]
+    fn stored_expansions_say_which_rules_they_were_made_under() {
+        let resources = vec![
+            versioned_system(SYS, "1", &["a"]),
+            versioned_set(SET, "1", SYS),
+        ];
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        assert!(!documents.is_empty());
+        assert!(documents.iter().all(super::expansion_is_current));
+        let mut old = documents[0].clone();
+        old.as_object_mut().unwrap().remove("rules");
+        assert!(!super::expansion_is_current(&old));
+        old["rules"] = json!(1);
+        assert!(!super::expansion_is_current(&old));
     }
 
     #[test]

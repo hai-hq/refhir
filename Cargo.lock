@@ -1542,6 +1542,7 @@ dependencies = [
  "refhir-server",
  "refhir-sqlite",
  "refhir-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
@@ -1619,6 +1620,7 @@ version = "0.1.0"
 dependencies = [
  "refhir-types",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]

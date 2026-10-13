@@ -1,7 +1,8 @@
 //! SQLite document log, index log, and persistence globals.
 //!
 //! Convex: `crates/sqlite/src/lib.rs` (`DOCUMENTS_INIT`, `INDEXES_INIT`,
-//! `PERSISTENCE_GLOBALS_INIT`, `write`, `index_scan`).
+//! `PERSISTENCE_GLOBALS_INIT`, `write`, `index_scan`). Here the schema is the versioned
+//! migrations in `migrations/` (see `docs/migrations.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,103 +20,9 @@ use rusqlite::{
 use serde_json::Value as JsonValue;
 
 mod lease;
+mod migrate;
 
-/// Convex `DOCUMENTS_INIT`.
-const DOCUMENTS_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS documents (
-    id BLOB NOT NULL,
-    ts INTEGER NOT NULL,
-    table_id BLOB NOT NULL,
-    json_value TEXT NULL,
-    deleted INTEGER NOT NULL,
-    prev_ts INTEGER,
-    PRIMARY KEY (ts, table_id, id)
-);
-CREATE INDEX IF NOT EXISTS documents_by_table_and_id ON documents (table_id, id, ts);
-"#;
-
-/// Convex `INDEXES_INIT`.
-const INDEXES_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS indexes (
-    index_id BLOB NOT NULL,
-    ts INTEGER NOT NULL,
-    key BLOB NOT NULL,
-    deleted INTEGER NOT NULL,
-    table_id BLOB NULL,
-    document_id BLOB NULL,
-    PRIMARY KEY (index_id, key, ts)
-);
--- A reader in another process learns what a commit wrote by scanning index rows by ts.
-CREATE INDEX IF NOT EXISTS indexes_by_ts ON indexes (ts);
-"#;
-
-/// Convex `PERSISTENCE_GLOBALS_INIT`.
-const PERSISTENCE_GLOBALS_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS persistence_globals (
-    key TEXT NOT NULL,
-    json_value TEXT NOT NULL,
-    PRIMARY KEY (key)
-);
-"#;
-
-const CONFORMANCE_INIT: &str = r#"
-CREATE TABLE IF NOT EXISTS packages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    version TEXT NOT NULL,
-    fhir_version TEXT NOT NULL,
-    UNIQUE (name, version)
-);
-CREATE TABLE IF NOT EXISTS structure_definitions (
-    package_id INTEGER NOT NULL,
-    url TEXT NOT NULL,
-    type_name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    is_abstract INTEGER NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url)
-);
-CREATE TABLE IF NOT EXISTS search_parameters (
-    package_id INTEGER NOT NULL,
-    url TEXT NOT NULL,
-    base TEXT NOT NULL,
-    code TEXT NOT NULL,
-    param_type TEXT NOT NULL,
-    expression TEXT,
-    status TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url, base)
-);
--- Installing a parameter looks up the rows that share its base and code.
-CREATE INDEX IF NOT EXISTS search_parameters_by_base_code ON search_parameters (base, code);
-CREATE TABLE IF NOT EXISTS index_backfills (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    package_id INTEGER NOT NULL,
-    watermark_ts INTEGER NOT NULL,
-    tablet TEXT NOT NULL,
-    cursor_id TEXT,
-    done INTEGER NOT NULL,
-    claimed_epoch INTEGER
-);
-CREATE TABLE IF NOT EXISTS terminology (
-    package_id INTEGER NOT NULL,
-    resource_type TEXT NOT NULL,
-    url TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url)
-);
-CREATE TABLE IF NOT EXISTS value_set_expansion (
-    package_id INTEGER NOT NULL,
-    url TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url)
-);
-CREATE TABLE IF NOT EXISTS backfill_parameter (
-    backfill_id INTEGER NOT NULL,
-    url TEXT NOT NULL,
-    PRIMARY KEY (backfill_id, url)
-);
-"#;
+pub use migrate::migration_report;
 
 const INSERT_DOCUMENT: &str = "INSERT INTO documents (id, ts, table_id, json_value, deleted, \
      prev_ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
@@ -185,32 +92,12 @@ impl SqlitePersistence {
         Self::from_connection(connection)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self, PersistError> {
+    fn from_connection(mut connection: Connection) -> Result<Self, PersistError> {
         connection
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
             .or_else(|_| connection.execute_batch("PRAGMA busy_timeout=5000;"))
             .map_err(definite)?;
-        connection
-            .execute_batch(DOCUMENTS_INIT)
-            .and_then(|_| connection.execute_batch(INDEXES_INIT))
-            .and_then(|_| connection.execute_batch(PERSISTENCE_GLOBALS_INIT))
-            .and_then(|_| connection.execute_batch(CONFORMANCE_INIT))
-            .and_then(|_| connection.execute_batch(auth_store::AUTH_INIT))
-            .and_then(|_| connection.execute_batch(job_store::JOBS_INIT))
-            .and_then(|_| job_store::migrate(&connection))
-            .map_err(definite)?;
-        // Databases made before a writer epoch was recorded on each backfill.
-        let has_claim: bool = connection
-            .prepare(
-                "SELECT 1 FROM pragma_table_info('index_backfills') WHERE name = 'claimed_epoch'",
-            )
-            .and_then(|mut stmt| stmt.exists([]))
-            .map_err(definite)?;
-        if !has_claim {
-            connection
-                .execute_batch("ALTER TABLE index_backfills ADD COLUMN claimed_epoch INTEGER")
-                .map_err(definite)?;
-        }
+        migrate::run(&mut connection, migrate::MIGRATIONS)?;
         Ok(Self {
             inner: Arc::new(Pool::new(
                 1,

@@ -34,9 +34,10 @@ pub use npm::{
     NpmRegistry, PackageFetcher, PackageSpec,
 };
 pub use package::{
-    default_r4_registry_specs, expression_clash_dir, extra_dir, install_package_dir, minir4_dir,
-    r4_dir, reload_catalog, run_backfills, sdc_dir, stage_package_dir, version_clash_dir,
-    watch_catalog, CatalogWatcher, R4_CORE_PACKAGE, SDC_PACKAGE,
+    cross_version_dir, default_r4_registry_specs, expression_clash_dir, extension_copies_dir,
+    extra_dir, install_package_dir, minir4_dir, newer_terminology_dir, r4_dir, reload_catalog,
+    run_backfills, sdc_dir, stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher,
+    R4_CORE_PACKAGE, SDC_PACKAGE,
 };
 pub use refhir_persistence::ConformanceStore;
 pub use run::{

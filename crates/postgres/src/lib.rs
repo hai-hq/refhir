@@ -1,7 +1,8 @@
 //! Postgres `Persistence` implementation.
 //!
 //! Convex: `crates/postgres` implements the same `Persistence` trait as SQLite.
-//! Tables match `DOCUMENTS_INIT` / `INDEXES_INIT` / `PERSISTENCE_GLOBALS_INIT`.
+//! Tables match `DOCUMENTS_INIT` / `INDEXES_INIT` / `PERSISTENCE_GLOBALS_INIT`; the schema is
+//! the versioned migrations in `migrations/` (see `docs/migrations.md`).
 //! SQLite stays the default for local runs.
 
 use std::sync::Arc;
@@ -18,96 +19,11 @@ use refhir_persistence::{
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 
 mod lease;
+mod migrate;
 mod tls;
+
+pub use migrate::migration_report;
 use serde_json::Value as JsonValue;
-
-const SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS documents (
-    id BYTEA NOT NULL,
-    ts BIGINT NOT NULL,
-    table_id BYTEA NOT NULL,
-    json_value TEXT NULL,
-    deleted INTEGER NOT NULL,
-    prev_ts BIGINT,
-    PRIMARY KEY (ts, table_id, id)
-);
-CREATE INDEX IF NOT EXISTS documents_by_table_and_id ON documents (table_id, id, ts);
-
-CREATE TABLE IF NOT EXISTS indexes (
-    index_id BYTEA NOT NULL,
-    ts BIGINT NOT NULL,
-    key BYTEA NOT NULL,
-    deleted INTEGER NOT NULL,
-    table_id BYTEA NULL,
-    document_id BYTEA NULL,
-    PRIMARY KEY (index_id, key, ts)
-);
-
-CREATE TABLE IF NOT EXISTS persistence_globals (
-    key TEXT NOT NULL,
-    json_value TEXT NOT NULL,
-    PRIMARY KEY (key)
-);
-
-CREATE TABLE IF NOT EXISTS packages (
-    id BIGSERIAL PRIMARY KEY,
-    name TEXT NOT NULL,
-    version TEXT NOT NULL,
-    fhir_version TEXT NOT NULL,
-    UNIQUE (name, version)
-);
-CREATE TABLE IF NOT EXISTS structure_definitions (
-    package_id BIGINT NOT NULL,
-    url TEXT NOT NULL,
-    type_name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    is_abstract INTEGER NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url)
-);
-CREATE TABLE IF NOT EXISTS search_parameters (
-    package_id BIGINT NOT NULL,
-    url TEXT NOT NULL,
-    base TEXT NOT NULL,
-    code TEXT NOT NULL,
-    param_type TEXT NOT NULL,
-    expression TEXT,
-    status TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url, base)
-);
--- Installing a parameter looks up the rows that share its base and code.
-CREATE INDEX IF NOT EXISTS search_parameters_by_base_code ON search_parameters (base, code);
-CREATE TABLE IF NOT EXISTS index_backfills (
-    id BIGSERIAL PRIMARY KEY,
-    package_id BIGINT NOT NULL,
-    watermark_ts BIGINT NOT NULL,
-    tablet TEXT NOT NULL,
-    cursor_id TEXT,
-    done INTEGER NOT NULL,
-    claimed_epoch BIGINT
-);
--- Databases created before backfills were claimed by a writer epoch.
-ALTER TABLE index_backfills ADD COLUMN IF NOT EXISTS claimed_epoch BIGINT;
-CREATE TABLE IF NOT EXISTS terminology (
-    package_id BIGINT NOT NULL,
-    resource_type TEXT NOT NULL,
-    url TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url)
-);
-CREATE TABLE IF NOT EXISTS value_set_expansion (
-    package_id BIGINT NOT NULL,
-    url TEXT NOT NULL,
-    json TEXT NOT NULL,
-    PRIMARY KEY (package_id, url)
-);
-CREATE TABLE IF NOT EXISTS backfill_parameter (
-    backfill_id BIGINT NOT NULL,
-    url TEXT NOT NULL,
-    PRIMARY KEY (backfill_id, url)
-);
-"#;
 
 pub(crate) struct Inner {
     pub(crate) client: Conn,
@@ -156,8 +72,8 @@ impl Drop for Conn {
 pub struct ConnectOptions {
     /// Most connections the pool opens. One behaves like the old single connection.
     pub pool_size: usize,
-    /// Create tables and indexes. A process that only reads sets this to false and waits for
-    /// the writer to have created them, so it never runs DDL.
+    /// Apply pending schema migrations. A process that only reads sets this to false and waits
+    /// for the writer to have migrated the database, so it never runs DDL.
     pub create_schema: bool,
 }
 
@@ -204,16 +120,6 @@ pub struct PostgresPersistence {
 /// Channel the writer notifies after recording a published timestamp.
 const PUBLISH_CHANNEL: &str = "refhir_published";
 
-/// Tables a reader waits for before it starts.
-const REQUIRED_TABLES: &[&str] = &[
-    "documents",
-    "indexes",
-    "persistence_globals",
-    "packages",
-    "smart_oauth",
-    "jobs",
-];
-
 impl PostgresPersistence {
     pub fn connect(url: &str) -> Result<Self, PersistError> {
         Self::connect_with(url, &ConnectOptions::default())
@@ -223,9 +129,9 @@ impl PostgresPersistence {
         off_runtime(|| {
             let mut client = Conn::new(connect_client(url)?);
             if options.create_schema {
-                create_schema(&mut client)?;
+                migrate::run(&mut client, migrate::MIGRATIONS)?;
             } else {
-                wait_for_schema(&mut client)?;
+                migrate::wait_until_current(&mut client, migrate::MIGRATIONS)?;
             }
             let owned: Arc<str> = Arc::from(url);
             let factory_url = owned.clone();
@@ -250,132 +156,6 @@ impl PostgresPersistence {
     }
 }
 
-/// Every table and index the schema creates. When all of them exist `create_schema` does
-/// nothing: even `CREATE ... IF NOT EXISTS` locks the table first, which would stall a
-/// running primary's writes whenever a standby or a restart connects.
-const SCHEMA_OBJECTS: &[&str] = &[
-    "documents",
-    "documents_by_table_and_id",
-    "indexes",
-    "indexes_by_ts",
-    "persistence_globals",
-    "packages",
-    "structure_definitions",
-    "search_parameters",
-    "search_parameters_by_base_code",
-    "index_backfills",
-    "terminology",
-    "value_set_expansion",
-    "backfill_parameter",
-    "smart_oauth",
-    "smart_oauth_by_exp",
-    "jobs",
-    "jobs_by_status",
-];
-
-/// Advisory lock around building `indexes_by_ts`, which runs outside a transaction.
-const INDEX_BUILD_LOCK: i64 = 7428311;
-
-/// Whether `index_backfills` has the column a claim is recorded in. Tables made by an earlier
-/// version lack it, and a process that finds it missing must run the schema step.
-const HAS_CLAIM_COLUMN: &str = "EXISTS (SELECT 1 FROM information_schema.columns \
-     WHERE table_name = 'index_backfills' AND column_name = 'claimed_epoch')";
-
-/// Whether `jobs` has the columns a lease is recorded in. A table made before jobs were leased
-/// lacks them, and a process that finds them missing must run the schema step.
-const HAS_JOB_LEASE_COLUMNS: &str = "(SELECT count(*) FROM information_schema.columns \
-     WHERE table_name = 'jobs' AND column_name IN ('lease_owner', 'lease_until')) = 2";
-
-/// An index that a failed concurrent build left behind exists but is not usable.
-const HAS_INVALID_INDEX: &str = "EXISTS (SELECT 1 FROM pg_index i \
-     JOIN pg_class c ON c.oid = i.indexrelid \
-     WHERE c.relname = 'indexes_by_ts' AND NOT i.indisvalid)";
-
-fn has_claim_column(client: &mut Client) -> Result<bool, PersistError> {
-    Ok(client
-        .query_one(&format!("SELECT {HAS_CLAIM_COLUMN}"), &[])
-        .map_err(definite)?
-        .get(0))
-}
-
-/// Whether every table and index exists, the claim column is there and the timestamp index is
-/// usable: one query, not one round trip per object, because this runs whenever a process connects.
-fn schema_complete(client: &mut Client) -> Result<bool, PersistError> {
-    let objects: Vec<&str> = SCHEMA_OBJECTS.to_vec();
-    Ok(client
-        .query_one(
-            &format!(
-                "SELECT COALESCE((SELECT bool_and(to_regclass(object) IS NOT NULL) \
-                                  FROM unnest($1::text[]) AS object), false) \
-                        AND {HAS_CLAIM_COLUMN} AND {HAS_JOB_LEASE_COLUMNS} \
-                        AND NOT {HAS_INVALID_INDEX}"
-            ),
-            &[&objects],
-        )
-        .map_err(definite)?
-        .get(0))
-}
-
-fn create_schema(client: &mut Client) -> Result<(), PersistError> {
-    if schema_complete(client)? {
-        return Ok(());
-    }
-    // Concurrent `CREATE TABLE IF NOT EXISTS` can still collide on a fresh database, so
-    // schema setup runs under a transaction-scoped advisory lock.
-    let mut tx = client.transaction().map_err(definite)?;
-    tx.batch_execute("SELECT pg_advisory_xact_lock(7428310)")
-        .map_err(definite)?;
-    tx.batch_execute(SCHEMA).map_err(definite)?;
-    tx.batch_execute(auth_store::AUTH_INIT).map_err(definite)?;
-    tx.batch_execute(job_store::JOBS_INIT).map_err(definite)?;
-    tx.commit().map_err(definite)?;
-    // A reader in another process finds what a commit wrote by scanning index rows by ts, and
-    // `max_ts` looks at the newest one. Built concurrently so an existing database keeps
-    // accepting writes while it is added.
-    //
-    // The lock is taken by polling, never by waiting: `CREATE INDEX CONCURRENTLY` waits for
-    // every other transaction to finish, so a process blocked inside `pg_advisory_lock` (which
-    // is itself a transaction) while another holds the lock and builds is a deadlock.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
-    loop {
-        let got: bool = client
-            .query_one("SELECT pg_try_advisory_lock($1)", &[&INDEX_BUILD_LOCK])
-            .map_err(definite)?
-            .get(0);
-        if got {
-            break;
-        }
-        // Whoever holds it is building the index; once it is there, there is nothing to do.
-        if schema_complete(client)? {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(definite(
-                "timed out waiting for another process to build indexes_by_ts",
-            ));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    let built = (|| {
-        let invalid: bool = client
-            .query_one(&format!("SELECT {HAS_INVALID_INDEX}"), &[])
-            .map_err(definite)?
-            .get(0);
-        if invalid {
-            client
-                .batch_execute("DROP INDEX CONCURRENTLY IF EXISTS indexes_by_ts")
-                .map_err(definite)?;
-        }
-        client
-            .batch_execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS indexes_by_ts ON indexes (ts)")
-            .map_err(definite)
-    })();
-    let released = client
-        .batch_execute(&format!("SELECT pg_advisory_unlock({INDEX_BUILD_LOCK})"))
-        .map_err(definite);
-    built.and(released)
-}
-
 impl PostgresPersistence {
     /// Gives up the writer lease: the dedicated connection is closed, which frees the advisory
     /// lock, and the lease thread stops without treating that as a loss. For an orderly shutdown,
@@ -390,36 +170,6 @@ impl PostgresPersistence {
         self.gate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// Polls until the writer has created the schema. A reader that starts first (a replica
-/// brought up alongside the primary) waits here instead of failing.
-fn wait_for_schema(client: &mut Client) -> Result<(), PersistError> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        let tables: Vec<&str> = REQUIRED_TABLES.to_vec();
-        let mut missing: Vec<String> = client
-            .query_one(
-                "SELECT COALESCE(array_agg(object), ARRAY[]::text[]) \
-                 FROM unnest($1::text[]) AS object WHERE to_regclass(object) IS NULL",
-                &[&tables],
-            )
-            .map_err(definite)?
-            .get(0);
-        if !has_claim_column(client)? {
-            missing.push("index_backfills.claimed_epoch".to_string());
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(PersistError::Definite(format!(
-                "the database has no {} yet; start the primary first",
-                missing.join(", ")
-            )));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
@@ -1209,7 +959,7 @@ mod tests {
 
     /// The Postgres URL for tests. CI sets `REFHIR_REQUIRE_POSTGRES` so a missing database
     /// fails the test instead of letting it pass without running anything.
-    fn test_url(what: &str) -> Option<String> {
+    pub(crate) fn test_url(what: &str) -> Option<String> {
         match std::env::var("HAIFHIR_POSTGRES_URL") {
             Ok(url) => Some(url),
             Err(_) if std::env::var("REFHIR_REQUIRE_POSTGRES").is_ok() => {
@@ -1259,7 +1009,7 @@ mod tests {
 
     /// A database of its own. The writer lease is an advisory lock, which is per database, and
     /// the other tests here wipe the shared one while these run.
-    fn fresh_database(admin_url: &str, tag: &str) -> String {
+    pub(crate) fn fresh_database(admin_url: &str, tag: &str) -> String {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let name = format!(

@@ -45,6 +45,34 @@ pub fn version_clash_dir() -> &'static Path {
     ))
 }
 
+/// A package for the same FHIR release as `r4_dir` that carries another release's copy of one of
+/// its code systems: `hl7.fhir.uv.xver-r5.r4`, which holds `5.0.0` of R4's `encounter-status`.
+pub fn cross_version_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/cross-version"
+    ))
+}
+
+/// A package for the same FHIR release as `r4_dir` that carries a newer copy of a code system
+/// the R4 package also carries: `hl7.terminology.r4`, with `v3-MaritalStatus` 4.0.0 (adds `C`).
+pub fn newer_terminology_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/newer-terminology"
+    ))
+}
+
+/// A package for the same FHIR release as `r4_dir` that carries R5-style copies of its value sets:
+/// `hl7.fhir.uv.extensions.r4`, whose `allerg-intol-substance-exp-risk` is another version over
+/// another code system URL.
+pub fn extension_copies_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/extension-copies"
+    ))
+}
+
 pub fn expression_clash_dir() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -669,16 +697,20 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     for resource in &terminology {
         terminology_rows.push(terminology_row(resource)?);
     }
-    let expansions = MemoryTerminology::expansion_documents(&terminology)
-        .into_iter()
-        .filter_map(|document| {
-            let url = document.get("url")?.as_str()?.to_string();
-            Some(NewExpansion {
-                url,
-                json: document.to_string(),
+    // Read for the release the package is for, as the catalog and a rebuild read it, so that what a
+    // rebuild gives is what is stored here.
+    let tagged: Vec<(i64, &Value)> = terminology.iter().map(|resource| (0, resource)).collect();
+    let expansions =
+        MemoryTerminology::expansion_documents_scoped(&tagged, Some(fhir_version.as_str()))
+            .into_iter()
+            .filter_map(|document| {
+                let url = document.get("url")?.as_str()?.to_string();
+                Some(NewExpansion {
+                    url,
+                    json: document.to_string(),
+                })
             })
-        })
-        .collect();
+            .collect();
     Ok(NewPackage {
         name,
         version,
