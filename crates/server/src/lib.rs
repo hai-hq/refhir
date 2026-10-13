@@ -3,6 +3,7 @@
 mod auth;
 mod cluster;
 mod graphql;
+mod health;
 mod http;
 mod jobs;
 mod sync;

@@ -332,6 +332,35 @@ Base URL defaults to **http://127.0.0.1:8080** (or the host/port in `refhir.toml
 curl -s http://127.0.0.1:8080/metadata
 ```
 
+### Health probes
+
+Use these for Kubernetes probes and other orchestration, not `/metadata`: that builds a full
+CapabilityStatement on every call. Both are open under `--smart` (no token, no scopes), return a
+small JSON body, read no resource, and are not logged.
+
+| Endpoint | Question | Answer |
+|----------|----------|--------|
+| `GET /livez` | Is the process up and the HTTP server answering? | Always `200 {"status":"ok"}` |
+| `GET /readyz` | Can it take traffic? | `200 {"status":"ok"}`, or `503 {"status":"starting"\|"unavailable","reason":"..."}` |
+
+`/readyz` is `starting` while startup runs: the database is opened, packages are installed, search
+indexes are backfilled (a standby is `starting` until it holds the writer lease, a replica until
+the primary's catalog exists). Every role listens from the moment it starts, so a process that is
+still starting answers `503` instead of refusing connections. Once serving it is `unavailable`
+when a one-row query to the database (it reads no resource) fails or takes more than two seconds,
+when a replica has stopped following the primary, or when the primary cannot record its published
+watermark. The `reason` is a fixed phrase. The cause is in the debug log. The database result is
+reused for one second and probes that overlap share one query, so more callers cost no more queries.
+
+```yaml
+livenessProbe:  { httpGet: { path: /livez,  port: http } }
+readinessProbe: { httpGet: { path: /readyz, port: http } }
+```
+
+`GET /healthz` is older and answers a load balancer's question (200 or 503, with `role`, and
+`?verbose=1` for pool and commit counters, which needs a token under `--smart`). It is not a
+liveness probe: a standby answers it with 503.
+
 ### CLI reference
 
 | Flag | Purpose |
