@@ -12,6 +12,12 @@ use std::sync::Arc;
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use serde_json::Value as JsonValue;
 
+mod audit_chain;
+mod governance;
+
+pub use audit_chain::*;
+pub use governance::*;
+
 /// How `Persistence::write` treats an existing primary key.
 /// Convex `ConflictStrategy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -40,6 +40,7 @@ pub use package::{
 };
 pub use refhir_persistence::ConformanceStore;
 pub use run::{
-    dispatch, import_resource, run, stamp_stored_json, RunError, RunResult, MAX_OCC_FAILURES,
+    dispatch, import_resource, run, stamp_stored_json, RunError, RunResult, CONTROL_ARGS,
+    MAX_OCC_FAILURES,
 };
 pub use search::resource_in_compartment;

@@ -13,7 +13,7 @@ use config::{
 };
 use refhir_database::Database;
 use refhir_fhir::Catalog;
-use refhir_persistence::{AuthStore, ConformanceStore, JobStore, Persistence};
+use refhir_persistence::{AuthStore, ConformanceStore, GovernanceStore, JobStore, Persistence};
 use refhir_postgres::PostgresPersistence;
 use refhir_sqlite::SqlitePersistence;
 use tokio::net::TcpListener;
@@ -30,12 +30,13 @@ fn main() -> ExitCode {
 }
 
 /// One backend serves every table the server keeps: the log, the conformance tables, the
-/// SMART tables and the background jobs.
+/// SMART tables, the background jobs, and the usage, request log and audit tables.
 type Stores = (
     Arc<dyn Persistence>,
     Arc<dyn ConformanceStore>,
     Arc<dyn AuthStore>,
     Arc<dyn JobStore>,
+    Arc<dyn GovernanceStore>,
 );
 
 #[tokio::main]
@@ -151,9 +152,11 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let file_path = discover_config_path(config_path.as_deref());
+    let mut unknown_sections = Vec::new();
     if let Some(path) = &file_path {
         let file = load_file(path)?;
         cfg.apply_file(&file)?;
+        unknown_sections = file.unknown.keys().cloned().collect();
     }
     apply_env(&mut cfg);
 
@@ -237,6 +240,8 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         cfg.update_as_create = true;
     }
 
+    // A limit that cannot work is refused now, and not discovered by the first caller to hit it.
+    cfg.governance.validate(cfg.auth)?;
     if cfg.postgres.is_some() && (cfg.sqlite.is_some() || cfg.memory) {
         return Err("pass only one of --sqlite, --memory, or --postgres".into());
     }
@@ -258,6 +263,19 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &file_path {
         tracing::info!("loaded config {}", path.display());
     }
+    for section in unknown_sections {
+        tracing::warn!(
+            "config section [{section}] is not one this server reads and is ignored; \
+             check its spelling"
+        );
+    }
+    if cfg.governance.proxy.trusted_hops > 0 && cfg.governance.proxy.trusted_peers.is_empty() {
+        tracing::warn!(
+            "[server] trusted_proxy_hops is set without trusted_proxy_peers, so X-Forwarded-For \
+             is believed on every connection: a client that reaches this server directly can \
+             choose, or frame, an address. List the networks your proxies connect from"
+        );
+    }
     if cfg.trace_engine {
         tracing::info!("reactive engine tracing enabled (target refhir_engine=debug)");
     }
@@ -272,33 +290,50 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     ensure_package_cache_env(&cfg);
+    tracing::info!("{}", cfg.describe_governance());
+    if cfg.governance.audit.enabled && cfg.governance.audit.chain_key.is_none() {
+        tracing::warn!(
+            "the audit trail is hash-chained but the chain has no key (REFHIR_AUDIT_KEY): it \
+             catches mistakes, and proves nothing against someone who can write the database. \
+             Set a key (`openssl rand -hex 32`) kept outside the database"
+        );
+    }
+    if cfg.memory && cfg.governance.audit.enabled {
+        tracing::warn!(
+            "audit is on but the database is in memory, so the audit trail ends with this process"
+        );
+    }
 
-    let (db, store, auth_store, job_store): Stores = if let Some(url) = &cfg.postgres {
-        let persistence = Arc::new(PostgresPersistence::connect(url)?);
-        (
-            persistence.clone(),
-            persistence.clone(),
-            persistence.clone(),
-            persistence,
-        )
-    } else if cfg.memory {
-        let persistence = Arc::new(SqlitePersistence::open_in_memory()?);
-        (
-            persistence.clone(),
-            persistence.clone(),
-            persistence.clone(),
-            persistence,
-        )
-    } else {
-        let path = cfg.sqlite.unwrap_or_else(|| "refhir.sqlite".to_string());
-        let persistence = Arc::new(SqlitePersistence::open(Path::new(&path))?);
-        (
-            persistence.clone(),
-            persistence.clone(),
-            persistence.clone(),
-            persistence,
-        )
-    };
+    let (db, store, auth_store, job_store, governance_store): Stores =
+        if let Some(url) = &cfg.postgres {
+            let persistence = Arc::new(PostgresPersistence::connect(url)?);
+            (
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence,
+            )
+        } else if cfg.memory {
+            let persistence = Arc::new(SqlitePersistence::open_in_memory()?);
+            (
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence,
+            )
+        } else {
+            let path = cfg.sqlite.unwrap_or_else(|| "refhir.sqlite".to_string());
+            let persistence = Arc::new(SqlitePersistence::open(Path::new(&path))?);
+            (
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence,
+            )
+        };
     // Nothing listens until this is done, so a slow start is a refused connection. Each phase
     // says how long it took, so that a wait can be put down to the package download, the
     // install, or the catalog.
@@ -367,6 +402,9 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             smart,
             // Export jobs are rows in the same database, so they outlive a restart.
             jobs: Some(refhir_server::SharedJobStore::new(job_store)),
+            // So are usage, the request log and the audit trail.
+            governance: cfg.governance,
+            governance_store: Some(refhir_server::SharedGovernanceStore::new(governance_store)),
         },
     )
     .await?;
@@ -528,7 +566,12 @@ fn print_help() {
          --smart enables SMART App Launch 2.2. --public-url is required when\n\
          --smart is used with a non-loopback --bind. Generated DCR and confidential\n\
          secrets print once to stderr in a terminal and are never written to logs.\n\
-         --sdc-archiver stores QuestionnaireResponse without allowing a later read."
+         --sdc-archiver stores QuestionnaireResponse without allowing a later read.\n\
+         \n\
+         Rate limits, quotas, the audit trail and the request log are set in the config file\n\
+         ([rate_limit], [quota], [audit], [request_log], [metering]). Usage, the request log and\n\
+         the audit trail are on by default; nothing is limited until a limit is configured.\n\
+         GET /_audit, /_usage and /_requests read them back (system/AuditEvent.read with --smart)."
     );
 }
 

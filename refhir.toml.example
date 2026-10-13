@@ -10,6 +10,17 @@ version = "r4"
 bind = "0.0.0.0:8080"
 # Required for SMART when bind is not loopback (production TLS URL).
 # public_url = "https://refhir.example.com/fhir"
+# How many reverse proxies (load balancer, ingress, CDN) stand between clients and this server.
+# Per-address limits and the audit trail need the client's address, which behind a proxy is only
+# in X-Forwarded-For. 0 ignores that header and uses the connection's address, which is right
+# when clients connect directly and wrong behind a proxy, where every client then looks like the
+# proxy. With N, the entry N from the right is the client (each proxy appends the address it
+# saw, so anything to the left of that is whatever the client claimed).
+# trusted_proxy_hops = 1
+# The networks those proxies connect from. X-Forwarded-For is then believed only on a connection
+# from one of them; without this a client that reaches the server directly (a node port, a pod
+# address) can write the header itself and choose, or frame, an address.
+# trusted_proxy_peers = ["10.0.0.0/8", "fd00::/8"]
 
 [database]
 kind = "sqlite" # sqlite | memory | postgres
@@ -64,3 +75,79 @@ urls = []
 [features]
 trace_engine = false
 sdc_archiver = false
+
+# --- Rate limits, quotas, metering, request logs and the audit trail -----------------------
+# Metering, the request log and the audit trail are ON by default. Nothing is limited until you
+# size a limit for your traffic: a [rate_limit] or [quota] section that is present is ON unless
+# it says `enabled = false`. See "Rate limits, quotas and audit" in the README.
+
+[metering]
+enabled = true            # per client, per UTC day, per class of request: GET /_usage
+
+[request_log]
+enabled = true            # one structured log line per request, with an X-Request-Id
+store = true              # also keep recent requests in the database: GET /_requests
+retention_hours = 24
+refused_per_second = 20   # rows kept per second for throttled or unattributed failures;
+                          # past that they are counted, not stored (0 keeps every one)
+
+[audit]
+enabled = true            # who did what to which resource: GET /_audit (FHIR AuditEvent)
+reads = true              # false records only changes, refusals and admin access
+include_query = true      # keep search parameters (they can name a patient by identifier)
+# retention_days = 2190   # unset keeps the audit trail forever
+unattributed_per_second = 20    # detailed rows per second for refusals with no caller known;
+                                # past that a `sampled` summary row says how many (0 keeps all)
+# The hash chain over the audit trail is keyed by the environment variable REFHIR_AUDIT_KEY
+# (at least 16 bytes, e.g. `openssl rand -hex 32`, the same on every server, kept outside the
+# database). Without it the chain only catches mistakes. GET /_audit/verify checks it.
+
+# A token bucket per caller (client + user; an address for callers with no token).
+# Switched off here; set enabled = true to turn it on.
+[rate_limit]
+enabled = false
+requests_per_second = 50  # sustained rate, in cost units a second
+burst = 100               # the most a caller can spend at once (must be >= the dearest cost)
+auth_failures_per_minute = 20   # per address, before more unknown tokens are refused unlooked-up
+max_sync_connections = 10       # /sync connections one caller may hold
+max_live_queries = 100          # live queries one /sync connection may hold
+# How many servers share these limits, each taking an equal part. Unset, servers count one
+# another through the database (a heartbeat every ten seconds) and follow a fleet as it grows.
+# Set 1 where a balancer sends each caller to a single server.
+# servers = 3
+# For callers with no token. Unset: a tenth of the above with --smart, the same without.
+# anonymous_requests_per_second = 5
+# anonymous_burst = 20
+
+# What a request costs. An export is one request that is a great deal of work.
+[rate_limit.cost]
+read = 1
+search = 2
+write = 2
+bundle = 5
+operation = 5
+export = 20
+sync = 5
+
+# A client's own rate, by client_id. 0 exempts the client.
+# [rate_limit.clients.batch-loader]
+# requests_per_second = 200
+# burst = 400
+# [rate_limit.clients.internal-monitor]
+# requests_per_second = 0
+
+# Totals a client may not pass in a UTC day or month. Switched off here.
+[quota]
+enabled = false
+# requests_per_day = 100000
+# writes_per_day = 10000
+# bytes_per_day = 1073741824
+# requests_per_month = 2000000
+# writes_per_month = 200000
+# bytes_per_month = 21474836480
+# refresh_seconds = 30    # how often totals are reread, to see other servers' counts
+
+# A client's own totals override field by field; 0 lifts a limit the default sets.
+# [quota.clients.acme]
+# requests_per_day = 1000000
+# bytes_per_day = 0

@@ -47,6 +47,28 @@ pub struct ServerConfig {
     /// Table of background jobs such as `$export`. `refhir` passes the database's own, so jobs
     /// outlive a restart. Without one they live in memory and end with the process.
     pub jobs: Option<crate::jobs::SharedJobStore>,
+    /// Rate limits, metering, request logs, quotas and the audit trail. All off by default.
+    pub governance: crate::governance::GovernanceConfig,
+    /// Where usage, the request log and the audit trail are written. `refhir` passes the
+    /// database's own, so they outlive a restart. Without one they live in memory and end with
+    /// the process.
+    pub governance_store: Option<SharedGovernanceStore>,
+}
+
+/// The database-backed governance tables, as passed in `ServerConfig::governance_store`.
+#[derive(Clone)]
+pub struct SharedGovernanceStore(pub std::sync::Arc<dyn refhir_persistence::GovernanceStore>);
+
+impl SharedGovernanceStore {
+    pub fn new(store: std::sync::Arc<dyn refhir_persistence::GovernanceStore>) -> Self {
+        Self(store)
+    }
+}
+
+impl std::fmt::Debug for SharedGovernanceStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SharedGovernanceStore")
+    }
 }
 
 impl Default for ServerConfig {
@@ -66,6 +88,8 @@ impl Default for ServerConfig {
             smart_demo_login: false,
             smart: None,
             jobs: None,
+            governance: crate::governance::GovernanceConfig::default(),
+            governance_store: None,
         }
     }
 }
@@ -79,6 +103,7 @@ pub struct AppState {
     pub smart: Arc<crate::auth::SmartStore>,
     pub oidc: Option<Arc<crate::auth::Oidc>>,
     pub jobs: Arc<crate::jobs::JobRunner>,
+    pub governance: Arc<crate::governance::Governance>,
 }
 
 /// Delete expired OAuth rows once a minute. Reads ignore expired rows, so this only reclaims
@@ -112,6 +137,16 @@ pub fn app_with(
     store: Arc<dyn ConformanceStore>,
     config: ServerConfig,
 ) -> Router {
+    app_parts(db, catalog, store, config).0
+}
+
+/// The router, and the governance state behind it, which a server flushes on shutdown.
+pub fn app_parts(
+    db: Arc<Database>,
+    catalog: Arc<RwLock<Catalog>>,
+    store: Arc<dyn ConformanceStore>,
+    config: ServerConfig,
+) -> (Router, Arc<crate::governance::Governance>) {
     catalog
         .write()
         .expect("catalog")
@@ -139,6 +174,10 @@ pub fn app_with(
         .route("/graphql", post(graphql_route))
         .route("/sync", get(sync_ws))
         .route("/_history", get(system_history))
+        .route("/_audit", get(crate::governance::audit_events))
+        .route("/_audit/verify", get(crate::governance::audit_verify))
+        .route("/_usage", get(crate::governance::usage))
+        .route("/_requests", get(crate::governance::requests))
         .route("/$export", post(export_system))
         .route("/export/:job", get(export_status))
         .route("/export/:job/file", get(export_file))
@@ -196,6 +235,15 @@ pub fn app_with(
     });
     prune_in_background(&smart);
     let jobs = crate::jobs::start(&db, &catalog, &config);
+    let governance = crate::governance::Governance::new(
+        config.governance.clone(),
+        config.auth,
+        config
+            .governance_store
+            .as_ref()
+            .map(|shared| shared.0.clone()),
+    );
+    governance.start_background();
     let state = AppState {
         db: db.clone(),
         catalog: catalog.clone(),
@@ -206,14 +254,25 @@ pub fn app_with(
             Arc::new(crate::auth::Oidc::new(cfg).expect("oidc config is validated at startup"))
         }),
         jobs,
+        governance: governance.clone(),
     };
+    // Outermost first: cors, the legacy request line (silent once governance logs instead),
+    // governance's scope, authentication, and then the caller's own limits.
     let router = router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::governance::gate,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), smart_guard))
-        .layer(middleware::from_fn(request_log))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::governance::govern,
+        ))
+        .layer(middleware::from_fn_with_state(state.clone(), request_log))
         .layer(middleware::from_fn_with_state(state.clone(), cors))
         .with_state(state);
     crate::jobs::attach(db, catalog, store, &config);
-    router
+    (router, governance)
 }
 
 pub async fn execute(
@@ -223,11 +282,14 @@ pub async fn execute(
     path: &str,
     args: Value,
 ) -> Result<RunResult, RunError> {
+    // Whoever is running this is attributed in the audit trail by what the engine reports it
+    // did, not by what the request said it would.
+    let audit = crate::governance::begin_audit(path, &args);
     let db = db.clone();
     let catalog = catalog.clone();
     let store = store.clone();
     let path = path.to_string();
-    match tokio::task::spawn_blocking(move || {
+    let outcome = match tokio::task::spawn_blocking(move || {
         refhir_fhir::commit_operation(store.as_ref(), &db, &catalog, &path, &args)
     })
     .await
@@ -236,7 +298,11 @@ pub async fn execute(
         Err(_) => Err(RunError::Commit(CommitError::Invalid(
             "operation worker stopped".into(),
         ))),
+    };
+    if let Some(audit) = audit {
+        audit.finish(&outcome);
     }
+    outcome
 }
 
 async fn metadata(State(app): State<AppState>, headers: HeaderMap) -> Response {
@@ -307,13 +373,18 @@ fn apply_cors(headers: &mut HeaderMap, app: &AppState, path: &str, origin: Optio
     );
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        "Location, Content-Location, ETag, WWW-Authenticate"
+        "Location, Content-Location, ETag, WWW-Authenticate, Retry-After, X-Request-Id, \
+         RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
             .parse()
             .unwrap(),
     );
 }
 
-async fn request_log(request: Request<Body>, next: Next) -> Response {
+async fn request_log(State(app): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    // Governance logs every request itself, with a request id and the caller.
+    if app.governance.config.request_log.enabled {
+        return next.run(request).await;
+    }
     let method = request.method().clone();
     let uri = request.uri().clone();
     let started = std::time::Instant::now();
@@ -363,7 +434,7 @@ fn log_http_request(
     }
 }
 
-fn redact_query(query: Option<&str>) -> Option<String> {
+pub(crate) fn redact_query(query: Option<&str>) -> Option<String> {
     let query = query?;
     if !query.contains("access_token") {
         return Some(query.to_string());
@@ -431,6 +502,7 @@ async fn smart_guard(
                 };
                 match opened {
                     Ok(session) => {
+                        note_identity(&app, request.headers(), query.as_deref());
                         request.extensions_mut().insert(session);
                     }
                     Err(response) => return response,
@@ -466,11 +538,26 @@ async fn smart_guard(
                         Err(response) => return response,
                     }
                 };
+                // A caller refused for want of scope is still known, and the refusal is
+                // attributed to them. One refused for want of a valid token is not.
+                if checked.is_ok()
+                    || matches!(&checked, Err(response) if response.status() == StatusCode::FORBIDDEN)
+                {
+                    note_identity(&app, request.headers(), query.as_deref());
+                }
                 let patient = match checked {
                     Ok(patient) => patient,
                     Err(response) => return response,
                 };
                 if let Some(patient) = patient {
+                    // The body is read and parsed below, so the caller's limits come first: a
+                    // refusal must not cost the work it is meant to spare.
+                    if let Some(scope) = crate::governance::current() {
+                        let class = crate::governance::classify(&method, &path);
+                        if let Err(rejection) = app.governance.admit_once(&scope, class).await {
+                            return rejection.into_response();
+                        }
+                    }
                     if let Some(response) =
                         reject_patient_http(&app, &patient, &method, &path, &mut request).await
                     {
@@ -481,6 +568,15 @@ async fn smart_guard(
         }
     }
     next.run(request).await
+}
+
+/// Tell the request's governance scope who this token belongs to.
+fn note_identity(app: &AppState, headers: &HeaderMap, query: Option<&str>) {
+    if let Some(scope) = crate::governance::current() {
+        if let Some(identity) = crate::auth::identity(app, headers, query) {
+            scope.set_identity(identity);
+        }
+    }
 }
 
 async fn reject_patient_http(
@@ -539,6 +635,10 @@ fn forbidden_response(message: &str) -> Response {
 
 fn fhir_type_from_path(path: &str) -> String {
     let segment = path.trim_start_matches('/').split('/').next().unwrap_or("");
+    // What the server recorded about its callers is read with the scope to read `AuditEvent`.
+    if matches!(segment, "_audit" | "_usage" | "_requests") {
+        return "AuditEvent".into();
+    }
     if segment.is_empty()
         || segment.starts_with('$')
         || segment.starts_with('_')
@@ -559,8 +659,20 @@ async fn sync_ws(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let session = session.map(|Extension(session)| session);
-    ws.on_upgrade(move |socket| {
-        sync::handle_socket(socket, app.db, app.catalog, app.store, session)
+    // The upgrade is one request, but the connection that follows is many. It keeps the
+    // scope of the request that opened it, so each message can be limited and attributed.
+    let scope = crate::governance::current();
+    let permit = match &scope {
+        Some(scope) => match app.governance.open_sync_connection(scope) {
+            Ok(permit) => Some(permit),
+            Err(rejection) => return rejection.into_response(),
+        },
+        None => None,
+    };
+    ws.on_upgrade(move |socket| async move {
+        // The permit is held as long as the connection is.
+        let _permit = permit;
+        sync::handle_socket(socket, app.db, app.catalog, app.store, session, scope).await
     })
     .into_response()
 }
@@ -1387,13 +1499,17 @@ async fn run_blocking(work: impl FnOnce() -> Response + Send + 'static) -> Respo
 async fn run_blocking_with<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Response> {
-    tokio::task::spawn_blocking(work).await.map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "authorization handler failed",
-        )
-            .into_response()
-    })
+    // A task-local does not cross into a blocking thread, so the scope goes along with the work.
+    let scope = crate::governance::current();
+    tokio::task::spawn_blocking(move || crate::governance::in_blocking(scope, work))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "authorization handler failed",
+            )
+                .into_response()
+        })
 }
 
 async fn oauth_interact_post(
@@ -1618,6 +1734,15 @@ pub(crate) fn error_response(err: RunError) -> Response {
         "fhir operation failed"
     );
     outcome(status, code, &diagnostics)
+}
+
+/// The HTTP status `error_response` answers with.
+pub(crate) fn run_error_status(err: &RunError) -> StatusCode {
+    match err {
+        RunError::Fhir(fhir) => fhir_status(fhir),
+        RunError::Commit(CommitError::Occ(_)) => StatusCode::CONFLICT,
+        RunError::Commit(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 pub(crate) fn outcome_value(err: &RunError) -> Value {

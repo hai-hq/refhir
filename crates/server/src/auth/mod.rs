@@ -230,8 +230,10 @@ impl SyncSession {
         let Some(object) = args.as_object_mut() else {
             return;
         };
-        object.remove("_readScopes");
-        object.remove("_sdcArchiver");
+        // Whatever a client sent under these names is not the server's word about the caller.
+        for name in refhir_fhir::CONTROL_ARGS {
+            object.remove(name);
+        }
         object.insert("_readScopes".into(), json!(self.scopes));
     }
 
@@ -556,8 +558,9 @@ fn entry_resource_type(entry: &Value) -> Option<&str> {
 
 pub(crate) fn strip_sdc_controls(args: &mut Value) {
     if let Some(object) = args.as_object_mut() {
-        object.remove("_readScopes");
-        object.remove("_sdcArchiver");
+        for name in refhir_fhir::CONTROL_ARGS {
+            object.remove(name);
+        }
     }
 }
 
@@ -572,6 +575,38 @@ pub fn resolve_token(headers: &HeaderMap, query: Option<&str>) -> Option<String>
 /// it is cached.
 pub fn lookup_is_cheap(app: &AppState, headers: &HeaderMap, query: Option<&str>) -> bool {
     resolve_token(headers, query).is_none_or(|token| app.smart.token_is_cached(&token))
+}
+
+/// Whether these scopes may read what the server recorded about its callers: a `system/` scope
+/// that covers `AuditEvent`. A user's wildcard read (`user/*.read`) does not, although it covers
+/// every resource type: it is the data a clinician may see, and the audit trail is the record of
+/// every clinician's access to it.
+pub(crate) fn can_read_audit(scopes: &[String]) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope.starts_with("system/") && scope_allows(scope, "AuditEvent", "read"))
+}
+
+/// Who the token on this request belongs to, for attributing what it does. `None` where SMART
+/// is off or there is no live token. Call it after the token has been checked: it is then in
+/// the cache, and this is no database read.
+pub(crate) fn identity(
+    app: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+) -> Option<crate::governance::Identity> {
+    if !app.config.auth {
+        return None;
+    }
+    let record = app.smart.token(&resolve_token(headers, query)?)?;
+    if record.exp <= now() {
+        return None;
+    }
+    Some(crate::governance::Identity {
+        client_id: record.client_id,
+        user: record.sub,
+        fhir_user: record.fhir_user,
+    })
 }
 
 pub fn token_scopes(
@@ -683,6 +718,61 @@ mod tests {
         let both = session(&["user/Patient.u", "user/Patient.c"], true);
         assert!(both.prepare("Patient/update", &update, false).is_ok());
         assert!(both.prepare("Bundle/transaction", &bundle, false).is_ok());
+    }
+
+    /// Whatever a session prepares for a read has to be something the engine runs: the server's
+    /// additions to the arguments ride beside the caller's, and a search used to refuse them.
+    #[test]
+    fn what_a_session_prepares_for_a_read_is_what_the_engine_runs() {
+        let (db, catalog, _store) = crate::tests::memory();
+        let catalog = catalog.read().unwrap();
+        for id in ["p1", "p2"] {
+            refhir_fhir::import_resource(
+                &db,
+                &catalog,
+                &json!({"resourceType": "Patient", "id": id, "active": true}),
+            )
+            .unwrap();
+        }
+        let run = |session: &SyncSession, path: &str, args: Value| {
+            let prepared = session.prepare(path, &args, true).unwrap();
+            assert!(
+                prepared["_readScopes"].is_array(),
+                "the server's word is on it"
+            );
+            refhir_fhir::run(&db, &catalog, path, &prepared)
+                .unwrap_or_else(|err| panic!("{path} with {prepared}: {err}"))
+        };
+        let user = SyncSession {
+            update_create: false,
+            scopes: vec!["user/*.read".into()],
+            patient: None,
+        };
+        assert_eq!(
+            run(&user, "Patient/search", json!({"active": "true"})).value["total"],
+            2
+        );
+        assert_eq!(run(&user, "Patient/search", json!({})).value["total"], 2);
+        for (path, args) in [
+            ("Patient/read", json!({"id": "p1"})),
+            ("Patient/history", json!({"id": "p1"})),
+            ("Patient/history", json!({})),
+            ("Patient/$meta", json!({"id": "p1"})),
+            ("Patient/$everything", json!({"id": "p1"})),
+            ("system/history", json!({})),
+        ] {
+            run(&user, path, args);
+        }
+        // A token confined to one patient has the compartment stamped beside the scopes, and
+        // the search stays inside it.
+        let confined = SyncSession {
+            update_create: false,
+            scopes: vec!["patient/Patient.read".into()],
+            patient: Some("Patient/p1".into()),
+        };
+        let found = run(&confined, "Patient/search", json!({"active": "true"}));
+        assert_eq!(found.value["total"], 1);
+        assert_eq!(found.value["entry"][0]["resource"]["id"], "p1");
     }
 
     #[test]

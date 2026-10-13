@@ -151,6 +151,8 @@ impl SqlitePersistence {
             .and_then(|_| connection.execute_batch(CONFORMANCE_INIT))
             .and_then(|_| connection.execute_batch(auth_store::AUTH_INIT))
             .and_then(|_| connection.execute_batch(job_store::JOBS_INIT))
+            .and_then(|_| connection.execute_batch(governance_store::GOVERNANCE_INIT))
+            .and_then(|_| governance_store::migrate(&connection))
             .and_then(|_| job_store::migrate(&connection))
             .map_err(definite)?;
         Ok(Self {
@@ -601,6 +603,7 @@ fn uncertain(err: impl ToString) -> PersistError {
 
 mod auth_store;
 mod conformance_store;
+mod governance_store;
 mod job_store;
 
 #[cfg(test)]

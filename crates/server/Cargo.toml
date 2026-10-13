@@ -22,10 +22,10 @@ jsonwebtoken = { workspace = true }
 rand = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }
+http-body-util = { workspace = true }
 
 [dev-dependencies]
 refhir-database = { path = "../database", features = ["test-util"] }
 refhir-sqlite = { path = "../sqlite" }
-http-body-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tower = { workspace = true }

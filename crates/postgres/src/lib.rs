@@ -165,6 +165,8 @@ impl PostgresPersistence {
             tx.batch_execute(SCHEMA).map_err(definite)?;
             tx.batch_execute(auth_store::AUTH_INIT).map_err(definite)?;
             tx.batch_execute(job_store::JOBS_INIT).map_err(definite)?;
+            tx.batch_execute(governance_store::GOVERNANCE_INIT)
+                .map_err(definite)?;
             tx.commit().map_err(definite)?;
             Ok(Self {
                 inner: Arc::new(Mutex::new(Inner {
@@ -636,6 +638,7 @@ fn uncertain(err: impl ToString) -> PersistError {
 
 mod auth_store;
 mod conformance_store;
+mod governance_store;
 mod job_store;
 
 #[cfg(test)]
@@ -690,6 +693,128 @@ mod tests {
                 .expect("clean");
         }
         refhir_persistence::auth::exercise(&persistence);
+    }
+
+    /// The audit trail is one table in the database, and these tests empty it and then verify
+    /// what they put in it, so they take turns whatever the number of test threads.
+    static AUDIT_TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn postgres_governance_store_when_configured() {
+        let Some(url) = test_url("postgres governance store") else {
+            return;
+        };
+        let _turn = AUDIT_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        // A tag of its own keeps this run's rows apart from earlier ones on the same database.
+        refhir_persistence::governance_checks::exercise(
+            &persistence,
+            &format!("postgres{}", unique()),
+        );
+        // A second connection, as a second server would have: both see both.
+        let other = PostgresPersistence::connect(&url).expect("connect");
+        refhir_persistence::governance_checks::exercise_members(
+            &persistence,
+            &format!("postgres{}", unique()),
+        );
+        drop(other);
+    }
+
+    #[test]
+    fn postgres_audit_chain_when_configured() {
+        let Some(url) = test_url("postgres audit chain") else {
+            return;
+        };
+        let _turn = AUDIT_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        refhir_persistence::governance_checks::exercise_chain(&persistence, "postgres");
+        // Several servers appending at once, each with a connection of its own.
+        let open = {
+            let url = url.clone();
+            move || -> Arc<dyn refhir_persistence::GovernanceStore> {
+                Arc::new(PostgresPersistence::connect(&url).expect("connect"))
+            }
+        };
+        refhir_persistence::governance_checks::exercise_concurrent_chain(&open, "postgres");
+    }
+
+    #[test]
+    fn postgres_audit_tampering_is_found_when_configured() {
+        use refhir_persistence::{
+            verify_audit_chain, AuditRow, ChainKey, ChainProblem, GovernanceStore,
+        };
+        let Some(url) = test_url("postgres audit tampering") else {
+            return;
+        };
+        let _turn = AUDIT_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let key = ChainKey::new(b"a key for the postgres tests".to_vec());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let clear = || persistence.prune(None, Some(now + 86_400_000)).unwrap();
+        let fresh = || {
+            clear();
+            let rows: Vec<AuditRow> = (0..6)
+                .map(|n| AuditRow {
+                    ts_ms: now,
+                    request_id: format!("r{n}"),
+                    source: "http".into(),
+                    action: "R".into(),
+                    subtype: "read".into(),
+                    principal: "client:a".into(),
+                    ..Default::default()
+                })
+                .collect();
+            persistence.audit_append(&rows, Some(&key)).unwrap();
+            persistence.audit_scan(0, 100).unwrap()
+        };
+        let sql = |statement: String| {
+            let mut guard = persistence.inner.lock().unwrap();
+            guard.client.batch_execute(&statement).unwrap();
+        };
+        let found = || {
+            verify_audit_chain(&persistence, Some(&key), None)
+                .unwrap()
+                .breaks
+                .iter()
+                .map(|found| (found.id, found.problem))
+                .collect::<Vec<_>>()
+        };
+        let ids = fresh()
+            .iter()
+            .map(|stored| stored.row.id)
+            .collect::<Vec<_>>();
+        assert!(found().is_empty());
+        sql(format!(
+            "UPDATE audit_log SET principal = 'client:nobody' WHERE id = {}",
+            ids[2]
+        ));
+        assert_eq!(found(), vec![(ids[2], ChainProblem::Edited)]);
+        let ids = fresh()
+            .iter()
+            .map(|stored| stored.row.id)
+            .collect::<Vec<_>>();
+        sql(format!("DELETE FROM audit_log WHERE id = {}", ids[2]));
+        assert_eq!(found(), vec![(ids[3], ChainProblem::Detached)]);
+        let ids = fresh()
+            .iter()
+            .map(|stored| stored.row.id)
+            .collect::<Vec<_>>();
+        sql(format!(
+            "INSERT INTO audit_log (ts, request_id, source, action, subtype, outcome, status, principal) \
+             VALUES (9, 'made-up', 'http', 'R', 'read', 0, 200, 'client:a')"
+        ));
+        let report = verify_audit_chain(&persistence, Some(&key), None).unwrap();
+        assert_eq!(report.breaks.len(), 1);
+        assert_eq!(report.breaks[0].problem, ChainProblem::Unhashed);
+        assert!(report.breaks[0].id > ids[5]);
+        // Retention from the start leaves no alarm.
+        fresh();
+        persistence.prune(None, Some(now + 1)).unwrap();
+        assert!(found().is_empty());
+        clear();
     }
 
     fn unique() -> u128 {

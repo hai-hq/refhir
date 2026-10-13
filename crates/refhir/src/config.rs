@@ -1,8 +1,11 @@
 //! Optional `refhir.toml` — CLI flags override file values when both are set.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use refhir_server::{ClientRate, GovernanceConfig, QuotaLimits};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -23,12 +26,29 @@ pub struct FileConfig {
     pub terminology: TerminologySection,
     #[serde(default)]
     pub features: FeaturesSection,
+    /// Present means on: a section with numbers in it that is not switched on would leave an
+    /// operator believing they are protected.
+    pub rate_limit: Option<RateLimitSection>,
+    pub quota: Option<QuotaSection>,
+    pub audit: Option<AuditSection>,
+    pub request_log: Option<RequestLogSection>,
+    pub metering: Option<MeteringSection>,
+    /// Sections nothing here reads. A misspelt `[rate_limt]` would otherwise leave the server
+    /// without the limit its operator thinks it has, so they are named at start-up.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ServerSection {
     pub bind: Option<String>,
     pub public_url: Option<String>,
+    /// Reverse proxies in front of this server. See `[server] trusted_proxy_hops` in
+    /// `refhir.toml.example`.
+    pub trusted_proxy_hops: Option<u8>,
+    /// The networks those proxies connect from, such as `["10.0.0.0/8"]`. See
+    /// `[server] trusted_proxy_peers` in `refhir.toml.example`.
+    pub trusted_proxy_peers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -97,6 +117,110 @@ pub struct FeaturesSection {
     pub sdc_archiver: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitSection {
+    pub enabled: Option<bool>,
+    pub requests_per_second: Option<f64>,
+    pub burst: Option<u32>,
+    pub anonymous_requests_per_second: Option<f64>,
+    pub anonymous_burst: Option<u32>,
+    pub auth_failures_per_minute: Option<u32>,
+    pub max_sync_connections: Option<u32>,
+    pub max_live_queries: Option<u32>,
+    pub servers: Option<u32>,
+    pub cost: Option<CostSection>,
+    #[serde(default)]
+    pub clients: BTreeMap<String, ClientRateSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CostSection {
+    pub read: Option<u32>,
+    pub search: Option<u32>,
+    pub write: Option<u32>,
+    pub bundle: Option<u32>,
+    pub operation: Option<u32>,
+    pub export: Option<u32>,
+    pub sync: Option<u32>,
+    pub auth: Option<u32>,
+    pub discovery: Option<u32>,
+    pub admin: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ClientRateSection {
+    pub requests_per_second: Option<f64>,
+    pub burst: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaLimitsSection {
+    pub requests_per_day: Option<u64>,
+    pub writes_per_day: Option<u64>,
+    pub bytes_per_day: Option<u64>,
+    pub requests_per_month: Option<u64>,
+    pub writes_per_month: Option<u64>,
+    pub bytes_per_month: Option<u64>,
+}
+
+impl From<&QuotaLimitsSection> for QuotaLimits {
+    fn from(section: &QuotaLimitsSection) -> Self {
+        QuotaLimits {
+            requests_per_day: section.requests_per_day,
+            writes_per_day: section.writes_per_day,
+            bytes_per_day: section.bytes_per_day,
+            requests_per_month: section.requests_per_month,
+            writes_per_month: section.writes_per_month,
+            bytes_per_month: section.bytes_per_month,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaSection {
+    pub enabled: Option<bool>,
+    pub requests_per_day: Option<u64>,
+    pub writes_per_day: Option<u64>,
+    pub bytes_per_day: Option<u64>,
+    pub requests_per_month: Option<u64>,
+    pub writes_per_month: Option<u64>,
+    pub bytes_per_month: Option<u64>,
+    /// How often the totals are reread from the database, to see other servers' counts.
+    pub refresh_seconds: Option<u64>,
+    #[serde(default)]
+    pub clients: BTreeMap<String, QuotaLimitsSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AuditSection {
+    pub enabled: Option<bool>,
+    pub reads: Option<bool>,
+    pub include_query: Option<bool>,
+    pub retention_days: Option<u32>,
+    pub unattributed_per_second: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RequestLogSection {
+    pub enabled: Option<bool>,
+    pub store: Option<bool>,
+    pub retention_hours: Option<u32>,
+    pub refused_per_second: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MeteringSection {
+    pub enabled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FhirRelease {
     R4,
@@ -131,6 +255,9 @@ pub struct ResolvedConfig {
     pub terminology_urls: Vec<String>,
     pub trace_engine: bool,
     pub sdc_archiver: bool,
+    /// Observing by default: usage, the request log and the audit trail are on, and nothing is
+    /// limited until an operator sizes a limit for their traffic.
+    pub governance: GovernanceConfig,
 }
 
 impl ResolvedConfig {
@@ -156,6 +283,7 @@ impl ResolvedConfig {
             terminology_urls: Vec::new(),
             trace_engine: false,
             sdc_archiver: false,
+            governance: GovernanceConfig::observing(),
         }
     }
 
@@ -283,7 +411,194 @@ impl ResolvedConfig {
         if let Some(v) = file.features.sdc_archiver {
             self.sdc_archiver = v;
         }
+        self.apply_governance(file)
+    }
+
+    fn apply_governance(&mut self, file: &FileConfig) -> Result<(), String> {
+        let governance = &mut self.governance;
+        if let Some(hops) = file.server.trusted_proxy_hops {
+            governance.proxy.trusted_hops = hops;
+        }
+        if let Some(peers) = &file.server.trusted_proxy_peers {
+            governance.proxy.trusted_peers = peers
+                .iter()
+                .map(|text| {
+                    refhir_server::Cidr::parse(text)
+                        .map_err(|err| format!("[server] trusted_proxy_peers: {err}"))
+                })
+                .collect::<Result<_, _>>()?;
+        }
+        if let Some(section) = &file.metering {
+            if let Some(v) = section.enabled {
+                governance.metering = v;
+            }
+        }
+        if let Some(section) = &file.request_log {
+            let log = &mut governance.request_log;
+            log.enabled = section.enabled.unwrap_or(true);
+            if let Some(v) = section.store {
+                log.store = v;
+            }
+            if let Some(v) = section.retention_hours {
+                log.retention_hours = v;
+            }
+            if let Some(v) = section.refused_per_second {
+                log.refused_per_second = v;
+            }
+        }
+        if let Some(section) = &file.audit {
+            let audit = &mut governance.audit;
+            audit.enabled = section.enabled.unwrap_or(true);
+            if let Some(v) = section.reads {
+                audit.reads = v;
+            }
+            if let Some(v) = section.include_query {
+                audit.include_query = v;
+            }
+            if section.retention_days.is_some() {
+                audit.retention_days = section.retention_days;
+            }
+            if let Some(v) = section.unattributed_per_second {
+                audit.unattributed_per_second = v;
+            }
+        }
+        if let Some(section) = &file.rate_limit {
+            let rate = &mut governance.rate_limit;
+            rate.enabled = section.enabled.unwrap_or(true);
+            if let Some(v) = section.requests_per_second {
+                rate.requests_per_second = v;
+            }
+            if let Some(v) = section.burst {
+                rate.burst = v;
+            }
+            if section.anonymous_requests_per_second.is_some() {
+                rate.anonymous_requests_per_second = section.anonymous_requests_per_second;
+            }
+            if section.anonymous_burst.is_some() {
+                rate.anonymous_burst = section.anonymous_burst;
+            }
+            if let Some(v) = section.auth_failures_per_minute {
+                rate.auth_failures_per_minute = v;
+            }
+            if let Some(v) = section.max_sync_connections {
+                rate.max_sync_connections = v;
+            }
+            if let Some(v) = section.max_live_queries {
+                rate.max_live_queries = v;
+            }
+            if section.servers.is_some() {
+                rate.servers = section.servers;
+            }
+            if let Some(cost) = &section.cost {
+                let costs = &mut rate.costs;
+                for (slot, value) in [
+                    (&mut costs.read, cost.read),
+                    (&mut costs.search, cost.search),
+                    (&mut costs.write, cost.write),
+                    (&mut costs.bundle, cost.bundle),
+                    (&mut costs.operation, cost.operation),
+                    (&mut costs.export, cost.export),
+                    (&mut costs.sync, cost.sync),
+                    (&mut costs.auth, cost.auth),
+                    (&mut costs.discovery, cost.discovery),
+                    (&mut costs.admin, cost.admin),
+                ] {
+                    if let Some(value) = value {
+                        *slot = value;
+                    }
+                }
+            }
+            for (client, over) in &section.clients {
+                rate.clients.insert(
+                    client.clone(),
+                    ClientRate {
+                        requests_per_second: over.requests_per_second,
+                        burst: over.burst,
+                    },
+                );
+            }
+        }
+        if let Some(section) = &file.quota {
+            let quota = &mut governance.quota;
+            quota.enabled = section.enabled.unwrap_or(true);
+            quota.limits = QuotaLimits {
+                requests_per_day: section.requests_per_day,
+                writes_per_day: section.writes_per_day,
+                bytes_per_day: section.bytes_per_day,
+                requests_per_month: section.requests_per_month,
+                writes_per_month: section.writes_per_month,
+                bytes_per_month: section.bytes_per_month,
+            };
+            if let Some(seconds) = section.refresh_seconds {
+                quota.refresh = Duration::from_secs(seconds.max(1));
+            }
+            for (client, limits) in &section.clients {
+                quota.clients.insert(client.clone(), limits.into());
+            }
+        }
         Ok(())
+    }
+
+    /// A one-line account of what is on, for the log at start-up.
+    pub fn describe_governance(&self) -> String {
+        let governance = &self.governance;
+        let mut parts = Vec::new();
+        parts.push(
+            if governance.metering {
+                "metering on"
+            } else {
+                "metering off"
+            }
+            .to_string(),
+        );
+        parts.push(if governance.audit.enabled {
+            format!(
+                "audit on ({}{}{})",
+                if governance.audit.reads {
+                    "reads and changes"
+                } else {
+                    "changes only"
+                },
+                match governance.audit.retention_days {
+                    Some(days) => format!(", kept {days} days"),
+                    None => ", kept forever".to_string(),
+                },
+                if governance.audit.chain_key.is_some() {
+                    ", chained with a key"
+                } else {
+                    ", chained with no key"
+                }
+            )
+        } else {
+            "audit OFF".to_string()
+        });
+        parts.push(if governance.request_log.enabled {
+            if governance.request_log.store {
+                format!(
+                    "request log on (kept {}h)",
+                    governance.request_log.retention_hours
+                )
+            } else {
+                "request log on (log lines only)".to_string()
+            }
+        } else {
+            "request log off".to_string()
+        });
+        let rate = &governance.rate_limit;
+        parts.push(if rate.enabled {
+            format!(
+                "rate limit {}/s burst {}",
+                rate.requests_per_second, rate.burst
+            )
+        } else {
+            "rate limit off".to_string()
+        });
+        parts.push(if governance.quota.enabled {
+            "quotas on".to_string()
+        } else {
+            "quotas off".to_string()
+        });
+        parts.join(", ")
     }
 }
 
@@ -390,6 +705,11 @@ pub fn apply_env(cfg: &mut ResolvedConfig) {
     }
     if let Some(value) = env_value("REFHIR_UPDATE_AS_CREATE") {
         cfg.update_as_create = matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    }
+    // The key to the audit chain is a secret and stays out of the config file; the database it
+    // protects must not be where it lives.
+    if let Some(key) = env_value("REFHIR_AUDIT_KEY") {
+        cfg.governance.audit.chain_key = Some(refhir_persistence::ChainKey::new(key.into_bytes()));
     }
     if let Some(token) = env_value("REFHIR_SMART_DCR_TOKEN") {
         cfg.smart_dcr_token = Some(token);
@@ -503,6 +823,264 @@ mod tests {
             ..FileConfig::default()
         };
         assert!(cfg.apply_file(&no_url).is_err());
+    }
+
+    fn resolved(text: &str) -> ResolvedConfig {
+        let file: FileConfig = toml::from_str(text).expect("parses");
+        let mut cfg = ResolvedConfig::defaults();
+        cfg.apply_file(&file).expect("applies");
+        cfg
+    }
+
+    #[test]
+    fn a_server_started_with_no_file_records_everything_and_limits_nothing() {
+        let governance = ResolvedConfig::defaults().governance;
+        assert!(governance.metering && governance.audit.enabled && governance.request_log.enabled);
+        assert!(governance.audit.reads && governance.audit.include_query);
+        assert_eq!(
+            governance.audit.retention_days, None,
+            "audit is kept until someone says otherwise"
+        );
+        assert!(!governance.rate_limit.enabled && !governance.quota.enabled);
+        assert_eq!(governance.proxy.trusted_hops, 0);
+    }
+
+    #[test]
+    fn the_governance_sections_are_read_from_the_file() {
+        let cfg = resolved(
+            r#"
+            [server]
+            trusted_proxy_hops = 2
+            trusted_proxy_peers = ["10.0.0.0/8", "fd00::/8"]
+
+            [metering]
+            enabled = true
+
+            [request_log]
+            store = false
+
+            [audit]
+            reads = false
+            include_query = false
+            retention_days = 2190
+
+            [rate_limit]
+            requests_per_second = 20
+            burst = 40
+            anonymous_requests_per_second = 2.5
+            anonymous_burst = 10
+            auth_failures_per_minute = 8
+            max_sync_connections = 3
+            max_live_queries = 12
+
+            [rate_limit.cost]
+            export = 40
+            read = 2
+
+            [rate_limit.clients.batch]
+            requests_per_second = 300
+            burst = 600
+
+            [rate_limit.clients.trusted]
+            requests_per_second = 0
+
+            [quota]
+            requests_per_day = 100000
+            writes_per_month = 50000
+            refresh_seconds = 10
+
+            [quota.clients.acme]
+            requests_per_day = 1000000
+            bytes_per_day = 0
+            "#,
+        );
+        let g = &cfg.governance;
+        assert_eq!(g.proxy.trusted_hops, 2);
+        assert_eq!(g.proxy.trusted_peers.len(), 2);
+        assert!(g.proxy.trusted_peers[0].contains("10.1.2.3".parse().unwrap()));
+        assert!(!g.proxy.trusted_peers[0].contains("11.0.0.1".parse().unwrap()));
+        assert!(!g.request_log.store && g.request_log.enabled);
+        assert!(g.audit.enabled && !g.audit.reads && !g.audit.include_query);
+        assert_eq!(g.audit.retention_days, Some(2190));
+        let rate = &g.rate_limit;
+        assert!(rate.enabled);
+        assert_eq!((rate.requests_per_second, rate.burst), (20.0, 40));
+        assert_eq!(rate.anonymous_requests_per_second, Some(2.5));
+        assert_eq!(rate.anonymous_burst, Some(10));
+        assert_eq!(
+            (
+                rate.auth_failures_per_minute,
+                rate.max_sync_connections,
+                rate.max_live_queries
+            ),
+            (8, 3, 12)
+        );
+        assert_eq!(
+            (rate.costs.export, rate.costs.read, rate.costs.search),
+            (40, 2, 2),
+            "the rest keep their default"
+        );
+        assert_eq!(rate.for_client("batch"), (300.0, 600));
+        assert_eq!(rate.for_client("trusted").0, 0.0, "exempt");
+        let quota = &g.quota;
+        assert!(quota.enabled);
+        assert_eq!(quota.refresh, Duration::from_secs(10));
+        assert_eq!(quota.for_client("anyone").requests_per_day, Some(100_000));
+        assert_eq!(quota.for_client("anyone").writes_per_month, Some(50_000));
+        assert_eq!(quota.for_client("acme").requests_per_day, Some(1_000_000));
+        // A client's own section overrides field by field: what it leaves out is inherited,
+        // and a zero lifts a limit the default sets.
+        assert_eq!(
+            quota.for_client("acme").writes_per_month,
+            Some(50_000),
+            "inherited"
+        );
+        assert_eq!(
+            quota.for_client("acme").bytes_per_day,
+            None,
+            "lifted by a zero"
+        );
+    }
+
+    #[test]
+    fn a_proxy_network_that_is_not_one_is_refused() {
+        let file: FileConfig =
+            toml::from_str("[server]\ntrusted_proxy_peers = [\"10.0.0.0/40\"]\n").unwrap();
+        let err = ResolvedConfig::defaults().apply_file(&file).unwrap_err();
+        assert!(err.contains("trusted_proxy_peers"), "{err}");
+    }
+
+    #[test]
+    fn a_section_that_is_present_is_on_unless_it_says_otherwise() {
+        let on = resolved("[rate_limit]\nrequests_per_second = 5\nburst = 20\n");
+        assert!(
+            on.governance.rate_limit.enabled,
+            "numbers without enabled = true still limit"
+        );
+        let off = resolved("[rate_limit]\nenabled = false\nrequests_per_second = 5\n");
+        assert!(!off.governance.rate_limit.enabled);
+        assert!(
+            resolved("[quota]\nrequests_per_day = 1\n")
+                .governance
+                .quota
+                .enabled
+        );
+        assert!(
+            !resolved("[quota]\nenabled = false\n")
+                .governance
+                .quota
+                .enabled
+        );
+        assert!(
+            !resolved("[audit]\nenabled = false\n")
+                .governance
+                .audit
+                .enabled
+        );
+        assert!(
+            resolved("[audit]\nreads = false\n")
+                .governance
+                .audit
+                .enabled
+        );
+        assert!(
+            !resolved("[metering]\nenabled = false\n")
+                .governance
+                .metering
+        );
+        assert!(
+            !resolved("[request_log]\nenabled = false\n")
+                .governance
+                .request_log
+                .enabled
+        );
+    }
+
+    #[test]
+    fn a_misspelt_key_in_a_governance_section_is_an_error_and_an_unknown_section_is_named() {
+        for typo in [
+            "[rate_limit]\nrequests_per_secnd = 5\n",
+            "[rate_limit.cost]\nexports = 5\n",
+            "[rate_limit.clients.a]\nburts = 5\n",
+            "[quota]\nrequest_per_day = 5\n",
+            "[audit]\nread = false\n",
+        ] {
+            assert!(toml::from_str::<FileConfig>(typo).is_err(), "{typo}");
+        }
+        let file: FileConfig = toml::from_str("[rate_limt]\nenabled = true\n").unwrap();
+        assert_eq!(file.unknown.keys().collect::<Vec<_>>(), ["rate_limt"]);
+        let file: FileConfig = toml::from_str("[rate_limit]\nenabled = true\n").unwrap();
+        assert!(file.unknown.is_empty());
+    }
+
+    #[test]
+    fn the_configurations_that_ship_with_the_server_parse_and_pass_validation() {
+        for (name, text) in [
+            (
+                "refhir.toml.example",
+                include_str!("../../../refhir.toml.example"),
+            ),
+            (
+                "deploy/refhir.production.toml",
+                include_str!("../../../deploy/refhir.production.toml"),
+            ),
+        ] {
+            let file: FileConfig =
+                toml::from_str(text).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert!(
+                file.unknown.is_empty(),
+                "{name}: {:?}",
+                file.unknown.keys().collect::<Vec<_>>()
+            );
+            let mut cfg = ResolvedConfig::defaults();
+            cfg.apply_file(&file)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+            cfg.governance
+                .validate(cfg.auth)
+                .unwrap_or_else(|err| panic!("{name}: {err}"));
+        }
+    }
+
+    #[test]
+    fn the_audit_key_comes_from_the_environment_and_is_never_printed() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cfg = ResolvedConfig::defaults();
+        assert!(cfg.governance.audit.chain_key.is_none());
+        assert!(cfg.describe_governance().contains("chained with no key"));
+        std::env::set_var("REFHIR_AUDIT_KEY", "0123456789abcdef0123456789abcdef");
+        apply_env(&mut cfg);
+        std::env::remove_var("REFHIR_AUDIT_KEY");
+        assert_eq!(
+            cfg.governance.audit.chain_key.as_ref().map(|key| key.len()),
+            Some(32)
+        );
+        assert!(cfg.describe_governance().contains("chained with a key"));
+        assert!(
+            !format!("{cfg:?}").contains("0123456789abcdef"),
+            "a key is not in Debug output"
+        );
+        assert!(cfg.governance.validate(false).is_ok());
+        // Too short to be a secret is refused when the server starts.
+        std::env::set_var("REFHIR_AUDIT_KEY", "short");
+        apply_env(&mut cfg);
+        std::env::remove_var("REFHIR_AUDIT_KEY");
+        assert!(cfg.governance.validate(false).is_err());
+    }
+
+    #[test]
+    fn what_is_on_is_described_in_one_line() {
+        let mut cfg = resolved(
+            "[rate_limit]\nrequests_per_second = 20\nburst = 40\n[audit]\nretention_days = 30\n",
+        );
+        let line = cfg.describe_governance();
+        assert!(line.contains("rate limit 20/s burst 40"), "{line}");
+        assert!(
+            line.contains("audit on (reads and changes, kept 30 days, chained with no key)"),
+            "{line}"
+        );
+        assert!(line.contains("quotas off"), "{line}");
+        cfg.governance.audit.enabled = false;
+        assert!(cfg.describe_governance().contains("audit OFF"));
     }
 
     #[test]
