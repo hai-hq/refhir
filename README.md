@@ -354,6 +354,7 @@ curl -s http://127.0.0.1:8080/metadata
 | `--standby` | Same as `--role standby` |
 | `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
 | `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
+| `refhir migrate --status\|--dry-run` | Report the database's schema version and what startup would do to it, without changing anything. See [Schema migrations](docs/migrations.md) |
 
 ### Several processes on one database
 
