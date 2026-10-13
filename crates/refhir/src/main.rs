@@ -33,11 +33,10 @@ const CATALOG_POLL: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let result = match args.first().map(String::as_str) {
-        Some("migrate") => migrate::run(&args[1..]),
-        _ => serve(args),
-    };
-    match result {
+    if args.first().map(String::as_str) == Some("migrate") {
+        return migrate::run(&args[1..]);
+    }
+    match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("refhir: {err}");

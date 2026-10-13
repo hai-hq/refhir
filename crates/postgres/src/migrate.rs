@@ -26,27 +26,6 @@ const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
 /// Held for the length of a migration transaction. (The key schema setup has always used.)
 const MIGRATION_LOCK: i64 = 7428310;
 
-/// Every table and index version 1 creates. A test checks it against the SQL.
-const BASELINE_OBJECTS: &[&str] = &[
-    "documents",
-    "documents_by_table_and_id",
-    "indexes",
-    "indexes_by_ts",
-    "persistence_globals",
-    "packages",
-    "structure_definitions",
-    "search_parameters",
-    "search_parameters_by_base_code",
-    "index_backfills",
-    "terminology",
-    "value_set_expansion",
-    "backfill_parameter",
-    "smart_oauth",
-    "smart_oauth_by_exp",
-    "jobs",
-    "jobs_by_status",
-];
-
 /// `index_backfills` has the column a claim is recorded in. Tables made by an earlier release
 /// lack it.
 const HAS_CLAIM_COLUMN: &str = "EXISTS (SELECT 1 FROM information_schema.columns \
@@ -62,6 +41,10 @@ const HAS_INVALID_INDEX: &str = "EXISTS (SELECT 1 FROM pg_index i \
      JOIN pg_class c ON c.oid = i.indexrelid \
      WHERE c.relname = 'indexes_by_ts' AND NOT i.indisvalid)";
 
+/// Longest a migration waits for a lock: the advisory lock another migrating process holds, or a
+/// table lock held by an open transaction. Past it startup fails with an error instead of hanging.
+const LOCK_TIMEOUT: &str = "120s";
+
 /// How long a reader waits for the primary to migrate.
 const WAIT_FOR_PRIMARY: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -76,12 +59,24 @@ pub(crate) fn run(client: &mut Client, known: &'static [Migration]) -> Result<()
     }
     let mut tx = client.transaction().map_err(definite)?;
     // Before anything is created: concurrent `CREATE TABLE IF NOT EXISTS` can still collide.
-    tx.batch_execute(&format!("SELECT pg_advisory_xact_lock({MIGRATION_LOCK})"))
-        .map_err(definite)?;
+    tx.batch_execute(&format!(
+        "SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'; SELECT pg_advisory_xact_lock({MIGRATION_LOCK})"
+    ))
+    .map_err(|err| {
+        definite(format!(
+            "could not take the schema migration lock within {LOCK_TIMEOUT}: {}",
+            err.error_text()
+        ))
+    })?;
     tx.batch_execute(CREATE_TABLE).map_err(definite)?;
     // Decided again under the lock: another process may have just done it.
     let applied = read_applied(&mut tx)?;
-    let plan = migrate::plan(known, &applied, existing(&mut tx)?)?;
+    let held = if applied.is_empty() {
+        existing(&mut tx)?
+    } else {
+        Existing::Complete // not consulted once versions are recorded
+    };
+    let plan = migrate::plan(known, &applied, held)?;
     match plan.adoption {
         Adoption::No => {}
         Adoption::Record => record(&mut tx, &known[0])?,
@@ -162,7 +157,7 @@ fn read_applied(client: &mut impl GenericClient) -> Result<Vec<AppliedMigration>
 
 /// What an unversioned database holds, judged against version 1.
 fn existing(client: &mut impl GenericClient) -> Result<Existing, PersistError> {
-    let objects: Vec<&str> = BASELINE_OBJECTS.to_vec();
+    let objects: Vec<&str> = migrate::BASELINE_OBJECTS.to_vec();
     let any: bool = client
         .query_one(
             "SELECT COALESCE(bool_or(to_regclass(object) IS NOT NULL), false) \
@@ -194,7 +189,7 @@ fn existing(client: &mut impl GenericClient) -> Result<Existing, PersistError> {
 }
 
 /// For a process that never runs DDL (a replica): waits until the primary has migrated the
-/// database to what this build knows. A database ahead of this build is refused at once, not
+/// database to what this build knows, or the database already has that schema unversioned. A database ahead of this build is refused at once, not
 /// waited on.
 pub(crate) fn wait_until_current(
     client: &mut Client,
@@ -203,7 +198,15 @@ pub(crate) fn wait_until_current(
     let deadline = std::time::Instant::now() + WAIT_FOR_PRIMARY;
     loop {
         let applied = read_applied(client)?;
-        if migrate::pending(known, &applied)?.is_empty() {
+        // A database that has the whole current schema but was never versioned (its primary
+        // still runs the previous release) is usable as it is; only a missing or older one waits.
+        let held = if applied.is_empty() {
+            existing(client)?
+        } else {
+            Existing::Complete
+        };
+        let plan = migrate::plan(known, &applied, held)?;
+        if plan.adoption != Adoption::CompleteThenRecord && plan.run.is_empty() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -610,6 +613,49 @@ mod tests {
         holder.batch_execute("COMMIT").unwrap();
         waiter.join().unwrap().unwrap();
         assert_eq!(versions(&mut holder), [1]);
+    }
+
+    #[test]
+    fn a_replica_starts_on_a_complete_unversioned_database_but_waits_for_a_partial_one() {
+        let Some(admin) = test_url("postgres migrations: replica on unversioned") else {
+            return;
+        };
+        let options = ConnectOptions {
+            pool_size: 1,
+            create_schema: false,
+        };
+        // Its primary still runs the previous release: every table, no schema_migrations.
+        let complete = fresh_database(&admin, "mreplicaok");
+        connect(&complete).batch_execute(MIGRATIONS[0].sql).unwrap();
+        PostgresPersistence::connect_with(&complete, &options).expect("usable as it is");
+        assert!(
+            !exists(&mut connect(&complete), "schema_migrations"),
+            "a replica ran DDL"
+        );
+
+        // An older schema is not usable yet: it waits for the primary to complete it.
+        let partial = fresh_database(&admin, "mreplicawait");
+        connect(&partial)
+            .batch_execute(
+                "CREATE TABLE index_backfills (id BIGSERIAL PRIMARY KEY, package_id BIGINT NOT NULL, \
+                 watermark_ts BIGINT NOT NULL, tablet TEXT NOT NULL, cursor_id TEXT, \
+                 done INTEGER NOT NULL)",
+            )
+            .unwrap();
+        let url = partial.clone();
+        let waiting = std::thread::spawn(move || {
+            PostgresPersistence::connect_with(&url, &options).map(|_| ())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(
+            !waiting.is_finished(),
+            "a replica started on a partial schema"
+        );
+        PostgresPersistence::connect(&partial).unwrap();
+        waiting
+            .join()
+            .unwrap()
+            .expect("starts once the primary has migrated");
     }
 
     #[test]

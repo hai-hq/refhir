@@ -26,27 +26,6 @@ const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
     checksum TEXT NOT NULL
 )";
 
-/// Every table and index version 1 creates. A test checks it against the SQL.
-const BASELINE_OBJECTS: &[&str] = &[
-    "documents",
-    "documents_by_table_and_id",
-    "indexes",
-    "indexes_by_ts",
-    "persistence_globals",
-    "packages",
-    "structure_definitions",
-    "search_parameters",
-    "search_parameters_by_base_code",
-    "index_backfills",
-    "terminology",
-    "value_set_expansion",
-    "backfill_parameter",
-    "smart_oauth",
-    "smart_oauth_by_exp",
-    "jobs",
-    "jobs_by_status",
-];
-
 /// Columns that releases before version 1 added to tables with `ALTER TABLE`, so a table such a
 /// release made may lack them. SQLite has no `ADD COLUMN IF NOT EXISTS`.
 const LATER_COLUMNS: &[(&str, &str, &str)] = &[
@@ -83,7 +62,12 @@ fn apply(connection: &mut Connection, known: &'static [Migration]) -> Result<(),
     tx.execute_batch(CREATE_TABLE).map_err(definite)?;
     // Decided again under the lock: another process may have just done it.
     let applied = read_applied(&tx).map_err(definite)?;
-    let plan = migrate::plan(known, &applied, existing(&tx).map_err(definite)?)?;
+    let held = if applied.is_empty() {
+        existing(&tx).map_err(definite)?
+    } else {
+        Existing::Complete // not consulted once versions are recorded
+    };
+    let plan = migrate::plan(known, &applied, held)?;
     match plan.adoption {
         Adoption::No => {}
         Adoption::Record => record(&tx, &known[0])?,
@@ -164,14 +148,14 @@ fn existing(connection: &Connection) -> rusqlite::Result<Existing> {
         .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'index')")?
         .query_map([], |row| row.get(0))?
         .collect::<Result<_, _>>()?;
-    let found = BASELINE_OBJECTS
+    let found = migrate::BASELINE_OBJECTS
         .iter()
         .filter(|name| present.contains(**name))
         .count();
     if found == 0 {
         return Ok(Existing::Empty);
     }
-    let mut complete = found == BASELINE_OBJECTS.len();
+    let mut complete = found == migrate::BASELINE_OBJECTS.len();
     for (table, column, _) in LATER_COLUMNS {
         complete = complete && has_column(connection, table, column)?;
     }
@@ -475,9 +459,13 @@ mod tests {
                 let path = path.clone();
                 std::thread::spawn(move || {
                     let mut connection = Connection::open(&path).unwrap();
+                    // As `from_connection` does: switching to WAL while another connection does
+                    // the same fails at once with BUSY (the busy handler is not consulted), so
+                    // the timeout is set on its own and the switch is allowed to lose the race.
                     connection
-                        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                        .execute_batch("PRAGMA busy_timeout=5000;")
                         .unwrap();
+                    let _ = connection.execute_batch("PRAGMA journal_mode=WAL;");
                     run(&mut connection, &WITH_SECOND)
                 })
             })

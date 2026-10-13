@@ -3,7 +3,9 @@
 
 use std::path::Path;
 
-use crate::config::{apply_env, discover_config_path, load_file, ResolvedConfig};
+use std::process::ExitCode;
+
+use crate::config::{discover_config_path, load_file, ResolvedConfig};
 
 pub const HELP: &str = "\
 refhir migrate --status | --dry-run [--config path] [--sqlite path | --postgres url]
@@ -16,8 +18,10 @@ SQLite file that does not exist is not created.
   --dry-run   the same, plus the SQL that would run
 
 The server applies pending migrations itself at startup, in one transaction. Migrations are
-not reversible: take a backup first. Exits 1 when this build would refuse to start, for
-example because the database was migrated by a newer ReFHIR.";
+not reversible: take a backup first.
+
+Exit codes: 0 this build would start; 1 it would refuse to start (for example the database was
+migrated by a newer ReFHIR); 2 the database could not be read, or the arguments were wrong.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -33,8 +37,24 @@ fn take(args: &[String], index: &mut usize, flag: &str) -> Result<String, String
         .ok_or_else(|| format!("{flag} needs a value"))
 }
 
-/// Runs the subcommand. `Err` is printed by the caller and exits 1.
-pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// Runs the subcommand: 0 if this build would start on the database, 1 if it would refuse, 2 if
+/// that could not be determined.
+pub fn run(args: &[String]) -> ExitCode {
+    match inspect(args) {
+        Ok(true) => ExitCode::SUCCESS,
+        Ok(false) => {
+            eprintln!("refhir: this build would refuse to start on this database");
+            ExitCode::from(1)
+        }
+        Err(err) => {
+            eprintln!("refhir: {err}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Whether this build would start on the database.
+fn inspect(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let mut mode = None;
     let mut config_path = None;
     let mut sqlite = None;
@@ -44,7 +64,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         match args[index].as_str() {
             "--help" | "-h" => {
                 println!("{HELP}");
-                return Ok(());
+                return Ok(true);
             }
             "--status" | "--dry-run" if mode.is_some() => {
                 return Err("pass only one of --status and --dry-run".into())
@@ -73,7 +93,16 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = discover_config_path(config_path.as_deref()) {
         cfg.apply_file(&load_file(&path)?)?;
     }
-    apply_env(&mut cfg)?;
+    // Only the database setting is read from the environment: the rest of `apply_env` validates
+    // settings (role, pool size) that have nothing to do with looking at a schema.
+    if let Some(url) = std::env::var("REFHIR_POSTGRES_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+    {
+        cfg.postgres = Some(url);
+        cfg.memory = false;
+        cfg.sqlite = None;
+    }
     if let Some(path) = sqlite {
         cfg.sqlite = Some(path);
         cfg.memory = false;
@@ -109,9 +138,5 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     };
     println!("database: {target}");
     print!("{}", report.render(mode == Mode::DryRun));
-    if report.can_start() {
-        Ok(())
-    } else {
-        Err("this build would refuse to start on this database".into())
-    }
+    Ok(report.can_start())
 }

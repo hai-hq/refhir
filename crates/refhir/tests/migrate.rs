@@ -128,11 +128,12 @@ fn a_database_from_a_newer_version_is_reported_and_exits_nonzero() {
 
 #[test]
 fn it_needs_to_be_told_what_to_do() {
+    // Not the exit code that means "this build would refuse to start".
     let output = migrate(&[]);
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(stderr(&output).contains("--status or --dry-run"));
     let both = migrate(&["--status", "--dry-run"]);
-    assert_eq!(both.status.code(), Some(1));
+    assert_eq!(both.status.code(), Some(2));
 }
 
 /// The server, not just the report, refuses: it exits without serving.
@@ -199,5 +200,27 @@ fn postgres_status_reports_the_recorded_versions() {
         stdout(&after).contains("up to date at version 1"),
         "{}",
         stdout(&after)
+    );
+}
+
+/// Settings `migrate` does not use must not stop it from looking at a database.
+#[test]
+fn unrelated_bad_settings_do_not_stop_a_status_check() {
+    let path = temp_db("unrelated");
+    drop(refhir_sqlite::SqlitePersistence::open(&path).unwrap());
+    let output = Command::new(env!("CARGO_BIN_EXE_refhir"))
+        .args(["migrate", "--status", "--sqlite", path.to_str().unwrap()])
+        .env("REFHIR_DB_POOL", "0")
+        .env("REFHIR_ROLE", "nonsense")
+        .env_remove("REFHIR_CONFIG")
+        .env_remove("REFHIR_POSTGRES_URL")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("up to date"),
+        "{}",
+        stdout(&output)
     );
 }

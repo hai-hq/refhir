@@ -27,9 +27,16 @@ the way back is to restore the backup.
 - Two processes starting together cannot both migrate. On Postgres the migration runs behind a
   transaction-scoped advisory lock; on SQLite it runs in a `BEGIN IMMEDIATE` transaction. The
   second process waits, then finds nothing to do.
-- A process started with `--role replica` never runs DDL. It waits (up to two minutes) for the
-  primary to bring the database to the version it knows, and refuses at once if the database is
-  *ahead* of it, since waiting would not help.
+- On Postgres, a process started with `--role replica` never runs DDL. It waits (up to two
+  minutes) for the primary to bring the database to the version it knows, and refuses at once if
+  the database is *ahead* of it, since waiting would not help. A database that has the whole
+  current schema but no `schema_migrations` (its primary still runs the previous release) is
+  usable as it is, so the replica starts without waiting. On SQLite, which has no separate
+  schema step for replicas, every process that opens the file migrates it, as above: start the
+  primary first if you want it to be the one that does.
+- On Postgres, a migration waits at most two minutes for a lock (the advisory lock another
+  migrating process holds, or a table lock held by an open transaction), then fails startup with
+  an error instead of hanging.
 
 If a migration fails, the transaction rolls back, nothing is recorded, the database is as it was,
 and the process exits with the error. Fix the cause and start again.
@@ -80,9 +87,11 @@ created. The Postgres URL is not printed.
   checksum prefix), and what startup would do.
 - `--dry-run`: the same, plus the SQL that would run.
 
-It exits `1` when this build would refuse to start (a newer database, a changed checksum, a
-damaged `schema_migrations`) and `0` otherwise, including when migrations are pending. It does
-not apply anything; the server applies migrations itself when it starts.
+Exit codes: `0` when it could read the database and this build would start (including when
+migrations are pending); `1` when this build would refuse to start (a newer database, a changed
+checksum, a damaged `schema_migrations`); `2` when it could not tell (bad arguments, an
+unreadable config file or database). A script can therefore tell "refused" from "could not
+look". It does not apply anything; the server applies migrations itself when it starts.
 
 ## Upgrading
 

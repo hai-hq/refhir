@@ -39,6 +39,28 @@ pub fn checksum(sql: &str) -> String {
         .collect()
 }
 
+/// Every table and index version 1 creates, the same in both backends. A backend test checks it
+/// against the SQL, and it is how an unversioned database is recognised as `Existing`.
+pub const BASELINE_OBJECTS: &[&str] = &[
+    "documents",
+    "documents_by_table_and_id",
+    "indexes",
+    "indexes_by_ts",
+    "persistence_globals",
+    "packages",
+    "structure_definitions",
+    "search_parameters",
+    "search_parameters_by_base_code",
+    "index_backfills",
+    "terminology",
+    "value_set_expansion",
+    "backfill_parameter",
+    "smart_oauth",
+    "smart_oauth_by_exp",
+    "jobs",
+    "jobs_by_status",
+];
+
 /// A row of `schema_migrations`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppliedMigration {
@@ -273,7 +295,7 @@ impl Report {
                     "  {:>3}  {name}  {}  sha256:{}",
                     row.version,
                     row.applied_at,
-                    &row.checksum[..row.checksum.len().min(12)]
+                    row.checksum.chars().take(12).collect::<String>()
                 );
             }
         }
@@ -456,6 +478,15 @@ mod tests {
         assert_eq!(checksum("a\nb\n"), checksum("a\r\nb\r\n"));
         assert_ne!(checksum("a\nb\n"), checksum("a\nc\n"));
         assert_eq!(checksum("").len(), 64);
+    }
+
+    #[test]
+    fn a_damaged_checksum_with_multibyte_text_does_not_panic_the_report() {
+        let mut damaged = row(1);
+        damaged.checksum = "ééééééééé".into(); // 18 bytes: byte 12 is mid-character
+        let report = Report::new(&KNOWN, vec![damaged], Existing::Complete);
+        assert!(report.render(false).contains("sha256:"));
+        assert!(!report.can_start());
     }
 
     #[test]
