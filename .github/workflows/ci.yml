@@ -94,6 +94,16 @@ jobs:
       - name: Test Postgres backend
         run: cargo test -p refhir-postgres
 
+      # The service above does not speak TLS, so this starts a TLS-only Postgres of its own
+      # (certificates, client-certificate role and all) and runs the TLS tests against it.
+      - name: Test Postgres over TLS
+        env:
+          REFHIR_REQUIRE_POSTGRES_TLS: "1"
+        run: |
+          out="$(scripts/postgres-tls-test.sh up)"
+          eval "$out"
+          cargo test -p refhir-postgres tls
+
       # Starts real refhir processes (primary, standby, replicas) on databases of their own and
       # kills the primary while writes are in flight. The Postgres role may create databases.
       - name: Test several processes on one database

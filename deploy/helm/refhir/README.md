@@ -23,7 +23,8 @@ one Postgres database instead of a single pod (SQLite cannot be shared between p
 ```bash
 helm install refhir ./deploy/helm/refhir \
   --set database.kind=postgres \
-  --set secretEnv.REFHIR_POSTGRES_URL='postgresql://refhir:...@postgres:5432/refhir' \
+  --set secretEnv.REFHIR_POSTGRES_URL='postgresql://refhir:...@postgres:5432/refhir?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt' \
+  --set database.tlsSecret=postgres-ca \
   --set cluster.enabled=true \
   --set cluster.writers=2 \
   --set cluster.replicas=2

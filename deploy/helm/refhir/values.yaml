@@ -18,6 +18,10 @@ server:
 
 database:
   kind: sqlite
+  # Name of an existing Secret with the files the Postgres URL points at (sslrootcert, and
+  # sslcert/sslkey for client certificates). It is mounted at /etc/refhir-pg-tls, so a Secret
+  # with a `ca.crt` key is reached as sslrootcert=/etc/refhir-pg-tls/ca.crt.
+  tlsSecret: ""
   sqlitePath: /data/refhir.sqlite
   postgresUrl: ""
 
