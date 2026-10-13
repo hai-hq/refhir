@@ -17,3 +17,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 uuid = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+
+[dev-dependencies]
+postgres = { workspace = true }
+ureq = { workspace = true }
+tungstenite = "0.24"
+serde_json = { workspace = true }
+refhir-types = { path = "../types" }

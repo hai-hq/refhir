@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # Run the performance check by hand: Actions -> CI -> Run workflow.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -92,6 +94,11 @@ jobs:
       - name: Test Postgres backend
         run: cargo test -p refhir-postgres
 
+      # Starts real refhir processes (primary, standby, replicas) on databases of their own and
+      # kills the primary while writes are in flight. The Postgres role may create databases.
+      - name: Test several processes on one database
+        run: cargo test -p refhir --test cluster -- --test-threads=4
+
   release-binary:
     name: Build release binary
     runs-on: ubuntu-latest
@@ -107,3 +114,56 @@ jobs:
 
       - name: Build refhir (release)
         run: cargo build --release -p refhir
+
+  # The plan's performance exit criteria need a quiet machine and a few minutes, so they are not
+  # part of every push. Trigger this job from the Actions tab; it fails if a pool of 8 does not
+  # beat a pool of 1 on the search-heavy workload, and uploads the raw results.
+  perf-smoke:
+    name: Perf criteria (manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Build refhir (release)
+        run: cargo build --release -p refhir
+
+      - name: Create an empty database
+        run: PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE perf"
+
+      - name: Check the performance criteria
+        env:
+          PERF_DB_URL: postgres://postgres:postgres@127.0.0.1:5432/perf
+          PERF_OUT: ${{ runner.temp }}/perf
+        run: scripts/perf-criteria.sh
+
+      - name: Upload the results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-results
+          path: ${{ runner.temp }}/perf/*.json

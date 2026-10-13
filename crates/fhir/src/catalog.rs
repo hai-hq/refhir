@@ -11,7 +11,7 @@ use refhir_persistence::{
     ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
 };
 use refhir_types::{exact_key, IndexId, TabletId};
-use refhir_validate::{MemoryTerminology, Schema};
+use refhir_validate::{expansion_is_current, MemoryTerminology, Schema};
 use serde_json::{json, Value};
 
 use crate::compartment::{self, Compartment};
@@ -133,6 +133,28 @@ impl ResourceModel {
     }
 }
 
+/// Which counter a process follows to know its catalog is out of date.
+///
+/// A catalog change that leaves search parameters pending (their index is still being built)
+/// moves only `Latest`. `Stable` moves once the backfill has completed and every parameter is
+/// ready. A replica never writes, so it follows `Stable` and never loads a parameter whose index
+/// is incomplete. A standby may have to finish the backfill when it takes over, so it follows
+/// `Latest` and already knows about the pending parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatalogClock {
+    Stable,
+    Latest,
+}
+
+impl CatalogClock {
+    pub fn read(self, store: &dyn ConformanceStore) -> Result<u64, PersistError> {
+        match self {
+            CatalogClock::Stable => store.catalog_version(),
+            CatalogClock::Latest => store.catalog_revision(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Catalog {
     fhir_version: Option<String>,
@@ -147,9 +169,19 @@ pub struct Catalog {
     /// Whether a PUT to an id that does not exist creates it under that id. Off by default: the
     /// server assigns ids.
     update_create: bool,
+    /// Whether any stored expansion was made under other rules than the current ones, so that it
+    /// may be wrong and the stored expansions need rebuilding.
+    stale_expansions: bool,
 }
 
 impl Catalog {
+    /// Whether any search parameter is still waiting for its backfill.
+    pub fn has_pending_parameters(&self) -> bool {
+        self.types
+            .values()
+            .any(|model| model.pending_params().next().is_some())
+    }
+
     pub fn empty() -> Self {
         Self {
             fhir_version: None,
@@ -161,6 +193,28 @@ impl Catalog {
             compartments: compartment::load(&[]),
             sdc_archiver: false,
             update_create: false,
+            stale_expansions: false,
+        }
+    }
+
+    /// The catalog and the value of `clock` it reflects. `open` reads five tables one after
+    /// another, so a change made in between could give a catalog that mixes two states; this
+    /// reads the clock before and after and tries again if it moved. If it never holds still the
+    /// catalog is returned with the *older* reading, so a caller that watches the clock sees it
+    /// differ and loads again, rather than trusting a catalog that may mix two states.
+    pub fn open_consistent(
+        store: &dyn ConformanceStore,
+        clock: CatalogClock,
+    ) -> Result<(Self, u64), PersistError> {
+        let mut attempts = 0;
+        loop {
+            let before = clock.read(store)?;
+            let catalog = Self::open(store)?;
+            let after = clock.read(store)?;
+            attempts += 1;
+            if before == after || attempts >= 5 {
+                return Ok((catalog, before));
+            }
         }
     }
 
@@ -187,9 +241,24 @@ impl Catalog {
         let definition_json = parse_all(definitions, |row| &row.json, "structure definition json")?;
         let term_json = parse_all(terminology, |row| &row.json, "terminology json")?;
         let expansion_json = parse_all(expansions, |row| &row.json, "value set expansion json")?;
+        // Each resource with the package it came from, so a value set reads the code systems of
+        // its own package first, as installing the package expanded it.
+        let scoped: Vec<(i64, &serde_json::Value)> = terminology
+            .iter()
+            .map(|row| row.package_id)
+            .zip(&term_json)
+            .collect();
+        // Each stored expansion with the package that stored it, so that a value set more than one
+        // package defines is answered by the definition in use, not by the package installed last.
+        let stored: Vec<(i64, &serde_json::Value)> = expansions
+            .iter()
+            .map(|row| row.package_id)
+            .zip(&expansion_json)
+            .collect();
         let (schema, terms) = std::thread::scope(|scope| {
             let schema = scope.spawn(|| Schema::from_definitions(&definition_json));
-            let terms = MemoryTerminology::from_stored(&term_json, &expansion_json);
+            let terms =
+                MemoryTerminology::from_stored_scoped(&scoped, &stored, fhir_version.as_deref());
             (schema.join().expect("schema build"), terms)
         });
         let mut types = BTreeMap::new();
@@ -272,7 +341,17 @@ impl Catalog {
             compartments: compartment::load(&term_json),
             sdc_archiver: false,
             update_create: false,
+            stale_expansions: expansion_json
+                .iter()
+                .any(|document| !expansion_is_current(document)),
         })
+    }
+
+    /// Whether any stored expansion was made under other rules than the current ones. A database
+    /// the previous version rebuilt has expansions read from one pool for every package, and
+    /// nothing else would ever correct them.
+    pub fn expansions_stale(&self) -> bool {
+        self.stale_expansions
     }
 
     pub fn reference_policy(&self) -> ReferencePolicy {

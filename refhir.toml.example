@@ -28,6 +28,12 @@ sqlite_path = "/data/refhir.sqlite"
 # postgres_url = "postgresql://refhir:refhir@postgres:5432/refhir"
 # Or set REFHIR_POSTGRES_URL instead of postgres_url.
 
+[cluster]
+# Several processes on one Postgres database (see README, "Several processes on one database").
+# role = "primary"   # primary | standby | replica; REFHIR_ROLE
+# primary_url = "http://primary:8080"   # replicas send writes here; REFHIR_PRIMARY_URL
+# db_pool = 8        # most Postgres connections (SQLite: read connections, default 4); REFHIR_DB_POOL
+
 [conformance]
 reference_policy = "strict" # strict | fhir
 # strict: a reference must point at a resource this server holds, of a type the element allows,

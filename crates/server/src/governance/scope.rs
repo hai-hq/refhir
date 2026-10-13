@@ -49,6 +49,9 @@ struct State {
     throttled: bool,
     /// The caller's limits have been applied to this request.
     admitted: bool,
+    /// A replica sent this request to the primary, which limits, meters and audits it as one
+    /// of its own.
+    forwarded: bool,
     decision: Option<Decision>,
 }
 
@@ -137,6 +140,17 @@ impl RequestScope {
 
     pub fn mark_admitted(&self) {
         self.state.lock().expect("scope").admitted = true;
+    }
+
+    /// The request was sent on to the primary. It is still logged here, as a request this
+    /// process received, but the primary counts and audits what it does: counted here too, a
+    /// forwarded write would use up twice its quota and leave two audit rows.
+    pub fn mark_forwarded(&self) {
+        self.state.lock().expect("scope").forwarded = true;
+    }
+
+    pub fn forwarded(&self) -> bool {
+        self.state.lock().expect("scope").forwarded
     }
 
     pub fn set_decision(&self, decision: Decision) {

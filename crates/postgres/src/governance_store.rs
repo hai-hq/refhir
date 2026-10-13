@@ -7,8 +7,9 @@ use refhir_persistence::{
 };
 
 /// Held for the length of a transaction that extends the audit chain, so that servers appending
-/// at the same time take turns and make one chain. (The schema is set up under 7428310.)
-const CHAIN_LOCK: i64 = 7428311;
+/// at the same time take turns and make one chain. (The schema is set up under 7428310, and
+/// the timestamp index is built under 7428311.)
+const CHAIN_LOCK: i64 = 7428312;
 
 use crate::{definite, PostgresPersistence};
 
@@ -173,7 +174,7 @@ impl GovernanceStore for PostgresPersistence {
             return Ok(());
         }
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             let stmt = tx
                 .prepare(
@@ -222,7 +223,7 @@ impl GovernanceStore for PostgresPersistence {
                 filter.limit.clamp(1, 10_000)
             );
             let values = bind(&clause);
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let rows = guard.client.query(&sql, &refs(&values)).map_err(definite)?;
             Ok(rows.iter().map(usage_from_row).collect())
         })
@@ -233,7 +234,7 @@ impl GovernanceStore for PostgresPersistence {
             return Ok(());
         }
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             let stmt = tx
                 .prepare(
@@ -278,7 +279,7 @@ impl GovernanceStore for PostgresPersistence {
                 filter.limit.clamp(1, 10_000)
             );
             let values = bind(&clause);
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let rows = guard.client.query(&sql, &refs(&values)).map_err(definite)?;
             Ok(rows.iter().map(request_from_row).collect())
         })
@@ -289,7 +290,7 @@ impl GovernanceStore for PostgresPersistence {
             return Ok(());
         }
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             // Every server that extends the chain takes this first, so the hash read below is
             // still the last one when the rows that follow it are inserted.
@@ -351,7 +352,7 @@ impl GovernanceStore for PostgresPersistence {
                 filter.limit.clamp(1, 10_000)
             );
             let values = bind(&clause);
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let rows = guard.client.query(&sql, &refs(&values)).map_err(definite)?;
             Ok(rows.iter().map(audit_from_row).collect())
         })
@@ -359,7 +360,7 @@ impl GovernanceStore for PostgresPersistence {
 
     fn audit_scan(&self, after_id: u64, limit: u32) -> Result<Vec<ChainedRow>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
                 .query(
@@ -383,7 +384,7 @@ impl GovernanceStore for PostgresPersistence {
 
     fn audit_head(&self) -> Result<Option<(u64, Vec<u8>)>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let row = guard
                 .client
                 .query_opt(
@@ -400,7 +401,7 @@ impl GovernanceStore for PostgresPersistence {
         // this is the one thing they all have in common.
         const NOW: &str = "(extract(epoch FROM clock_timestamp()) * 1000)::bigint";
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             tx.execute(
                 &format!(
@@ -426,7 +427,7 @@ impl GovernanceStore for PostgresPersistence {
 
     fn members_leave(&self, owner: &str) -> Result<(), PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             guard
                 .client
                 .execute("DELETE FROM governance_members WHERE owner = $1", &[&owner])
@@ -441,7 +442,7 @@ impl GovernanceStore for PostgresPersistence {
         audit_before_ms: Option<u64>,
     ) -> Result<Pruned, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             let mut pruned = Pruned::default();
             if let Some(before) = request_log_before_ms {

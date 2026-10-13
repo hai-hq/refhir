@@ -77,6 +77,8 @@ pub(crate) struct Launch {
 
 pub struct SmartStore {
     backend: Arc<dyn AuthStore>,
+    /// A reader never creates the signing key; see [`SmartStore::open_reader`].
+    key_creation: bool,
     /// Loaded from `backend` on first use; see [`SmartStore::signing_keys`].
     keys: std::sync::OnceLock<super::signing::ServerKeys>,
     /// Token lookups happen several times per request; keep them off the database.
@@ -141,21 +143,58 @@ impl SmartStore {
 
     /// Tables in `backend`. The built-in clients are (re)written, so the configured secret
     /// always wins over the one saved last run.
+    ///
+    /// Panics if the built-in clients cannot be stored; a server that must report that as an
+    /// error uses [`SmartStore::try_open`].
     pub fn open(backend: Arc<dyn AuthStore>, confidential_secret: impl Into<String>) -> Self {
-        let store = Self {
+        Self::try_open(backend, confidential_secret).expect("store the built-in smart clients")
+    }
+
+    /// [`SmartStore::open`] that reports a database that cannot be written as an error.
+    pub fn try_open(
+        backend: Arc<dyn AuthStore>,
+        confidential_secret: impl Into<String>,
+    ) -> Result<Self, PersistError> {
+        let store = Self::attach(backend, true);
+        store.seed_defaults(confidential_secret)?;
+        Ok(store)
+    }
+
+    /// Tables in `backend` for a process that only serves them, next to a writer that owns the
+    /// built-in clients and the signing key. It writes neither: seeding from here would
+    /// overwrite the writer's values, and a key it created would be a second one.
+    pub fn open_reader(backend: Arc<dyn AuthStore>) -> Self {
+        Self::attach(backend, false)
+    }
+
+    fn attach(backend: Arc<dyn AuthStore>, key_creation: bool) -> Self {
+        Self {
             backend,
+            key_creation,
             keys: std::sync::OnceLock::new(),
             token_cache: Mutex::new(HashMap::new()),
             origin_cache: Mutex::new(None),
-        };
+        }
+    }
+
+    /// Seed the built-in clients. Only a process that owns the database calls this (a
+    /// replica never does).
+    ///
+    /// The `public` client is written only if it is not there, so a second process starting
+    /// does not rewrite what the first stored. The `confidential` client always takes the secret
+    /// this process was given: every writer in a cluster is given the same pinned one (a standby
+    /// refuses to start without it), so the stored value never changes under another process; a
+    /// single process that generated a fresh secret at startup has just printed it, and it has
+    /// to be the one that works.
+    fn seed_defaults(&self, confidential_secret: impl Into<String>) -> Result<(), PersistError> {
         let redirects: Vec<String> = vec![
             "http://127.0.0.1/cb".into(),
             "http://localhost/cb".into(),
             "http://127.0.0.1/app".into(),
             "http://localhost/app".into(),
         ];
-        store
-            .put_client(Client {
+        if self.client("public").is_none() {
+            self.put_client(Client {
                 id: "public".into(),
                 secret: None,
                 public: true,
@@ -163,20 +202,17 @@ impl SmartStore {
                 jwks: None,
                 grants: vec!["authorization_code".into(), "refresh_token".into()],
                 allowed_scopes: None,
-            })
-            .expect("store the built-in smart clients");
-        store
-            .put_client(Client {
-                id: "confidential".into(),
-                secret: Some(hash_secret(&confidential_secret.into())),
-                public: false,
-                redirect_uris: redirects,
-                jwks: None,
-                grants: vec!["authorization_code".into(), "refresh_token".into()],
-                allowed_scopes: None,
-            })
-            .expect("store the built-in smart clients");
-        store
+            })?;
+        }
+        self.put_client(Client {
+            id: "confidential".into(),
+            secret: Some(hash_secret(&confidential_secret.into())),
+            public: false,
+            redirect_uris: redirects,
+            jwks: None,
+            grants: vec!["authorization_code".into(), "refresh_token".into()],
+            allowed_scopes: None,
+        })
     }
 
     /// Load the signing key now instead of on the first token request, so a missing or wrong
@@ -191,7 +227,11 @@ impl SmartStore {
         if let Some(keys) = self.keys.get() {
             return Ok(keys);
         }
-        let loaded = super::signing::load_or_create(self.backend.as_ref())?;
+        let loaded = if self.key_creation {
+            super::signing::load_or_create(self.backend.as_ref())?
+        } else {
+            super::signing::load_existing(self.backend.as_ref())?
+        };
         Ok(self.keys.get_or_init(|| loaded))
     }
 
@@ -348,6 +388,15 @@ impl SmartStore {
                 false
             }
         }
+    }
+
+    /// True when `origins` would answer from memory, without a database read.
+    pub(crate) fn origins_are_cached(&self) -> bool {
+        self.origin_cache
+            .lock()
+            .expect("origins")
+            .as_ref()
+            .is_some_and(|(at, _)| at.elapsed() < CACHE_TTL)
     }
 
     pub(crate) fn origins(&self) -> HashSet<String> {
@@ -580,6 +629,154 @@ mod tests {
         assert!(store.token("tok").is_some());
         assert_eq!(store.signing_keys().unwrap().kid, kid);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_reader_never_seeds_clients_or_creates_the_signing_key() {
+        let db = Arc::new(refhir_sqlite::SqlitePersistence::open_in_memory().unwrap());
+        // A replica that starts before the primary finds nothing and writes nothing.
+        let reader = SmartStore::open_reader(db.clone());
+        assert!(reader.client("confidential").is_none());
+        assert!(reader.client("public").is_none());
+        let err = reader.init_signing_key().unwrap_err();
+        assert!(err.contains("start the primary"), "{err}");
+        assert!(db.auth_get(SIGNING_KEY, "rs256", 0).unwrap().is_none());
+
+        // The primary creates both. The reader then sees the same key and the same client.
+        let primary = SmartStore::open(db.clone(), "pinned");
+        let kid = primary.signing_keys().unwrap().kid.clone();
+        reader.init_signing_key().expect("the key exists now");
+        assert_eq!(reader.signing_keys().unwrap().kid, kid);
+        assert!(reader
+            .client("confidential")
+            .unwrap()
+            .secret_matches("pinned"));
+    }
+
+    #[test]
+    fn processes_opening_at_the_same_time_never_change_the_secret() {
+        let db = Arc::new(refhir_sqlite::SqlitePersistence::open_in_memory().unwrap());
+        SmartStore::open(db.clone(), "pinned");
+        let opening: Vec<_> = (0..6)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        SmartStore::open(db.clone(), "pinned");
+                    }
+                })
+            })
+            .collect();
+        // While they open, another process reading the client never sees the secret change.
+        let reader = SmartStore::open_reader(db.clone());
+        for _ in 0..200 {
+            let client = reader.client("confidential").expect("always present");
+            assert!(
+                client.secret_matches("pinned"),
+                "the secret changed under a reader"
+            );
+        }
+        for handle in opening {
+            handle.join().unwrap();
+        }
+        assert!(reader.client("public").is_some());
+    }
+
+    #[test]
+    fn the_public_client_is_seeded_once_and_then_left_alone() {
+        let (store, db) = sqlite_store("s");
+        let mut custom = store.client("public").unwrap();
+        custom.redirect_uris = vec!["https://app.example/callback".into()];
+        store.put_client(custom).unwrap();
+        // Another process starting does not put the defaults back.
+        let again = SmartStore::open(db, "s");
+        assert_eq!(
+            again.client("public").unwrap().redirect_uris,
+            vec!["https://app.example/callback".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_database_that_cannot_be_written_is_an_error_not_a_panic() {
+        struct ReadOnly(refhir_persistence::MemoryAuthStore);
+        impl AuthStore for ReadOnly {
+            fn auth_put(&self, _: &str, _: &str, _: &str, _: u64) -> Result<(), PersistError> {
+                Err(PersistError::Definite("the database is read-only".into()))
+            }
+            fn auth_insert(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<bool, PersistError> {
+                Err(PersistError::Definite("the database is read-only".into()))
+            }
+            fn auth_get(&self, k: &str, i: &str, n: u64) -> Result<Option<String>, PersistError> {
+                self.0.auth_get(k, i, n)
+            }
+            fn auth_take(&self, k: &str, i: &str, n: u64) -> Result<Option<String>, PersistError> {
+                self.0.auth_take(k, i, n)
+            }
+            fn auth_delete_if(&self, k: &str, i: &str, j: &str) -> Result<bool, PersistError> {
+                self.0.auth_delete_if(k, i, j)
+            }
+            fn auth_list(&self, k: &str, n: u64) -> Result<Vec<String>, PersistError> {
+                self.0.auth_list(k, n)
+            }
+            fn auth_prune(&self, n: u64) -> Result<(), PersistError> {
+                self.0.auth_prune(n)
+            }
+        }
+        let err = SmartStore::try_open(Arc::new(ReadOnly(Default::default())), "s")
+            .err()
+            .expect("seeding needs a writable database");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    #[test]
+    fn what_one_process_issues_another_verifies() {
+        let db = Arc::new(refhir_sqlite::SqlitePersistence::open_in_memory().unwrap());
+        let primary = SmartStore::open(db.clone(), "pinned");
+        let replica = SmartStore::open_reader(db);
+        primary.install_token("tok", &["user/*.rs"], Some("p1"));
+        let seen = replica
+            .token("tok")
+            .expect("a replica accepts the primary's token");
+        assert_eq!(seen.patient.as_deref(), Some("p1"));
+        // Both use one key, so the replica publishes the keys the primary signs with.
+        assert_eq!(
+            primary.signing_keys().unwrap().kid,
+            replica.signing_keys().unwrap().kid
+        );
+    }
+
+    #[test]
+    fn a_process_restarting_with_the_same_secret_changes_nothing() {
+        let (first, db) = sqlite_store("pinned");
+        let before = first.client("confidential").unwrap().secret;
+        // A promoted standby seeds the same values again.
+        let second = SmartStore::open(db, "pinned");
+        assert_eq!(second.client("confidential").unwrap().secret, before);
+    }
+
+    #[test]
+    fn a_corrupt_key_is_replaced_without_removing_a_good_key_written_since() {
+        use refhir_persistence::AuthStore;
+        let db = refhir_persistence::MemoryAuthStore::default();
+        db.auth_put(SIGNING_KEY, "rs256", "\"not a pem\"", u64::MAX)
+            .unwrap();
+        // Another process replaced the bad row with a good one after this one read it.
+        db.auth_put(SIGNING_KEY, "rs256", "\"a good key\"", u64::MAX)
+            .unwrap();
+        assert!(!db
+            .auth_delete_if(SIGNING_KEY, "rs256", "\"not a pem\"")
+            .unwrap());
+        assert_eq!(
+            db.auth_get(SIGNING_KEY, "rs256", 0).unwrap().as_deref(),
+            Some("\"a good key\"")
+        );
     }
 
     #[test]

@@ -28,6 +28,12 @@ data:
     postgres_url = "{{ .Values.database.postgresUrl }}"
     {{- end }}
 
+    {{- if .Values.cluster.enabled }}
+
+    [cluster]
+    db_pool = {{ .Values.cluster.dbPool }}
+    {{- end }}
+
     [conformance]
     reference_policy = "{{ .Values.conformance.referencePolicy }}"
     {{- if .Values.conformance.packageRegistry }}

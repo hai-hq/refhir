@@ -174,7 +174,7 @@ impl GovernanceStore for SqlitePersistence {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut guard = self.inner.lock().expect("sqlite");
+        let mut guard = self.inner.lock()?;
         let tx = guard.connection.transaction().map_err(definite)?;
         {
             let mut stmt = tx
@@ -219,7 +219,7 @@ impl GovernanceStore for SqlitePersistence {
             clause.sql(false, 1),
             filter.limit.clamp(1, 10_000)
         );
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard.connection.prepare(&sql).map_err(definite)?;
         let rows = stmt
             .query_map(params_from_iter(bind(&clause)), usage_from_row)
@@ -233,7 +233,7 @@ impl GovernanceStore for SqlitePersistence {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut guard = self.inner.lock().expect("sqlite");
+        let mut guard = self.inner.lock()?;
         let tx = guard.connection.transaction().map_err(definite)?;
         {
             let mut stmt = tx
@@ -274,7 +274,7 @@ impl GovernanceStore for SqlitePersistence {
             clause.sql(false, 1),
             filter.limit.clamp(1, 10_000)
         );
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard.connection.prepare(&sql).map_err(definite)?;
         let rows = stmt
             .query_map(params_from_iter(bind(&clause)), request_from_row)
@@ -288,7 +288,7 @@ impl GovernanceStore for SqlitePersistence {
         if rows.is_empty() {
             return Ok(());
         }
-        let mut guard = self.inner.lock().expect("sqlite");
+        let mut guard = self.inner.lock()?;
         // Taking the write lock before reading the last hash, so that no other connection can
         // add a row between the read and the insert and make the chain fork.
         let tx = guard
@@ -352,7 +352,7 @@ impl GovernanceStore for SqlitePersistence {
             clause.sql(false, 1),
             filter.limit.clamp(1, 10_000)
         );
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard.connection.prepare(&sql).map_err(definite)?;
         let rows = stmt
             .query_map(params_from_iter(bind(&clause)), audit_from_row)
@@ -363,7 +363,7 @@ impl GovernanceStore for SqlitePersistence {
     }
 
     fn audit_scan(&self, after_id: u64, limit: u32) -> Result<Vec<ChainedRow>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
             .prepare_cached(&format!(
@@ -386,7 +386,7 @@ impl GovernanceStore for SqlitePersistence {
     }
 
     fn audit_head(&self) -> Result<Option<(u64, Vec<u8>)>, PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .query_row(
@@ -399,7 +399,7 @@ impl GovernanceStore for SqlitePersistence {
     }
 
     fn members_touch(&self, owner: &str, now_ms: u64, ttl_ms: u64) -> Result<u32, PersistError> {
-        let mut guard = self.inner.lock().expect("sqlite");
+        let mut guard = self.inner.lock()?;
         let tx = guard.connection.transaction().map_err(definite)?;
         tx.execute(
             "INSERT INTO governance_members (owner, seen_ms) VALUES (?1, ?2) \
@@ -422,7 +422,7 @@ impl GovernanceStore for SqlitePersistence {
     }
 
     fn members_leave(&self, owner: &str) -> Result<(), PersistError> {
-        let guard = self.inner.lock().expect("sqlite");
+        let guard = self.inner.lock()?;
         guard
             .connection
             .execute("DELETE FROM governance_members WHERE owner = ?1", [owner])
@@ -435,7 +435,7 @@ impl GovernanceStore for SqlitePersistence {
         request_log_before_ms: Option<u64>,
         audit_before_ms: Option<u64>,
     ) -> Result<Pruned, PersistError> {
-        let mut guard = self.inner.lock().expect("sqlite");
+        let mut guard = self.inner.lock()?;
         let tx = guard.connection.transaction().map_err(definite)?;
         let mut pruned = Pruned::default();
         if let Some(before) = request_log_before_ms {

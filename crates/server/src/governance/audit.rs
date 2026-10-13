@@ -282,6 +282,15 @@ pub fn begin(path: &str, args: &Value) -> Option<Pending> {
 
 impl Pending {
     pub fn finish(self, outcome: &Result<RunResult, RunError>) {
+        // A replica that cannot commit sends the operation to the primary, which records it.
+        // Nothing was done here, and what was refused, if it is not sent on, is recorded at the
+        // edge. Leaving this request unaccounted for is what makes that so.
+        if matches!(
+            outcome,
+            Err(RunError::Commit(refhir_database::CommitError::ReadOnly))
+        ) {
+            return;
+        }
         let config = &self.scope.governance().config.audit;
         let rows = rows_for(&self.scope, &self.facts, outcome, super::now_ms());
         // Whatever is recorded, this request has been accounted for.

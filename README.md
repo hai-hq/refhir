@@ -351,6 +351,61 @@ curl -s http://127.0.0.1:8080/metadata
 | `--oidc-issuer url`, `--oidc-client-id id` | Sign SMART users in through an OpenID Connect provider (secret: `REFHIR_OIDC_CLIENT_SECRET`) |
 | `--smart-demo-login` | Testing only: accept any username, verify nothing |
 | `--update-as-create` | Let `PUT [type]/[id]` create a resource under an id the client names (also `[conformance].update_as_create`). Off by default: the server assigns ids. |
+| `--role primary\|standby\|replica` | What this process does next to others on one database (default `primary`; or `REFHIR_ROLE`). See [Several processes](#several-processes-on-one-database) |
+| `--standby` | Same as `--role standby` |
+| `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
+| `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
+
+### Several processes on one database
+
+By default there is one process. To survive a crash or serve more reads, run several against one
+**Postgres** database (a SQLite file can also be shared by a primary and standbys on one machine):
+
+| Role | What it does |
+|------|--------------|
+| `primary` | The one process that writes. It holds a lease on the database and refuses to start while another primary has it. |
+| `standby` (`--standby`) | Waits for the lease and starts serving the moment the primary is gone. |
+| `replica` | Serves reads from what the primary has published and sends everything it cannot do (writes, `$export`, `$install`) to `--primary-url`. |
+
+```bash
+refhir --postgres $URL                                                  # primary
+refhir --postgres $URL --standby                                        # takes over
+refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
+```
+
+- **Writer lease.** A session-level Postgres advisory lock on a dedicated connection (a file lock
+  `<db>.lock` for SQLite), kept alive every two seconds. If the connection is lost the process
+  exits. Each takeover bumps a `writer_epoch`, and every write checks it inside its own
+  transaction, so a paused primary that wakes up after its successor took over is fenced and
+  exits instead of writing.
+- **Load balancers.** `GET /healthz` is 200 when a process can take traffic and 503 when it
+  cannot: a standby, a process still starting, or a replica that has stopped following the
+  primary. `?verbose=1` adds connection pool and commit timing counters.
+- **Reading your own writes.** Write responses carry `X-Refhir-Commit-Ts` (reads carry the
+  snapshot they ran at). Send the largest value you have seen as `X-Refhir-Min-Ts` and a replica
+  waits briefly for its snapshot to reach it, then asks the primary. A replica that has no
+  `--primary-url` to ask answers `503` with `Retry-After: 1` instead of an older snapshot. The Go
+  and TypeScript clients do this on their own.
+- **`/sync`** works on a replica: queries are answered and invalidated locally; mutations go to
+  the primary on a connection of their own. `$websocket` subscriptions, Subscription delivery and
+  `$export` live on the primary.
+- **SMART.** Tokens, clients and the signing key are in the database, so any process accepts a
+  token another issued. Every process must be given the same `--smart-dcr-token` and
+  `--smart-confidential-secret`; standbys and replicas refuse to start without them.
+- **Catalog.** Search parameters and profiles are loaded into memory, so two counters in the
+  database tell other processes to reload. A replica follows the *version*, which moves only when
+  no search parameter is waiting for its backfill: it is bumped when a backfill completes (or at
+  once for a change with nothing to backfill), so a replica never loads a parameter whose index is
+  incomplete. A standby follows the *revision*, which moves on every change, because after a
+  takeover it may have to finish the backfill itself.
+- **Backfills.** Each backfill job records the writer epoch that claims it. A standby that takes
+  over resumes a job its predecessor left half done from the stored cursor and takes the claim;
+  an older writer is refused a job a newer one holds. Backfill progress, the claim, installs and
+  the catalog counters are written inside a transaction that first checks the writer epoch, like
+  document commits, so a replaced primary cannot alter them.
+
+Running it: [deploy/cluster](deploy/cluster/README.md) (Docker Compose with HAProxy), the Helm
+chart's `cluster.enabled`, and measurements in [docs/perf](docs/perf/baseline.md).
 
 ### HTTP examples
 
@@ -382,7 +437,7 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 
 `ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
 
-A code system can be installed in several versions, and each is kept. HL7's v2 tables carry theirs in the URL (`.../v2-0006|2.1`), other packages in `CodeSystem.version`; a code system written through the API with a `version` is stored the same way. A value set that names a version (`system|version`, or `include.version`) gets exactly that one; with none named, the latest installed version is used, and the expansion records the version it read. A version that is not installed is refused, naming the versions that are, rather than answered from another one. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
+A code system can be installed in several versions, and each is kept. HL7's v2 tables carry theirs in the URL (`.../v2-0006|2.1`), other packages in `CodeSystem.version`; a code system written through the API with a `version` is stored the same way. A value set that names a version (`system|version`, or `include.version`) gets exactly that one; with none named, a value set from a package reads the versions of that system **its own package** holds (installing the package expanded it with those, and a rebuild gives the same answer), and a value set written through the API, or one whose package does not hold the system, reads the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed and the latest installed version otherwise. The expansion records the version it read. A value set that includes another by URL reads that one's definition from its own package too, when the package has one. When several packages define the same value set URL, the definition at the server's release version is the one in use (the extensions package carries `5.3.0-ballot-tc1` copies of R4's value sets over R5's code system URLs, and an R4 server means R4's `4.0.1`); with none at the release, the one installed last, because version strings in different styles (`2018-08-12`, `2.9`, `3.0.0`) do not order against each other. If the one in use cannot be expanded, the next that can answers, so a newer terminology package that needs a code system nothing carries does not take away the older expansion. A start, a rebuild and an incremental change choose the same definition: each is tried first as installing its own package tried it, against what that package holds alone, and only when none can be expanded that way is the rest of the store read, which is how a value set that waits on another package's code system gets an expansion (a start reads what installing each package stored, so it has none for such a value set until the next rebuild). A rebuild stores the expansion under the package whose definition is in use. Stored expansions carry the rules they were made under, and a database written by an older version has them rebuilt once, at its next start. Cross-version and newer packages are why: `hl7.fhir.uv.xver-r5.r4`, a dependency of SDC, has `5.0.0` of `http://hl7.org/fhir/encounter-status`, and `hl7.terminology.r4` carries newer copies of systems the R4 core package also carries; an R4 value set that includes them still means R4's codes (`arrived`, `finished`). A version that is not installed is refused, naming the versions that are, rather than answered from another one. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
 
 `POST /ValueSet/$expandability` reports, for the value sets named in `url` (a string, an array, or `url` parameters of a Parameters resource), whether each can be expanded and why not; with none named it lists every loaded value set that cannot. Use it as a deployment check for the value sets a UI depends on. `POST /ImplementationGuide/$install` adds a warning to its response for any value set the package made unexpandable, and the server logs how many there are at start-up.
 
@@ -498,7 +553,10 @@ cargo fmt --all
 ```
 
 CI: [.github/workflows/ci.yml](.github/workflows/ci.yml).  
-Postgres test: set `HAIFHIR_POSTGRES_URL`.
+Postgres tests: set `HAIFHIR_POSTGRES_URL` (a URL or `host=... user=...`) to a role that may
+`CREATE DATABASE`. They include `crates/refhir/tests/cluster.rs`, which starts real primary,
+standby and replica processes and kills the primary while writes are in flight; the lease tests
+make a database of their own each, so they do not disturb each other.
 
 ---
 

@@ -16,12 +16,12 @@ CREATE INDEX IF NOT EXISTS smart_oauth_by_exp ON smart_oauth (exp);
 impl AuthStore for PostgresPersistence {
     fn auth_put(&self, kind: &str, id: &str, json: &str, exp: u64) -> Result<(), PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             guard
                 .client
                 .execute(
                     "INSERT INTO smart_oauth (kind, id, json, exp) VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (kind, id) DO UPDATE SET json = excluded.json, exp = excluded.exp",
+                 ON CONFLICT (kind, id) DO UPDATE SET json = excluded.json, exp = excluded.exp",
                     &[&kind, &id, &json, &auth_exp(exp)],
                 )
                 .map_err(definite)?;
@@ -38,13 +38,13 @@ impl AuthStore for PostgresPersistence {
         now: u64,
     ) -> Result<bool, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let changed = guard
                 .client
                 .execute(
                     "INSERT INTO smart_oauth (kind, id, json, exp) VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (kind, id) DO UPDATE SET json = excluded.json, exp = excluded.exp \
-                     WHERE smart_oauth.exp <= $5",
+                 ON CONFLICT (kind, id) DO UPDATE SET json = excluded.json, exp = excluded.exp \
+                 WHERE smart_oauth.exp <= $5",
                     &[&kind, &id, &json, &auth_exp(exp), &auth_exp(now)],
                 )
                 .map_err(definite)?;
@@ -54,7 +54,7 @@ impl AuthStore for PostgresPersistence {
 
     fn auth_get(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let row = guard
                 .client
                 .query_opt(
@@ -68,7 +68,7 @@ impl AuthStore for PostgresPersistence {
 
     fn auth_take(&self, kind: &str, id: &str, now: u64) -> Result<Option<String>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let row = guard
                 .client
                 .query_opt(
@@ -82,9 +82,23 @@ impl AuthStore for PostgresPersistence {
         })
     }
 
+    fn auth_delete_if(&self, kind: &str, id: &str, json: &str) -> Result<bool, PersistError> {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let deleted = guard
+                .client
+                .execute(
+                    "DELETE FROM smart_oauth WHERE kind = $1 AND id = $2 AND json = $3",
+                    &[&kind, &id, &json],
+                )
+                .map_err(definite)?;
+            Ok(deleted == 1)
+        })
+    }
+
     fn auth_list(&self, kind: &str, now: u64) -> Result<Vec<String>, PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
                 .query(
@@ -98,7 +112,7 @@ impl AuthStore for PostgresPersistence {
 
     fn auth_prune(&self, now: u64) -> Result<(), PersistError> {
         crate::off_runtime(|| {
-            let mut guard = self.inner.lock().expect("postgres");
+            let mut guard = self.inner.lock()?;
             guard
                 .client
                 .execute("DELETE FROM smart_oauth WHERE exp <= $1", &[&auth_exp(now)])

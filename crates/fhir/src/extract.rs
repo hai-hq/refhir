@@ -104,6 +104,37 @@ impl Extractor {
         }
     }
 
+    /// Whether finding a resource through the index range that `probe(query)` selects already
+    /// proves that `matches(.., query)` holds, so a search need not evaluate the parameter against
+    /// the resource a second time.
+    ///
+    /// That is so for a string, token, reference or uri parameter read from a path. The keys are
+    /// written from `path_strings`, which is the list of values `path_match` compares; a token key
+    /// holds the whole token behind its length, and a string key the lowercased value followed by
+    /// a NUL; so the range holds exactly the resources with a value equal to the token, or starting
+    /// with the lowercased prefix. Two things break that and are refused. An expression that asks
+    /// the world something when it is read (a referenced resource, the clock, a profile, a value
+    /// set) can disagree with keys saved earlier. And a NUL in a string query would match the NUL
+    /// that ends every string key.
+    ///
+    /// This trusts the keys: they are as the code that reads them would write them. After a release
+    /// that changes how a value is turned into keys, rows saved by the old release keep their old
+    /// keys until they are written again, and a search no longer sets aside the ones that would
+    /// not match now, as its second check did. Nothing guards against that but re-indexing.
+    pub fn index_proves(&self, query: &str) -> bool {
+        let Source::Path(expr) = &self.source else {
+            return false;
+        };
+        if expr.depends_on_host() {
+            return false;
+        }
+        match self.kind {
+            SearchKind::Token | SearchKind::Reference | SearchKind::Uri => true,
+            SearchKind::String => !query.contains('\0'),
+            _ => false,
+        }
+    }
+
     pub fn keys(
         &self,
         resource: &Value,

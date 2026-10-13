@@ -1,0 +1,13 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "v3-MaritalStatus",
+  "url": "http://terminology.hl7.org/CodeSystem/v3-MaritalStatus",
+  "version": "4.0.0",
+  "name": "MaritalStatus",
+  "status": "active",
+  "content": "complete",
+  "concept": [
+    {"code": "A"}, {"code": "C"}, {"code": "D"}, {"code": "I"}, {"code": "L"},
+    {"code": "M"}, {"code": "P"}, {"code": "S"}, {"code": "T"}, {"code": "U"}, {"code": "W"}
+  ]
+}

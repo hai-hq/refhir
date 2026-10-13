@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::Message;
-use axum::extract::{Extension, Path, Query, State, WebSocketUpgrade};
+use axum::extract::{Extension, Path, Query, RawQuery, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -44,6 +44,13 @@ pub struct ServerConfig {
     pub smart_demo_login: bool,
     /// Injected SMART tables for tests. A fresh store is created when this is `None`.
     pub smart: Option<std::sync::Arc<crate::auth::SmartStore>>,
+    /// Where a replica sends what it cannot do itself: writes, and reads that need a newer
+    /// snapshot than it has. Unused by a primary.
+    pub primary_url: Option<String>,
+    /// A replica that has not refreshed within this long reports itself unhealthy.
+    pub max_staleness: std::time::Duration,
+    /// How long a replica waits for `X-Refhir-Min-Ts` before sending the request to the primary.
+    pub min_ts_wait: std::time::Duration,
     /// Table of background jobs such as `$export`. `refhir` passes the database's own, so jobs
     /// outlive a restart. Without one they live in memory and end with the process.
     pub jobs: Option<crate::jobs::SharedJobStore>,
@@ -87,6 +94,9 @@ impl Default for ServerConfig {
             oidc: None,
             smart_demo_login: false,
             smart: None,
+            primary_url: None,
+            max_staleness: std::time::Duration::from_secs(5),
+            min_ts_wait: std::time::Duration::from_millis(250),
             jobs: None,
             governance: crate::governance::GovernanceConfig::default(),
             governance_store: None,
@@ -152,6 +162,7 @@ pub fn app_parts(
         .expect("catalog")
         .set_sdc_archiver(config.sdc_archiver);
     let router = Router::new()
+        .route("/healthz", get(crate::cluster::healthz))
         .route("/metadata", get(metadata))
         .route("/.well-known/smart-configuration", get(smart_config))
         .route("/.well-known/jwks.json", get(jwks))
@@ -233,7 +244,10 @@ pub fn app_parts(
             .unwrap_or_else(|| format!("secret-{}", uuid::Uuid::new_v4()));
         Arc::new(crate::auth::SmartStore::with_confidential_secret(secret))
     });
-    prune_in_background(&smart);
+    // Only the writer reclaims expired OAuth rows; a reader has nothing to delete with.
+    if !db.is_read_only() {
+        prune_in_background(&smart);
+    }
     let jobs = crate::jobs::start(&db, &catalog, &config);
     let governance = crate::governance::Governance::new(
         config.governance.clone(),
@@ -257,8 +271,14 @@ pub fn app_parts(
         governance: governance.clone(),
     };
     // Outermost first: cors, the legacy request line (silent once governance logs instead),
-    // governance's scope, authentication, and then the caller's own limits.
+    // governance's scope, authentication, the caller's own limits, and then what a replica does
+    // with a request it cannot serve. The limits come before that, so that a request is turned
+    // away before a replica buffers its body to forward it or waits for a snapshot.
     let router = router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::cluster::cluster_layer,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::governance::gate,
@@ -271,7 +291,10 @@ pub fn app_parts(
         .layer(middleware::from_fn_with_state(state.clone(), request_log))
         .layer(middleware::from_fn_with_state(state.clone(), cors))
         .with_state(state);
-    crate::jobs::attach(db, catalog, store, &config);
+    // Hooks, subscriptions and terminology fetches run where commits are made.
+    if !db.is_read_only() {
+        crate::jobs::attach(db, catalog, store, &config);
+    }
     (router, governance)
 }
 
@@ -294,7 +317,12 @@ pub async fn execute(
     })
     .await
     {
-        Ok(result) => result,
+        Ok(result) => {
+            if let Ok(run) = &result {
+                crate::cluster::report_ts(run.ts);
+            }
+            result
+        }
         Err(_) => Err(RunError::Commit(CommitError::Invalid(
             "operation worker stopped".into(),
         ))),
@@ -328,26 +356,43 @@ async fn cors(State(app): State<AppState>, request: Request<Body>, next: Next) -
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let origin_ok = match &origin {
+        Some(origin) if !is_discovery(&path) => origin_registered(&app, origin).await,
+        _ => false,
+    };
     if request.method() == axum::http::Method::OPTIONS {
         let mut response = StatusCode::NO_CONTENT.into_response();
-        apply_cors(response.headers_mut(), &app, &path, origin.as_deref());
+        apply_cors(response.headers_mut(), &path, origin.as_deref(), origin_ok);
         return response;
     }
     let mut response = next.run(request).await;
-    apply_cors(response.headers_mut(), &app, &path, origin.as_deref());
+    apply_cors(response.headers_mut(), &path, origin.as_deref(), origin_ok);
     response
 }
 
-fn apply_cors(headers: &mut HeaderMap, app: &AppState, path: &str, origin: Option<&str>) {
-    let discovery = path == "/metadata" || path.starts_with("/.well-known");
-    let allow = if discovery {
+fn is_discovery(path: &str) -> bool {
+    path == "/metadata" || path.starts_with("/.well-known")
+}
+
+/// Whether `origin` belongs to a registered SMART client. The list is cached in memory; when
+/// the cache has expired the read goes to the database, which must not happen on an async
+/// worker thread (the synchronous Postgres client refuses to run there).
+async fn origin_registered(app: &AppState, origin: &str) -> bool {
+    if app.smart.origins_are_cached() {
+        return crate::auth::origin_allowed(&app.smart, origin);
+    }
+    let smart = app.smart.clone();
+    let origin = origin.to_string();
+    tokio::task::spawn_blocking(move || crate::auth::origin_allowed(&smart, &origin))
+        .await
+        .unwrap_or(false)
+}
+
+fn apply_cors(headers: &mut HeaderMap, path: &str, origin: Option<&str>, origin_ok: bool) {
+    let allow = if is_discovery(path) {
         Some("*".to_string())
-    } else if let Some(origin) = origin {
-        if crate::auth::origin_allowed(&app.smart, origin) {
-            Some(origin.to_string())
-        } else {
-            None
-        }
+    } else if let (Some(origin), true) = (origin, origin_ok) {
+        Some(origin.to_string())
     } else {
         None
     };
@@ -367,14 +412,14 @@ fn apply_cors(headers: &mut HeaderMap, app: &AppState, path: &str, origin: Optio
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        "Authorization, Content-Type, Accept, Prefer, If-Match, If-None-Match"
+        "Authorization, Content-Type, Accept, Prefer, If-Match, If-None-Match, X-Refhir-Min-Ts"
             .parse()
             .unwrap(),
     );
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        "Location, Content-Location, ETag, WWW-Authenticate, Retry-After, X-Request-Id, \
-         RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
+        "Location, Content-Location, ETag, WWW-Authenticate, X-Refhir-Commit-Ts, Retry-After, \
+         X-Request-Id, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
             .parse()
             .unwrap(),
     );
@@ -477,8 +522,18 @@ async fn smart_guard(
 ) -> Response {
     if app.config.auth {
         let path = request.uri().path().to_string();
-        let open =
-            path == "/metadata" || path.starts_with("/.well-known") || path.starts_with("/oauth/");
+        // `/healthz` stays open for a load balancer. Its `verbose` form shows commit counts,
+        // timings and pool use, and takes a token like any other path.
+        let verbose_health = path == "/healthz"
+            && request.uri().query().is_some_and(|query| {
+                query
+                    .split('&')
+                    .any(|pair| pair.split('=').next() == Some("verbose"))
+            });
+        let open = (path == "/healthz" && !verbose_health)
+            || path == "/metadata"
+            || path.starts_with("/.well-known")
+            || path.starts_with("/oauth/");
         if !open {
             let method = request.method().as_str().to_string();
             let query = request.uri().query().map(str::to_string);
@@ -653,6 +708,8 @@ fn fhir_type_from_path(path: &str) -> String {
 async fn sync_ws(
     ws: WebSocketUpgrade,
     State(app): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
     session: Option<Extension<crate::auth::SyncSession>>,
 ) -> Response {
     if app.config.auth && session.is_none() {
@@ -669,10 +726,31 @@ async fn sync_ws(
         },
         None => None,
     };
+    // A replica answers queries itself and sends mutations to the primary as the same caller.
+    let upstream = if app.db.is_read_only() {
+        app.config
+            .primary_url
+            .as_deref()
+            .map(|base| sync::Upstream {
+                url: crate::cluster::sync_url(base),
+                bearer: crate::auth::resolve_token(&headers, query.as_deref()),
+            })
+    } else {
+        None
+    };
     ws.on_upgrade(move |socket| async move {
         // The permit is held as long as the connection is.
         let _permit = permit;
-        sync::handle_socket(socket, app.db, app.catalog, app.store, session, scope).await
+        sync::handle_socket(
+            socket,
+            app.db,
+            app.catalog,
+            app.store,
+            session,
+            scope,
+            upstream,
+        )
+        .await
     })
     .into_response()
 }
@@ -1277,8 +1355,18 @@ async fn patch_op(
 
 async fn subscription_socket(
     ws: WebSocketUpgrade,
+    State(app): State<AppState>,
     Path((_resource_type, id)): Path<(String, String)>,
-) -> impl IntoResponse {
+) -> Response {
+    // Notifications are delivered by the process that commits, so a socket opened on a replica
+    // would never hear anything.
+    if app.db.is_read_only() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "subscription sockets are served by the primary",
+        )
+            .into_response();
+    }
     ws.on_upgrade(move |socket| async move {
         let mut rx = crate::jobs::register_socket(id);
         let (mut sink, mut stream) = socket.split();
@@ -1298,6 +1386,7 @@ async fn subscription_socket(
             }
         }
     })
+    .into_response()
 }
 
 async fn compartment_search(
@@ -1721,6 +1810,9 @@ pub(crate) fn error_response(err: RunError) -> Response {
             "conflict",
             "OCC retries exhausted".into(),
         ),
+        RunError::Commit(CommitError::ReadOnly) => {
+            return crate::cluster::read_only_response(crate::cluster::READ_ONLY_MESSAGE)
+        }
         RunError::Commit(other) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "exception",
@@ -1741,8 +1833,13 @@ pub(crate) fn run_error_status(err: &RunError) -> StatusCode {
     match err {
         RunError::Fhir(fhir) => fhir_status(fhir),
         RunError::Commit(CommitError::Occ(_)) => StatusCode::CONFLICT,
+        RunError::Commit(CommitError::ReadOnly) => StatusCode::SERVICE_UNAVAILABLE,
         RunError::Commit(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+fn other_read_only() -> String {
+    crate::cluster::READ_ONLY_MESSAGE.to_string()
 }
 
 pub(crate) fn outcome_value(err: &RunError) -> Value {
@@ -1752,6 +1849,7 @@ pub(crate) fn outcome_value(err: &RunError) -> Value {
     let (code, diagnostics) = match err {
         RunError::Fhir(fhir) => (outcome_code(fhir), fhir.to_string()),
         RunError::Commit(CommitError::Occ(_)) => ("conflict", "OCC retries exhausted".into()),
+        RunError::Commit(CommitError::ReadOnly) => ("transient", other_read_only()),
         RunError::Commit(other) => ("exception", other.to_string()),
     };
     json!({

@@ -428,7 +428,8 @@ impl Governance {
         let now = now_ms();
         let principal = scope.principal();
         let throttled = scope.throttled();
-        if self.config.metering || self.config.quota.enabled {
+        let forwarded = scope.forwarded();
+        if (self.config.metering || self.config.quota.enabled) && !forwarded {
             self.meter.record(
                 &Observation {
                     principal: &principal,
@@ -450,6 +451,7 @@ impl Governance {
             && done.class != Class::Discovery
             && scope.audited() == 0
             && !throttled
+            && !forwarded
         {
             if let Some(row) = self.refusal_row(scope, done, now) {
                 // A refusal with no caller known costs the server nothing to cause, so there is

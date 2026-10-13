@@ -11,6 +11,17 @@ export type DialOptions = {
   token?: string;
   /** Default: browser when `window` exists, else Node (`ws` + Authorization header). */
   runtime?: "browser" | "node";
+  /**
+   * Echo the highest commit timestamp seen as `X-Refhir-Min-Ts` on REST calls so
+   * a replica never serves a read older than this client's own writes.
+   * Default: true. `lastCommitTs` tracks either way.
+   *
+   * Timestamps come from `X-Refhir-Commit-Ts` on REST responses and `ts` on
+   * `/sync` mutation responses. In browsers `fetch` can only read the REST
+   * header if the server lists it in `Access-Control-Expose-Headers`; mutations
+   * over `/sync` always count.
+   */
+  readYourWrites?: boolean;
 };
 
 type Subscription = {
@@ -35,6 +46,8 @@ export class Client {
   private readonly httpBase: string;
   private readonly wsURL: string;
   private readonly token: string | undefined;
+  private readonly readYourWrites: boolean;
+  private lastTs = 0n;
 
   private socket: SocketConnection | null = null;
   private readonly openSocket: (wsURL: string) => Promise<SocketConnection>;
@@ -43,6 +56,7 @@ export class Client {
   private nextQuery = 1;
   private nextReq = 1;
   private closing = false;
+  private wakeReconnect: (() => void) | null = null;
 
   private readonly subs = new Map<number, Subscription>();
   private queue: QueryModification[] = [];
@@ -56,11 +70,13 @@ export class Client {
     wsURL: string,
     token: string | undefined,
     openSocket: (wsURL: string) => Promise<SocketConnection>,
+    readYourWrites: boolean,
   ) {
     this.httpBase = httpBase;
     this.wsURL = wsURL;
     this.token = token;
     this.openSocket = openSocket;
+    this.readYourWrites = readYourWrites;
   }
 
   /** @internal Used by `dial()` in dial.ts */
@@ -69,14 +85,22 @@ export class Client {
     wsURL: string,
     token: string | undefined,
     openSocket: (wsURL: string) => Promise<SocketConnection>,
+    options: { readYourWrites?: boolean } = {},
   ): Promise<Client> {
-    const client = new Client(httpBase, wsURL, token, openSocket);
+    const client = new Client(
+      httpBase,
+      wsURL,
+      token,
+      openSocket,
+      options.readYourWrites ?? true,
+    );
     await client.connectSocket();
     return client;
   }
 
   async close(): Promise<void> {
     this.closing = true;
+    this.wakeReconnect?.();
     if (this.socket) {
       this.socket.close();
       this.socket = null;
@@ -119,6 +143,11 @@ export class Client {
 
   private async connectSocket(): Promise<void> {
     const socket = await this.openSocket(this.wsURL);
+    if (this.closing) {
+      // close() ran while the socket was opening; do not leak it.
+      socket.close();
+      return;
+    }
     this.gen += 1;
     const gen = this.gen;
     socket.onMessage((text) => {
@@ -139,9 +168,35 @@ export class Client {
     this.flight = null;
     this.queue = [];
     this.socket = null;
-    await this.connectSocket();
+    await this.reconnect();
+    if (this.closing) return;
     this.version = 0;
+    // Watches added while offline are already in `subs`; resubscribe re-adds all of them.
+    this.queue = [];
     this.resubscribe();
+  }
+
+  /** Dial again until it works or the client closes: 50ms doubling to 1s, with jitter. */
+  private async reconnect(): Promise<void> {
+    let backoff = RECONNECT_MIN_MS;
+    while (!this.closing) {
+      try {
+        await this.connectSocket();
+        return;
+      } catch {
+        // fall through to the delay
+      }
+      const delay = backoff / 2 + Math.random() * (backoff / 2);
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, delay);
+        this.wakeReconnect = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      this.wakeReconnect = null;
+      backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
+    }
   }
 
   private resubscribe(): void {
@@ -221,6 +276,7 @@ export class Client {
           requestId: number;
           success: boolean;
           result: JsonValue;
+          ts?: string | number | null;
         };
         this.onMutation(msg);
         break;
@@ -276,12 +332,19 @@ export class Client {
     requestId: number;
     success: boolean;
     result: JsonValue;
+    ts?: string | number | null;
   }): void {
     const pending = this.pending.get(msg.requestId);
     if (!pending) return;
     this.pending.delete(msg.requestId);
-    if (msg.success) pending.resolve(msg.result);
-    else pending.reject(new OutcomeError(msg.result));
+    if (msg.success) {
+      // Record the timestamp before waking the caller so lastCommitTs and the
+      // next REST request already reflect this write.
+      this.observeTs(msg.ts);
+      pending.resolve(msg.result);
+      return;
+    }
+    pending.reject(new OutcomeError(msg.result));
   }
 
   private failMutations(err: Error): void {
@@ -324,6 +387,15 @@ export class Client {
     return rest.doRequest(this, method, path, body);
   }
 
+  /** Like `doRequest`, but also returns the status and response headers. */
+  requestWithHeaders(
+    method: string,
+    path: string,
+    body?: Uint8Array,
+  ): Promise<rest.RestResponse> {
+    return rest.requestWithHeaders(this, method, path, body);
+  }
+
   search(resourceType: string, params: Record<string, string>): Promise<Watch> {
     return helpers.search(this, resourceType, params);
   }
@@ -357,6 +429,26 @@ export class Client {
     return helpers.transaction(this, bundle);
   }
 
+  /**
+   * Highest commit timestamp this client has seen (`0n` until the server
+   * reports one). Raised by `X-Refhir-Commit-Ts` on REST responses and `ts` on
+   * successful `/sync` mutations; never lowered.
+   */
+  get lastCommitTs(): bigint {
+    return this.lastTs;
+  }
+
+  /** @internal Value for `X-Refhir-Min-Ts`, or undefined when nothing should be sent. */
+  minTs(): bigint | undefined {
+    return this.readYourWrites && this.lastTs > 0n ? this.lastTs : undefined;
+  }
+
+  /** @internal Raise `lastCommitTs` from a header or wire value; malformed values are ignored. */
+  observeTs(raw: string | number | bigint | null | undefined): void {
+    const ts = parseTs(raw);
+    if (ts !== undefined && ts > this.lastTs) this.lastTs = ts;
+  }
+
   /** @internal */
   httpOrigin(): string {
     return this.httpBase;
@@ -367,6 +459,22 @@ export class Client {
     return this.token;
   }
 }
+
+/** Parse a u64 timestamp from a decimal string (or a safe integer). Anything else is undefined. */
+function parseTs(raw: string | number | bigint | null | undefined): bigint | undefined {
+  if (typeof raw === "bigint") return raw >= 0n ? raw : undefined;
+  if (typeof raw === "number") return Number.isSafeInteger(raw) && raw >= 0 ? BigInt(raw) : undefined;
+  if (typeof raw !== "string") return undefined;
+  const text = raw.trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const ts = BigInt(text);
+  return ts <= U64_MAX ? ts : undefined;
+}
+
+const RECONNECT_MIN_MS = 50;
+const RECONNECT_MAX_MS = 1000;
+
+const U64_MAX = (1n << 64n) - 1n;
 
 function flightMet(flight: Flight, mods: StateModification[]): boolean {
   const seen = new Map<number, string>();

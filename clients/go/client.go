@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -32,7 +33,8 @@ func (e *OutcomeError) Error() string {
 type Option func(*dialOptions)
 
 type dialOptions struct {
-	token string
+	token          string
+	readYourWrites bool
 }
 
 // Bearer sets the Authorization header on the /sync upgrade and on HTTP calls.
@@ -42,12 +44,30 @@ func Bearer(token string) Option {
 	}
 }
 
+// WithReadYourWrites controls read-your-writes for REST calls; the default is on.
+//
+// When on, the client remembers the highest commit timestamp the server has
+// reported (X-Refhir-Commit-Ts on REST responses, ts on /sync mutation
+// responses) and sends it as X-Refhir-Min-Ts on every later REST request, so a
+// replica only answers once it has caught up to this client's own writes.
+// When off, nothing is sent; LastCommitTs still tracks timestamps.
+func WithReadYourWrites(enabled bool) Option {
+	return func(o *dialOptions) {
+		o.readYourWrites = enabled
+	}
+}
+
 // Client is one /sync session. Watch and Mutate share that socket.
 type Client struct {
 	httpBase string
 	wsURL    string
 	token    string
 	http     *http.Client
+
+	// lastTs is the highest commit timestamp seen. Do reads and writes it from
+	// any goroutine; the actor goroutine writes it on mutation responses.
+	lastTs         atomic.Uint64
+	readYourWrites bool
 
 	root   context.Context
 	cancel context.CancelFunc
@@ -112,7 +132,7 @@ type sessionEvent struct {
 
 // Dial connects to a ReFHIR server. baseURL is the HTTP origin, such as http://127.0.0.1:8080.
 func Dial(ctx context.Context, baseURL string, opts ...Option) (*Client, error) {
-	var options dialOptions
+	options := dialOptions{readYourWrites: true}
 	for _, opt := range opts {
 		opt(&options)
 	}
@@ -141,6 +161,8 @@ func Dial(ctx context.Context, baseURL string, opts ...Option) (*Client, error) 
 		nextReq:   1,
 		subs:      make(map[uint64]*subscription),
 		pending:   make(map[uint64]chan mutationResult),
+
+		readYourWrites: options.readYourWrites,
 	}
 	go client.read(conn, 1)
 	go client.loop()
@@ -447,6 +469,11 @@ func (c *Client) onMutation(msg mutationResponse) {
 		return
 	}
 	if msg.Success {
+		// Record the timestamp before waking the caller so LastCommitTs and the
+		// next REST request already reflect this write.
+		if ts, ok := parseTS(msg.TS); ok {
+			c.observeTs(ts)
+		}
 		ch <- mutationResult{value: cloneRaw(msg.Result)}
 		return
 	}

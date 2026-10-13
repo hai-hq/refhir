@@ -85,6 +85,7 @@ Start by observing: leave `[rate_limit]` and `[quota]` off, run for a week, and 
 - **Rate limits are divided automatically.** Servers sharing a database count one another with a heartbeat every ten seconds, and each takes an equal part of every rate limit, bucket and connection cap (never a bucket smaller than the dearest request), so you configure the limit you want for the *fleet*. `GET /_usage` shows the number a server is dividing by (`servers`). Scaling up or down adjusts within about ten seconds, and a server that stops removes itself at once. This assumes the balancer spreads a caller's requests about evenly: where it pins each caller to one server (sticky sessions), set `[rate_limit] servers = 1`, or each caller gets one Nth of what you meant. `servers = N` pins the count if you would rather not have it measured.
 - **Quotas are shared** through the database, so all servers must use the same one. Each rereads a client's totals every `refresh_seconds` (default 30), so a client can overshoot by about one interval of what the *other* servers serve. For a hard cap, set the quota a little under the real one.
 - **Audit and usage rows** from all servers land in the same tables; each server adds its own counters.
+- **With replicas** (see "Availability and read scaling"), a write a replica receives is sent on to the primary, and the primary limits, meters and audits it as its own request, under the caller's token and the same request id. The replica logs it but does not count it or audit it as well, so a forwarded write is neither charged twice against a quota nor written twice to the audit trail. It is limited on the way in as well, by the replica's share of the caller's rate, and then by the primary's, so a caller who writes through several replicas is limited by the primary's share of the rate for those writes: set `[rate_limit] servers = 1` if that is too little. The primary sees a forwarded request come from the replica, so list the pod or node network among `[server] trusted_proxy_peers`, or the audit trail records the replica's address instead of the caller's.
 
 ### The database
 
@@ -201,6 +202,53 @@ Tested against MinIO. Installing the default packages on a fresh database took a
 
 - Mount a persistent volume at `/data/export` and pull files out of band, or
 - Front ReFHIR with a job that copies completed files to object storage (future native support).
+
+## Availability and read scaling
+
+One process is a single point of failure. On Postgres you can run a **standby** that takes over
+within about a second when the primary is gone (it keeps its catalog loaded while it waits, so
+takeover does not wait for that), and **replicas** that serve reads:
+
+- `refhir --postgres $URL` is the primary. It holds a lease on the database and refuses to start
+  while another primary has it.
+- `refhir --postgres $URL --standby` waits for the lease and then starts serving.
+- `refhir --postgres $URL --role replica --primary-url http://<primary-or-balancer>` serves reads
+  and sends writes to the primary.
+
+Put a load balancer in front that checks `GET /healthz` (200 means it can take traffic, 503 means
+it cannot) and sends nothing to a process that answers 503. Give replicas a `--primary-url` that
+always reaches the current primary, such as a second balancer port that routes only to the process
+whose `/healthz` says `"role":"primary"`. A ready-made Compose file and HAProxy configuration are
+in [cluster/](cluster/README.md), and the Helm chart has `cluster.enabled`.
+
+Things to know before relying on it:
+
+- **Same secrets everywhere.** With SMART on, every process needs the same
+  `REFHIR_SMART_DCR_TOKEN` and `REFHIR_SMART_CONFIDENTIAL_SECRET`; standbys and replicas refuse to
+  start without them. Set `REFHIR_SIGNING_KEY_PASSPHRASE` the same on every process too.
+- **A sign-in can be lost to a crash.** While a user is at the identity provider, the pending
+  login is held by the process that started it, and the callback takes it, asks the provider,
+  and puts it back. If that process dies in those moments the user simply signs in again.
+  Nothing is issued twice and no token is lost.
+- **Revocation is not instant on other processes.** Each process caches token lookups for two
+  seconds, so a revoked token may still work on another process for up to that long.
+- **Replicas are slightly behind.** They follow the primary within tens of milliseconds. Clients
+  that must read their own writes send `X-Refhir-Min-Ts` (the Go and TypeScript clients do).
+  The SMART patient picker reads the replica's own snapshot, so a patient created a moment ago can
+  be missing from it until the replica refreshes (accepted by design). A request that must see it
+  sends `X-Refhir-Min-Ts` like any other: `/oauth/*` goes through the same gate, so a replica that
+  is behind hands the request to the primary. A replica with no `--primary-url` cannot hand it
+  over, so it answers `503` with `Retry-After: 1` instead of an older snapshot.
+- **Database connections.** Each process opens up to `REFHIR_DB_POOL` (default 8) Postgres
+  connections, and a writer keeps one more for its lease. Size Postgres `max_connections` for all of them.
+- **Failure behaviour.** A writer that loses its lease, or finds a newer writer in the database,
+  exits (codes 70 and 71) rather than risk a second writer. Run it under a supervisor that
+  restarts it; it comes back as a standby if started with `--standby`.
+- **Backfills resume.** A new search parameter's index is built in the background and the
+  parameter is searchable only when it finishes. If the primary dies part way, the standby that
+  takes over claims the job and continues from where it stopped. Replicas do not see the
+  parameter until the job is complete.
+- **Export jobs and Subscription delivery** belong to the primary.
 
 ## Install the binary without Docker
 

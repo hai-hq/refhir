@@ -8,8 +8,9 @@ mod walk;
 pub use outcome::{Issue, Outcome, Severity};
 pub use schema::Schema;
 pub use terminology::{
-    code_system_key, code_system_row_key, ExpansionFailure, ExpansionUpdate, IncludeAt,
-    MemoryTerminology, TermAnswer, Terminology, TerminologyChange,
+    code_system_key, code_system_row_key, expansion_is_current, winning_scopes, ExpansionFailure,
+    ExpansionUpdate, IncludeAt, MemoryTerminology, Scope, TermAnswer, Terminology,
+    TerminologyChange,
 };
 pub use walk::validate;
 

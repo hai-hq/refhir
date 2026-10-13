@@ -30,6 +30,24 @@ database:
 fhir:
   version: r4
 
+# Several processes on one Postgres database. Needs database.kind: postgres.
+#
+# `writers` pods all start as standbys. One takes the writer lease and serves; the rest wait and
+# take over within a couple of seconds when it goes away, so rolling updates and node failures do
+# not stop writes for long. `replicas` pods serve reads from the same database and send writes
+# to the live writer. Readiness is /healthz, so a standby or a lagging replica gets no traffic.
+cluster:
+  enabled: false
+  writers: 2
+  replicas: 2
+  # Most database connections each pod opens.
+  dbPool: 8
+  # Where replicas send writes. Defaults to the <release>-primary Service, which only ever has
+  # the live writer behind it.
+  primaryUrl: ""
+  # With smart.enabled every pod must agree on these (set them in secretEnv):
+  #   REFHIR_SMART_DCR_TOKEN, REFHIR_SMART_CONFIDENTIAL_SECRET
+
 conformance:
   referencePolicy: strict
   packages: []

@@ -64,6 +64,14 @@ impl SyncMessage {
         }
     }
 
+    /// A replica sent the mutation on to the primary, which counts and audits it as a message
+    /// of its own; it is only logged here.
+    pub fn forwarded(&self) {
+        if let Some(scope) = &self.scope {
+            scope.mark_forwarded();
+        }
+    }
+
     /// The message was refused because the caller's scopes do not allow it.
     pub fn deny(&self, args: &Value, reason: &str) {
         if let Some(scope) = &self.scope {

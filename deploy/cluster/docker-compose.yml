@@ -1,0 +1,105 @@
+# Several refhir processes on one Postgres database: two writers (one serves as the primary, the
+# other takes over when it is gone), two read replicas, and a load balancer.
+#
+#   docker compose -f deploy/cluster/docker-compose.yml up --build
+#
+# Clients talk to http://localhost:8080. See deploy/cluster/README.md for what to try (kill the
+# primary and watch the standby take over) and for the settings SMART needs.
+
+x-refhir: &refhir
+  image: refhir:cluster
+  # A process that exits (a lost lease, a crash) is started again, and comes back as a standby
+  # or a replica.
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+  environment: &refhir-env
+    # The same database for every process. The environment wins over the config file in the
+    # image, which names a SQLite file.
+    REFHIR_POSTGRES_URL: postgres://refhir:refhir@postgres:5432/refhir
+    REFHIR_DB_POOL: "8"
+    # With SMART enabled every process must be given the same two values, or it refuses to
+    # start. Generate your own; these are placeholders.
+    # REFHIR_SMART_DCR_TOKEN: change-me
+    # REFHIR_SMART_CONFIDENTIAL_SECRET: change-me-too
+    # REFHIR_PUBLIC_URL: http://localhost:8080
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: refhir
+      POSTGRES_PASSWORD: refhir
+      POSTGRES_DB: refhir
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U refhir -d refhir"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Two writers. Both start as standbys; whichever takes the writer lease first serves as the
+  # primary, and the other waits and takes over within seconds if it goes away. Neither is
+  # configured as "the" primary, so it does not matter which one starts first, and a writer that
+  # is restarted after a failure simply comes back as the standby.
+  writer1:
+    <<: *refhir
+    # One service builds the image; the others use it. (Several parallel builds of the same tag
+    # race each other.)
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      <<: *refhir-env
+      REFHIR_ROLE: standby
+    volumes:
+      - writer1-data:/data
+
+  writer2:
+    <<: *refhir
+    environment:
+      <<: *refhir-env
+      REFHIR_ROLE: standby
+    volumes:
+      - writer2-data:/data
+
+  replica1:
+    <<: *refhir
+    environment:
+      <<: *refhir-env
+      REFHIR_ROLE: replica
+      # Writes go to whichever process is the primary now, not to a fixed host.
+      REFHIR_PRIMARY_URL: http://lb:8081
+    volumes:
+      - replica1-data:/data
+
+  replica2:
+    <<: *refhir
+    environment:
+      <<: *refhir-env
+      REFHIR_ROLE: replica
+      REFHIR_PRIMARY_URL: http://lb:8081
+    volumes:
+      - replica2-data:/data
+
+  lb:
+    image: haproxy:2.9-alpine
+    ports:
+      - "8080:8080"
+      - "8404:8404"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - writer1
+      - writer2
+      - replica1
+      - replica2
+
+volumes:
+  pgdata:
+  writer1-data:
+  writer2-data:
+  replica1-data:
+  replica2-data:

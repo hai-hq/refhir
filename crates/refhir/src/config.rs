@@ -37,6 +37,52 @@ pub struct FileConfig {
     /// without the limit its operator thinks it has, so they are named at start-up.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub cluster: ClusterSection,
+}
+
+/// Running several processes against one database. See `Role`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ClusterSection {
+    /// `primary` (default), `standby`, or `replica`.
+    pub role: Option<String>,
+    /// Where a replica sends writes and reads that need a newer snapshot than it has.
+    pub primary_url: Option<String>,
+    /// Most Postgres connections to open (default 8). On SQLite, the read connections opened
+    /// next to the one writer (default 4).
+    pub db_pool: Option<usize>,
+}
+
+/// What this process does in a deployment with more than one process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The one process that writes. Refuses to start while another primary holds the lease.
+    Primary,
+    /// Waits for the lease and becomes the primary when the current one is gone.
+    Standby,
+    /// Serves reads from the database the primary writes; sends everything else to it.
+    Replica,
+}
+
+impl Role {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "primary" => Ok(Role::Primary),
+            "standby" => Ok(Role::Standby),
+            "replica" => Ok(Role::Replica),
+            other => Err(format!(
+                "unknown role `{other}`: use primary, standby or replica"
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Primary => "primary",
+            Role::Standby => "standby",
+            Role::Replica => "replica",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -258,6 +304,10 @@ pub struct ResolvedConfig {
     /// Observing by default: usage, the request log and the audit trail are on, and nothing is
     /// limited until an operator sizes a limit for their traffic.
     pub governance: GovernanceConfig,
+    pub role: Role,
+    pub primary_url: Option<String>,
+    /// Database connections to open at most; `None` means the default.
+    pub db_pool: Option<usize>,
 }
 
 impl ResolvedConfig {
@@ -284,10 +334,25 @@ impl ResolvedConfig {
             trace_engine: false,
             sdc_archiver: false,
             governance: GovernanceConfig::observing(),
+            role: Role::Primary,
+            primary_url: None,
+            db_pool: None,
         }
     }
 
     pub fn apply_file(&mut self, file: &FileConfig) -> Result<(), String> {
+        if let Some(role) = &file.cluster.role {
+            self.role = Role::parse(role)?;
+        }
+        if file.cluster.primary_url.is_some() {
+            self.primary_url = file.cluster.primary_url.clone();
+        }
+        if let Some(size) = file.cluster.db_pool {
+            if size == 0 {
+                return Err("cluster.db_pool must be a positive number".into());
+            }
+            self.db_pool = Some(size);
+        }
         if let Some(v) = &file.server.bind {
             self.bind = v.clone();
         }
@@ -694,7 +759,21 @@ fn package_plan_from_file(
 
 /// Environment overrides for secrets and URLs. Applied after the config file and before the CLI
 /// flags, so precedence is file < env < CLI.
-pub fn apply_env(cfg: &mut ResolvedConfig) {
+pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
+    if let Some(role) = env_value("REFHIR_ROLE") {
+        cfg.role = Role::parse(&role)?;
+    }
+    if let Some(url) = env_value("REFHIR_PRIMARY_URL") {
+        cfg.primary_url = Some(url);
+    }
+    if let Some(size) = env_value("REFHIR_DB_POOL") {
+        cfg.db_pool = Some(
+            size.parse::<usize>()
+                .ok()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| format!("REFHIR_DB_POOL must be a positive number, not `{size}`"))?,
+        );
+    }
     if let Some(url) = env_value("REFHIR_POSTGRES_URL") {
         cfg.postgres = Some(url);
         cfg.memory = false;
@@ -734,6 +813,7 @@ pub fn apply_env(cfg: &mut ResolvedConfig) {
             oidc.client_secret = client_secret;
         }
     }
+    Ok(())
 }
 
 fn env_value(name: &str) -> Option<String> {
@@ -782,7 +862,7 @@ mod tests {
         std::env::set_var("REFHIR_OIDC_ISSUER", "https://idp.example");
         std::env::set_var("REFHIR_OIDC_CLIENT_ID", "refhir");
         std::env::set_var("REFHIR_OIDC_CLIENT_SECRET", "idp-secret");
-        apply_env(&mut cfg);
+        apply_env(&mut cfg).unwrap();
         for name in [
             "REFHIR_OIDC_ISSUER",
             "REFHIR_OIDC_CLIENT_ID",

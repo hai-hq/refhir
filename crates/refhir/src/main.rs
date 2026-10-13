@@ -9,14 +9,28 @@ use std::sync::{Arc, RwLock};
 
 use config::{
     apply_env, check_release_matches_database, discover_config_path, load_file, release_from_plan,
-    FhirRelease, PackagePlan, ResolvedConfig,
+    FhirRelease, PackagePlan, ResolvedConfig, Role,
 };
 use refhir_database::Database;
-use refhir_fhir::Catalog;
-use refhir_persistence::{AuthStore, ConformanceStore, GovernanceStore, JobStore, Persistence};
-use refhir_postgres::PostgresPersistence;
-use refhir_sqlite::SqlitePersistence;
+use refhir_fhir::{Catalog, CatalogClock};
+use refhir_persistence::{
+    AuthStore, ConformanceStore, GovernanceStore, JobStore, Lease, Persistence,
+};
+use refhir_postgres::{ConnectOptions, PostgresPersistence};
+use refhir_sqlite::{SqliteOptions, SqlitePersistence};
+use std::time::Duration;
 use tokio::net::TcpListener;
+
+/// Database connections to open when `--db-pool` is not given.
+const DEFAULT_DB_POOL: usize = 8;
+/// How often a standby asks for the writer lease.
+const STANDBY_POLL: Duration = Duration::from_secs(1);
+/// How often a replica moves its snapshot up to the writer's watermark.
+const REPLICA_REFRESH: Duration = Duration::from_millis(25);
+/// How often a replica looks anyway when its backend announces publishes, in case it missed one.
+const REPLICA_NOTIFIED_REFRESH: Duration = Duration::from_millis(500);
+/// How often a replica checks whether the catalog changed.
+const CATALOG_POLL: Duration = Duration::from_millis(250);
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -39,8 +53,14 @@ type Stores = (
     Arc<dyn GovernanceStore>,
 );
 
-#[tokio::main]
-async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+/// Startup runs on this thread, outside the runtime: the synchronous Postgres client refuses
+/// to block on a thread that belongs to one. The runtime only serves requests and runs the
+/// small bootstrap server; `enter` lets startup spawn onto it.
+fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let _enter = runtime.enter();
     let mut cfg = ResolvedConfig::defaults();
     let mut config_path: Option<std::path::PathBuf> = None;
     let mut cli_packages = Vec::new();
@@ -64,6 +84,9 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_trace_engine = false;
     let mut cli_sdc_archiver = false;
     let mut cli_update_as_create = false;
+    let mut cli_role: Option<Role> = None;
+    let mut cli_primary_url: Option<String> = None;
+    let mut cli_db_pool: Option<usize> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -146,6 +169,27 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 cli_terminology_urls.get_or_insert_with(Vec::new).push(url);
             }
             "--trace-engine" => cli_trace_engine = true,
+            "--role" => {
+                index += 1;
+                cli_role = Some(Role::parse(&required(&args, index, "--role")?)?);
+            }
+            "--standby" => cli_role = Some(Role::Standby),
+            "--primary-url" => {
+                index += 1;
+                cli_primary_url = Some(required(&args, index, "--primary-url")?);
+            }
+            "--db-pool" => {
+                index += 1;
+                let size = required(&args, index, "--db-pool")?;
+                cli_db_pool = Some(
+                    size.parse::<usize>()
+                        .ok()
+                        .filter(|size| *size > 0)
+                        .ok_or_else(|| {
+                            format!("--db-pool must be a positive number, not `{size}`")
+                        })?,
+                );
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
         index += 1;
@@ -158,7 +202,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         cfg.apply_file(&file)?;
         unknown_sections = file.unknown.keys().cloned().collect();
     }
-    apply_env(&mut cfg);
+    apply_env(&mut cfg)?;
 
     if let Some(v) = cli_sqlite {
         cfg.sqlite = v;
@@ -239,6 +283,15 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if cli_update_as_create {
         cfg.update_as_create = true;
     }
+    if let Some(role) = cli_role {
+        cfg.role = role;
+    }
+    if cli_primary_url.is_some() {
+        cfg.primary_url = cli_primary_url;
+    }
+    if cli_db_pool.is_some() {
+        cfg.db_pool = cli_db_pool;
+    }
 
     // A limit that cannot work is refused now, and not discovered by the first caller to hit it.
     cfg.governance.validate(cfg.auth)?;
@@ -289,6 +342,7 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    check_role(&cfg)?;
     ensure_package_cache_env(&cfg);
     tracing::info!("{}", cfg.describe_governance());
     if cfg.governance.audit.enabled && cfg.governance.audit.chain_key.is_none() {
@@ -304,9 +358,35 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let (db, store, auth_store, job_store, governance_store): Stores =
+    let role = cfg.role;
+    let addr: SocketAddr = cfg.bind.parse()?;
+    // A standby or replica starts answering `/healthz` (503) at once, on the port the real
+    // server will use, so a load balancer sees it as not ready instead of refusing connections.
+    let mut early_listener = None;
+    let mut bootstrap = None;
+    if role != Role::Primary {
+        let std_listener = std::net::TcpListener::bind(addr)?;
+        std_listener.set_nonblocking(true)?;
+        let probe = std_listener.try_clone()?;
+        let detail = if role == Role::Standby {
+            "waiting for the writer lease"
+        } else {
+            "waiting for the primary's schema and catalog"
+        };
+        bootstrap = Some(refhir_server::serve_bootstrap(probe, role.name(), detail)?);
+        early_listener = Some(TcpListener::from_std(std_listener)?);
+        tracing::info!("{} listening on http://{addr}, not ready yet", role.name());
+    }
+
+    let pool_size = cfg.db_pool.unwrap_or(DEFAULT_DB_POOL);
+    let (persistence, store, auth_store, job_store, governance_store): Stores =
         if let Some(url) = &cfg.postgres {
-            let persistence = Arc::new(PostgresPersistence::connect(url)?);
+            let options = ConnectOptions {
+                pool_size,
+                // A replica never runs DDL: it waits for the primary to have created the tables.
+                create_schema: role != Role::Replica,
+            };
+            let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
             (
                 persistence.clone(),
                 persistence.clone(),
@@ -324,8 +404,16 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 persistence,
             )
         } else {
-            let path = cfg.sqlite.unwrap_or_else(|| "refhir.sqlite".to_string());
-            let persistence = Arc::new(SqlitePersistence::open(Path::new(&path))?);
+            let path = cfg
+                .sqlite
+                .clone()
+                .unwrap_or_else(|| "refhir.sqlite".to_string());
+            let options = SqliteOptions {
+                read_connections: cfg
+                    .db_pool
+                    .unwrap_or(SqliteOptions::default().read_connections),
+            };
+            let persistence = Arc::new(SqlitePersistence::open_with(Path::new(&path), &options)?);
             (
                 persistence.clone(),
                 persistence.clone(),
@@ -334,22 +422,94 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 persistence,
             )
         };
-    // Nothing listens until this is done, so a slow start is a refused connection. Each phase
-    // says how long it took, so that a wait can be put down to the package download, the
-    // install, or the catalog.
-    let phase = std::time::Instant::now();
-    let db = Arc::new(Database::open(db)?);
-    let catalog = Arc::new(RwLock::new(Catalog::open(store.as_ref())?));
-    tracing::info!(target: "refhir", elapsed_ms = phase.elapsed().as_millis() as u64, "database and catalog opened");
-    check_release_matches_database(release_from_plan(&cfg.packages), store.as_ref())?;
-    let phase = std::time::Instant::now();
-    install_packages(store.as_ref(), &db, &catalog, &cfg.packages)?;
-    tracing::info!(target: "refhir", elapsed_ms = phase.elapsed().as_millis() as u64, "packages installed");
 
-    let phase = std::time::Instant::now();
-    refhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;
-    refhir_fhir::repair_conformance(store.as_ref(), &db, &catalog)?;
-    tracing::info!(target: "refhir", elapsed_ms = phase.elapsed().as_millis() as u64, "search index backfills and conformance repair done");
+    // A standby loads the catalog now, while it waits, and keeps it current. Loading the full
+    // R4 catalog takes seconds, and doing that only after the lease is won would leave the
+    // service without a writer for all of them.
+    let warm = if role == Role::Standby {
+        // The latest revision, not the stable version a replica follows: after a takeover this
+        // process may have to finish a backfill, so it needs the pending parameters too.
+        match Catalog::open_consistent(store.as_ref(), CatalogClock::Latest) {
+            Ok((loaded, version)) => {
+                let catalog = Arc::new(RwLock::new(loaded));
+                let watcher = refhir_fhir::watch_catalog(
+                    store.clone(),
+                    &catalog,
+                    version,
+                    CATALOG_POLL,
+                    CatalogClock::Latest,
+                );
+                Some((catalog, watcher))
+            }
+            Err(err) => {
+                tracing::warn!("standby could not load the catalog while waiting: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let (db, catalog, smart_tables) = if role == Role::Replica {
+        start_replica(&cfg, persistence, store.clone(), auth_store)?
+    } else {
+        // Becoming the writer comes first: `Database::open` reads the newest timestamp, which
+        // is only final once no other process can still commit.
+        loop {
+            match persistence.try_acquire_writer_lease()? {
+                Lease::Held { epoch } => {
+                    tracing::info!("{} holds the writer lease (epoch {epoch})", role.name());
+                    break;
+                }
+                Lease::Busy if role == Role::Standby => {
+                    std::thread::sleep(STANDBY_POLL);
+                }
+                Lease::Busy => {
+                    return Err(
+                        "another process holds the writer lease. Start this one with \
+                                --role standby to wait for it, or stop the other primary"
+                            .into(),
+                    );
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let db = Arc::new(Database::open(persistence)?);
+        let opened = started.elapsed();
+        let catalog = match warm {
+            // The previous primary may have changed the catalog after the last poll: catch up,
+            // which costs nothing when it did not.
+            Some((catalog, watcher)) => {
+                let version = watcher.stop();
+                refhir_fhir::reload_catalog(
+                    store.as_ref(),
+                    &catalog,
+                    version,
+                    CatalogClock::Latest,
+                )?;
+                catalog
+            }
+            None => Arc::new(RwLock::new(Catalog::open(store.as_ref())?)),
+        };
+        let loaded = started.elapsed();
+        check_release_matches_database(release_from_plan(&cfg.packages), store.as_ref())?;
+        install_packages(store.as_ref(), &db, &catalog, &cfg.packages)?;
+        let installed = started.elapsed();
+
+        refhir_fhir::run_backfills(store.as_ref(), &db, &catalog)?;
+        let backfilled = started.elapsed();
+        refhir_fhir::repair_conformance(store.as_ref(), &db, &catalog)?;
+        let repaired = started.elapsed();
+        tracing::info!(
+            "startup after the lease: {repaired:.1?} (database {opened:.1?}, catalog {:.1?}, \
+             packages {:.1?}, backfills {:.1?}, repair {:.1?})",
+            loaded.saturating_sub(opened),
+            installed.saturating_sub(loaded),
+            backfilled.saturating_sub(installed),
+            repaired.saturating_sub(backfilled)
+        );
+        (db, catalog, auth_store)
+    };
     let unexpandable = refhir_fhir::unexpandable_value_sets(&catalog);
     if !unexpandable.is_empty() {
         tracing::info!(
@@ -365,7 +525,6 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         current.set_reference_policy(policy);
         current.set_update_create(cfg.update_as_create);
     }
-    let addr: SocketAddr = cfg.bind.parse()?;
 
     let mut smart_dcr_token = cfg.smart_dcr_token;
     let mut smart_confidential_secret = cfg.smart_confidential_secret;
@@ -373,15 +532,29 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if cfg.auth {
         fill_smart_credentials(&mut smart_dcr_token, &mut smart_confidential_secret)?;
         // OAuth clients, codes, tokens and the signing key live in the database.
-        let secret = smart_confidential_secret.clone().unwrap_or_default();
-        let tables = refhir_server::SmartStore::open(auth_store, secret);
-        tables.init_signing_key()?;
+        let tables = if role == Role::Replica {
+            // The primary owns the built-in clients and the signing key; wait for the key.
+            let tables = refhir_server::SmartStore::open_reader(smart_tables);
+            wait_for_signing_key(&tables);
+            tables
+        } else {
+            let secret = smart_confidential_secret.clone().unwrap_or_default();
+            let tables = refhir_server::SmartStore::try_open(smart_tables, secret)?;
+            tables.init_signing_key()?;
+            tables
+        };
         smart = Some(Arc::new(tables));
     }
-    let listener = TcpListener::bind(addr).await?;
+    let listener = match early_listener {
+        Some(listener) => listener,
+        None => runtime.block_on(TcpListener::bind(addr))?,
+    };
+    if let Some(bootstrap) = bootstrap {
+        runtime.block_on(bootstrap.stop());
+    }
     let local = listener.local_addr()?;
     tracing::info!("listening on http://{local}");
-    refhir_server::serve(
+    runtime.block_on(refhir_server::serve(
         db,
         catalog,
         store,
@@ -400,15 +573,119 @@ async fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             oidc: cfg.oidc,
             smart_demo_login: cfg.smart_demo_login,
             smart,
+            primary_url: cfg.primary_url,
+            max_staleness: Duration::from_secs(5),
+            min_ts_wait: Duration::from_millis(250),
             // Export jobs are rows in the same database, so they outlive a restart.
             jobs: Some(refhir_server::SharedJobStore::new(job_store)),
             // So are usage, the request log and the audit trail.
             governance: cfg.governance,
             governance_store: Some(refhir_server::SharedGovernanceStore::new(governance_store)),
         },
-    )
-    .await?;
+    ))?;
     Ok(())
+}
+
+/// Settings that make no sense for a role, or that would make several processes disagree.
+fn check_role(cfg: &ResolvedConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let role = cfg.role;
+    if role == Role::Primary {
+        return Ok(());
+    }
+    let name = role.name();
+    if cfg.memory {
+        return Err(
+            format!("--memory is private to one process, so it cannot run as a {name}").into(),
+        );
+    }
+    if role == Role::Replica && cfg.postgres.is_none() {
+        return Err(
+            "a replica reads the database the primary writes from another process, which needs \
+             --postgres (SQLite can only be shared on one machine, by a standby)"
+                .into(),
+        );
+    }
+    if cfg.auth {
+        // Each process would otherwise invent its own, and a process that restarts would
+        // replace the confidential secret every other process is using.
+        let pinned = |value: &Option<String>| value.as_deref().is_some_and(|text| !text.is_empty());
+        if !pinned(&cfg.smart_dcr_token) || !pinned(&cfg.smart_confidential_secret) {
+            return Err(format!(
+                "a {name} needs --smart-dcr-token and --smart-confidential-secret (or \
+                 REFHIR_SMART_DCR_TOKEN and REFHIR_SMART_CONFIDENTIAL_SECRET) set to the same \
+                 values on every process, so they agree on the built-in client and the \
+                 registration token"
+            )
+            .into());
+        }
+    }
+    if role == Role::Replica && cfg.primary_url.is_none() {
+        tracing::warn!(
+            "no --primary-url: this replica cannot forward writes, and answers them with 503"
+        );
+    }
+    Ok(())
+}
+
+type ReplicaParts = (Arc<Database>, Arc<RwLock<Catalog>>, Arc<dyn AuthStore>);
+
+/// A replica has no committer. It waits until the primary has published a timestamp and
+/// installed its packages, then follows the primary's watermark and catalog version.
+fn start_replica(
+    cfg: &ResolvedConfig,
+    persistence: Arc<dyn Persistence>,
+    store: Arc<dyn ConformanceStore>,
+    auth_store: Arc<dyn AuthStore>,
+) -> Result<ReplicaParts, Box<dyn std::error::Error>> {
+    let persistence_notifies = persistence.publishes_notifications();
+    let mut attempts = 0u64;
+    let db = loop {
+        let waiting_for = match Database::open_read_only(persistence.clone()) {
+            Ok(db) => {
+                if store.load_packages()?.is_empty() {
+                    "the primary to install its packages".to_string()
+                } else {
+                    break Arc::new(db);
+                }
+            }
+            Err(err) => err.to_string(),
+        };
+        if attempts % 10 == 0 {
+            tracing::info!("replica waiting for {waiting_for}");
+        }
+        attempts += 1;
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    check_release_matches_database(release_from_plan(&cfg.packages), store.as_ref())?;
+    // A replica follows the stable version: it never loads a parameter that is still pending.
+    let (loaded, version) = Catalog::open_consistent(store.as_ref(), CatalogClock::Stable)?;
+    let catalog = Arc::new(RwLock::new(loaded));
+    // With a notification channel the refresher wakes the moment the writer publishes, so the
+    // timer is only a safety net for a missed notice.
+    db.start_refresher(if persistence_notifies {
+        REPLICA_NOTIFIED_REFRESH
+    } else {
+        REPLICA_REFRESH
+    });
+    refhir_fhir::watch_catalog(store, &catalog, version, CATALOG_POLL, CatalogClock::Stable);
+    Ok((db, catalog, auth_store))
+}
+
+/// The primary creates the signing key. A replica that starts first waits for it.
+fn wait_for_signing_key(tables: &refhir_server::SmartStore) {
+    let mut attempts = 0u64;
+    loop {
+        match tables.init_signing_key() {
+            Ok(()) => return,
+            Err(err) => {
+                if attempts % 10 == 0 {
+                    tracing::info!("replica waiting for the signing key: {err}");
+                }
+                attempts += 1;
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
 }
 
 /// SMART needs a way to sign users in: an OpenID Connect provider, or explicit demo login.
@@ -552,6 +829,7 @@ fn print_help() {
          [--smart-confidential-secret secret]\n\
          [--oidc-issuer url --oidc-client-id id] [--smart-demo-login]\n\
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
+         [--role primary|standby|replica] [--standby] [--primary-url url] [--db-pool n]\n\
          \n\
          Config file (optional): refhir.toml in the working directory, /etc/refhir/refhir.toml,\n\
          or REFHIR_CONFIG. CLI flags override the file. See refhir.toml.example.\n\
@@ -571,7 +849,14 @@ fn print_help() {
          Rate limits, quotas, the audit trail and the request log are set in the config file\n\
          ([rate_limit], [quota], [audit], [request_log], [metering]). Usage, the request log and\n\
          the audit trail are on by default; nothing is limited until a limit is configured.\n\
-         GET /_audit, /_usage and /_requests read them back (system/AuditEvent.read with --smart)."
+         GET /_audit, /_usage and /_requests read them back (system/AuditEvent.read with --smart).\n\
+         \n\
+         Several processes on one database: exactly one primary writes and holds a lease on the\n\
+         database. --standby (--role standby) waits for that lease and takes over when the\n\
+         primary is gone. --role replica reads what the primary publishes and sends writes, and\n\
+         reads that need a newer snapshot, to --primary-url. /healthz is 200 when a process can\n\
+         take traffic and 503 when it cannot. --db-pool sets the most Postgres connections\n\
+         (default 8), or, on SQLite, the read connections next to the one writer (default 4)."
     );
 }
 
@@ -590,6 +875,12 @@ fn fill_smart_credentials(
     if !generated_dcr && !generated_secret {
         return Ok(());
     }
+    // `--role primary` is also the single-process default, so this is a warning and not a refusal.
+    // A standby refuses to start without pinned values, because the one that takes over writes its
+    // own over the stored ones: generated here, they stop working at the first failover.
+    tracing::warn!(
+        "the SMART DCR token or confidential client secret was generated at startup and changes on          every restart. Before running a standby or replica, set REFHIR_SMART_DCR_TOKEN and          REFHIR_SMART_CONFIDENTIAL_SECRET to the same values on every process, this one included"
+    );
     if !std::io::stderr().is_terminal() {
         return Ok(());
     }
@@ -618,6 +909,68 @@ fn required(args: &[String], index: usize, flag: &str) -> Result<String, String>
 mod tests {
     use super::*;
     use refhir_fhir::FhirError;
+
+    fn config(role: Role) -> ResolvedConfig {
+        let mut cfg = ResolvedConfig::defaults();
+        cfg.role = role;
+        cfg.postgres = Some("postgres://example/db".into());
+        cfg
+    }
+
+    #[test]
+    fn roles_parse_and_unknown_ones_are_refused() {
+        assert_eq!(Role::parse("primary").unwrap(), Role::Primary);
+        assert_eq!(Role::parse(" Standby ").unwrap(), Role::Standby);
+        assert_eq!(Role::parse("REPLICA").unwrap(), Role::Replica);
+        let err = Role::parse("leader").unwrap_err();
+        assert!(err.contains("primary, standby or replica"), "{err}");
+    }
+
+    #[test]
+    fn a_primary_is_never_refused_by_the_role_checks() {
+        let mut cfg = config(Role::Primary);
+        cfg.memory = true;
+        cfg.postgres = None;
+        cfg.auth = true;
+        assert!(check_role(&cfg).is_ok());
+    }
+
+    #[test]
+    fn roles_that_share_a_database_need_one_that_can_be_shared() {
+        let mut memory = config(Role::Standby);
+        memory.postgres = None;
+        memory.memory = true;
+        let err = check_role(&memory).unwrap_err().to_string();
+        assert!(err.contains("private to one process"), "{err}");
+
+        // A standby can share a SQLite file on one machine; a replica needs Postgres.
+        let mut sqlite = config(Role::Standby);
+        sqlite.postgres = None;
+        sqlite.sqlite = Some("shared.sqlite".into());
+        assert!(check_role(&sqlite).is_ok());
+        let mut replica = config(Role::Replica);
+        replica.postgres = None;
+        replica.sqlite = Some("shared.sqlite".into());
+        let err = check_role(&replica).unwrap_err().to_string();
+        assert!(err.contains("--postgres"), "{err}");
+    }
+
+    #[test]
+    fn processes_that_serve_smart_must_agree_on_its_secrets() {
+        for role in [Role::Standby, Role::Replica] {
+            let mut cfg = config(role);
+            cfg.auth = true;
+            let err = check_role(&cfg).unwrap_err().to_string();
+            assert!(err.contains("--smart-dcr-token"), "{err}");
+            cfg.smart_dcr_token = Some("token".into());
+            assert!(
+                check_role(&cfg).is_err(),
+                "the confidential secret is still unset"
+            );
+            cfg.smart_confidential_secret = Some("secret".into());
+            assert!(check_role(&cfg).is_ok());
+        }
+    }
 
     #[test]
     fn only_download_failures_get_the_registry_advice() {

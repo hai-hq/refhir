@@ -1398,17 +1398,22 @@ dependencies = [
 name = "refhir"
 version = "0.1.0"
 dependencies = [
+ "postgres",
  "refhir-database",
  "refhir-fhir",
  "refhir-persistence",
  "refhir-postgres",
  "refhir-server",
  "refhir-sqlite",
+ "refhir-types",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
+ "ureq",
  "uuid",
 ]
 
@@ -1491,6 +1496,7 @@ dependencies = [
  "refhir-types",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1545,10 +1551,12 @@ dependencies = [
 name = "refhir-sqlite"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "refhir-persistence",
  "refhir-types",
  "rusqlite",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
