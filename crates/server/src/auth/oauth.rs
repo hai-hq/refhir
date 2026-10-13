@@ -1113,12 +1113,24 @@ fn authenticate_client(
     form: &HashMap<String, String>,
     grant: Option<&str>,
 ) -> Result<Client, Response> {
+    authenticate_client_at(app, headers, form, grant, &["token"])
+}
+
+/// [`authenticate_client`] for an endpoint that also takes assertions addressed to the
+/// `/oauth/{audience}` paths in `audiences`.
+fn authenticate_client_at(
+    app: &AppState,
+    headers: &HeaderMap,
+    form: &HashMap<String, String>,
+    grant: Option<&str>,
+    audiences: &[&str],
+) -> Result<Client, Response> {
     if form
         .get("client_assertion_type")
         .map(|value| value.as_str())
         == Some("urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
     {
-        return authenticate_jwt(app, headers, form, grant);
+        return authenticate_jwt(app, headers, form, grant, audiences);
     }
     let (id, secret) = match basic_client(headers) {
         Some(pair) => pair,
@@ -1178,7 +1190,8 @@ fn introspect_authorized(
             return true;
         }
     }
-    match authenticate_client(app, headers, form, None) {
+    // An assertion for introspection is only good here; the token endpoint does not take it.
+    match authenticate_client_at(app, headers, form, None, &["token", "introspect"]) {
         Ok(client) if !client.public => {
             attribute(&client.id, None, None);
             true
@@ -1192,6 +1205,7 @@ fn authenticate_jwt(
     headers: &HeaderMap,
     form: &HashMap<String, String>,
     grant: Option<&str>,
+    audiences: &[&str],
 ) -> Result<Client, Response> {
     let Some(assertion) = form.get("client_assertion") else {
         return Err(oauth_error(
@@ -1272,8 +1286,14 @@ fn authenticate_jwt(
     let mut validation = Validation::new(header.alg);
     validation.set_issuer(&[iss]);
     validation.validate_aud = true;
-    let token_endpoint = format!("{}/oauth/token", issuer(app, headers));
-    validation.set_audience(&[token_endpoint]);
+    // The assertion is addressed to the endpoint it is sent to (RFC 7523): each caller names the
+    // endpoints it accepts, so one made for introspection cannot be replayed at /oauth/token.
+    let issuer = issuer(app, headers);
+    let audiences: Vec<String> = audiences
+        .iter()
+        .map(|endpoint| format!("{issuer}/oauth/{endpoint}"))
+        .collect();
+    validation.set_audience(&audiences);
     let claims: Value = jsonwebtoken::decode(assertion, &decoding, &validation)
         .map_err(|_| {
             oauth_error(

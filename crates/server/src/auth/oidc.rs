@@ -4,6 +4,7 @@
 //! callback exchanges the code server-side and validates the ID token against the provider's
 //! published keys. The verified `sub` and `fhirUser` claim become the identity SMART tokens carry.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,81 @@ pub struct OidcConfig {
     /// Redirect URI registered at the provider. Defaults to `<issuer>/oauth/oidc/callback`
     /// of this server.
     pub redirect_uri: Option<String>,
+    /// Restrict who may sign in by ID token claim: every named claim must carry at least one of
+    /// the listed values (a claim holding an array matches if any element is listed). Empty
+    /// means anyone the provider authenticates is accepted.
+    pub allowed_claims: BTreeMap<String, Vec<String>>,
+    /// Restrict who may sign in by the domain of the `email` claim (exact match, case
+    /// insensitive). An address the provider has not marked `email_verified: true` never matches. Empty means
+    /// any address, or none, is accepted. Combined with `allowed_claims`, both must pass.
+    pub allowed_email_domains: Vec<String>,
+    /// Bind a person to a FHIR resource by search when the ID token has no usable
+    /// `fhir_user_claim`. Off when unset.
+    pub fhir_user_lookup: Option<FhirUserLookup>,
+    /// When the signed-in person is bound to a `Patient`, make that patient the launch context
+    /// instead of showing the patient picker. Off by default.
+    pub patient_from_fhir_user: bool,
+}
+
+/// How to find the FHIR resource for a person the provider has authenticated: search
+/// `[resource_type]?[search_param]=[system|]<value of claim>` and bind only on exactly one hit.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FhirUserLookup {
+    /// One of `Practitioner`, `Patient`, `RelatedPerson` or `Person`.
+    pub resource_type: String,
+    /// ID token claim holding the value to search for. `sub` (the default) or any claim name,
+    /// e.g. `email`.
+    pub claim: String,
+    /// Search parameter to match the value against.
+    pub search_param: String,
+    /// Identifier system, sent as `system|value`. Without it only the value is sent.
+    pub system: Option<String>,
+}
+
+impl FhirUserLookup {
+    pub fn new(resource_type: impl Into<String>) -> Self {
+        Self {
+            resource_type: resource_type.into(),
+            claim: "sub".into(),
+            search_param: "identifier".into(),
+            system: None,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        const TYPES: [&str; 4] = ["Practitioner", "Patient", "RelatedPerson", "Person"];
+        if !TYPES.contains(&self.resource_type.as_str()) {
+            return Err(format!(
+                "oidc fhir_user_lookup resource_type must be one of {}",
+                TYPES.join(", ")
+            ));
+        }
+        if self.claim.is_empty() {
+            return Err("oidc fhir_user_lookup claim must not be empty".into());
+        }
+        let param_ok = !self.search_param.is_empty()
+            && self
+                .search_param
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !param_ok {
+            return Err("oidc fhir_user_lookup search_param is not a valid parameter name".into());
+        }
+        if let Some(system) = &self.system {
+            if system.is_empty() || system.contains([',', '$', '\\', '|']) {
+                return Err(
+                    "oidc fhir_user_lookup system is empty or has a reserved character".into(),
+                );
+            }
+            // `system|value` is token syntax; it means nothing to a string parameter.
+            if self.search_param != "identifier" {
+                return Err(
+                    "oidc fhir_user_lookup system only applies to search_param identifier".into(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OidcConfig {
@@ -51,6 +127,27 @@ impl OidcConfig {
         if let Some(uri) = &self.redirect_uri {
             check_endpoint("oidc redirect_uri", uri)?;
         }
+        for (claim, values) in &self.allowed_claims {
+            if claim.is_empty() {
+                return Err("oidc allowed_claims has an empty claim name".into());
+            }
+            // An empty list could never match, which would lock everyone out.
+            if values.is_empty() || values.iter().any(String::is_empty) {
+                return Err(format!(
+                    "oidc allowed_claims.{claim} needs at least one non-empty value"
+                ));
+            }
+        }
+        if self
+            .allowed_email_domains
+            .iter()
+            .any(|domain| normalise_domain(domain).is_empty())
+        {
+            return Err("oidc allowed_email_domains has an empty domain".into());
+        }
+        if let Some(lookup) = &self.fhir_user_lookup {
+            lookup.validate()?;
+        }
         Ok(())
     }
 
@@ -62,6 +159,10 @@ impl OidcConfig {
             scopes: vec!["openid".into()],
             fhir_user_claim: "fhirUser".into(),
             redirect_uri: None,
+            allowed_claims: BTreeMap::new(),
+            allowed_email_domains: Vec::new(),
+            fhir_user_lookup: None,
+            patient_from_fhir_user: false,
         }
     }
 }
@@ -74,6 +175,24 @@ pub(crate) struct Identity {
     pub fhir_user: Option<String>,
     /// Human-readable label for the consent page.
     pub display: Option<String>,
+    /// Value of the claim `fhir_user_lookup` searches on, when one is configured.
+    #[serde(default)]
+    pub lookup_key: Option<String>,
+}
+
+/// Why a sign-in did not complete.
+#[derive(Debug)]
+pub(crate) enum SignInError {
+    /// The provider authenticated the user but the allowlist does not admit them. The text is
+    /// for the log, not the user.
+    NotPermitted(String),
+    Failed(String),
+}
+
+impl From<String> for SignInError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
 }
 
 /// State kept between redirecting to the provider and the callback.
@@ -114,8 +233,11 @@ impl std::fmt::Debug for Oidc {
 }
 
 impl Oidc {
-    pub fn new(cfg: OidcConfig) -> Result<Self, String> {
+    pub fn new(mut cfg: OidcConfig) -> Result<Self, String> {
         cfg.validate()?;
+        for domain in &mut cfg.allowed_email_domains {
+            *domain = normalise_domain(domain);
+        }
         let agent = ureq::AgentBuilder::new()
             .timeout(HTTP_TIMEOUT)
             .redirects(0)
@@ -225,10 +347,44 @@ impl Oidc {
         code: &str,
         flow: &OidcFlow,
         redirect_uri: &str,
-    ) -> Result<Identity, String> {
+    ) -> Result<Identity, SignInError> {
         let discovery = self.discovery()?;
         let id_token = self.exchange(&discovery, code, &flow.verifier, redirect_uri)?;
-        self.verify_id_token(&discovery, &id_token, &flow.nonce)
+        let (identity, claims) = self.verify_id_token(&discovery, &id_token, &flow.nonce)?;
+        // Before anything is stored or shown: someone the allowlist refuses never reaches consent.
+        self.admit(&identity.sub, &claims)
+            .map_err(SignInError::NotPermitted)?;
+        Ok(identity)
+    }
+
+    /// Apply `allowed_claims` and `allowed_email_domains` to a verified ID token.
+    fn admit(&self, sub: &str, claims: &Value) -> Result<(), String> {
+        for (name, allowed) in &self.cfg.allowed_claims {
+            if !claim_listed(claims.get(name), allowed) {
+                return Err(format!(
+                    "{sub}: claim {name} is not among the permitted values"
+                ));
+            }
+        }
+        if !self.cfg.allowed_email_domains.is_empty() {
+            let domain = verified_email(claims).and_then(|email| {
+                email
+                    .rsplit_once('@')
+                    .map(|(_, domain)| domain.to_lowercase())
+            });
+            let admitted = domain.as_deref().is_some_and(|domain| {
+                self.cfg
+                    .allowed_email_domains
+                    .iter()
+                    .any(|allowed| allowed == domain)
+            });
+            if !admitted {
+                return Err(format!(
+                    "{sub}: email is missing, unverified, or not in a permitted domain"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn exchange(
@@ -284,7 +440,7 @@ impl Oidc {
         discovery: &Discovery,
         token: &str,
         nonce: &str,
-    ) -> Result<Identity, String> {
+    ) -> Result<(Identity, Value), String> {
         let header =
             jsonwebtoken::decode_header(token).map_err(|err| format!("bad id_token: {err}"))?;
         if !matches!(
@@ -333,13 +489,24 @@ impl Oidc {
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         };
-        Ok(Identity {
+        let lookup_key =
+            self.cfg
+                .fhir_user_lookup
+                .as_ref()
+                .and_then(|lookup| match lookup.claim.as_str() {
+                    "sub" => Some(sub.clone()),
+                    "email" => verified_email(&claims),
+                    other => text(other),
+                });
+        let identity = Identity {
             fhir_user: text(&self.cfg.fhir_user_claim),
             display: text("preferred_username")
                 .or_else(|| text("name"))
                 .or_else(|| text("email")),
+            lookup_key,
             sub,
-        })
+        };
+        Ok((identity, claims))
     }
 
     fn signing_key(&self, discovery: &Discovery, kid: Option<&str>) -> Result<DecodingKey, String> {
@@ -384,6 +551,41 @@ impl Oidc {
     }
 }
 
+/// An allowed email domain as compared: no `@`, no padding, lower case.
+fn normalise_domain(domain: &str) -> String {
+    domain.trim().trim_start_matches('@').to_lowercase()
+}
+
+/// Whether a claim value is one of `allowed`. An array claim matches if any element does;
+/// numbers and booleans compare by their JSON text.
+fn claim_listed(value: Option<&Value>, allowed: &[String]) -> bool {
+    let listed = |item: &Value| match item {
+        Value::String(text) => allowed.contains(text),
+        Value::Number(_) | Value::Bool(_) => allowed.contains(&item.to_string()),
+        _ => false,
+    };
+    match value {
+        Some(Value::Array(items)) => items.iter().any(listed),
+        Some(item) => listed(item),
+        None => false,
+    }
+}
+
+/// The `email` claim, only when the provider says it has verified it. A token with no
+/// `email_verified` claim counts as unverified.
+fn verified_email(claims: &Value) -> Option<String> {
+    let verified = match claims.get("email_verified") {
+        Some(Value::Bool(verified)) => *verified,
+        Some(Value::String(text)) => text.eq_ignore_ascii_case("true"),
+        _ => false,
+    };
+    claims
+        .get("email")
+        .and_then(Value::as_str)
+        .filter(|email| !email.is_empty() && verified)
+        .map(str::to_string)
+}
+
 fn check_endpoint(name: &str, url: &str) -> Result<(), String> {
     let parsed = parse_http_uri(url).ok_or_else(|| format!("{name} {url} is not a valid URL"))?;
     if parsed.scheme == "https" || is_loopback_host(&parsed.host) {
@@ -420,6 +622,129 @@ mod tests {
         assert!(Oidc::new(OidcConfig::new("http://idp.example.com", "c")).is_err());
         assert!(Oidc::new(OidcConfig::new("not a url", "c")).is_err());
         assert!(Oidc::new(OidcConfig::new("https://idp.example.com", "")).is_err());
+    }
+
+    fn gated(claims: &[(&str, &[&str])], domains: &[&str]) -> Oidc {
+        let mut cfg = OidcConfig::new("https://idp.example.com", "c");
+        for (name, values) in claims {
+            cfg.allowed_claims.insert(
+                name.to_string(),
+                values.iter().map(|v| v.to_string()).collect(),
+            );
+        }
+        cfg.allowed_email_domains = domains.iter().map(|d| d.to_string()).collect();
+        Oidc::new(cfg).unwrap()
+    }
+
+    #[test]
+    fn no_allowlist_admits_everyone() {
+        let oidc = gated(&[], &[]);
+        assert!(oidc.admit("u", &serde_json::json!({})).is_ok());
+    }
+
+    #[test]
+    fn allowed_claims_need_every_claim_to_match_one_listed_value() {
+        let oidc = gated(
+            &[("organization_id", &["org_a", "org_b"]), ("tier", &["1"])],
+            &[],
+        );
+        let ok = serde_json::json!({"organization_id": "org_b", "tier": 1});
+        assert!(oidc.admit("u", &ok).is_ok());
+        let wrong_org = serde_json::json!({"organization_id": "org_c", "tier": 1});
+        assert!(oidc.admit("u", &wrong_org).is_err());
+        let missing = serde_json::json!({"organization_id": "org_a"});
+        assert!(oidc.admit("u", &missing).is_err());
+        // An array claim is admitted when any element is listed.
+        let many = serde_json::json!({"organization_id": ["org_x", "org_a"], "tier": "1"});
+        assert!(oidc.admit("u", &many).is_ok());
+        let none = serde_json::json!({"organization_id": ["org_x"], "tier": "1"});
+        assert!(oidc.admit("u", &none).is_err());
+        let nested = serde_json::json!({"organization_id": {"id": "org_a"}, "tier": "1"});
+        assert!(oidc.admit("u", &nested).is_err());
+    }
+
+    #[test]
+    fn allowed_email_domains_match_the_whole_domain_of_a_verified_address() {
+        let oidc = gated(&[], &["boolbyte.com", "@Example.org"]);
+        let admit = |claims: Value| oidc.admit("u", &claims).is_ok();
+        let verified = |email: &str| serde_json::json!({"email": email, "email_verified": true});
+        assert!(admit(verified("a@boolbyte.com")));
+        assert!(admit(verified("A@BoolByte.COM")));
+        assert!(admit(verified("a@example.org")));
+        // A token that does not say the address is verified does not count.
+        assert!(!admit(serde_json::json!({"email": "a@boolbyte.com"})));
+        assert!(!admit(serde_json::json!({"email": "a@evil-boolbyte.com"})));
+        assert!(!admit(serde_json::json!({"email": "a@mail.boolbyte.com"})));
+        assert!(!admit(
+            serde_json::json!({"email": "boolbyte.com@evil.com"})
+        ));
+        assert!(!admit(
+            serde_json::json!({"email": "a@boolbyte.com", "email_verified": false})
+        ));
+        assert!(!admit(
+            serde_json::json!({"email": "a@boolbyte.com", "email_verified": "false"})
+        ));
+        assert!(!admit(serde_json::json!({"sub": "no-email"})));
+    }
+
+    #[test]
+    fn claims_and_email_domains_must_both_pass() {
+        let oidc = gated(&[("organization_id", &["org_a"])], &["boolbyte.com"]);
+        assert!(oidc
+            .admit(
+                "u",
+                &serde_json::json!({"organization_id": "org_a", "email": "a@boolbyte.com", "email_verified": true})
+            )
+            .is_ok());
+        assert!(oidc
+            .admit("u", &serde_json::json!({"organization_id": "org_a"}))
+            .is_err());
+    }
+
+    #[test]
+    fn an_allowlist_that_could_never_match_is_a_startup_error() {
+        let mut cfg = OidcConfig::new("https://idp.example.com", "c");
+        cfg.allowed_claims.insert("organization_id".into(), vec![]);
+        assert!(cfg.validate().is_err());
+        cfg.allowed_claims
+            .insert("organization_id".into(), vec!["org_a".into()]);
+        assert!(cfg.validate().is_ok());
+        cfg.allowed_email_domains = vec!["@".into()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn fhir_user_lookup_is_validated() {
+        let mut cfg = OidcConfig::new("https://idp.example.com", "c");
+        cfg.fhir_user_lookup = Some(FhirUserLookup::new("Practitioner"));
+        assert!(cfg.validate().is_ok());
+        for bad in [
+            FhirUserLookup::new("Observation"),
+            FhirUserLookup {
+                search_param: "a=b".into(),
+                ..FhirUserLookup::new("Patient")
+            },
+            FhirUserLookup {
+                claim: String::new(),
+                ..FhirUserLookup::new("Patient")
+            },
+            FhirUserLookup {
+                system: Some(String::new()),
+                ..FhirUserLookup::new("Patient")
+            },
+            FhirUserLookup {
+                system: Some("urn:a,b".into()),
+                ..FhirUserLookup::new("Patient")
+            },
+            FhirUserLookup {
+                system: Some("urn:x".into()),
+                search_param: "email".into(),
+                ..FhirUserLookup::new("Patient")
+            },
+        ] {
+            cfg.fhir_user_lookup = Some(bad);
+            assert!(cfg.validate().is_err());
+        }
     }
 
     #[test]

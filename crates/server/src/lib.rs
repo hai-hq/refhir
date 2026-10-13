@@ -19,7 +19,7 @@ use refhir_database::Database;
 use refhir_fhir::{Catalog, ConformanceStore};
 use tokio::net::TcpListener;
 
-pub use auth::{OidcConfig, SmartStore};
+pub use auth::{FhirUserLookup, OidcConfig, SmartStore};
 pub use cluster::{bootstrap_router, serve_bootstrap, Bootstrap};
 pub use governance::{
     AuditConfig, Cidr, ClientRate, Costs, Governance, GovernanceConfig, ProxyConfig, QuotaConfig,

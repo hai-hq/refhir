@@ -145,6 +145,27 @@ pub struct OidcSection {
     pub scopes: Option<Vec<String>>,
     pub fhir_user_claim: Option<String>,
     pub redirect_uri: Option<String>,
+    /// Only let users whose ID token carries one of these values for each named claim sign in,
+    /// e.g. `allowed_claims = { organization_id = ["org_..."] }`.
+    pub allowed_claims: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Only let users with a verified email in one of these domains sign in.
+    pub allowed_email_domains: Option<Vec<String>>,
+    /// Bind a person to a FHIR resource by search when the ID token has no `fhir_user_claim`.
+    pub fhir_user_lookup: Option<FhirUserLookupSection>,
+    /// Use the signed-in user's own `Patient` as the launch patient instead of the picker.
+    pub patient_from_fhir_user: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FhirUserLookupSection {
+    /// `Practitioner` (default), `Patient`, `RelatedPerson` or `Person`.
+    pub resource_type: Option<String>,
+    /// ID token claim to search for: `sub` (default), `email`, or any other claim.
+    pub claim: Option<String>,
+    /// Search parameter to match it against. Default `identifier`.
+    pub search_param: Option<String>,
+    /// Identifier system for `system|value`.
+    pub system: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -462,6 +483,28 @@ impl ResolvedConfig {
             }
             if section.redirect_uri.is_some() {
                 oidc.redirect_uri = section.redirect_uri.clone();
+            }
+            if let Some(v) = &section.allowed_claims {
+                oidc.allowed_claims = v.clone();
+            }
+            if let Some(v) = &section.allowed_email_domains {
+                oidc.allowed_email_domains = v.clone();
+            }
+            if let Some(v) = section.patient_from_fhir_user {
+                oidc.patient_from_fhir_user = v;
+            }
+            if let Some(lookup) = &section.fhir_user_lookup {
+                let mut found = refhir_server::FhirUserLookup::new(
+                    lookup.resource_type.as_deref().unwrap_or("Practitioner"),
+                );
+                if let Some(v) = &lookup.claim {
+                    found.claim = v.clone();
+                }
+                if let Some(v) = &lookup.search_param {
+                    found.search_param = v.clone();
+                }
+                found.system = lookup.system.clone();
+                oidc.fhir_user_lookup = Some(found);
             }
         }
         if let Some(v) = &file.export.dir {
@@ -879,6 +922,52 @@ mod tests {
         std::env::remove_var("REFHIR_SMART_CONFIDENTIAL_SECRET");
         assert_eq!(cfg.postgres.as_deref(), Some("postgres://real"));
         assert_eq!(cfg.smart_confidential_secret.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn oidc_allowlist_and_fhir_user_binding_come_from_the_file() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file: FileConfig = toml::from_str(
+            r#"
+            [smart.oidc]
+            issuer = "https://idp.example"
+            client_id = "refhir"
+            allowed_claims = { organization_id = ["org_a", "org_b"] }
+            allowed_email_domains = ["boolbyte.com"]
+            patient_from_fhir_user = true
+            [smart.oidc.fhir_user_lookup]
+            system = "https://idp.example/sub"
+            "#,
+        )
+        .unwrap();
+        let mut cfg = ResolvedConfig::defaults();
+        cfg.apply_file(&file).unwrap();
+        let oidc = cfg.oidc.expect("oidc");
+        assert_eq!(oidc.allowed_claims["organization_id"], ["org_a", "org_b"]);
+        assert_eq!(oidc.allowed_email_domains, ["boolbyte.com"]);
+        assert!(oidc.patient_from_fhir_user);
+        let lookup = oidc.fhir_user_lookup.clone().expect("lookup");
+        assert_eq!(lookup.resource_type, "Practitioner");
+        assert_eq!(lookup.claim, "sub");
+        assert_eq!(lookup.search_param, "identifier");
+        assert_eq!(lookup.system.as_deref(), Some("https://idp.example/sub"));
+        assert!(oidc.validate().is_ok());
+    }
+
+    #[test]
+    fn oidc_stays_open_and_unbound_unless_configured() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file: FileConfig = toml::from_str(
+            "[smart.oidc]\nissuer = \"https://idp.example\"\nclient_id = \"refhir\"\n",
+        )
+        .unwrap();
+        let mut cfg = ResolvedConfig::defaults();
+        cfg.apply_file(&file).unwrap();
+        let oidc = cfg.oidc.expect("oidc");
+        assert!(oidc.allowed_claims.is_empty());
+        assert!(oidc.allowed_email_domains.is_empty());
+        assert!(oidc.fhir_user_lookup.is_none());
+        assert!(!oidc.patient_from_fhir_user);
     }
 
     #[test]

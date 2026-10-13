@@ -38,5 +38,5 @@ Document Inferno pass/fail in your release process.
 
 - Demo login (`demo_login`) is unauthenticated and for testing only; production uses `[smart.oidc]`
 - SAML is not supported; use an OpenID Connect provider (most SAML IdPs can be brokered through Keycloak)
-- No group or role mapping: every authenticated user gets the scopes the client requests
+- No group or role mapping: every user who may sign in (all of them, unless `allowed_claims` or `allowed_email_domains` narrows it) gets the scopes the client requests
 - No multi-node OAuth store (file snapshot is single-process)
