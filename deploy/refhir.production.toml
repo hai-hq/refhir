@@ -7,6 +7,14 @@ version = "r4"
 [server]
 bind = "0.0.0.0:8080"
 public_url = "https://refhir.example.com/fhir"
+# Reverse proxies in front of this server (load balancer, ingress). Behind one, every client
+# looks like the proxy unless this is set, and per-address limits and the audit trail then
+# record the proxy's address for everyone. See deploy/production.md.
+trusted_proxy_hops = 1
+# The networks the proxies connect from, so that X-Forwarded-For is believed only from them and
+# not from a client that reaches the server directly. Set it to your ingress or load balancer's
+# range (the pod network, for an in-cluster ingress); see deploy/production.md.
+# trusted_proxy_peers = ["10.0.0.0/8"]
 
 [database]
 kind = "postgres"
@@ -63,3 +71,47 @@ urls = []
 [features]
 trace_engine = false
 sdc_archiver = false
+
+# --- Limits, metering and audit (see deploy/production.md) -------------------------------------
+# Size these for your traffic: they are a starting point, not a recommendation.
+
+[metering]
+enabled = true
+
+[request_log]
+enabled = true
+store = true
+retention_hours = 72
+
+[audit]
+enabled = true
+reads = true
+include_query = true
+# The chain over the audit trail is keyed by REFHIR_AUDIT_KEY (see deploy/production.md): set it
+# from your secret store, the same on every server. Without it the chain catches only mistakes.
+# Keep the audit trail as long as your regulations require, e.g. 6 years (HIPAA documentation
+# retention) = 2190. Unset keeps it forever.
+# retention_days = 2190
+
+[rate_limit]
+enabled = true
+requests_per_second = 50
+burst = 100
+auth_failures_per_minute = 20
+max_sync_connections = 10
+max_live_queries = 100
+
+[rate_limit.cost]
+read = 1
+search = 2
+write = 2
+bundle = 5
+operation = 5
+export = 20
+sync = 5
+
+# Per-client daily and monthly totals. Off until you have a number for each tenant.
+[quota]
+enabled = false
+# requests_per_day = 100000
+# writes_per_day = 10000

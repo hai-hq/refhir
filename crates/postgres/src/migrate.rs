@@ -11,11 +11,18 @@ use refhir_persistence::PersistError;
 
 use crate::{connect_client, definite, off_runtime, ErrorText};
 
-pub(crate) static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "baseline",
-    sql: include_str!("../migrations/0001_baseline.sql"),
-}];
+pub(crate) static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "baseline",
+        sql: include_str!("../migrations/0001_baseline.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "governance",
+        sql: include_str!("../migrations/0002_governance.sql"),
+    },
+];
 
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
     version BIGINT PRIMARY KEY,
@@ -283,6 +290,51 @@ mod tests {
         );
     }
 
+    /// Migration 2 is pinned like the baseline, from the first release that carries it.
+    #[test]
+    fn the_governance_migration_is_frozen() {
+        assert_eq!(MIGRATIONS[1].name, "governance");
+        assert_eq!(
+            MIGRATIONS[1].checksum(),
+            "97715d421cbf6d3fe408d5ae921b2735b36b30c56ac7d1f70c8ddce2c7a6ca44",
+            "migration 2 was edited"
+        );
+    }
+
+    #[test]
+    fn a_database_at_the_baseline_gets_the_governance_tables_and_keeps_what_it_held() {
+        let Some(admin) = test_url("postgres migrations: baseline to governance") else {
+            return;
+        };
+        let url = fresh_database(&admin, "mgovernance");
+        let mut client = connect(&url);
+        run(&mut client, &MIGRATIONS[..1]).unwrap();
+        client
+            .batch_execute("INSERT INTO persistence_globals (key, json_value) VALUES ('kept', '1')")
+            .unwrap();
+        assert_eq!(versions(&mut client), [1]);
+        assert!(!exists(&mut client, "audit_log"));
+
+        PostgresPersistence::connect(&url).unwrap();
+        assert_eq!(versions(&mut client), [1, 2]);
+        for table in [
+            "usage_daily",
+            "request_log",
+            "governance_members",
+            "audit_log",
+        ] {
+            assert!(exists(&mut client, table), "{table}");
+        }
+        let kept: String = client
+            .query_one(
+                "SELECT json_value FROM persistence_globals WHERE key = 'kept'",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(kept, "1");
+    }
+
     #[test]
     fn a_new_database_gets_the_baseline_and_a_record_of_it() {
         let Some(admin) = test_url("postgres migrations: new database") else {
@@ -292,7 +344,7 @@ mod tests {
         PostgresPersistence::connect(&url).unwrap();
         let mut client = connect(&url);
         let applied = read_applied(&mut client).unwrap();
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].version, 1);
         assert_eq!(applied[0].checksum, MIGRATIONS[0].checksum());
         assert!(
@@ -306,7 +358,7 @@ mod tests {
         assert!(index_is_valid(&mut client));
         // Connecting again changes nothing.
         PostgresPersistence::connect(&url).unwrap();
-        assert_eq!(versions(&mut client), [1]);
+        assert_eq!(versions(&mut client), [1, 2]);
     }
 
     #[test]
@@ -350,7 +402,7 @@ mod tests {
             .unwrap();
         client.batch_execute("COMMIT").unwrap();
 
-        assert_eq!(versions(&mut client), [1]);
+        assert_eq!(versions(&mut client), [1, 2]);
         assert_eq!(
             read_applied(&mut client).unwrap()[0].checksum,
             MIGRATIONS[0].checksum()
@@ -389,7 +441,7 @@ mod tests {
             .unwrap();
         assert_eq!(migration_report(&url).unwrap().existing, Existing::Partial);
         PostgresPersistence::connect(&url).unwrap();
-        assert_eq!(versions(&mut client), [1]);
+        assert_eq!(versions(&mut client), [1, 2]);
         assert_eq!(existing(&mut client).unwrap(), Existing::Complete);
         let cursor: String = client
             .query_one("SELECT cursor_id FROM index_backfills", &[])
@@ -422,7 +474,7 @@ mod tests {
         assert_eq!(existing(&mut client).unwrap(), Existing::Partial);
         PostgresPersistence::connect(&url).unwrap();
         assert!(index_is_valid(&mut client));
-        assert_eq!(versions(&mut client), [1]);
+        assert_eq!(versions(&mut client), [1, 2]);
     }
 
     #[test]
@@ -435,7 +487,7 @@ mod tests {
         let mut client = connect(&url);
         client
             .execute(
-                "INSERT INTO schema_migrations (version, checksum) VALUES (2, 'from-the-future')",
+                "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'from-the-future')",
                 &[],
             )
             .unwrap();
@@ -444,7 +496,7 @@ mod tests {
             Ok(_) => panic!("a database from a newer version was opened"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("schema version 2"), "{err}");
+        assert!(err.contains("schema version 3"), "{err}");
         assert!(err.contains("newer ReFHIR"), "{err}");
 
         // A replica refuses at once too, instead of waiting for a primary that cannot help.
@@ -457,7 +509,7 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
         assert!(!migration_report(&url).unwrap().can_start());
-        assert_eq!(versions(&mut client), [1, 2], "nothing was written");
+        assert_eq!(versions(&mut client), [1, 2, 3], "nothing was written");
     }
 
     #[test]
@@ -477,7 +529,7 @@ mod tests {
         assert!(err.contains("checksum"), "{err}");
     }
 
-    static FAILING: [Migration; 2] = [
+    static FAILING: [Migration; 3] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -485,6 +537,11 @@ mod tests {
         },
         Migration {
             version: 2,
+            name: "governance",
+            sql: include_str!("../migrations/0002_governance.sql"),
+        },
+        Migration {
+            version: 3,
             name: "half_done",
             // The table is created, then the second statement fails.
             sql: "CREATE TABLE half_done (x INTEGER); INSERT INTO no_such_table VALUES (1);",
@@ -501,7 +558,7 @@ mod tests {
         let url = fresh_database(&admin, "mfail");
         let mut client = connect(&url);
         let err = run(&mut client, &FAILING).unwrap_err().to_string();
-        assert!(err.contains("migration 2 (half_done) failed"), "{err}");
+        assert!(err.contains("migration 3 (half_done) failed"), "{err}");
         assert!(err.contains("no_such_table"), "{err}");
         assert!(!exists(&mut client, "half_done"));
         assert!(!exists(&mut client, "documents"));
@@ -510,14 +567,14 @@ mod tests {
         // On a database already at version 1 the earlier work is kept and the failed one is not.
         run(&mut client, MIGRATIONS).unwrap();
         assert!(run(&mut client, &FAILING).is_err());
-        assert_eq!(versions(&mut client), [1]);
+        assert_eq!(versions(&mut client), [1, 2]);
         assert!(!exists(&mut client, "half_done"));
         assert!(exists(&mut client, "documents"));
         // And the connection is usable afterwards: the failed transaction did not wedge it.
-        assert_eq!(versions(&mut client), [1]);
+        assert_eq!(versions(&mut client), [1, 2]);
     }
 
-    static WITH_SECOND: [Migration; 2] = [
+    static WITH_SECOND: [Migration; 3] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -525,6 +582,11 @@ mod tests {
         },
         Migration {
             version: 2,
+            name: "governance",
+            sql: include_str!("../migrations/0002_governance.sql"),
+        },
+        Migration {
+            version: 3,
             name: "probe",
             // Not idempotent: a second run is an error.
             sql: "CREATE TABLE probe (n INTEGER); INSERT INTO probe VALUES (1);",
@@ -558,7 +620,7 @@ mod tests {
             result.expect("every process gets through");
         }
         let mut client = connect(&url);
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
         let rows: i64 = client
             .query_one("SELECT COUNT(*) FROM probe", &[])
             .unwrap()
@@ -578,7 +640,7 @@ mod tests {
         for result in run_together(&url, 8) {
             result.expect("every process gets through");
         }
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
         let rows: i64 = client
             .query_one("SELECT COUNT(*) FROM probe", &[])
             .unwrap()
@@ -612,7 +674,7 @@ mod tests {
         );
         holder.batch_execute("COMMIT").unwrap();
         waiter.join().unwrap().unwrap();
-        assert_eq!(versions(&mut holder), [1]);
+        assert_eq!(versions(&mut holder), [1, 2]);
     }
 
     #[test]
@@ -627,11 +689,27 @@ mod tests {
         // Its primary still runs the previous release: every table, no schema_migrations.
         let complete = fresh_database(&admin, "mreplicaok");
         connect(&complete).batch_execute(MIGRATIONS[0].sql).unwrap();
-        PostgresPersistence::connect_with(&complete, &options).expect("usable as it is");
+        // A build that knows only the baseline finds that usable as it is.
+        wait_until_current(&mut connect(&complete), &MIGRATIONS[..1]).expect("usable as it is");
         assert!(
             !exists(&mut connect(&complete), "schema_migrations"),
             "a replica ran DDL"
         );
+        // This build knows a later migration too, which only a primary applies: the replica
+        // waits for it, and does not run it itself.
+        let url = complete.clone();
+        let replica_options = options.clone();
+        let behind = std::thread::spawn(move || {
+            PostgresPersistence::connect_with(&url, &replica_options).map(|_| ())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(!behind.is_finished(), "a replica started without version 2");
+        assert!(!exists(&mut connect(&complete), "audit_log"));
+        PostgresPersistence::connect(&complete).unwrap();
+        behind
+            .join()
+            .unwrap()
+            .expect("starts once the primary has migrated");
 
         // An older schema is not usable yet: it waits for the primary to complete it.
         let partial = fresh_database(&admin, "mreplicawait");

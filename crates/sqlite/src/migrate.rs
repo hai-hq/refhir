@@ -14,11 +14,18 @@ use rusqlite::{params, Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::definite;
 
-pub(crate) static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "baseline",
-    sql: include_str!("../migrations/0001_baseline.sql"),
-}];
+pub(crate) static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "baseline",
+        sql: include_str!("../migrations/0001_baseline.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "governance",
+        sql: include_str!("../migrations/0002_governance.sql"),
+    },
+];
 
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -243,6 +250,62 @@ mod tests {
         );
     }
 
+    /// Migration 2 is pinned like the baseline, from the first release that carries it.
+    #[test]
+    fn the_governance_migration_is_frozen() {
+        assert_eq!(MIGRATIONS[1].name, "governance");
+        assert_eq!(
+            MIGRATIONS[1].checksum(),
+            "b3da78316099b4a8e0a4d8d8df6e04e8341dd8b9dd91e01ebe21ab4185ea4333",
+            "migration 2 was edited"
+        );
+    }
+
+    /// How many times running `sql` changes the schema, which SQLite counts in `schema_version`.
+    fn schema_changes_made_by(sql: &str) -> i64 {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(MIGRATIONS[0].sql).unwrap();
+        let before = schema_version(&connection);
+        connection.execute_batch(sql).unwrap();
+        schema_version(&connection) - before
+    }
+
+    #[test]
+    fn a_database_at_the_baseline_gets_the_governance_tables_and_keeps_what_it_held() {
+        let path = temp_db("baseline-to-governance");
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            run(&mut connection, &MIGRATIONS[..1]).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO persistence_globals (key, json_value) VALUES ('kept', '1');",
+                )
+                .unwrap();
+            assert_eq!(versions(&connection), [1]);
+            assert!(!table_exists(&connection, "audit_log"));
+        }
+        SqlitePersistence::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        assert_eq!(versions(&connection), [1, 2]);
+        for table in [
+            "usage_daily",
+            "request_log",
+            "governance_members",
+            "audit_log",
+        ] {
+            assert!(table_exists(&connection, table), "{table}");
+        }
+        let kept: String = connection
+            .query_row(
+                "SELECT json_value FROM persistence_globals WHERE key = 'kept'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "1");
+        remove_db(&path);
+    }
+
     #[test]
     fn a_new_database_gets_the_baseline_and_a_record_of_it() {
         let path = temp_db("fresh");
@@ -251,9 +314,10 @@ mod tests {
         }
         let connection = Connection::open(&path).unwrap();
         let applied = read_applied(&connection).unwrap();
-        assert_eq!(applied.len(), 1);
+        assert_eq!(applied.len(), 2);
         assert_eq!(applied[0].version, 1);
         assert_eq!(applied[0].checksum, MIGRATIONS[0].checksum());
+        assert_eq!(applied[1].checksum, MIGRATIONS[1].checksum());
         assert!(
             applied[0].applied_at.ends_with('Z'),
             "{}",
@@ -264,7 +328,7 @@ mod tests {
         // Opening again is a read and changes nothing.
         let before = schema_version(&connection);
         SqlitePersistence::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1]);
+        assert_eq!(versions(&connection), [1, 2]);
         assert_eq!(schema_version(&connection), before);
         remove_db(&path);
     }
@@ -296,13 +360,17 @@ mod tests {
         SqlitePersistence::open(&path).unwrap();
 
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1]);
+        assert_eq!(versions(&connection), [1, 2]);
         assert_eq!(
             read_applied(&connection).unwrap()[0].checksum,
             MIGRATIONS[0].checksum()
         );
-        // Not re-run: the only schema change is the new `schema_migrations` table.
-        assert_eq!(schema_version(&connection), before + 1);
+        // The baseline is not re-run: the only schema changes are the new `schema_migrations`
+        // table and what the governance migration creates.
+        assert_eq!(
+            schema_version(&connection),
+            before + 1 + schema_changes_made_by(MIGRATIONS[1].sql)
+        );
         let kept: String = connection
             .query_row(
                 "SELECT json_value FROM persistence_globals WHERE key = 'kept'",
@@ -343,7 +411,7 @@ mod tests {
         assert_eq!(migration_report(&path).unwrap().existing, Existing::Partial);
         SqlitePersistence::open(&path).unwrap();
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1]);
+        assert_eq!(versions(&connection), [1, 2]);
         assert_eq!(existing(&connection).unwrap(), Existing::Complete);
         let kept: (String, i64) = connection
             .query_row(
@@ -365,7 +433,7 @@ mod tests {
             let connection = Connection::open(&path).unwrap();
             connection
                 .execute(
-                    "INSERT INTO schema_migrations (version, checksum) VALUES (2, 'from-the-future')",
+                    "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'from-the-future')",
                     [],
                 )
                 .unwrap();
@@ -374,13 +442,13 @@ mod tests {
             Ok(_) => panic!("a database from a newer version was opened"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("schema version 2"), "{err}");
+        assert!(err.contains("schema version 3"), "{err}");
         assert!(err.contains("newer ReFHIR"), "{err}");
         let report = migration_report(&path).unwrap();
         assert!(!report.can_start());
         // Nothing was written to it.
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         remove_db(&path);
     }
 
@@ -402,7 +470,7 @@ mod tests {
         remove_db(&path);
     }
 
-    static FAILING: [Migration; 2] = [
+    static FAILING: [Migration; 3] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -410,6 +478,11 @@ mod tests {
         },
         Migration {
             version: 2,
+            name: "governance",
+            sql: include_str!("../migrations/0002_governance.sql"),
+        },
+        Migration {
+            version: 3,
             name: "half_done",
             // The table is created, then the second statement fails.
             sql: "CREATE TABLE half_done (x INTEGER); INSERT INTO no_such_table VALUES (1);",
@@ -422,22 +495,23 @@ mod tests {
         // transaction, so there is no state in between.
         let mut fresh = Connection::open_in_memory().unwrap();
         let err = run(&mut fresh, &FAILING).unwrap_err().to_string();
-        assert!(err.contains("migration 2 (half_done) failed"), "{err}");
+        assert!(err.contains("migration 3 (half_done) failed"), "{err}");
         assert!(err.contains("no_such_table"), "{err}");
         assert!(!table_exists(&fresh, "half_done"));
         assert!(!table_exists(&fresh, "documents"));
         assert!(!table_exists(&fresh, "schema_migrations"));
 
-        // On a database already at version 1 the earlier work is kept and the failed one is not.
+        // On a database already at the last version this build knows, the earlier work is kept
+        // and the failed one is not.
         let mut at_one = Connection::open_in_memory().unwrap();
         run(&mut at_one, MIGRATIONS).unwrap();
         assert!(run(&mut at_one, &FAILING).is_err());
-        assert_eq!(versions(&at_one), [1]);
+        assert_eq!(versions(&at_one), [1, 2]);
         assert!(!table_exists(&at_one, "half_done"));
         assert!(table_exists(&at_one, "documents"));
     }
 
-    static WITH_SECOND: [Migration; 2] = [
+    static WITH_SECOND: [Migration; 3] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -445,6 +519,11 @@ mod tests {
         },
         Migration {
             version: 2,
+            name: "governance",
+            sql: include_str!("../migrations/0002_governance.sql"),
+        },
+        Migration {
+            version: 3,
             name: "probe",
             // Not idempotent: a second run is an error.
             sql: "CREATE TABLE probe (n INTEGER); INSERT INTO probe VALUES (1);",
@@ -474,20 +553,20 @@ mod tests {
             handle.join().unwrap().expect("every opener gets through");
         }
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         let rows: i64 = connection
             .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(rows, 1, "the second migration ran once");
+        assert_eq!(rows, 1, "the last migration ran once");
         remove_db(&path);
     }
 
     #[test]
-    fn a_pending_migration_is_applied_to_a_database_at_version_one() {
+    fn a_pending_migration_is_applied_to_a_database_at_the_last_version_this_build_knows() {
         let mut connection = Connection::open_in_memory().unwrap();
         run(&mut connection, MIGRATIONS).unwrap();
         run(&mut connection, &WITH_SECOND).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         assert!(table_exists(&connection, "probe"));
     }
 

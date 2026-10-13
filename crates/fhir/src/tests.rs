@@ -5398,3 +5398,66 @@ fn deleting_a_local_value_set_leaves_a_package_holding_that_url_in_charge() {
         .collect();
     assert_eq!(codes, vec!["package"]);
 }
+
+/// What the server hands an operation beside the caller's own arguments: the scopes of the token,
+/// and whether the server is an archiver. They are not search parameters, and an array among the
+/// arguments of a search is not a reason to refuse it.
+fn server_controls() -> Value {
+    json!({"_readScopes": ["user/Patient.read"], "_sdcArchiver": true})
+}
+
+#[test]
+fn a_search_is_not_refused_for_the_controls_the_server_adds() {
+    let harness = ready();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p2", false, "Bea")}),
+    );
+    let mut args = json!({"active": "true"});
+    for (name, value) in server_controls().as_object().unwrap() {
+        args[name] = value.clone();
+    }
+    let found = apply(&harness, "Patient/search", args);
+    assert_eq!(
+        found["total"], 1,
+        "the controls did not become search parameters"
+    );
+    assert_eq!(found["entry"][0]["resource"]["id"], "p1");
+    // Nothing else about a search changed: an argument that is not a string is still refused.
+    let refused = run_op(&harness, "Patient/search", &json!({"active": ["true"]})).unwrap_err();
+    assert!(
+        refused.to_string().contains("must be a string"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_search_in_a_batch_is_not_refused_for_the_scopes_every_entry_carries() {
+    let harness = ready();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
+    let mut args = json!({"resource": {
+        "resourceType": "Bundle",
+        "type": "batch",
+        "entry": [
+            {"request": {"method": "GET", "url": "Patient?active=true"}},
+            {"request": {"method": "GET", "url": "Patient/p1"}}
+        ]
+    }});
+    for (name, value) in server_controls().as_object().unwrap() {
+        args[name] = value.clone();
+    }
+    let batch = apply(&harness, "Bundle/batch", args);
+    assert_eq!(batch["entry"][0]["response"]["status"], "200 OK", "{batch}");
+    assert_eq!(batch["entry"][0]["resource"]["total"], 1);
+    assert_eq!(batch["entry"][1]["resource"]["id"], "p1");
+}

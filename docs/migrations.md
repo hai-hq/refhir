@@ -109,6 +109,16 @@ Restore-and-test first, then upgrade in place:
 
 To go back, restore the backup taken in step 1.
 
+## The migrations so far
+
+| Version | Name | What it does |
+|---|---|---|
+| 1 | `baseline` | The schema of the last release that created its tables at startup. |
+| 2 | `governance` | Adds `usage_daily`, `request_log`, `audit_log` (hash-chained) and `governance_members`, which record what each caller used, the recent requests, who touched which resource, and how many servers share the database. Purely additive. |
+
+A replica on a database that a previous release's primary still owns waits for the primary to
+apply version 2, as it would for any later migration: it never runs DDL itself.
+
 ## Adding a migration
 
 1. Add `NNNN_short_name.sql` to **both** `crates/sqlite/migrations/` and

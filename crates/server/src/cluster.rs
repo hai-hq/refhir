@@ -420,6 +420,10 @@ pub(crate) async fn forward(
             .map(|value| value.as_str())
             .unwrap_or("/")
     );
+    // The primary records the request under the id this process gave it, so that the two
+    // processes' logs for one request can be put together.
+    let scope = crate::governance::current();
+    let request_id = scope.as_ref().map(|scope| scope.request_id.clone());
     let outcome = tokio::task::spawn_blocking(move || {
         let mut request = forward_agent().request(method.as_str(), &target);
         for (name, value) in &headers {
@@ -432,6 +436,9 @@ pub(crate) async fn forward(
             }
         }
         request = request.set(FORWARDED, "1");
+        if let Some(id) = &request_id {
+            request = request.set("x-request-id", id);
+        }
         let result = if body.is_empty() && matches!(method, Method::GET | Method::HEAD) {
             request.call()
         } else {
@@ -449,6 +456,10 @@ pub(crate) async fn forward(
         Ok(Err(message)) => return bad_gateway(&message),
         Err(_) => return bad_gateway("forwarding task stopped"),
     };
+    // The primary has it now, and counts and audits what it does.
+    if let Some(scope) = &scope {
+        scope.mark_forwarded();
+    }
     let status = StatusCode::from_u16(response.status()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut headers = HeaderMap::new();
     for name in response.headers_names() {

@@ -760,6 +760,7 @@ fn uncertain(err: impl ToString) -> PersistError {
 
 mod auth_store;
 mod conformance_store;
+mod governance_store;
 mod job_store;
 
 #[cfg(test)]

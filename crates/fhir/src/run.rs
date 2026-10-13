@@ -19,6 +19,13 @@ use crate::ops;
 use crate::resolve::TxHost;
 use crate::search;
 
+/// Arguments the server puts beside a caller's own to say what it knows about the caller: the
+/// scopes of the token (`_readScopes`, read by the SDC operations and by stores that must not
+/// read what the token may not), and whether it is an archiver. They are not the client's, so a
+/// search does not take them for search parameters, and the code that adds them (and the code
+/// that makes sure a client did not) uses this same list.
+pub const CONTROL_ARGS: [&str; 2] = ["_readScopes", "_sdcArchiver"];
+
 /// Retries after an OCC conflict. The first attempt is not counted.
 pub const MAX_OCC_FAILURES: usize = 4;
 
@@ -385,6 +392,9 @@ fn search_args(args: &Value) -> Result<BTreeMap<String, String>, FhirError> {
         .ok_or_else(|| FhirError::Invalid("search args must be an object".into()))?;
     let mut params = BTreeMap::new();
     for (key, value) in object {
+        if CONTROL_ARGS.contains(&key.as_str()) {
+            continue;
+        }
         let Some(text) = value.as_str() else {
             return Err(FhirError::Invalid(format!(
                 "search parameter {key} must be a string"

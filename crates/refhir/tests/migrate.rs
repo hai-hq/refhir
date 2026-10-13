@@ -65,7 +65,7 @@ fn status_and_dry_run_of_a_current_database() {
     let status = migrate(&["--status", "--sqlite", file]);
     assert!(status.status.success(), "{}", stderr(&status));
     let text = stdout(&status);
-    assert!(text.contains("up to date at version 1"), "{text}");
+    assert!(text.contains("up to date at version 2"), "{text}");
     assert!(text.contains("baseline"), "{text}");
     assert!(
         !text.contains("would run"),
@@ -110,7 +110,7 @@ fn a_database_from_a_newer_version_is_reported_and_exits_nonzero() {
     drop(refhir_sqlite::SqlitePersistence::open(&path).unwrap());
     sqlite(
         &path,
-        "INSERT INTO schema_migrations (version, checksum) VALUES (2, 'future')",
+        "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'future')",
     );
     let output = migrate(&["--status", "--sqlite", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1));
@@ -143,7 +143,7 @@ fn the_server_refuses_to_start_on_a_database_from_a_newer_version() {
     drop(refhir_sqlite::SqlitePersistence::open(&path).unwrap());
     sqlite(
         &path,
-        "INSERT INTO schema_migrations (version, checksum) VALUES (2, 'future')",
+        "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'future')",
     );
     let dir = path.parent().unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_refhir"))
@@ -197,7 +197,7 @@ fn postgres_status_reports_the_recorded_versions() {
     let after = migrate(&["--status", "--postgres", &database.url]);
     assert!(after.status.success(), "{}", stderr(&after));
     assert!(
-        stdout(&after).contains("up to date at version 1"),
+        stdout(&after).contains("up to date at version 2"),
         "{}",
         stdout(&after)
     );

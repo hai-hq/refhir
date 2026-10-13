@@ -12,6 +12,12 @@ data:
     {{- if .Values.server.publicUrl }}
     public_url = "{{ .Values.server.publicUrl }}"
     {{- end }}
+    {{- if .Values.server.trustedProxyHops }}
+    trusted_proxy_hops = {{ .Values.server.trustedProxyHops }}
+    {{- end }}
+    {{- if .Values.server.trustedProxyPeers }}
+    trusted_proxy_peers = [{{ range $i, $peer := .Values.server.trustedProxyPeers }}{{ if $i }}, {{ end }}"{{ $peer }}"{{ end }}]
+    {{- end }}
 
     [database]
     kind = "{{ .Values.database.kind }}"
@@ -92,3 +98,7 @@ data:
     [features]
     trace_engine = false
     sdc_archiver = false
+{{- if .Values.extraConfig }}
+
+{{ .Values.extraConfig | indent 4 }}
+{{- end }}

@@ -22,7 +22,7 @@ use crate::app;
 /// A server over the minimal R4 package. Most tests need resources with ids they know in
 /// advance, so update-as-create is on here (a PUT to a new id creates it); `strict()` is the
 /// default configuration.
-fn memory() -> (
+pub(crate) fn memory() -> (
     Arc<Database>,
     Arc<RwLock<Catalog>>,
     Arc<dyn ConformanceStore>,
@@ -32,7 +32,7 @@ fn memory() -> (
     (db, catalog, store)
 }
 
-fn strict() -> (
+pub(crate) fn strict() -> (
     Arc<Database>,
     Arc<RwLock<Catalog>>,
     Arc<dyn ConformanceStore>,
@@ -44,13 +44,13 @@ fn strict() -> (
     (db, catalog, store)
 }
 
-struct Reply {
-    status: StatusCode,
-    body: Value,
-    location: Option<String>,
+pub(crate) struct Reply {
+    pub(crate) status: StatusCode,
+    pub(crate) body: Value,
+    pub(crate) location: Option<String>,
 }
 
-async fn send(
+pub(crate) async fn send(
     app: &axum::Router,
     method: &str,
     uri: &str,
@@ -97,7 +97,7 @@ async fn put(app: &axum::Router, resource: Value) -> Reply {
     send(app, "PUT", &uri, Some(resource), None).await
 }
 
-fn patient(id: &str) -> Value {
+pub(crate) fn patient(id: &str) -> Value {
     json!({
         "resourceType": "Patient",
         "id": id,
@@ -439,7 +439,7 @@ async fn sync_subscription_transitions_after_mutation() {
     assert_eq!(family, "Bee");
 }
 
-async fn connect(
+pub(crate) async fn connect(
     url: &str,
 ) -> (
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -458,7 +458,7 @@ async fn connect(
     panic!("connect {url}: {last:?}");
 }
 
-async fn next_json(
+pub(crate) async fn next_json(
     socket: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
@@ -907,6 +907,85 @@ async fn xml_graphql_smart_export_and_subscription() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A live search is the point of the sync protocol, and with SMART on it failed for a reason that
+/// had nothing to do with scopes: the server's own additions to the arguments were taken for
+/// search parameters.
+#[tokio::test]
+async fn a_live_search_under_smart_returns_results_and_follows_writes() {
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            smart_demo_login: true,
+            ..Default::default()
+        },
+    );
+    let reader = token(&app, "user/Patient.read").await;
+    let writer = token(&app, "user/Patient.write").await;
+    // A router is cheap to clone, and the server task below takes the original.
+    let writes = app.clone();
+    let put = |id: &'static str, active: bool| {
+        let app = writes.clone();
+        let writer = writer.clone();
+        async move {
+            let body = json!({"resourceType": "Patient", "id": id, "active": active}).to_string();
+            send_text(
+                &app,
+                "PUT",
+                &format!("/Patient/{id}"),
+                &body,
+                &[
+                    ("authorization", &format!("Bearer {writer}")),
+                    ("content-type", "application/fhir+json"),
+                ],
+            )
+            .await
+            .0
+        }
+    };
+    assert!(put("p1", true).await.is_success());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut socket, _) = connect(&format!("ws://{addr}/sync?access_token={reader}")).await;
+    socket
+        .send(Message::Text(
+            json!({"type": "ModifyQuerySet", "baseVersion": 0, "newVersion": 1, "modifications": [
+                {"type": "Add", "queryId": 1, "udfPath": "Patient/search", "args": {"active": "true"}}
+            ]})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let total = |message: &Value| message["modifications"][0]["value"]["total"].clone();
+    // The search ran, and found the patient that was already there.
+    let first = next_json(&mut socket).await;
+    assert_eq!(first["modifications"][0]["type"], "QueryUpdated", "{first}");
+    assert_eq!(total(&first), 1);
+    // A write that joins the result is pushed.
+    assert!(put("p2", true).await.is_success());
+    let joined = next_json(&mut socket).await;
+    assert_eq!(
+        joined["modifications"][0]["type"], "QueryUpdated",
+        "{joined}"
+    );
+    assert_eq!(total(&joined), 2);
+    // And one that leaves it.
+    assert!(put("p1", false).await.is_success());
+    let left = next_json(&mut socket).await;
+    assert_eq!(total(&left), 1);
+    assert_eq!(
+        left["modifications"][0]["value"]["entry"][0]["resource"]["id"],
+        "p2"
+    );
+}
+
 #[tokio::test]
 async fn smart_scopes_gate_http_and_sync() {
     let (db, catalog, store) = memory();
@@ -1001,6 +1080,12 @@ async fn smart_scopes_gate_http_and_sync() {
         .unwrap();
     let first = next_json(&mut socket).await;
     assert_eq!(first["type"], "Transition");
+    // A failed query is also a Transition, so what is asked is that the search worked.
+    assert_eq!(
+        first["modifications"][0]["type"], "QueryUpdated",
+        "the live search failed: {first}"
+    );
+    assert_eq!(first["modifications"][0]["value"]["resourceType"], "Bundle");
     socket
         .send(Message::Text(
             json!({
@@ -2229,7 +2314,7 @@ async fn subscription_rest_hook_runs_after_commit() {
     assert!(body.contains("p9"), "{body}");
 }
 
-async fn send_text(
+pub(crate) async fn send_text(
     app: &axum::Router,
     method: &str,
     uri: &str,
@@ -4486,6 +4571,113 @@ mod cluster {
         );
     }
 
+    /// What a replica recorded about itself, read back through it.
+    async fn recorded_by(cluster: &Pair) -> (Vec<String>, Vec<Value>) {
+        let usage = call(&cluster.replica_app, "GET", "/_usage", None, &[]).await;
+        let classes = usage.body["usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["class"].as_str().unwrap().to_string())
+            .collect();
+        let audit = call(&cluster.replica_app, "GET", "/_audit", None, &[]).await;
+        let entries = audit.body["entry"].as_array().cloned().unwrap_or_default();
+        (classes, entries)
+    }
+
+    fn observed(
+        rows: &Arc<refhir_persistence::MemoryGovernanceStore>,
+    ) -> impl FnOnce(&mut ServerConfig) {
+        let rows = rows.clone();
+        move |settings| {
+            settings.governance = crate::GovernanceConfig::observing();
+            settings.governance_store = Some(crate::SharedGovernanceStore::new(rows));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_a_replica_sends_on_is_not_counted_or_audited_by_the_replica_as_well() {
+        // The primary limits, counts and audits what it is sent, as a request of its own. Counted
+        // and audited by the replica too, a forwarded write would use up twice its quota and
+        // be in the audit trail twice.
+        let rows = Arc::new(refhir_persistence::MemoryGovernanceStore::default());
+        let cluster = pair(observed(&rows)).await;
+        let created = call(
+            &cluster.replica_app,
+            "POST",
+            "/Patient",
+            Some(patient("via-replica")),
+            &[],
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        assert_eq!(header(&created, "x-refhir-role"), "primary");
+        let (classes, entries) = recorded_by(&cluster).await;
+        assert!(
+            !classes.iter().any(|class| class == "write"),
+            "the primary counts the write: {classes:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["resource"]["action"] != "C"),
+            "the primary audits the write, and here it has the audit off: {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transaction_a_replica_tries_and_then_sends_on_leaves_no_row_of_its_own() {
+        // A transaction is run where it arrives, and only found to need the primary when the
+        // commit is refused. That refusal is not an operation anyone performed, and the primary
+        // records the one that was.
+        let rows = Arc::new(refhir_persistence::MemoryGovernanceStore::default());
+        let cluster = pair(observed(&rows)).await;
+        let bundle = json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"resource": patient("in-a-bundle"), "request": {"method": "POST", "url": "Patient"}}
+        ]});
+        let sent = call(&cluster.replica_app, "POST", "/", Some(bundle), &[]).await;
+        assert_eq!(sent.status, StatusCode::OK, "{}", sent.body);
+        assert_eq!(header(&sent, "x-refhir-role"), "primary");
+        let (classes, entries) = recorded_by(&cluster).await;
+        assert!(
+            !classes.iter().any(|class| class == "bundle"),
+            "{classes:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["resource"]["subtype"][0]["code"] != "transaction"),
+            "{entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_a_replica_cannot_send_on_is_refused_and_recorded_once() {
+        let rows = Arc::new(refhir_persistence::MemoryGovernanceStore::default());
+        let cluster = pair(|settings| {
+            settings.primary_url = None;
+            observed(&rows)(settings);
+        })
+        .await;
+        let refused = call(
+            &cluster.replica_app,
+            "POST",
+            "/Patient",
+            Some(patient("nowhere")),
+            &[],
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        let (_, entries) = recorded_by(&cluster).await;
+        let attempts: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["resource"]["action"] == "C")
+            .collect();
+        // Not once by the engine that could not commit it and once at the edge.
+        assert_eq!(attempts.len(), 1, "{entries:?}");
+        assert_eq!(attempts[0]["resource"]["outcome"], "8");
+    }
+
     #[tokio::test]
     async fn a_read_after_a_write_waits_for_the_replica_or_asks_the_primary() {
         let cluster = pair(|_| {}).await;
@@ -4671,6 +4863,7 @@ mod cluster {
             jobs: Arc::new(crate::jobs::JobRunner::new(Arc::new(
                 refhir_persistence::MemoryJobStore::default(),
             ))),
+            governance: crate::Governance::new(crate::GovernanceConfig::default(), false, None),
             ready_probe: Default::default(),
         };
         assert!(

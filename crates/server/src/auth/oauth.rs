@@ -306,6 +306,19 @@ pub(crate) fn storage_unavailable() -> Response {
     )
 }
 
+/// Tell the request's governance scope who has just been checked, so that what it did is
+/// recorded under their name and not as `anonymous`. Called only once a credential has held: a
+/// public client id alone proves nothing, so it is never taken as one.
+fn attribute(client_id: &str, user: Option<&str>, fhir_user: Option<&str>) {
+    if let Some(scope) = crate::governance::current() {
+        scope.set_identity(crate::governance::Identity {
+            client_id: client_id.to_string(),
+            user: user.map(str::to_string),
+            fhir_user: fhir_user.map(str::to_string),
+        });
+    }
+}
+
 pub fn issue(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
     if !app.config.auth {
         return oauth_error(
@@ -415,6 +428,12 @@ pub fn revoke(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
                 "token does not belong to this client",
             );
         }
+        // Holding the token is the proof here, which a public client's id is not.
+        attribute(
+            &record.client_id,
+            record.sub.as_deref(),
+            record.fhir_user.as_deref(),
+        );
     }
     app.smart.remove_token(&token);
     app.smart.take_refresh(&token);
@@ -590,6 +609,9 @@ pub fn register(app: &AppState, headers: &HeaderMap, body: &[u8]) -> Response {
     if app.smart.put_client(client).is_err() {
         return storage_unavailable();
     }
+    // The registrant holds the initial access token and has no client of their own: the client
+    // created is the only name this registration has.
+    attribute(&id, None, None);
     let mut body = json!({
         "client_id": id,
         "token_endpoint_auth_method": method,
@@ -995,6 +1017,7 @@ fn issue_tokens(
     if app.smart.put_token(access.clone(), record.clone()).is_err() {
         return storage_unavailable();
     }
+    attribute(&client.id, Some(sub.as_str()), fhir_user.as_deref());
     let mut body = json!({
         "access_token": access,
         "token_type": "Bearer",
@@ -1158,19 +1181,23 @@ fn introspect_authorized(
     form: &HashMap<String, String>,
 ) -> bool {
     if let Some(token) = super::resolve_token(headers, None) {
-        if app
-            .smart
-            .token(&token)
-            .is_some_and(|record| record.exp > now())
-        {
+        if let Some(record) = app.smart.token(&token).filter(|record| record.exp > now()) {
+            attribute(
+                &record.client_id,
+                record.sub.as_deref(),
+                record.fhir_user.as_deref(),
+            );
             return true;
         }
     }
     // An assertion for introspection is only good here; the token endpoint does not take it.
-    matches!(
-        authenticate_client_at(app, headers, form, None, &["token", "introspect"]),
-        Ok(client) if !client.public
-    )
+    match authenticate_client_at(app, headers, form, None, &["token", "introspect"]) {
+        Ok(client) if !client.public => {
+            attribute(&client.id, None, None);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn authenticate_jwt(

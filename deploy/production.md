@@ -66,6 +66,82 @@ connect with). `sslmode=require` encrypts but does not verify the server, and a 
 
 Helm chart: [helm/refhir](helm/refhir/README.md) (`values.yaml` + optional `secretEnv`).
 
+## Rate limits, quotas, metering and audit
+
+What each setting does is in the [README](../README.md#rate-limits-quotas-metering-and-audit); this is what to decide when you run it. [refhir.production.toml](refhir.production.toml) turns the rate limit on and leaves quotas for you to size.
+
+### Tell it how many proxies are in front
+
+Per-address limits, the failed-sign-in limit and the audit trail all need the client's address. Behind a load balancer or ingress the connection's address is the proxy's, so **every client shares one bucket** until `[server] trusted_proxy_hops` says how many proxies to believe. Count the hops that append to `X-Forwarded-For`: a Kubernetes ingress is 1; a cloud load balancer in front of an ingress is 2.
+
+Also say where the proxies connect from, with `[server] trusted_proxy_peers = ["10.0.0.0/8"]` (the Helm value is `server.trustedProxyPeers`). `X-Forwarded-For` is then believed only on a connection from one of those networks. Without it a client that reaches the server directly, such as through a node port or a pod address, can write the header itself: it gets a fresh bucket for every address it invents, and can burn another address's failed-sign-in allowance by naming it. ReFHIR warns at start-up when hops are set and peers are not.
+
+Check it rather than trusting your count. Call the server from an address you know, then read back what it recorded:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" 'https://refhir.example.com/_requests?_count=1'   # "remoteIp"
+```
+
+If `remoteIp` is a proxy's address, the number is too low. If it is whatever you put in a forged `X-Forwarded-For`, it is too high, and a client can choose its own address.
+
+### Sizing a limit
+
+Start by observing: leave `[rate_limit]` and `[quota]` off, run for a week, and read `GET /_usage?client=...` for what each client actually uses (`requests`, `bytesOut`, and by class). Set a client's rate at a few times its busiest period, and the burst for the largest batch it sends at once. A cost is in the same units as the rate: with `requests_per_second = 50` and `export = 20`, a caller can start two exports a second at most, and one in a burst of 100 leaves room for 80 reads.
+
+`burst` must be at least the cost of the dearest request a caller can make, or that request could never be served; ReFHIR refuses to start otherwise. It also refuses a `[quota]` without `--smart` (a quota is per client, and without SMART there is none) and a `[rate_limit.clients.*]` for the same reason.
+
+### Several servers
+
+- **Rate limits are divided automatically.** Servers sharing a database count one another with a heartbeat every ten seconds, and each takes an equal part of every rate limit, bucket and connection cap (never a bucket smaller than the dearest request), so you configure the limit you want for the *fleet*. `GET /_usage` shows the number a server is dividing by (`servers`). Scaling up or down adjusts within about ten seconds, and a server that stops removes itself at once. This assumes the balancer spreads a caller's requests about evenly: where it pins each caller to one server (sticky sessions), set `[rate_limit] servers = 1`, or each caller gets one Nth of what you meant. `servers = N` pins the count if you would rather not have it measured.
+- **Quotas are shared** through the database, so all servers must use the same one. Each rereads a client's totals every `refresh_seconds` (default 30), so a client can overshoot by about one interval of what the *other* servers serve. For a hard cap, set the quota a little under the real one.
+- **Audit and usage rows** from all servers land in the same tables; each server adds its own counters.
+- **With replicas** (see "Availability and read scaling"), a write a replica receives is sent on to the primary, and the primary limits, meters and audits it as its own request, under the caller's token and the same request id. The replica logs it but does not count it or audit it as well, so a forwarded write is neither charged twice against a quota nor written twice to the audit trail. It is limited on the way in as well, by the replica's share of the caller's rate, and then by the primary's, so a caller who writes through several replicas is limited by the primary's share of the rate for those writes: set `[rate_limit] servers = 1` if that is too little. The primary sees a forwarded request come from the replica, so list the pod or node network among `[server] trusted_proxy_peers`, or the audit trail records the replica's address instead of the caller's.
+
+### The database
+
+Usage, the request log and the audit trail are three tables (`usage_daily`, `request_log`, `audit_log`) in the same database as the clinical data, with the table the servers count one another in (`governance_members`). Schema migration 2 creates them the first time a version of ReFHIR that has them starts on a database (see [docs/migrations.md](../docs/migrations.md)), so back the database up before that upgrade, as for any other. Writes are batched every two seconds, so they cost a transaction every two seconds and not one per request.
+
+- `audit_log` grows by about a row per resource touched (a few hundred bytes). It is kept forever unless `[audit] retention_days` is set; set it to what your regulations require (6 years is 2190). **Back it up with the rest of the database**, and do not truncate it.
+- `request_log` is pruned to `[request_log] retention_hours` every minute. At a sustained 50 requests a second, 72 hours is about 13 million rows; shorten it, or set `store = false` and keep only the structured log lines, if you ship logs elsewhere.
+- Nothing updates or deletes an audit row except the retention you set.
+- Rows are bounded in size however a caller phrased the request, but a flood of requests the server answers still leaves a row each. If the server is reachable from an untrusted network, switch the rate limit on.
+
+### Keep the audit trail honest
+
+The audit trail is hash-chained so that an edit, a deletion from the middle, or a forged row shows. Make that mean something:
+
+1. **Set `REFHIR_AUDIT_KEY`** (`openssl rand -hex 32`) in your secret store, the same value on every server, and **not** in the database or the config file. Without it anyone who can write the table can recompute the chain, and ReFHIR warns at start-up. Choose it once: after a change, older rows verify only against the old key.
+2. **Keep the checkpoints.** A chain cannot show that its newest rows were deleted. The server logs `audit checkpoint` lines (target `refhir_audit`, with `id` and `hash`) whenever the newest row changes; ship them to somewhere append-only, such as your log platform with a retention lock.
+3. **Verify on a schedule.** `GET /_audit/verify?checkpoint=<id>:<hash>` with a recent checkpoint reports `verified: true` only if every link holds and the trail still contains that row. It reads the whole trail, so run it nightly and not on a dashboard; one runs at a time.
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "https://refhir.example.com/_audit/verify?checkpoint=18342:9f2c...(64 hex characters)"
+```
+
+An alert on `"verified": false` is worth paging for: `breaks` names the rows (`edited`, `detached`, `unhashed`), and `checkpoint` says `different`, `missing` or `truncated`.
+
+### Watch for lost rows
+
+If the database stops taking writes, rows wait in memory (up to 100,000 audit rows), are written when it recovers, and after that the newest are dropped. Alert on these:
+
+- the log lines `could not write the audit trail`, `could not write usage` and `could not write the request log` (the database is refusing writes and the server is retrying);
+- the error `buffer is full because the database is not taking writes` (rows are now being lost);
+- `dropped` in `GET /_usage`, which counts rows lost since the server started;
+- `sampled` in the same response, which counts refusals that were counted and not stored one by one, and `sampled` rows in `/_audit`: a steady stream means the server is being probed or flooded.
+
+Also alert on throttled requests (`throttled` in `/_usage`, or the `429` rate at the proxy): a client that is refused often either needs a bigger limit or is misbehaving.
+
+### Reading it
+
+`/_audit`, `/_usage` and `/_requests` need a token with a **`system/` scope that covers `AuditEvent`**. Register a backend client for whoever reads them (`private_key_jwt`, scope `system/AuditEvent.read`) and keep it apart from your application clients: a `user/*.read` token does not qualify.
+
+To feed a SIEM, poll `/_audit?date=ge<last>` and follow the `next` link, or ship the structured log lines (every line has `request_id`, which is the `request` filter on `/_audit` and `/_requests`).
+
+### Stopping
+
+`SIGTERM` and `SIGINT` write what is still buffered before the process exits, so a rolling deploy loses nothing. If the database does not take them within eight seconds, or the process is signalled a second time, it exits with the rows unwritten (and says so in the log). A hard kill (`SIGKILL`, an out-of-memory kill, a node failure) can lose up to two seconds of rows. Give the pod a termination grace period of at least ten seconds.
+
 ## SMART sign-in (OpenID Connect)
 
 With `[smart].enabled`, the server needs a way to sign users in. ReFHIR does not store passwords: it delegates login to your OpenID Connect provider (Keycloak, Okta, Entra ID, Auth0, ...) and refuses to start with SMART enabled and no login configured.

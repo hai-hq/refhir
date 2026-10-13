@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::SyncSession;
+use crate::governance::{classify_operation, json_len, Class, RequestScope, SyncMessage};
 use crate::http::{self, execute};
 
 const ENGINE: &str = "refhir_engine";
@@ -147,6 +148,7 @@ pub async fn handle_socket(
     catalog: Arc<RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
     session: Option<SyncSession>,
+    scope: Option<Arc<RequestScope>>,
     upstream: Option<Upstream>,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -167,7 +169,7 @@ pub async fn handle_socket(
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Text(text))) => {
-                        if handle_text(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), upstream.as_ref(), &text).await.is_err() {
+                        if handle_text(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), scope.as_ref(), upstream.as_ref(), &text).await.is_err() {
                             break;
                         }
                     }
@@ -187,7 +189,7 @@ pub async fn handle_socket(
                     query_ids = ?ids,
                     "sync invalidation received, rerunning queries"
                 );
-                if push_updates(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), ids).await.is_err() {
+                if push_updates(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), scope.as_ref(), ids).await.is_err() {
                     break;
                 }
             }
@@ -208,6 +210,7 @@ async fn handle_text(
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
     session: Option<&SyncSession>,
+    scope: Option<&Arc<RequestScope>>,
     upstream: Option<&Upstream>,
     text: &str,
 ) -> Result<(), ()> {
@@ -256,24 +259,56 @@ async fn handle_text(
                         udf_path,
                         args,
                     } => {
+                        // A live query is run again whenever a write overlaps it, so it is a
+                        // cost that goes on after the message, and it is limited as one. The
+                        // message is only the size of this one query, not of the whole frame.
+                        let message = SyncMessage::begin(
+                            scope,
+                            Class::Sync,
+                            &udf_path,
+                            scope.map_or(0, |_| udf_path.len() + json_len(&args)),
+                        );
+                        if let Some(cap) =
+                            scope.and_then(|scope| scope.governance().live_query_cap())
+                        {
+                            // Replacing a query is not holding another one.
+                            let others =
+                                queries.len() - usize::from(queries.contains_key(&query_id));
+                            if others >= cap {
+                                message.limit_reached();
+                                transition.push(query_failed(
+                                    query_id,
+                                    format!("too many live queries: a connection may hold {cap}"),
+                                ));
+                                continue;
+                            }
+                        }
+                        if let Err(rejection) = message.admit().await {
+                            transition
+                                .push(query_failed(query_id, rejection.message().to_string()));
+                            continue;
+                        }
+                        // Only now, with the new query let in, is the one it replaces let go: a
+                        // client refused for going too fast keeps the subscription it had.
                         if let Some(old) = queries.remove(&query_id) {
                             db.unsubscribe(old.token);
                         }
                         let args = match authorize(session, db, catalog, &udf_path, &args, true) {
                             Ok(args) => args,
                             Err(err) => {
-                                transition.push(json!({
-                                    "type": "QueryFailed",
-                                    "queryId": query_id,
-                                    "error": err,
-                                    "logLines": []
-                                }));
+                                message.deny(&args, &err);
+                                transition.push(query_failed(query_id, err));
                                 continue;
                             }
                         };
-                        match add_query(db, catalog, store, inv_tx, query_id, &udf_path, args).await
-                        {
+                        let added = message
+                            .run(add_query(
+                                db, catalog, store, inv_tx, query_id, &udf_path, args,
+                            ))
+                            .await;
+                        match added {
                             Ok((value, token, args)) => {
+                                message.done(200, || json_len(&value));
                                 queries.insert(
                                     query_id,
                                     LiveQuery {
@@ -289,12 +324,10 @@ async fn handle_text(
                                     "logLines": []
                                 }));
                             }
-                            Err(err) => transition.push(json!({
-                                "type": "QueryFailed",
-                                "queryId": query_id,
-                                "error": err,
-                                "logLines": []
-                            })),
+                            Err(err) => {
+                                message.done(400, || 0);
+                                transition.push(query_failed(query_id, err));
+                            }
                         }
                     }
                     QueryModification::Remove { query_id } => {
@@ -328,9 +361,26 @@ async fn handle_text(
                 operation = udf_path.as_str(),
                 "sync Mutation"
             );
+            let message =
+                SyncMessage::begin(scope, classify_operation(&udf_path), &udf_path, text.len());
+            if let Err(rejection) = message.admit().await {
+                return send_json(
+                    sink,
+                    &json!({
+                        "type": "MutationResponse",
+                        "requestId": request_id,
+                        "success": false,
+                        "result": throttled_outcome(rejection.message()),
+                        "retryAfterSeconds": rejection.retry_after_secs(),
+                        "ts": Value::Null
+                    }),
+                )
+                .await;
+            }
             let args = match authorize(session, db, catalog, &udf_path, &args, false) {
                 Ok(args) => args,
-                Err(message) => {
+                Err(reason) => {
+                    message.deny(&args, &reason);
                     return send_json(
                         sink,
                         &json!({
@@ -342,7 +392,7 @@ async fn handle_text(
                                 "issue": [{
                                     "severity": "error",
                                     "code": "forbidden",
-                                    "diagnostics": message
+                                    "diagnostics": reason
                                 }]
                             }),
                             "ts": Value::Null
@@ -353,30 +403,70 @@ async fn handle_text(
             };
             // Only a replica that can reach a primary may need the arguments again, to forward.
             let replay = upstream.map(|_| args.clone());
-            let response = match execute(db, catalog, store, &udf_path, args).await {
-                Ok(result) => json!({
-                    "type": "MutationResponse",
-                    "requestId": request_id,
-                    "success": true,
-                    "result": result.value,
-                    "ts": result.ts.to_string()
-                }),
-                // A replica cannot commit. The primary can, so ask it.
+            let outcome = message
+                .run(execute(db, catalog, store, &udf_path, args))
+                .await;
+            let (response, status) = match outcome {
+                Ok(result) => (
+                    json!({
+                        "type": "MutationResponse",
+                        "requestId": request_id,
+                        "success": true,
+                        "result": result.value,
+                        "ts": result.ts.to_string()
+                    }),
+                    if result.status == 0 {
+                        200
+                    } else {
+                        result.status
+                    },
+                ),
+                // A replica cannot commit. The primary can, so ask it. The primary limits,
+                // meters and audits the mutation as a message of its own, so it is not counted
+                // here as well.
                 Err(RunError::Commit(CommitError::ReadOnly)) if replay.is_some() => {
                     let (upstream, args) = (upstream.expect("checked"), replay.expect("checked"));
-                    forwarded_response(db, upstream, request_id, &udf_path, &args).await
+                    message.forwarded();
+                    let response =
+                        forwarded_response(db, upstream, request_id, &udf_path, &args).await;
+                    let status = if response["success"] == true {
+                        200
+                    } else {
+                        400
+                    };
+                    (response, status)
                 }
-                Err(err) => json!({
-                    "type": "MutationResponse",
-                    "requestId": request_id,
-                    "success": false,
-                    "result": http::outcome_value(&err),
-                    "ts": Value::Null
-                }),
+                Err(err) => (
+                    json!({
+                        "type": "MutationResponse",
+                        "requestId": request_id,
+                        "success": false,
+                        "result": http::outcome_value(&err),
+                        "ts": Value::Null
+                    }),
+                    http::run_error_status(&err).as_u16(),
+                ),
             };
+            message.done(status, || json_len(&response));
             send_json(sink, &response).await
         }
     }
+}
+
+fn query_failed(query_id: u64, error: String) -> Value {
+    json!({
+        "type": "QueryFailed",
+        "queryId": query_id,
+        "error": error,
+        "logLines": []
+    })
+}
+
+fn throttled_outcome(message: &str) -> Value {
+    json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{"severity": "error", "code": "throttled", "diagnostics": message}]
+    })
 }
 
 fn authorize(
@@ -454,6 +544,7 @@ async fn push_updates(
     queries: &mut HashMap<u64, LiveQuery>,
     version: &mut u64,
     session: Option<&SyncSession>,
+    scope: Option<&Arc<RequestScope>>,
     ids: HashSet<u64>,
 ) -> Result<(), ()> {
     let start = *version;
@@ -516,6 +607,9 @@ async fn push_updates(
         updates = transition.len(),
         "sync Transition (invalidation)"
     );
+    if let Some(scope) = scope {
+        scope.governance().record_push(scope, json_len(&transition));
+    }
     send_transition(sink, start, end, transition).await
 }
 

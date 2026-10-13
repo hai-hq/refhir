@@ -14,7 +14,9 @@ use config::{
 };
 use refhir_database::Database;
 use refhir_fhir::{Catalog, CatalogClock};
-use refhir_persistence::{AuthStore, ConformanceStore, JobStore, Lease, Persistence};
+use refhir_persistence::{
+    AuthStore, ConformanceStore, GovernanceStore, JobStore, Lease, Persistence,
+};
 use refhir_postgres::{ConnectOptions, PostgresPersistence};
 use refhir_sqlite::{SqliteOptions, SqlitePersistence};
 use std::time::Duration;
@@ -46,12 +48,13 @@ fn main() -> ExitCode {
 }
 
 /// One backend serves every table the server keeps: the log, the conformance tables, the
-/// SMART tables and the background jobs.
+/// SMART tables, the background jobs, and the usage, request log and audit tables.
 type Stores = (
     Arc<dyn Persistence>,
     Arc<dyn ConformanceStore>,
     Arc<dyn AuthStore>,
     Arc<dyn JobStore>,
+    Arc<dyn GovernanceStore>,
 );
 
 /// Startup runs on this thread, outside the runtime: the synchronous Postgres client refuses
@@ -197,9 +200,11 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let file_path = discover_config_path(config_path.as_deref());
+    let mut unknown_sections = Vec::new();
     if let Some(path) = &file_path {
         let file = load_file(path)?;
         cfg.apply_file(&file)?;
+        unknown_sections = file.unknown.keys().cloned().collect();
     }
     apply_env(&mut cfg)?;
 
@@ -292,6 +297,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         cfg.db_pool = cli_db_pool;
     }
 
+    // A limit that cannot work is refused now, and not discovered by the first caller to hit it.
+    cfg.governance.validate(cfg.auth)?;
     if cfg.postgres.is_some() && (cfg.sqlite.is_some() || cfg.memory) {
         return Err("pass only one of --sqlite, --memory, or --postgres".into());
     }
@@ -313,6 +320,19 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(path) = &file_path {
         tracing::info!("loaded config {}", path.display());
     }
+    for section in unknown_sections {
+        tracing::warn!(
+            "config section [{section}] is not one this server reads and is ignored; \
+             check its spelling"
+        );
+    }
+    if cfg.governance.proxy.trusted_hops > 0 && cfg.governance.proxy.trusted_peers.is_empty() {
+        tracing::warn!(
+            "[server] trusted_proxy_hops is set without trusted_proxy_peers, so X-Forwarded-For \
+             is believed on every connection: a client that reaches this server directly can \
+             choose, or frame, an address. List the networks your proxies connect from"
+        );
+    }
     if cfg.trace_engine {
         tracing::info!("reactive engine tracing enabled (target refhir_engine=debug)");
     }
@@ -328,6 +348,19 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     check_role(&cfg)?;
     ensure_package_cache_env(&cfg);
+    tracing::info!("{}", cfg.describe_governance());
+    if cfg.governance.audit.enabled && cfg.governance.audit.chain_key.is_none() {
+        tracing::warn!(
+            "the audit trail is hash-chained but the chain has no key (REFHIR_AUDIT_KEY): it \
+             catches mistakes, and proves nothing against someone who can write the database. \
+             Set a key (`openssl rand -hex 32`) kept outside the database"
+        );
+    }
+    if cfg.memory && cfg.governance.audit.enabled {
+        tracing::warn!(
+            "audit is on but the database is in memory, so the audit trail ends with this process"
+        );
+    }
 
     let role = cfg.role;
     let addr: SocketAddr = cfg.bind.parse()?;
@@ -348,45 +381,49 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("{} listening on http://{addr}, not ready yet", role.name());
 
     let pool_size = cfg.db_pool.unwrap_or(DEFAULT_DB_POOL);
-    let (persistence, store, auth_store, job_store): Stores = if let Some(url) = &cfg.postgres {
-        let options = ConnectOptions {
-            pool_size,
-            // A replica never runs DDL: it waits for the primary to have created the tables.
-            create_schema: role != Role::Replica,
+    let (persistence, store, auth_store, job_store, governance_store): Stores =
+        if let Some(url) = &cfg.postgres {
+            let options = ConnectOptions {
+                pool_size,
+                // A replica never runs DDL: it waits for the primary to have created the tables.
+                create_schema: role != Role::Replica,
+            };
+            let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
+            (
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence,
+            )
+        } else if cfg.memory {
+            let persistence = Arc::new(SqlitePersistence::open_in_memory()?);
+            (
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence,
+            )
+        } else {
+            let path = cfg
+                .sqlite
+                .clone()
+                .unwrap_or_else(|| "refhir.sqlite".to_string());
+            let options = SqliteOptions {
+                read_connections: cfg
+                    .db_pool
+                    .unwrap_or(SqliteOptions::default().read_connections),
+            };
+            let persistence = Arc::new(SqlitePersistence::open_with(Path::new(&path), &options)?);
+            (
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence.clone(),
+                persistence,
+            )
         };
-        let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
-        (
-            persistence.clone(),
-            persistence.clone(),
-            persistence.clone(),
-            persistence,
-        )
-    } else if cfg.memory {
-        let persistence = Arc::new(SqlitePersistence::open_in_memory()?);
-        (
-            persistence.clone(),
-            persistence.clone(),
-            persistence.clone(),
-            persistence,
-        )
-    } else {
-        let path = cfg
-            .sqlite
-            .clone()
-            .unwrap_or_else(|| "refhir.sqlite".to_string());
-        let options = SqliteOptions {
-            read_connections: cfg
-                .db_pool
-                .unwrap_or(SqliteOptions::default().read_connections),
-        };
-        let persistence = Arc::new(SqlitePersistence::open_with(Path::new(&path), &options)?);
-        (
-            persistence.clone(),
-            persistence.clone(),
-            persistence.clone(),
-            persistence,
-        )
-    };
 
     // A standby loads the catalog now, while it waits, and keeps it current. Loading the full
     // R4 catalog takes seconds, and doing that only after the lease is won would leave the
@@ -539,6 +576,9 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             min_ts_wait: Duration::from_millis(250),
             // Export jobs are rows in the same database, so they outlive a restart.
             jobs: Some(refhir_server::SharedJobStore::new(job_store)),
+            // So are usage, the request log and the audit trail.
+            governance: cfg.governance,
+            governance_store: Some(refhir_server::SharedGovernanceStore::new(governance_store)),
         },
     ))?;
     Ok(())
@@ -804,6 +844,11 @@ fn print_help() {
          --smart is used with a non-loopback --bind. Generated DCR and confidential\n\
          secrets print once to stderr in a terminal and are never written to logs.\n\
          --sdc-archiver stores QuestionnaireResponse without allowing a later read.\n\
+         \n\
+         Rate limits, quotas, the audit trail and the request log are set in the config file\n\
+         ([rate_limit], [quota], [audit], [request_log], [metering]). Usage, the request log and\n\
+         the audit trail are on by default; nothing is limited until a limit is configured.\n\
+         GET /_audit, /_usage and /_requests read them back (system/AuditEvent.read with --smart).\n\
          \n\
          Several processes on one database: exactly one primary writes and holds a lease on the\n\
          database. --standby (--role standby) waits for that lease and takes over when the\n\

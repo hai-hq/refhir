@@ -15,6 +15,12 @@ persistence:
 server:
   bind: "0.0.0.0:8080"
   publicUrl: ""
+  # Reverse proxies in front of the server. An ingress is 1. Without it every client looks like
+  # the ingress, so per-address limits and the audit trail see one caller. See deploy/production.md.
+  trustedProxyHops: 0
+  # The networks the proxies connect from, such as ["10.0.0.0/8"]: X-Forwarded-For is then
+  # believed only on a connection from one of them. Unset, it is believed on every connection.
+  trustedProxyPeers: []
 
 database:
   kind: sqlite
@@ -84,3 +90,17 @@ smart:
 secretEnv: {}
 
 resources: {}
+
+# Any other refhir.toml sections, appended as they are. Usage, the request log and the audit
+# trail are on without this; this is where limits go. Example:
+# extraConfig: |
+#   [rate_limit]
+#   requests_per_second = 50
+#   burst = 100
+#
+#   [quota]
+#   requests_per_day = 100000
+#
+#   [audit]
+#   retention_days = 2190
+extraConfig: ""
