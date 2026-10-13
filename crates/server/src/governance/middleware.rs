@@ -33,7 +33,7 @@ pub(crate) async fn govern(
     next: Next,
 ) -> Response {
     let governance = app.governance.clone();
-    if !governance.active() {
+    if !governance.active() || is_open_probe(request.uri().path(), request.uri().query()) {
         return next.run(request).await;
     }
     let started = Instant::now();
@@ -110,6 +110,20 @@ pub(crate) async fn gate(
         Ok(()) => next.run(request).await,
         Err(rejection) => rejection.into_response(),
     }
+}
+
+/// A load balancer's health probe: `/healthz` without `verbose`. It is not a caller. A probe that
+/// the limiter refused would take a healthy server out of rotation, and one that was logged,
+/// metered and audited would be most of every trail. `/livez` and `/readyz` are added after
+/// every layer and never reach this one; this keeps `/healthz` as they are. Its `verbose` form
+/// shows commit counts and takes a token, and is governed like any other request.
+fn is_open_probe(path: &str, query: Option<&str>) -> bool {
+    path == "/healthz"
+        && !query.is_some_and(|query| {
+            query
+                .split('&')
+                .any(|pair| pair.split('=').next() == Some("verbose"))
+        })
 }
 
 /// Whether the request presents a credential at all.
@@ -207,6 +221,16 @@ mod tests {
             !failed_attempt("/oauth/authorize", StatusCode::BAD_REQUEST),
             "a browser page"
         );
+    }
+
+    #[test]
+    fn a_health_probe_is_not_a_caller_but_its_verbose_form_is() {
+        assert!(is_open_probe("/healthz", None));
+        assert!(is_open_probe("/healthz", Some("x=1")));
+        assert!(!is_open_probe("/healthz", Some("verbose")));
+        assert!(!is_open_probe("/healthz", Some("a=b&verbose=1")));
+        assert!(!is_open_probe("/Patient", None));
+        assert!(!is_open_probe("/healthz/extra", None));
     }
 
     #[test]

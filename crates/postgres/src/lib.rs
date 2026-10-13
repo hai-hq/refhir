@@ -20,6 +20,7 @@ use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 
 mod lease;
 mod migrate;
+mod tls;
 
 pub use migrate::migration_report;
 use serde_json::Value as JsonValue;
@@ -857,11 +858,30 @@ fn i64_ts(ts: Timestamp) -> Result<i64, PersistError> {
 /// one, and the pool opens connections on demand from request threads, so every connection is
 /// made here, on a plain thread, and then handed back. Once connected the client can be used
 /// from any thread.
+///
+/// TLS comes from the `ssl*` parameters of `url` (see [`tls`]); without `sslmode` the
+/// connection is not encrypted.
 pub(crate) fn connect_client(url: &str) -> Result<Client, PersistError> {
-    let url = url.to_string();
+    let (rest, settings) = tls::split(url).map_err(definite)?;
+    let mut config: postgres::Config = rest.parse().map_err(definite)?;
+    // Like libpq, never use TLS over a Unix socket: it is a local, access-controlled channel.
+    let local = tls::all_unix_sockets(&config);
+    config.ssl_mode(if local {
+        postgres::config::SslMode::Disable
+    } else {
+        settings.mode.driver_mode()
+    });
+    let connector = if local {
+        None
+    } else {
+        settings.connector().map_err(definite)?
+    };
     std::thread::Builder::new()
         .name("refhir-pg-connect".into())
-        .spawn(move || Client::connect(&url, NoTls))
+        .spawn(move || match connector {
+            Some(connector) => config.connect(connector),
+            None => config.connect(NoTls),
+        })
         .map_err(|err| definite(format!("connection thread: {err}")))?
         .join()
         .map_err(|_| definite("the connection thread panicked"))?

@@ -49,6 +49,11 @@ pub struct ServerConfig {
     pub primary_url: Option<String>,
     /// A replica that has not refreshed within this long reports itself unhealthy.
     pub max_staleness: std::time::Duration,
+    /// How long `/readyz` waits for its database query before it says `unavailable`.
+    pub ready_timeout: std::time::Duration,
+    /// How long `/readyz` reuses its last database result. The endpoint is open, so this keeps
+    /// the query count at one per interval however many callers probe it.
+    pub ready_cache: std::time::Duration,
     /// How long a replica waits for `X-Refhir-Min-Ts` before sending the request to the primary.
     pub min_ts_wait: std::time::Duration,
     /// Table of background jobs such as `$export`. `refhir` passes the database's own, so jobs
@@ -96,6 +101,8 @@ impl Default for ServerConfig {
             smart: None,
             primary_url: None,
             max_staleness: std::time::Duration::from_secs(5),
+            ready_timeout: std::time::Duration::from_secs(2),
+            ready_cache: std::time::Duration::from_secs(1),
             min_ts_wait: std::time::Duration::from_millis(250),
             jobs: None,
             governance: crate::governance::GovernanceConfig::default(),
@@ -114,6 +121,7 @@ pub struct AppState {
     pub oidc: Option<Arc<crate::auth::Oidc>>,
     pub jobs: Arc<crate::jobs::JobRunner>,
     pub governance: Arc<crate::governance::Governance>,
+    pub(crate) ready_probe: Arc<crate::health::ReadyProbe>,
 }
 
 /// Delete expired OAuth rows once a minute. Reads ignore expired rows, so this only reclaims
@@ -269,6 +277,7 @@ pub fn app_parts(
         }),
         jobs,
         governance: governance.clone(),
+        ready_probe: Arc::default(),
     };
     // Outermost first: cors, the legacy request line (silent once governance logs instead),
     // governance's scope, authentication, the caller's own limits, and then what a replica does
@@ -290,6 +299,10 @@ pub fn app_parts(
         ))
         .layer(middleware::from_fn_with_state(state.clone(), request_log))
         .layer(middleware::from_fn_with_state(state.clone(), cors))
+        // After every layer, on purpose: `layer` wraps only the routes added before it, so the
+        // probes skip SMART, CORS, request logging and a replica's forwarding. Keep them here.
+        .route("/livez", get(crate::health::livez))
+        .route("/readyz", get(crate::health::readyz))
         .with_state(state);
     // Hooks, subscriptions and terminology fetches run where commits are made.
     if !db.is_read_only() {

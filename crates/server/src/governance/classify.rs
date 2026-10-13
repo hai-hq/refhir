@@ -25,7 +25,7 @@ pub enum Class {
     Sync,
     /// The OAuth endpoints.
     Auth,
-    /// `/metadata` and `/.well-known/*`.
+    /// `/metadata`, `/.well-known/*` and the verbose `/healthz` (the plain probe is not governed at all).
     Discovery,
     /// The server's own `/_audit`, `/_usage` and `/_requests`.
     Admin,
@@ -100,7 +100,7 @@ pub fn classify(method: &str, path: &str) -> Class {
         };
     };
     match first {
-        "metadata" | ".well-known" => return Class::Discovery,
+        "metadata" | ".well-known" | "healthz" => return Class::Discovery,
         "oauth" => return Class::Auth,
         "graphql" => return Class::Operation,
         "sync" => return Class::Sync,
@@ -234,6 +234,7 @@ mod tests {
     fn every_route_lands_in_the_class_that_prices_it() {
         let cases = [
             ("GET", "/metadata", Class::Discovery),
+            ("GET", "/healthz", Class::Discovery),
             ("GET", "/.well-known/smart-configuration", Class::Discovery),
             ("POST", "/oauth/token", Class::Auth),
             ("GET", "/oauth/authorize", Class::Auth),

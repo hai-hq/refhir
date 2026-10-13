@@ -2107,3 +2107,38 @@ async fn a_long_resource_type_that_reaches_the_engine_cannot_make_a_row_large() 
         }
     }
 }
+
+#[tokio::test]
+async fn a_health_probe_is_never_refused_counted_logged_or_audited() {
+    // A bucket of two, refilling once in a thousand seconds: a caller is refused on its third.
+    let rig = rig(
+        GovernanceConfig {
+            rate_limit: limits(0.001, 2),
+            ..observing()
+        },
+        false,
+    );
+    for _ in 0..20 {
+        let probe = rig.call("GET", "/healthz", None, None).await;
+        assert_eq!(probe.status, StatusCode::OK, "{}", probe.body);
+    }
+    rig.governance.flush().await;
+    assert!(
+        rig.audit().await.is_empty(),
+        "a probe is not an interaction"
+    );
+    assert!(rig
+        .store
+        .request_log_query(&RequestLogFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .unwrap()
+        .is_empty());
+    assert!(rig.usage("anonymous").await.is_empty());
+    // And it did not use up what the same address gets for everything else.
+    assert_eq!(
+        rig.call("GET", "/metadata", None, None).await.status,
+        StatusCode::OK
+    );
+}

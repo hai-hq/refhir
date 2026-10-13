@@ -4,6 +4,7 @@ mod auth;
 mod cluster;
 mod governance;
 mod graphql;
+mod health;
 mod http;
 mod jobs;
 mod sync;

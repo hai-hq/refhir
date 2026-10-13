@@ -37,7 +37,7 @@ kind: Secret
 metadata:
   name: refhir-secrets
 stringData:
-  REFHIR_POSTGRES_URL: postgresql://refhir:...@postgres:5432/refhir?sslmode=require
+  REFHIR_POSTGRES_URL: postgresql://refhir:...@postgres:5432/refhir?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt
   REFHIR_SMART_DCR_TOKEN: "..."
   REFHIR_SMART_CONFIDENTIAL_SECRET: "..."
   REFHIR_OIDC_CLIENT_SECRET: "..."
@@ -53,6 +53,16 @@ env:
   - name: REFHIR_CONFIG
     value: /etc/refhir/refhir.toml
 ```
+
+Mount the CA that signed Postgres's certificate (a ConfigMap or Secret) at the `sslrootcert` path, not
+under `/etc/refhir`, which the config ConfigMap occupies. The Helm chart does it for you:
+`--set database.tlsSecret=<secret with ca.crt>` mounts that Secret at `/etc/refhir-pg-tls`.
+With `verify-full` the certificate must be valid for the host name in the URL (for CloudNativePG,
+the `-rw` Service name and its namespaced forms are in its server certificate; use the one you
+connect with). `sslmode=require` encrypts but does not verify the server, and a URL with no
+`sslmode` does not use TLS at all, so production should use `verify-full`. Client certificates
+(`sslcert`, `sslkey`) are supported for servers that require them. Details: README,
+[Postgres and TLS](../README.md#postgres-and-tls).
 
 Helm chart: [helm/refhir](helm/refhir/README.md) (`values.yaml` + optional `secretEnv`).
 

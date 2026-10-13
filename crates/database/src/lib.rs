@@ -434,6 +434,16 @@ impl Database {
         self.mode == Mode::Reader
     }
 
+    /// Whether the backend answers: one single-row read of the published watermark (a global,
+    /// not a resource), the cheapest query there is. For a readiness probe. Only a failure to
+    /// run the query counts; what the row holds is not looked at. It takes a connection, so it
+    /// can wait as long as the pool makes it wait; the caller bounds that.
+    pub fn ping(&self) -> Result<(), PersistError> {
+        self.persistence
+            .get_persistence_global(PersistenceGlobalKey::PublishedTimestamp)
+            .map(|_| ())
+    }
+
     pub fn latest_ts(&self) -> Timestamp {
         self.state.lock().expect("committer").snapshot.latest_ts()
     }

@@ -103,6 +103,23 @@ fn not_caught_up_response(min: u64) -> Response {
 pub(crate) const READ_ONLY_MESSAGE: &str =
     "this server is a read-only replica; send writes to the primary";
 
+/// Why this process should get no traffic although it is up, from what it already knows
+/// (nothing is queried). Shared by `/healthz` and `/readyz` so they agree: a replica that has not
+/// refreshed within `max_staleness`, or a writer that cannot record its published watermark.
+pub(crate) fn not_following(app: &AppState) -> Option<&'static str> {
+    if app.db.is_read_only() {
+        let stale = app
+            .db
+            .refreshed_ago()
+            .is_none_or(|age| age > app.config.max_staleness);
+        stale.then_some("replica has stopped following the primary")
+    } else {
+        app.db
+            .watermark_failing()
+            .then_some("cannot record the published watermark")
+    }
+}
+
 /// `/healthz`. A primary is healthy while it runs. A replica is healthy while it keeps
 /// refreshing; one that has not refreshed within `max_staleness` is out of rotation.
 pub(crate) async fn healthz(
@@ -111,16 +128,14 @@ pub(crate) async fn healthz(
 ) -> Response {
     let verbose = query.contains_key("verbose");
     let replica = app.db.is_read_only();
-    let mut healthy = true;
+    let problem = not_following(&app);
+    let healthy = problem.is_none();
     let mut body = json!({
         "role": if replica { "replica" } else { "primary" },
         "latest_ts": app.db.latest_ts().to_string(),
     });
     if replica {
-        let age = app.db.refreshed_ago();
-        let stale = age.is_none_or(|age| age > app.config.max_staleness);
-        healthy = !stale;
-        body["refreshed_ms_ago"] = match age {
+        body["refreshed_ms_ago"] = match app.db.refreshed_ago() {
             Some(age) => json!(age.as_millis() as u64),
             None => Value::Null,
         };
@@ -129,10 +144,9 @@ pub(crate) async fn healthz(
         if let Ok(Some(lag)) = app.db.published_lag() {
             body["lag_ts"] = json!(lag);
         }
-    } else if app.db.watermark_failing() {
+    } else if let Some(detail) = problem {
         // It is committing but cannot tell the readers, who fall behind without knowing it.
-        healthy = false;
-        body["detail"] = json!("cannot record the published watermark");
+        body["detail"] = json!(detail);
     }
     body["status"] = json!(if healthy { "ok" } else { "unhealthy" });
     if verbose {
@@ -171,8 +185,9 @@ pub(crate) async fn healthz(
         .into_response()
 }
 
-/// What a process serves while it waits to become the primary, or for a replica's schema and
-/// catalog to appear: `/healthz` says 503 and nothing else is available.
+/// What a process serves while it starts, waits to become the primary, or waits for a replica's
+/// schema and catalog to appear: `/healthz` and `/readyz` say 503 (`starting`), `/livez` says
+/// 200 because the process is up, and nothing else is available.
 pub fn bootstrap_router(role: &'static str, detail: &'static str) -> Router {
     let answer = move || async move {
         (
@@ -186,6 +201,11 @@ pub fn bootstrap_router(role: &'static str, detail: &'static str) -> Router {
     };
     Router::new()
         .route("/healthz", get(answer))
+        .route("/livez", get(crate::health::livez))
+        .route(
+            "/readyz",
+            get(move || async move { crate::health::not_ready("starting", detail) }),
+        )
         .fallback(answer)
 }
 

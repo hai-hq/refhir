@@ -118,7 +118,12 @@ impl Node {
 
     /// `/healthz` status and body, or `None` if nothing is listening.
     fn health(&self) -> Option<(u16, Value)> {
-        match ureq::get(&format!("{}/healthz", self.base()))
+        self.probe("/healthz")
+    }
+
+    /// Status and body of a GET, or `None` if nothing is listening.
+    fn probe(&self, path: &str) -> Option<(u16, Value)> {
+        match ureq::get(&format!("{}{path}", self.base()))
             .timeout(Duration::from_secs(2))
             .call()
         {
@@ -326,6 +331,47 @@ fn a_sqlite_standby_takes_over_on_the_same_machine() {
         get_patient(&standby.base(), "kept", None).unwrap().status,
         200
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_primary_answers_probes_while_it_starts_and_is_ready_afterwards() {
+    let dir = std::env::temp_dir().join(format!("refhir-probes-{}", free_port()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // The full R4 package takes many seconds to install, so the primary is still starting when
+    // it first answers.
+    let r4 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/fixtures/r4");
+    let mut starting = Node::start_sqlite(
+        "probes-starting",
+        &dir.join("starting.sqlite"),
+        &["--package", r4.to_str().unwrap()],
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while starting.probe("/livez").is_none() {
+        assert!(
+            starting.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "never answered while starting:\n{}",
+            starting.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Not a refused connection: the process is up, says so, and says it cannot take traffic.
+    assert_eq!(
+        starting.probe("/livez"),
+        Some((200, json!({"status": "ok"})))
+    );
+    let (status, ready) = starting.probe("/readyz").unwrap();
+    assert_eq!(status, 503, "{ready}");
+    assert_eq!(ready["status"], "starting");
+    assert!(ready["reason"].as_str().is_some_and(|r| !r.is_empty()));
+    assert_eq!(starting.probe("/healthz").unwrap().0, 503);
+    assert_eq!(starting.probe("/metadata").unwrap().0, 503);
+    starting.kill();
+
+    let mut ready = Node::start_sqlite("probes-ready", &dir.join("ready.sqlite"), &[]);
+    ready.wait_ready(60);
+    assert_eq!(ready.probe("/readyz"), Some((200, json!({"status": "ok"}))));
+    assert_eq!(ready.probe("/livez"), Some((200, json!({"status": "ok"}))));
     let _ = std::fs::remove_dir_all(dir);
 }
 

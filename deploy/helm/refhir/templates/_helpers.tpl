@@ -82,6 +82,11 @@ containers:
         readOnly: true
       - name: data
         mountPath: /data
+      {{- if $root.Values.database.tlsSecret }}
+      - name: postgres-tls
+        mountPath: /etc/refhir-pg-tls
+        readOnly: true
+      {{- end }}
     resources:
       {{- toYaml $root.Values.resources | nindent 6 }}
 volumes:
@@ -95,6 +100,11 @@ volumes:
     {{- else }}
     emptyDir: {}
     {{- end }}
+  {{- if $root.Values.database.tlsSecret }}
+  - name: postgres-tls
+    secret:
+      secretName: {{ $root.Values.database.tlsSecret }}
+  {{- end }}
 {{- end }}
 
 {{- define "refhir.checkCluster" -}}

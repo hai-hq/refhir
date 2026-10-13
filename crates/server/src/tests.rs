@@ -4206,6 +4206,7 @@ mod cluster {
                 refhir_persistence::MemoryJobStore::default(),
             ))),
             governance: crate::Governance::new(crate::GovernanceConfig::default(), false, None),
+            ready_probe: Default::default(),
         };
         assert!(
             !crate::auth::patient_exists(&app, "fresh-patient"),
