@@ -60,6 +60,17 @@ smart:
     clientId: ""
     fhirUserClaim: fhirUser
     scopes: ["openid", "profile"]
+    # All off unless set; see deploy/production.md.
+    # Only users whose ID token carries one of these values for each claim may sign in:
+    #   allowedClaims: {organization_id: ["org_abc123"]}
+    allowedClaims: {}
+    #   allowedEmailDomains: ["example.com"]
+    allowedEmailDomains: []
+    # A Patient-bound user skips the patient picker.
+    patientFromFhirUser: false
+    # Bind a person by search when the ID token has no fhirUser claim:
+    #   fhirUserLookup: {resourceType: Practitioner, claim: sub, system: "https://idp.example.com/sub"}
+    fhirUserLookup: {}
 
 # Optional keys → Secret + env (see deploy/production.md). Example:
 # secretEnv:
