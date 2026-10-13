@@ -9,6 +9,8 @@
 
 mod pool;
 
+pub mod migrate;
+
 pub use pool::{Pool, PoolGuard, PoolStats};
 
 use std::sync::Arc;

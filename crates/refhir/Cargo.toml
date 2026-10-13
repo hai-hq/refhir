@@ -24,3 +24,4 @@ ureq = { workspace = true }
 tungstenite = "0.24"
 serde_json = { workspace = true }
 refhir-types = { path = "../types" }
+rusqlite = { workspace = true }

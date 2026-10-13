@@ -174,6 +174,14 @@ Things to know before relying on it:
   parameter until the job is complete.
 - **Export jobs and Subscription delivery** belong to the primary.
 
+## Upgrading
+
+The database schema is versioned and the server migrates it when it starts. **Migrations are not
+reversible: back up the database first**, and use one ReFHIR version for every process that shares
+a database (a database from a newer version makes an older server refuse to start). Restore the
+backup into a scratch database and run `refhir migrate --dry-run` against it with the new binary
+before you upgrade. Details: [docs/migrations.md](../docs/migrations.md).
+
 ## Install the binary without Docker
 
 The crate is not on crates.io yet (`publish = false` in the workspace). Install from GitHub:
