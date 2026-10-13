@@ -368,7 +368,7 @@ liveness probe: a standby answers it with 503.
 | `--config path` | Config file (also `REFHIR_CONFIG`) |
 | `--sqlite path` | SQLite file (default `refhir.sqlite`) |
 | `--memory` | SQLite in RAM; no file (not with `--sqlite` or `--postgres`) |
-| `--postgres url` | Postgres (not with `--sqlite` or `--memory`; or `REFHIR_POSTGRES_URL`) |
+| `--postgres url` | Postgres (not with `--sqlite` or `--memory`; or `REFHIR_POSTGRES_URL`). TLS is set in the URL: see [Postgres and TLS](#postgres-and-tls) |
 | `--bind host:port` | Default `127.0.0.1:8080` |
 | `--package spec` | FHIR IG. Repeatable. Installed after `[fhir].version` defaults. Directory, `.tgz`, or `name@version`. |
 | `--smart` | SMART App Launch 2.2 (`/.well-known/smart-configuration`, `/oauth/*`) |
@@ -384,6 +384,38 @@ liveness probe: a standby answers it with 503.
 | `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
 | `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
 | `refhir migrate --status\|--dry-run` | Report the database's schema version and what startup would do to it, without changing anything. See [Schema migrations](docs/migrations.md) |
+
+### Postgres and TLS
+
+`--postgres` takes a URL (`postgresql://user:pass@host:5432/db`) or libpq `host=... user=...`
+pairs. TLS is chosen with libpq's parameters in that string:
+
+```bash
+refhir --postgres 'postgresql://refhir:...@db.example.com:5432/refhir?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt'
+```
+
+| `sslmode` | Encrypted | Server certificate |
+|-----------|-----------|--------------------|
+| *(absent)*, `disable` | never | n/a. **The default**: nothing changes for URLs that never set it |
+| `prefer` | if the server offers TLS | not checked |
+| `require` | always | not checked, unless `sslrootcert` is given, in which case the chain is (as in libpq) |
+| `verify-ca` | always | chain must lead to `sslrootcert`; the host name is not checked |
+| `verify-full` | always | chain must lead to `sslrootcert` and the certificate must be valid for the host in the URL |
+
+- **Use `verify-full` in production.** `prefer` and `require` without `sslrootcert` stop someone
+  listening on the network, not someone answering in the server's place.
+- `sslrootcert=<file>`: PEM file with the CA certificate(s) that signed the server's certificate
+  (required by `verify-ca` and `verify-full`). There is no system trust store fallback.
+- `sslcert=<file>` and `sslkey=<file>`: PEM client certificate and private key, for servers
+  that authenticate with them (`hostssl ... cert` in `pg_hba.conf`). Give both or neither.
+- The files are re-read whenever their modification time changes, so a rotated certificate is
+  picked up without a restart. Percent-encode paths in a URL if they hold special characters.
+- As in libpq, TLS is not used over a Unix socket (`host=/var/run/postgresql`), whatever the
+  `sslmode`. `sslnegotiation=direct` works with Postgres 17 and later.
+- The certificate must carry the host name or address in `subjectAltName`; a common name alone
+  is not accepted. `allow` and `PGSSL*` environment variables are not supported.
+- A mistake (an unknown mode, `verify-full` with no `sslrootcert`, certificate files with
+  `sslmode=disable`) fails at startup instead of connecting without the check.
 
 ### Several processes on one database
 
@@ -514,7 +546,11 @@ CI: [.github/workflows/ci.yml](.github/workflows/ci.yml).
 Postgres tests: set `HAIFHIR_POSTGRES_URL` (a URL or `host=... user=...`) to a role that may
 `CREATE DATABASE`. They include `crates/refhir/tests/cluster.rs`, which starts real primary,
 standby and replica processes and kills the primary while writes are in flight; the lease tests
-make a database of their own each, so they do not disturb each other.
+make a database of their own each, so they do not disturb each other.  
+TLS tests: `out="$(scripts/postgres-tls-test.sh up)" && eval "$out"` starts a throwaway TLS-only Postgres (a
+container named `refhir-tls-pg-test`) and exports the two variables they read;
+`cargo test -p refhir-postgres tls`; then `scripts/postgres-tls-test.sh down`. Without those
+variables the TLS server tests are skipped, unless `REFHIR_REQUIRE_POSTGRES_TLS` is set.
 
 ---
 

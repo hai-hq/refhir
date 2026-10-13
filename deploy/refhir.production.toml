@@ -11,7 +11,9 @@ public_url = "https://refhir.example.com/fhir"
 [database]
 kind = "postgres"
 # Prefer REFHIR_POSTGRES_URL in Kubernetes instead of inline credentials.
-postgres_url = "postgresql://refhir:CHANGE_ME@postgres:5432/refhir?sslmode=require"
+# verify-full checks the server certificate and its host name against the CA in sslrootcert.
+# `sslmode=require` alone encrypts but trusts anyone who answers.
+postgres_url = "postgresql://refhir:CHANGE_ME@postgres:5432/refhir?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt"
 
 [conformance]
 reference_policy = "strict"
