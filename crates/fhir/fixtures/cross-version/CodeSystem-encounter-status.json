@@ -1,0 +1,20 @@
+{
+  "resourceType": "CodeSystem",
+  "id": "encounter-status",
+  "url": "http://hl7.org/fhir/encounter-status",
+  "version": "5.0.0",
+  "name": "EncounterStatus",
+  "status": "active",
+  "content": "complete",
+  "concept": [
+    {"code": "planned"},
+    {"code": "in-progress"},
+    {"code": "on-hold"},
+    {"code": "discharged"},
+    {"code": "completed"},
+    {"code": "cancelled"},
+    {"code": "discontinued"},
+    {"code": "entered-in-error"},
+    {"code": "unknown"}
+  ]
+}
