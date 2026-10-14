@@ -3,8 +3,9 @@
 For maintainers. A release is a version tag. Pushing `vX.Y.Z` runs
 [`.github/workflows/release.yml`](../.github/workflows/release.yml), which builds the binaries and
 the container image, publishes a GitHub release whose notes come from
-[`CHANGELOG.md`](../CHANGELOG.md), and then publishes both clients. There is nothing to do by hand
-after the tag, once the [one-time setup](#one-time-setup) is done.
+[`CHANGELOG.md`](../CHANGELOG.md), tags the Go client, and **stages** the TypeScript client on npm.
+npm does not let a CI token publish, so one step is left to you after the tag: approving the staged
+npm version with two-factor authentication ([below](#approving-the-npm-release)).
 
 ## What a release contains
 
@@ -14,7 +15,7 @@ after the tag, once the [one-time setup](#one-time-setup) is done.
 | `SHA256SUMS` | the GitHub release. Verify with `shasum -a 256 -c SHA256SUMS` |
 | `ghcr.io/hai-hq/refhir:X.Y.Z` and `:X.Y` (a multi-architecture image for amd64 and arm64), plus `:X` from 1.0 and `:latest` for stable releases | GitHub Container Registry |
 | the Go module `github.com/hai-hq/refhir/clients/go` at `vX.Y.Z` (the workflow creates the tag `clients/go/vX.Y.Z`) | the Go module proxy, on first `go get` |
-| `@haihq/refhir@X.Y.Z` (with npm provenance once the repository is public) | npm |
+| `@haihq/refhir@X.Y.Z` (with npm provenance once the repository is public). The workflow stages it; it is public once you approve it | npm |
 
 There are no Windows or Intel macOS binaries; build those from source. A pre-release tag such as
 `v0.2.0-rc.1` is marked as a pre-release on GitHub, never moves `:latest`, and is published to npm
@@ -58,27 +59,55 @@ changelog says so. The clients are released at the same version:
 
    The workflow refuses a tag that does not match the version in `Cargo.toml`, a version with no
    changelog section, or a TypeScript client at another version, before it builds anything.
-5. **Check the result.** The release page lists three archives and `SHA256SUMS`;
+5. **Approve the npm release** ([details](#approving-the-npm-release)). The workflow's run summary
+   links the steps. Until you approve it, `@haihq/refhir@X.Y.Z` is not public.
+6. **Check the result.** The release page lists three archives and `SHA256SUMS`;
    `docker run --rm ghcr.io/hai-hq/refhir:X.Y.Z --version` prints `refhir X.Y.Z`;
-   `npm view @haihq/refhir@X.Y.Z version` and
-   `go list -m github.com/hai-hq/refhir/clients/go@vX.Y.Z` find the clients.
+   `go list -m github.com/hai-hq/refhir/clients/go@vX.Y.Z` finds the Go client; and once the npm
+   version is approved, `npm view @haihq/refhir@X.Y.Z version` finds the TypeScript one.
 
-The clients are published after the GitHub release, and only if it succeeded, in two jobs of their
-own: **Tag the Go client** and **Publish the TypeScript client**. Both are safe to re-run: a tag
-that already points at the release commit, and a version that is already on npm, are left alone.
+The clients are handled after the GitHub release, and only if it succeeded, in two jobs of their
+own: **Tag the Go client** and **Stage the TypeScript client on npm**. Both are safe to re-run: a
+tag that already points at the release commit, and a version that is already on npm or already
+staged, are left alone.
+
+## Approving the npm release
+
+The workflow runs `npm stage publish`, which puts the version in the registry without making it
+public. A maintainer with two-factor authentication on their npm account makes it public:
+
+- on npmjs.com: open **@haihq/refhir**, then the **Staged Packages** tab, review it, and
+  **Approve**; or
+- in a terminal (npm 11.15 or later): `npm stage list @haihq/refhir`, then
+  `npm stage approve <stage-id>`. `npm stage view <stage-id>` shows what is in it, and
+  `npm stage reject <stage-id>` throws it away.
+
+Look at what is staged before you approve it: it is the tarball built from the tagged commit, and
+approving is what makes it permanent, because npm never lets a published version be replaced.
+
+The first time a package is staged, npm also publishes a public placeholder version,
+`0.0.0-stage`. The real version stays private until it is approved.
+
+The tag the version goes under is fixed when it is staged (`latest`, or `next` for a pre-release).
+To change it, reject the staged version and re-run the job.
 
 ## One-time setup
 
 1. **npm.** The organization is `haihq` on [npmjs.com](https://www.npmjs.com) (not `hai-hq`, which
    is the GitHub organization), so the package is `@haihq/refhir`. Create a *granular access
-   token* with read and write access to packages in that scope, and with two-factor authentication
-   bypass for automation. Store it as the repository secret `NPM_TOKEN`:
+   token* with the **Read and write (stage only)** permission for packages in the `@haihq` scope.
+   Such a token can stage a version but cannot publish one: npm rejects a direct `npm publish`
+   with it, so a leaked token cannot put code on npm. Store it as the repository secret
+   `NPM_TOKEN`:
 
    ```bash
    gh secret set NPM_TOKEN --repo hai-hq/refhir
    ```
 
-   Without the secret, a release still goes out; the npm job prints a warning and skips the publish.
+   Without the secret, a release still goes out; the npm job prints a warning and stages nothing,
+   and you can re-run just that job after adding it. Staging needs npm 11.15 or later, which the
+   workflow installs. npm has said it will stop accepting direct publishes from tokens that bypass
+   two-factor authentication, so use the stage-only type rather than that one.
 2. **Go.** Nothing to set up, but the Go module proxy can only fetch a public repository. The
    workflow asks the proxy for each new version so `go get` finds it at once, and warns if the
    proxy cannot.
@@ -94,7 +123,8 @@ and the image have succeeded, and the clients only after that. Fix the problem o
 the tag (`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`), and tag again.
 
 If only a client job fails (the release is already out), fix the cause and use *Re-run failed jobs*
-on the workflow run. Do not delete the tag for that.
+on the workflow run. Do not delete the tag for that. A version that is already staged cannot be
+staged again: approve it, or reject it (`npm stage reject <stage-id>`) and re-run the job.
 
 If the release was published and is wrong, do not reuse the version: npm and the Go module proxy
 both refuse to replace a published version. Fix forward with a patch release.
