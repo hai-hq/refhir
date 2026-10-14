@@ -2195,6 +2195,116 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
 }
 
 #[test]
+fn the_servers_patient_limit_is_combined_with_the_callers_compartment_and_never_replaced() {
+    let harness = ready();
+    for (id, name) in [("p1", "Ann"), ("p2", "Bee")] {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": patient(id, true, name)}),
+        );
+    }
+    for (id, subject) in [("o1", "p1"), ("o2", "p2")] {
+        apply(
+            &harness,
+            "Observation/create",
+            json!({"resource": observation(id, subject, "2020-01-02", "8480-6")}),
+        );
+    }
+    let ids = |result: &Value| -> Vec<String> {
+        result["entry"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.pointer("/resource/id"))
+            .filter_map(|id| id.as_str().map(str::to_string))
+            .collect()
+    };
+
+    // The limit alone.
+    let limited = apply(
+        &harness,
+        "Observation/search",
+        json!({"_patientCompartment": "Patient/p1"}),
+    );
+    assert_eq!(ids(&limited), ["o1"]);
+    // The caller's own `_compartment` cannot take a search past the limit, whichever it names.
+    for asked in ["Patient/p2", "Patient/p1"] {
+        let combined = apply(
+            &harness,
+            "Observation/search",
+            json!({"_patientCompartment": "Patient/p1", "_compartment": asked}),
+        );
+        let expected: &[&str] = if asked == "Patient/p1" { &["o1"] } else { &[] };
+        assert_eq!(ids(&combined), expected, "_compartment={asked}");
+        assert_eq!(combined["total"], expected.len(), "_compartment={asked}");
+    }
+    // Paging links do not carry either parameter: each request gets its limit from the server.
+    let page = apply(
+        &harness,
+        "Observation/search",
+        json!({"_patientCompartment": "Patient/p1", "_count": "1"}),
+    );
+    assert!(
+        !page.to_string().contains("_patientCompartment"),
+        "the limit leaked into a link: {page}"
+    );
+    // A limit the search cannot read is an error, never a search without it.
+    for bad in [json!("p1"), json!(7)] {
+        let refused = run_op(
+            &harness,
+            "Observation/search",
+            &json!({"_patientCompartment": bad}),
+        );
+        assert!(refused.is_err(), "{bad} was accepted");
+    }
+
+    // The same limit holds for the searches inside a Bundle. What a URL puts under the server's
+    // name is replaced by the server's own, and with none set it is dropped: it is not the
+    // client's name to use.
+    let batch = |url: &str, controls: Value| {
+        let mut args = json!({"resource": {"resourceType": "Bundle", "type": "batch", "entry": [
+            {"request": {"method": "GET", "url": url}}
+        ]}});
+        args.as_object_mut()
+            .unwrap()
+            .extend(controls.as_object().unwrap().clone());
+        let result = run_op(&harness, "Bundle/batch", &args).expect("batch");
+        result.value["entry"][0]["resource"].clone()
+    };
+    let limit = json!({"_patientCompartment": "Patient/p1"});
+    assert_eq!(ids(&batch("Observation?_count=100", limit.clone())), ["o1"]);
+    assert_eq!(
+        ids(&batch(
+            "Observation?_patientCompartment=Patient/p2&_compartment=Patient/p2",
+            limit.clone()
+        )),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        ids(&batch(
+            "Observation?_patientCompartment=Patient/p1",
+            json!({})
+        )),
+        ["o1", "o2"]
+    );
+    let transaction = run_op(
+        &harness,
+        "Bundle/transaction",
+        &json!({"resource": {"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"request": {"method": "GET", "url": "Observation?_patientCompartment=Patient/p2"}}
+        ]}, "_patientCompartment": "Patient/p1"}),
+    )
+    .expect("transaction");
+    assert_eq!(
+        ids(&transaction.value["entry"][0]["resource"]),
+        ["o1"],
+        "{}",
+        transaction.value
+    );
+}
+
+#[test]
 fn patch_conditional_history_batch_and_urn_references() {
     let harness = ready();
     apply(

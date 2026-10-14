@@ -178,8 +178,8 @@ fn run(admin: &str, with_watermark: bool, threads: usize, per_thread: usize) -> 
 #[test]
 #[ignore]
 fn the_watermark_costs_a_commit_this_much() {
-    let Ok(admin) = std::env::var("HAIFHIR_POSTGRES_URL") else {
-        eprintln!("HAIFHIR_POSTGRES_URL unset, skipping the watermark benchmark");
+    let Ok(admin) = std::env::var("REFHIR_TEST_POSTGRES_URL") else {
+        eprintln!("REFHIR_TEST_POSTGRES_URL unset, skipping the watermark benchmark");
         return;
     };
     let median = |mut v: Vec<f64>| {

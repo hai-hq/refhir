@@ -29,10 +29,10 @@ sqlite_path = "/data/refhir.sqlite"
 # Or set REFHIR_POSTGRES_URL instead of postgres_url.
 # TLS: no sslmode means no TLS. In production use
 #   ?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt
-# (also sslcert/sslkey for client certificates; see README, "Postgres and TLS").
+# (also sslcert/sslkey for client certificates; see docs/operations.md, "Postgres and TLS").
 
 [cluster]
-# Several processes on one Postgres database (see README, "Several processes on one database").
+# Several processes on one Postgres database (see docs/clustering.md).
 # role = "primary"   # primary | standby | replica; REFHIR_ROLE
 # primary_url = "http://primary:8080"   # replicas send writes here; REFHIR_PRIMARY_URL
 # db_pool = 8        # most Postgres connections (SQLite: read connections, default 4); REFHIR_DB_POOL
@@ -96,7 +96,7 @@ sdc_archiver = false
 # --- Rate limits, quotas, metering, request logs and the audit trail -----------------------
 # Metering, the request log and the audit trail are ON by default. Nothing is limited until you
 # size a limit for your traffic: a [rate_limit] or [quota] section that is present is ON unless
-# it says `enabled = false`. See "Rate limits, quotas and audit" in the README.
+# it says `enabled = false`. See docs/governance.md.
 
 [metering]
 enabled = true            # per client, per UTC day, per class of request: GET /_usage

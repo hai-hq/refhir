@@ -3130,12 +3130,12 @@ mod tests {
         MemoryTerminology::from_resources_scoped(&tagged, release)
     }
 
+    /// What a package holds, each resource with the scope it was installed under.
+    type Definitions = Vec<(super::Scope, serde_json::Value)>;
+
     /// The R4 package and a package that carries an R5-style copy of the same value set: another
     /// version, over another code system URL (as `hl7.fhir.uv.extensions.r4` does).
-    fn r4_and_its_r5_style_copy() -> (
-        Vec<(super::Scope, serde_json::Value)>,
-        Vec<(super::Scope, serde_json::Value)>,
-    ) {
+    fn r4_and_its_r5_style_copy() -> (Definitions, Definitions) {
         (
             package(
                 1,

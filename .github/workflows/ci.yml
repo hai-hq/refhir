@@ -2,10 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
   # Run the performance check by hand: Actions -> CI -> Run workflow.
   workflow_dispatch:
+
+# Workflows get a read-only token unless a job asks for more.
+permissions:
+  contents: read
+
+# A new push to a pull request replaces the run in progress. Runs on main always finish.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +23,7 @@ jobs:
   build-and-test:
     name: Build and test
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,15 +40,21 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Build workspace
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --locked
 
       - name: Test workspace
-        run: cargo test --workspace -- --test-threads=8
+        run: cargo test --workspace --locked -- --test-threads=8
 
       - name: Install Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.23"
+
+      - name: Check the Go client
+        working-directory: clients/go
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "gofmt: the files above need formatting"; exit 1; }
+          go vet ./...
 
       - name: Test Go client
         working-directory: clients/go
@@ -62,9 +78,31 @@ jobs:
           npm run build
           npm test
 
+  # Warnings fail the build, so the code base stays clean. The toolchain is the pinned 1.88.0,
+  # whose lints are the ones that count: a newer clippy knows lints this one does not.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   postgres:
     name: Postgres tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
@@ -78,7 +116,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     env:
-      HAIFHIR_POSTGRES_URL: host=127.0.0.1 port=5432 user=postgres password=postgres
+      REFHIR_TEST_POSTGRES_URL: host=127.0.0.1 port=5432 user=postgres password=postgres
       # Fail instead of skipping when the database is missing.
       REFHIR_REQUIRE_POSTGRES: "1"
     steps:
@@ -92,7 +130,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Test Postgres backend
-        run: cargo test -p refhir-postgres
+        run: cargo test -p refhir-postgres --locked
 
       # The service above does not speak TLS, so this starts a TLS-only Postgres of its own
       # (certificates, client-certificate role and all) and runs the TLS tests against it.
@@ -102,16 +140,17 @@ jobs:
         run: |
           out="$(scripts/postgres-tls-test.sh up)"
           eval "$out"
-          cargo test -p refhir-postgres tls
+          cargo test -p refhir-postgres --locked tls
 
       # Starts real refhir processes (primary, standby, replicas) on databases of their own and
       # kills the primary while writes are in flight. The Postgres role may create databases.
       - name: Test several processes on one database
-        run: cargo test -p refhir --test cluster -- --test-threads=4
+        run: cargo test -p refhir --locked --test cluster -- --test-threads=4
 
   release-binary:
     name: Build release binary
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,7 +162,77 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build refhir (release)
-        run: cargo build --release -p refhir
+        run: cargo build --release --locked -p refhir
+
+      - name: Smoke test the binary
+        run: target/release/refhir --version
+
+  # The image is what most people run, so build it on every change. It is not pushed: only the
+  # release workflow publishes.
+  docker:
+    name: Build container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: refhir:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run the image
+        run: docker run --rm refhir:ci --version
+
+  helm:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint
+        run: helm lint deploy/helm/refhir
+
+      - name: Render with the defaults
+        run: helm template ci deploy/helm/refhir > /dev/null
+
+      - name: Render a Postgres cluster
+        run: helm template ci deploy/helm/refhir --set database.kind=postgres --set cluster.enabled=true > /dev/null
+
+  docs:
+    name: Docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check Markdown links and anchors
+        run: python3 scripts/check-doc-links.py
+
+  # Dependency advisories and licenses; see deny.toml. Advisories can appear without any change
+  # here, so a failure on an unrelated pull request is a reason to update or review a dependency.
+  deny:
+    name: Dependencies (cargo deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check advisories, licenses and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
 
   # The plan's performance exit criteria need a quiet machine and a few minutes, so they are not
   # part of every push. Trigger this job from the Actions tab; it fails if a pool of 8 does not
@@ -132,6 +241,7 @@ jobs:
     name: Perf criteria (manual)
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16
@@ -160,7 +270,7 @@ jobs:
           go-version: "1.23"
 
       - name: Build refhir (release)
-        run: cargo build --release -p refhir
+        run: cargo build --release --locked -p refhir
 
       - name: Create an empty database
         run: PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -c "CREATE DATABASE perf"

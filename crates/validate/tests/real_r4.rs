@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 struct NoHost;
 impl Host for NoHost {}
 
-const EXT: &str = "https://boolbyte.health/fhir/StructureDefinition/onboarding-json";
+const EXT: &str = "https://example.org/fhir/StructureDefinition/onboarding-json";
 
 fn r4() -> Schema {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../fhir/fixtures/r4");

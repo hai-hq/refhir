@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hai-hq/haifhir/clients/go"
+	"github.com/hai-hq/refhir/clients/go"
 )
 
 func main() {

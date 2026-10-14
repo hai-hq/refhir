@@ -1,4 +1,4 @@
-module github.com/hai-hq/haifhir/clients/go
+module github.com/hai-hq/refhir/clients/go
 
 go 1.23
 

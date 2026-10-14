@@ -436,11 +436,14 @@ fn same_keys(left: &[(IndexId, Vec<u8>)], right: &[(IndexId, Vec<u8>)]) -> bool 
     left == right
 }
 
+/// The index keys of each document of one type, by document id.
+type KeysByDocument = HashMap<String, Vec<(IndexId, Vec<u8>)>>;
+
 fn index_keys_for_pending(
     db: &Database,
     catalog: &RwLock<Catalog>,
     type_name: &str,
-) -> Result<HashMap<String, Vec<(IndexId, Vec<u8>)>>, FhirError> {
+) -> Result<KeysByDocument, FhirError> {
     let guard = catalog.read().expect("catalog");
     let Ok(model) = guard.get(type_name) else {
         return Ok(HashMap::new());

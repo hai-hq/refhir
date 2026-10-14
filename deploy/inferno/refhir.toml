@@ -1,4 +1,4 @@
-# ReFHIR profile for local SMART / Inferno validation (see README.md).
+# ReFHIR profile for local SMART / Inferno validation (see deploy/inferno/README.md).
 
 [fhir]
 version = "r4"

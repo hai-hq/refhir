@@ -1,6 +1,6 @@
 # ReFHIR TypeScript client
 
-Node client for [ReFHIR](https://github.com/hai-hq/haifhir): reactive FHIR over `/sync`, plus HTTP for metadata.
+Node client for [ReFHIR](https://github.com/hai-hq/refhir): reactive FHIR over `/sync`, plus HTTP for metadata.
 
 Package: `@hai-hq/refhir`  
 **Node 20+** uses `ws` with `Authorization` on upgrade. **Browsers** use native `WebSocket` and pass SMART tokens as `?access_token=` on `/sync` (server accepts header or query).
@@ -27,7 +27,6 @@ import { dial } from "@hai-hq/refhir";
 const client = await dial("http://127.0.0.1:8080");
 await client.create("Patient", {
   resourceType: "Patient",
-  id: "p1",
   active: true,
   name: [{ family: "Ann" }],
 });
@@ -40,6 +39,8 @@ console.log(updated);
 
 await client.close();
 ```
+
+The server assigns the id of every resource it creates and ignores one in the body; see [Resource ids](../../docs/fhir-api.md#resource-ids).
 
 SMART (Node):
 
@@ -96,9 +97,9 @@ Against a replica, a read right after a write could be served before the replica
 
 ```ts
 const client = await dial(url);                          // read-your-writes on
-await client.create("Patient", patient);
+const created = await client.create("Patient", patient);  // the server assigns the id
 client.lastCommitTs;                                     // e.g. 4172n
-await client.doRequest("GET", "/Patient/p1");            // sends X-Refhir-Min-Ts: 4172
+await client.doRequest("GET", `/Patient/${created.id}`);  // sends X-Refhir-Min-Ts: 4172
 
 await dial(url, { readYourWrites: false });              // never send the header
 ```
@@ -107,7 +108,7 @@ With `readYourWrites: false`, `lastCommitTs` still tracks. In browsers, `fetch` 
 
 Failed mutations throw `OutcomeError` with `.outcome`. HTTP errors throw `HttpError` with `.status` and `.body`.
 
-After a dropped socket the client redials with backoff (50 ms doubling to 1 s, with jitter) until it is back or `close()` is called. Reconnect, batching, and protocol details match the Go client. See [clients/go/README.md](../go/README.md).
+After a dropped socket the client redials with backoff (50 ms doubling to 1 s, with jitter) until it is back or `close()` is called. If the server answers a redial with HTTP 401 or 403 (the token expired or was revoked, which the server enforces on open sockets), the session ends instead: every watch and `mutate` rejects with an `UpgradeError` (a subclass of `HttpError`, with `.status` and `.retryAfterMs`), as does `dial` if the first upgrade is refused. Any other refusal is retried after the longer of the backoff and the server's `Retry-After`, up to a minute. Only Node can see why an upgrade failed; in a browser every failure is retried. Batching and protocol details match the Go client (see [clients/go/README.md](../go/README.md)); the reconnect backoff differs. The protocol side of reconnecting is in [Reconnect and recovery](../../docs/sync-protocol.md#reconnect-and-recovery).
 
 ## Mock data
 

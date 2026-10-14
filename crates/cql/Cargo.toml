@@ -3,6 +3,10 @@ name = "refhir-cql"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CQL compilation and evaluation for SDC"
 
 [dependencies]
 serde_json = { workspace = true }

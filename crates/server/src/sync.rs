@@ -1,7 +1,7 @@
 //! WebSocket subscribe / mutate / transition.
 //!
-//! Convex `crates/sync/src/worker.rs` handles `ModifyQuerySet`, `Mutation`,
-//! and `Transition`. `udfPath` is a FHIR operation name such as `Patient/read`.
+//! The sync worker handles `ModifyQuerySet`, `Mutation` and `Transition` messages.
+//! `udfPath` is a FHIR operation name such as `Patient/read`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -142,6 +142,86 @@ struct LiveQuery {
     args: Value,
 }
 
+/// What a socket needs from the server to run its queries and be told when they change.
+struct Engine {
+    db: Arc<Database>,
+    catalog: Arc<RwLock<Catalog>>,
+    store: Arc<dyn ConformanceStore>,
+    inv_tx: tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
+}
+
+/// One socket's live queries, and the version it is at.
+#[derive(Default)]
+struct Live {
+    queries: HashMap<u64, LiveQuery>,
+    /// Where the socket is: a pushed `Transition` moves it on by one, and so does the answer to a
+    /// `ModifyQuerySet`.
+    version: u64,
+    /// Where the last `ModifyQuerySet` left the socket. No later change can be based on less: the
+    /// next one names this version, or a later one if pushes have moved the socket on since.
+    floor: u64,
+}
+
+/// When an open socket looks at its token again: now and then, and when the token runs out of its
+/// own accord. A socket with no token never does.
+struct TokenWatch {
+    every: Option<tokio::time::Interval>,
+    expires: Option<tokio::time::Instant>,
+}
+
+/// A token that lives longer than this is not given a timer; the periodic check covers it.
+const LONGEST_EXPIRY_TIMER: std::time::Duration = std::time::Duration::from_secs(10 * 365 * 86_400);
+
+impl TokenWatch {
+    fn new(session: Option<&SyncSession>) -> Self {
+        let Some((every, remaining)) = session.and_then(SyncSession::token_checks) else {
+            return Self {
+                every: None,
+                expires: None,
+            };
+        };
+        let every = (!every.is_zero()).then(|| {
+            let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval
+        });
+        Self {
+            every,
+            expires: (remaining < LONGEST_EXPIRY_TIMER)
+                .then(|| tokio::time::Instant::now() + remaining),
+        }
+    }
+
+    /// Resolves when the token is due to be looked at again, and never for a socket with none.
+    async fn due(&mut self) {
+        let expires = self.expires;
+        let expiry = async {
+            match expires {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        let tick = async {
+            match self.every.as_mut() {
+                Some(every) => {
+                    every.tick().await;
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            _ = expiry => {
+                // Once. If the token is somehow still good, the periodic check carries on.
+                self.expires = None;
+            }
+            _ = tick => {}
+        }
+    }
+}
+
+/// What a socket is told when it is closed because its token no longer stands.
+const TOKEN_ENDED: &str = "the token expired or was revoked";
+
 pub async fn handle_socket(
     socket: WebSocket,
     db: Arc<Database>,
@@ -153,8 +233,14 @@ pub async fn handle_socket(
 ) {
     let (mut sink, mut stream) = socket.split();
     let (inv_tx, mut inv_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut queries: HashMap<u64, LiveQuery> = HashMap::new();
-    let mut version: u64 = 0;
+    let engine = Engine {
+        db,
+        catalog,
+        store,
+        inv_tx,
+    };
+    let mut live = Live::default();
+    let mut watch = TokenWatch::new(session.as_ref());
 
     loop {
         tokio::select! {
@@ -169,7 +255,15 @@ pub async fn handle_socket(
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Text(text))) => {
-                        if handle_text(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), scope.as_ref(), upstream.as_ref(), &text).await.is_err() {
+                        // The token was checked when the socket opened. It is looked at again
+                        // before anything it asks for is run, so a revoked one does nothing more.
+                        if let Some(session) = session.as_ref() {
+                            if !session.is_live().await {
+                                let _ = fatal(&mut sink, TOKEN_ENDED).await;
+                                break;
+                            }
+                        }
+                        if handle_text(&mut sink, &engine, &mut live, session.as_ref(), scope.as_ref(), upstream.as_ref(), &text).await.is_err() {
                             break;
                         }
                     }
@@ -189,26 +283,32 @@ pub async fn handle_socket(
                     query_ids = ?ids,
                     "sync invalidation received, rerunning queries"
                 );
-                if push_updates(&mut sink, &db, &catalog, &store, &inv_tx, &mut queries, &mut version, session.as_ref(), scope.as_ref(), ids).await.is_err() {
+                if push_updates(&mut sink, &engine, &mut live, session.as_ref(), scope.as_ref(), ids).await.is_err() {
                     break;
+                }
+            }
+            // A socket that only listens sends nothing to check the token on, so it is also
+            // looked at on a timer, and when the token's own lifetime ends.
+            () = watch.due() => {
+                if let Some(session) = session.as_ref() {
+                    if !session.is_live().await {
+                        let _ = fatal(&mut sink, TOKEN_ENDED).await;
+                        break;
+                    }
                 }
             }
         }
     }
 
-    for query in queries.values() {
-        db.unsubscribe(query.token);
+    for query in live.queries.values() {
+        engine.db.unsubscribe(query.token);
     }
 }
 
 async fn handle_text(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
-    db: &Arc<Database>,
-    catalog: &Arc<RwLock<Catalog>>,
-    store: &Arc<dyn ConformanceStore>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
-    queries: &mut HashMap<u64, LiveQuery>,
-    version: &mut u64,
+    engine: &Engine,
+    live: &mut Live,
     session: Option<&SyncSession>,
     scope: Option<&Arc<RequestScope>>,
     upstream: Option<&Upstream>,
@@ -217,14 +317,13 @@ async fn handle_text(
     let message: ClientMessage = match serde_json::from_str(text) {
         Ok(message) => message,
         Err(err) => {
-            send_json(
-                sink,
-                &json!({"type": "FatalError", "message": err.to_string()}),
-            )
-            .await?;
+            fatal(sink, &err.to_string()).await?;
             return Err(());
         }
     };
+    let Engine {
+        db, catalog, store, ..
+    } = engine;
     match message {
         ClientMessage::ModifyQuerySet {
             base_version,
@@ -238,19 +337,27 @@ async fn handle_text(
                 modifications = modifications.len(),
                 "sync ModifyQuerySet"
             );
-            if base_version != *version {
-                send_json(
+            // The base is normally the version the socket is at. It can be an earlier one: a push
+            // moved the socket on after the client sent this, and the client has not read it yet.
+            // Anything from where the last change left the socket up to where it is now can only
+            // be that, so it is taken. Anything else is a client that has lost its place.
+            if base_version > live.version || base_version < live.floor {
+                fatal(
                     sink,
-                    &json!({
-                        "type": "FatalError",
-                        "message": format!("baseVersion {base_version} does not match {version}")
-                    }),
+                    &format!("baseVersion {base_version} does not match {}", live.version),
                 )
                 .await?;
                 return Err(());
             }
-            let start = *version;
-            *version = new_version;
+            let start = live.version;
+            // In step, the client names the next version. Out of step, it would name one the
+            // pushes have already used, so the answer carries on from where the socket is.
+            live.version = if base_version == start {
+                new_version
+            } else {
+                start + 1
+            };
+            live.floor = live.version;
             let mut transition = Vec::new();
             for modification in modifications {
                 match modification {
@@ -272,8 +379,8 @@ async fn handle_text(
                             scope.and_then(|scope| scope.governance().live_query_cap())
                         {
                             // Replacing a query is not holding another one.
-                            let others =
-                                queries.len() - usize::from(queries.contains_key(&query_id));
+                            let others = live.queries.len()
+                                - usize::from(live.queries.contains_key(&query_id));
                             if others >= cap {
                                 message.limit_reached();
                                 transition.push(query_failed(
@@ -290,7 +397,7 @@ async fn handle_text(
                         }
                         // Only now, with the new query let in, is the one it replaces let go: a
                         // client refused for going too fast keeps the subscription it had.
-                        if let Some(old) = queries.remove(&query_id) {
+                        if let Some(old) = live.queries.remove(&query_id) {
                             db.unsubscribe(old.token);
                         }
                         let args = match authorize(session, db, catalog, &udf_path, &args, true) {
@@ -302,14 +409,12 @@ async fn handle_text(
                             }
                         };
                         let added = message
-                            .run(add_query(
-                                db, catalog, store, inv_tx, query_id, &udf_path, args,
-                            ))
+                            .run(add_query(engine, query_id, &udf_path, args))
                             .await;
                         match added {
                             Ok((value, token, args)) => {
                                 message.done(200, || json_len(&value));
-                                queries.insert(
+                                live.queries.insert(
                                     query_id,
                                     LiveQuery {
                                         token,
@@ -331,7 +436,7 @@ async fn handle_text(
                         }
                     }
                     QueryModification::Remove { query_id } => {
-                        if let Some(old) = queries.remove(&query_id) {
+                        if let Some(old) = live.queries.remove(&query_id) {
                             db.unsubscribe(old.token);
                         }
                         transition.push(json!({
@@ -344,11 +449,11 @@ async fn handle_text(
             tracing::debug!(
                 target: ENGINE,
                 start_version = start,
-                end_version = *version,
+                end_version = live.version,
                 updates = transition.len(),
                 "sync Transition (query set change)"
             );
-            send_transition(sink, start, *version, transition).await
+            send_transition(sink, start, live.version, transition).await
         }
         ClientMessage::Mutation {
             request_id,
@@ -403,9 +508,17 @@ async fn handle_text(
             };
             // Only a replica that can reach a primary may need the arguments again, to forward.
             let replay = upstream.map(|_| args.clone());
-            let outcome = message
-                .run(execute(db, catalog, store, &udf_path, args))
-                .await;
+            // A batch has no commit of its own to be refused: each entry commits, or fails, by
+            // itself, so a replica would report its refusals one entry at a time inside a
+            // success. A batch that writes belongs to the primary, like any other write.
+            let outcome = if udf_path == "Bundle/batch" && db.is_read_only() && batch_writes(&args)
+            {
+                Err(RunError::Commit(CommitError::ReadOnly))
+            } else {
+                message
+                    .run(execute(db, catalog, store, &udf_path, args))
+                    .await
+            };
             let (response, status) = match outcome {
                 Ok(result) => (
                     json!({
@@ -453,6 +566,22 @@ async fn handle_text(
     }
 }
 
+/// Whether a batch has an entry that is not a read.
+fn batch_writes(args: &Value) -> bool {
+    let bundle = args.get("resource").unwrap_or(args);
+    bundle
+        .get("entry")
+        .and_then(Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .pointer("/request/method")
+                    .and_then(Value::as_str)
+                    .is_none_or(|method| !method.eq_ignore_ascii_case("GET"))
+            })
+        })
+}
+
 fn query_failed(query_id: u64, error: String) -> Value {
     json!({
         "type": "QueryFailed",
@@ -481,6 +610,9 @@ fn authorize(
         return Err("ImplementationGuide/$install requires authentication".into());
     }
     let Some(session) = session else {
+        if subscribe {
+            crate::auth::refuse_subscribed_write(path)?;
+        }
         let mut args = args.clone();
         crate::auth::strip_sdc_controls(&mut args);
         return Ok(args);
@@ -494,14 +626,17 @@ fn authorize(
 }
 
 async fn add_query(
-    db: &Arc<Database>,
-    catalog: &Arc<RwLock<Catalog>>,
-    store: &Arc<dyn ConformanceStore>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
+    engine: &Engine,
     query_id: u64,
     path: &str,
     args: Value,
 ) -> Result<(Value, SubToken, Value), String> {
+    let Engine {
+        db,
+        catalog,
+        store,
+        inv_tx,
+    } = engine;
     for _ in 0..8 {
         let result = execute(db, catalog, store, path, args.clone())
             .await
@@ -537,37 +672,33 @@ async fn add_query(
 
 async fn push_updates(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
-    db: &Arc<Database>,
-    catalog: &Arc<RwLock<Catalog>>,
-    store: &Arc<dyn ConformanceStore>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
-    queries: &mut HashMap<u64, LiveQuery>,
-    version: &mut u64,
+    engine: &Engine,
+    live: &mut Live,
     session: Option<&SyncSession>,
     scope: Option<&Arc<RequestScope>>,
     ids: HashSet<u64>,
 ) -> Result<(), ()> {
-    let start = *version;
-    *version += 1;
-    let end = *version;
+    let start = live.version;
+    live.version += 1;
+    let end = live.version;
     let mut transition = Vec::new();
     for query_id in ids {
-        let Some(query) = queries.get(&query_id) else {
+        let Some(query) = live.queries.get(&query_id) else {
             continue;
         };
         let path = query.path.clone();
         let args = query.args.clone();
         let token = query.token;
-        match rerun(db, catalog, store, inv_tx, token, query_id, &path, &args).await {
+        match rerun(engine, token, query_id, &path, &args).await {
             Ok((value, new_token)) => {
                 if let Some(patient) = session.and_then(|session| session.patient()) {
                     let allowed = {
-                        let loaded = catalog.read().expect("catalog");
-                        crate::auth::delivered_in_patient(db, &loaded, patient, &value)
+                        let loaded = engine.catalog.read().expect("catalog");
+                        crate::auth::delivered_in_patient(&engine.db, &loaded, patient, &value)
                     };
                     if allowed != Ok(true) {
-                        if let Some(old) = queries.remove(&query_id) {
-                            db.unsubscribe(old.token);
+                        if let Some(old) = live.queries.remove(&query_id) {
+                            engine.db.unsubscribe(old.token);
                         }
                         transition.push(json!({
                             "type": "QueryFailed",
@@ -578,7 +709,7 @@ async fn push_updates(
                         continue;
                     }
                 }
-                if let Some(query) = queries.get_mut(&query_id) {
+                if let Some(query) = live.queries.get_mut(&query_id) {
                     query.token = new_token;
                 }
                 transition.push(json!({
@@ -588,16 +719,19 @@ async fn push_updates(
                     "logLines": []
                 }));
             }
-            Err(err) => transition.push(json!({
-                "type": "QueryFailed",
-                "queryId": query_id,
-                "error": err,
-                "logLines": []
-            })),
+            Err(err) => {
+                // A failed query is over for the client: both shipped clients drop it on
+                // `QueryFailed`. The server lets it go too, or it would go on being run, and
+                // counted against `max_live_queries`, for a query nobody is listening to.
+                if let Some(old) = live.queries.remove(&query_id) {
+                    engine.db.unsubscribe(old.token);
+                }
+                transition.push(query_failed(query_id, err));
+            }
         }
     }
     if transition.is_empty() {
-        *version = start;
+        live.version = start;
         return Ok(());
     }
     tracing::debug!(
@@ -614,15 +748,18 @@ async fn push_updates(
 }
 
 async fn rerun(
-    db: &Arc<Database>,
-    catalog: &Arc<RwLock<Catalog>>,
-    store: &Arc<dyn ConformanceStore>,
-    inv_tx: &tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
+    engine: &Engine,
     token: SubToken,
     query_id: u64,
     path: &str,
     args: &Value,
 ) -> Result<(Value, SubToken), String> {
+    let Engine {
+        db,
+        catalog,
+        store,
+        inv_tx,
+    } = engine;
     for _ in 0..8 {
         let RunResult {
             value, ts, reads, ..
@@ -683,6 +820,14 @@ async fn send_transition(
         }),
     )
     .await
+}
+
+/// Tell the client why the connection is about to end. The caller then drops it.
+async fn fatal(
+    sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
+    message: &str,
+) -> Result<(), ()> {
+    send_json(sink, &json!({"type": "FatalError", "message": message})).await
 }
 
 async fn send_json(

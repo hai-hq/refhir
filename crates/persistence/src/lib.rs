@@ -1,11 +1,8 @@
 //! Persistence contract.
 //!
-//! Convex: `crates/common/src/persistence/mod.rs`
-//! `Persistence::write`, `PersistenceReader::index_scan`, `previous_revisions`,
-//! `load_documents`, `get_persistence_global`.
-//!
-//! Streams in Convex are `Vec` here. The rows and the timestamp rules are the same.
-//! `DocumentLogEntry::value` is JSON text, not `ResolvedDocument`.
+//! `Persistence::write` appends documents and index rows in one SQL transaction.
+//! `PersistenceReader` answers `index_scan`, `previous_revision` and `exact_revision` at a
+//! timestamp. Row streams are `Vec`s. `DocumentLogEntry::value` is JSON text.
 
 mod pool;
 
@@ -25,14 +22,13 @@ pub use audit_chain::*;
 pub use governance::*;
 
 /// How `Persistence::write` treats an existing primary key.
-/// Convex `ConflictStrategy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConflictStrategy {
     Error,
     Overwrite,
 }
 
-/// Convex `PersistenceGlobalKey`. Retention keys are not written yet.
+/// Keys of the persistence globals. Retention keys are not written yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceGlobalKey {
     /// Highest persisted timestamp. Written at persist time, so it can run ahead of what
@@ -66,7 +62,6 @@ impl PersistenceGlobalKey {
 }
 
 /// One document-log row. `value: None` is a tombstone.
-/// Convex `DocumentLogEntry`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DocumentLogEntry {
     pub ts: Timestamp,
@@ -82,7 +77,6 @@ impl DocumentLogEntry {
 }
 
 /// One index-log row. `value: None` is a tombstone.
-/// Convex `PersistenceIndexEntry` without backfill mode or `prev` pointers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistenceIndexEntry {
     pub ts: Timestamp,
@@ -91,7 +85,7 @@ pub struct PersistenceIndexEntry {
     pub value: Option<DocumentId>,
 }
 
-/// A live document returned by `index_scan`. Convex `LatestDocument`.
+/// A live document returned by `index_scan`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LatestDocument {
     pub ts: Timestamp,
@@ -185,7 +179,7 @@ impl LiveEntries {
     }
 }
 
-/// Inclusive start, exclusive end. Convex `TimestampRange`.
+/// Inclusive start, exclusive end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimestampRange {
     pub start_inclusive: Timestamp,
@@ -195,7 +189,7 @@ pub struct TimestampRange {
 /// Failure of a persistence call.
 ///
 /// `Uncertain` means the process cannot tell whether the SQL commit landed.
-/// Convex `track_and_write_to_persistence` treats that as fatal.
+/// The committer treats that as fatal.
 #[derive(Debug)]
 pub enum PersistError {
     Definite(String),
@@ -239,7 +233,7 @@ pub fn document_from_parts(
         None
     } else {
         Some(json_value.ok_or_else(|| {
-            PersistError::Definite(format!("live document {} at {ts} has no json", tablet))
+            PersistError::Definite(format!("live document {tablet} at {ts} has no json"))
         })?)
     };
     Ok(DocumentLogEntry {
@@ -263,14 +257,14 @@ pub trait PersistenceReader: Send + Sync {
         snapshot: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError>;
 
-    /// Convex `previous_revisions`: newest row with `ts < at`.
+    /// Newest row with `ts < at`.
     fn previous_revision(
         &self,
         id: &DocumentId,
         at: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError>;
 
-    /// Convex `previous_revisions_of_documents` / `EXACT_REV_QUERY`.
+    /// The row written at exactly `ts`.
     fn exact_revision(
         &self,
         id: &DocumentId,
@@ -285,7 +279,6 @@ pub trait PersistenceReader: Send + Sync {
 
     /// Latest index row per key with `ts <= read_timestamp`, skipping tombstones,
     /// joined to the document written in the same commit.
-    /// Convex `PersistenceReader::index_scan`.
     fn index_scan(
         &self,
         index_id: &IndexId,
@@ -392,7 +385,6 @@ pub trait Persistence: PersistenceReader {
     fn reader(&self) -> Arc<dyn PersistenceReader>;
 
     /// Documents and index rows in one SQL transaction.
-    /// Convex `Persistence::write`.
     fn write(
         &self,
         documents: &[DocumentLogEntry],

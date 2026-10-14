@@ -3,6 +3,10 @@ name = "refhir-sdc"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Structured Data Capture 4.0.0 operations"
 
 [dependencies]
 refhir-cql = { path = "../cql" }

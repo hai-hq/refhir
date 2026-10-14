@@ -609,8 +609,8 @@ impl Governance {
         // Without SMART nobody is known, and a 404 is an answer like any other.
         let refused = throttled || (self.auth && principal == "anonymous" && done.status >= 400);
         if self.config.request_log.store
-            && !(refused
-                && !self.within_budget("requests", self.config.request_log.refused_per_second))
+            && (!refused
+                || self.within_budget("requests", self.config.request_log.refused_per_second))
         {
             let params = done
                 .query

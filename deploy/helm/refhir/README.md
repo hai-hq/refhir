@@ -10,7 +10,7 @@ helm install refhir ./deploy/helm/refhir \
   --set conformance.packages[0]=hl7.fhir.us.core@6.1.0
 ```
 
-Production notes (Postgres URL, SMART secrets, export storage): [../production.md](../production.md).
+Production notes (Postgres URL, SMART secrets, export storage): [../production.md](../../production.md).
 
 Set `server.publicUrl` when SMART is enabled behind an ingress. Put credentials in `secretEnv` (creates a Secret and wires env vars).
 

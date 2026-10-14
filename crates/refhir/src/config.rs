@@ -413,12 +413,13 @@ impl ResolvedConfig {
                 ));
             }
         }
-        if file.database.postgres_url.is_some() && file.database.kind.as_deref() != Some("sqlite") {
-            if file.database.kind.as_deref() == Some("postgres") || file.database.kind.is_none() {
-                self.postgres = file.database.postgres_url.clone();
-                self.memory = false;
-                self.sqlite = None;
-            }
+        if file.database.postgres_url.is_some()
+            && file.database.kind.as_deref() != Some("sqlite")
+            && (file.database.kind.as_deref() == Some("postgres") || file.database.kind.is_none())
+        {
+            self.postgres = file.database.postgres_url.clone();
+            self.memory = false;
+            self.sqlite = None;
         }
 
         self.packages = package_plan_from_file(&file.fhir, &file.conformance)?;
@@ -933,7 +934,7 @@ mod tests {
             issuer = "https://idp.example"
             client_id = "refhir"
             allowed_claims = { organization_id = ["org_a", "org_b"] }
-            allowed_email_domains = ["boolbyte.com"]
+            allowed_email_domains = ["example.com"]
             patient_from_fhir_user = true
             [smart.oidc.fhir_user_lookup]
             system = "https://idp.example/sub"
@@ -944,7 +945,7 @@ mod tests {
         cfg.apply_file(&file).unwrap();
         let oidc = cfg.oidc.expect("oidc");
         assert_eq!(oidc.allowed_claims["organization_id"], ["org_a", "org_b"]);
-        assert_eq!(oidc.allowed_email_domains, ["boolbyte.com"]);
+        assert_eq!(oidc.allowed_email_domains, ["example.com"]);
         assert!(oidc.patient_from_fhir_user);
         let lookup = oidc.fhir_user_lookup.clone().expect("lookup");
         assert_eq!(lookup.resource_type, "Practitioner");
@@ -1217,7 +1218,7 @@ mod tests {
         assert!(cfg.governance.audit.chain_key.is_none());
         assert!(cfg.describe_governance().contains("chained with no key"));
         std::env::set_var("REFHIR_AUDIT_KEY", "0123456789abcdef0123456789abcdef");
-        apply_env(&mut cfg);
+        apply_env(&mut cfg).unwrap();
         std::env::remove_var("REFHIR_AUDIT_KEY");
         assert_eq!(
             cfg.governance.audit.chain_key.as_ref().map(|key| key.len()),
@@ -1231,7 +1232,7 @@ mod tests {
         assert!(cfg.governance.validate(false).is_ok());
         // Too short to be a secret is refused when the server starts.
         std::env::set_var("REFHIR_AUDIT_KEY", "short");
-        apply_env(&mut cfg);
+        apply_env(&mut cfg).unwrap();
         std::env::remove_var("REFHIR_AUDIT_KEY");
         assert!(cfg.governance.validate(false).is_err());
     }

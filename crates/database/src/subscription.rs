@@ -1,7 +1,6 @@
 //! Subscriptions woken when a published write overlaps their read set.
 //!
-//! Convex `crates/database/src/subscription.rs`. The sync worker reruns the
-//! FHIR operation after an `Invalidation`.
+//! The sync worker reruns the FHIR operation after an `Invalidation`.
 
 use std::collections::BTreeMap;
 

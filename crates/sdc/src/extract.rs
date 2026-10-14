@@ -174,10 +174,8 @@ fn extract_observation(questionnaire: &Json, response: &Json, entries: &mut Vec<
                         json!({"method": "PUT", "url": format!("Observation/{resource_id}")});
                 }
             }
-            if relationship == "component" {
-                if attach_component(entries, &entry) {
-                    continue;
-                }
+            if relationship == "component" && attach_component(entries, &entry) {
+                continue;
             }
             entries.push(entry);
             if relationship == "hasMember" {
@@ -244,10 +242,10 @@ fn attach_member(entries: &mut [Json]) {
 }
 
 fn value_key(item_type: &str, item: &Json) -> &'static str {
-    if item_type == "decimal" || item_type == "integer" {
-        if crate::ext::first_ext(item, UNIT).is_some() {
-            return "valueQuantity";
-        }
+    if (item_type == "decimal" || item_type == "integer")
+        && crate::ext::first_ext(item, UNIT).is_some()
+    {
+        return "valueQuantity";
     }
     match item_type {
         "boolean" => "valueBoolean",

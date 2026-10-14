@@ -4,9 +4,20 @@
 **/*.sqlite-shm
 .DS_Store
 
-docs/architecture.md
-.cursor/plans/haifhir_build_roadmap.plan.md
+# Local configuration. Copy refhir.toml.example; it can hold secrets.
+/refhir.toml
+.env
+.env.*
+
+# Where $export writes by default when a server runs from the repo root
+/export/
 
 # Default package download cache and the output of scripts/package-bundle.py
 .refhir/
 /dist/
+
+# Editor and assistant state, and private working notes
+.cursor/
+.claude/worktrees/
+.claude/settings.local.json
+docs/architecture.md

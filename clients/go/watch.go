@@ -125,7 +125,8 @@ func (w *Watch) waitAfter(ctx context.Context, after uint64) (json.RawMessage, e
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-w.client.root.Done():
-			return nil, errClosed
+			// Say why the session ended: Close, or a server that refused it for good.
+			return nil, w.client.closedErr()
 		}
 	}
 }

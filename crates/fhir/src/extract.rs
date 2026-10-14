@@ -971,7 +971,7 @@ fn quantities_of(items: &[refhir_fhirpath::Value]) -> Vec<Span> {
     for item in items {
         match item {
             refhir_fhirpath::Value::Quantity { value, unit, .. } => {
-                if let Some(exact) = value.to_string().parse::<f64>().ok() {
+                if let Ok(exact) = value.to_string().parse::<f64>() {
                     spans.push(point_span(exact, None, unit_code(unit)));
                 }
             }
@@ -979,7 +979,7 @@ fn quantities_of(items: &[refhir_fhirpath::Value]) -> Vec<Span> {
                 spans.push(point_span(*value as f64, None, None))
             }
             refhir_fhirpath::Value::Decimal { value, .. } => {
-                if let Some(exact) = value.to_string().parse::<f64>().ok() {
+                if let Ok(exact) = value.to_string().parse::<f64>() {
                     spans.push(point_span(exact, None, None));
                 }
             }
@@ -1193,9 +1193,8 @@ fn clock_start(time: &str) -> i64 {
 
 fn clock_seconds(time: &str) -> i64 {
     let (hour, minute, second) = clock_parts(time);
-    let step = if time.contains('.') {
-        1
-    } else if time.split(':').count() >= 3 {
+    // Fractions of a second and whole seconds both end one second after they start.
+    let step = if time.contains('.') || time.split(':').count() >= 3 {
         1
     } else if time.contains(':') {
         60

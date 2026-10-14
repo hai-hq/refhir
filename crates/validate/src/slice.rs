@@ -98,8 +98,7 @@ fn matches_slice(
                 types.iter().any(|item| {
                     item.profiles.iter().any(|profile| {
                         profiles.iter().any(|stated| {
-                            stated.trim_end_matches(|ch| ch == '|') == profile
-                                || stated.starts_with(profile)
+                            stated.trim_end_matches('|') == profile || stated.starts_with(profile)
                         })
                     }) || item.target_profiles.iter().any(|profile| {
                         profiles

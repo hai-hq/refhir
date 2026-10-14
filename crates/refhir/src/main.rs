@@ -99,6 +99,10 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 print_help();
                 return Ok(());
             }
+            "--version" | "-V" => {
+                println!("refhir {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "--config" => {
                 index += 1;
                 config_path = Some(std::path::PathBuf::from(required(
@@ -521,7 +525,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let policy = refhir_fhir::ReferencePolicy::parse(&cfg.references)
-        .ok_or_else(|| format!("--references must be strict or fhir"))?;
+        .ok_or_else(|| "--references must be strict or fhir".to_string())?;
     {
         let mut current = catalog.write().expect("catalog");
         current.set_reference_policy(policy);
@@ -574,6 +578,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             ready_timeout: Duration::from_secs(2),
             ready_cache: Duration::from_secs(1),
             min_ts_wait: Duration::from_millis(250),
+            sync_token_recheck: Duration::from_secs(30),
             // Export jobs are rows in the same database, so they outlive a restart.
             jobs: Some(refhir_server::SharedJobStore::new(job_store)),
             // So are usage, the request log and the audit trail.
@@ -829,6 +834,7 @@ fn print_help() {
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
          [--role primary|standby|replica] [--standby] [--primary-url url] [--db-pool n]\n\
          refhir migrate --status | --dry-run   (schema versions; see refhir migrate --help)\n\
+         refhir --version | -V                 (print the version and exit)\n\
          \n\
          Config file (optional): refhir.toml in the working directory, /etc/refhir/refhir.toml,\n\
          or REFHIR_CONFIG. CLI flags override the file. See refhir.toml.example.\n\

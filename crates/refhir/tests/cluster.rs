@@ -3,7 +3,7 @@
 //! These start the real binary, so they cover what the in-process tests cannot: process
 //! exit, a killed primary, the load balancer's view through `/healthz`. Each test creates a
 //! database of its own, because the writer lease is an advisory lock and those are per
-//! database. They need `HAIFHIR_POSTGRES_URL` (a role that may `CREATE DATABASE`); without it
+//! database. They need `REFHIR_TEST_POSTGRES_URL` (a role that may `CREATE DATABASE`); without it
 //! they are skipped, unless `REFHIR_REQUIRE_POSTGRES` is set, as it is in CI.
 
 use std::path::{Path, PathBuf};

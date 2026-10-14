@@ -1,10 +1,9 @@
 //! Snapshot, transaction, and one committer.
 //!
-//! Convex `crates/database/src/committer.rs`:
-//! `next_commit_ts`, `commit_has_conflict`, `write_to_persistence`, `publish_commit`.
-//! Read-only transactions skip persistence (`Committer::go` when `is_readonly`).
-//! An uncertain persist exits the process. Convex:
-//! "Write failed. Unsure if transaction committed to disk."
+//! The committer picks the next commit timestamp (`next_commit_ts`), checks the read set
+//! for conflicts (`validate_commit`), writes to persistence and publishes the commit
+//! (`publish_commit`). Read-only transactions skip persistence.
+//! An uncertain persist exits the process: it cannot tell whether the transaction reached disk.
 
 mod reads;
 mod snapshot_manager;
@@ -57,7 +56,7 @@ pub use transaction::{
     Stored, Transaction, WrittenId,
 };
 
-/// OCC conflict. Convex `ConflictingRead` reduced to the index key and write ts.
+/// OCC conflict, reduced to the index key and the write timestamp.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OccConflict {
     pub index_id: IndexId,
@@ -171,7 +170,6 @@ impl Committer {
         }
     }
 
-    /// Convex `Committer::next_commit_ts`.
     fn next_commit_ts(&mut self) -> Result<Timestamp, CommitError> {
         let latest = self.snapshot.latest_ts();
         let pending = self.pending.max_ts().unwrap_or(latest);
@@ -183,7 +181,6 @@ impl Committer {
         Ok(next)
     }
 
-    /// Convex `validate_commit` / `commit_has_conflict`.
     fn validate_commit(
         &mut self,
         reads: &ReadSet,
@@ -558,7 +555,7 @@ impl Database {
         Ok(commit_ts)
     }
 
-    /// Convex `publish_commit`: append the write log, push the snapshot, wake subscribers.
+    /// Append the write log, push the snapshot and wake subscribers.
     /// Waits until this timestamp is the oldest pending commit so publishes stay ordered.
     fn publish_commit(&self, ts: Timestamp, keys: Vec<(IndexId, Vec<u8>)>) {
         let waiting = Instant::now();

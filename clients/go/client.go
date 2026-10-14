@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,44 @@ var (
 	errClosed       = errors.New("refhir: client closed")
 	errDisconnected = errors.New("refhir: disconnected")
 )
+
+// UpgradeError is a /sync upgrade the server refused: it answered the WebSocket handshake with
+// an HTTP error. Dial returns it, and so does a session that could not dial again. A 401 or 403
+// is final: the session ends rather than dial a server that has said the token does not stand.
+type UpgradeError struct {
+	// Status is the HTTP status of the refusal.
+	Status int
+	// RetryAfter is how long the server's Retry-After header asked the client to wait, or zero.
+	RetryAfter time.Duration
+}
+
+func (e *UpgradeError) Error() string {
+	return fmt.Sprintf("refhir: the server refused the /sync upgrade: HTTP %d", e.Status)
+}
+
+// maxRetryAfter caps how long a Retry-After can hold a redial back.
+const maxRetryAfter = time.Minute
+
+// retryAfter reads a Retry-After header: a number of seconds, or an HTTP date.
+func retryAfter(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var wait time.Duration
+	if seconds, err := strconv.Atoi(value); err == nil {
+		wait = time.Duration(seconds) * time.Second
+	} else if when, err := http.ParseTime(value); err == nil {
+		wait = time.Until(when)
+	}
+	if wait < 0 {
+		return 0
+	}
+	if wait > maxRetryAfter {
+		return maxRetryAfter
+	}
+	return wait
+}
 
 // OutcomeError is a failed mutation. Outcome is the OperationOutcome JSON.
 type OutcomeError struct {
@@ -87,6 +126,11 @@ type Client struct {
 	flight    *flight
 	pending   map[uint64]chan mutationResult
 	closing   bool
+
+	// fatal is why the session ended when the server ended it (an upgrade it refused for good),
+	// rather than Close. It is written before the session is cancelled, so any goroutine that
+	// sees the cancellation sees it.
+	fatal error
 }
 
 type subscription struct {
@@ -97,8 +141,9 @@ type subscription struct {
 	sent  bool
 }
 
+// flight is the change to the query set that is waiting for its answer. The answer is the
+// Transition that holds one item for each modification in it, whichever version it is at.
 type flight struct {
-	base uint64
 	want map[uint64]string
 }
 
@@ -169,6 +214,15 @@ func Dial(ctx context.Context, baseURL string, opts ...Option) (*Client, error) 
 	return client, nil
 }
 
+// closedErr is the error for a call on a session that has ended: the refusal that ended it, or
+// errClosed when it was closed.
+func (c *Client) closedErr() error {
+	if c.fatal != nil {
+		return c.fatal
+	}
+	return errClosed
+}
+
 // Close shuts down the session.
 func (c *Client) Close() error {
 	c.cancel()
@@ -185,7 +239,7 @@ func (c *Client) Mutate(ctx context.Context, path string, args map[string]any) (
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.root.Done():
-		return nil, errClosed
+		return nil, c.closedErr()
 	}
 	select {
 	case result := <-resp:
@@ -193,7 +247,7 @@ func (c *Client) Mutate(ctx context.Context, path string, args map[string]any) (
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.root.Done():
-		return nil, errClosed
+		return nil, c.closedErr()
 	}
 }
 
@@ -205,7 +259,7 @@ func (c *Client) Watch(ctx context.Context, path string, args map[string]any) (*
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.root.Done():
-		return nil, errClosed
+		return nil, c.closedErr()
 	}
 	if _, err := watch.waitAfter(ctx, 0); err != nil {
 		watch.Close()
@@ -252,9 +306,10 @@ func (c *Client) finish() {
 		c.conn.Close(websocket.StatusNormalClosure, "")
 		c.conn = nil
 	}
-	c.failMutations(errClosed)
+	err := c.closedErr()
+	c.failMutations(err)
 	for _, sub := range c.subs {
-		sub.watch.fail(errClosed)
+		sub.watch.fail(err)
 	}
 	close(c.stopped)
 }
@@ -376,7 +431,7 @@ func (c *Client) flush() {
 		c.dropSocket()
 		return
 	}
-	c.flight = &flight{base: base, want: want}
+	c.flight = &flight{want: want}
 }
 
 func (c *Client) onMessage(data []byte) {
@@ -414,12 +469,14 @@ func (c *Client) onTransition(msg transitionMessage) {
 		c.dropSocket()
 		return
 	}
-	start := msg.StartVersion
 	c.version = msg.EndVersion
 	for _, mod := range msg.Modifications {
 		c.apply(mod)
 	}
-	if c.flight != nil && start == c.flight.base && c.flight.met(msg.Modifications) {
+	// A push can land between the change being sent and its answer, so the answer is not at the
+	// version the change was based on. It is found by what it holds: one item for each
+	// modification. The server answers the change before it pushes anything for what it added.
+	if c.flight != nil && c.flight.met(msg.Modifications) {
 		c.flight = nil
 		c.flush()
 	}
@@ -494,6 +551,11 @@ func (c *Client) onDown() {
 	}
 	conn, err := c.dialUntilCancelled()
 	if err != nil {
+		if !errors.Is(err, errClosed) {
+			// The server refused for good. The session ends, and says why.
+			c.fatal = err
+			c.cancel()
+		}
 		return
 	}
 	c.conn = conn
@@ -538,7 +600,16 @@ func (c *Client) dialUntilCancelled() (*websocket.Conn, error) {
 		if err == nil {
 			return conn, nil
 		}
-		timer := time.NewTimer(backoff)
+		wait := backoff
+		var refused *UpgradeError
+		if errors.As(err, &refused) {
+			// A token the server does not accept will not be accepted by asking again.
+			if refused.Status == http.StatusUnauthorized || refused.Status == http.StatusForbidden {
+				return nil, err
+			}
+			wait = max(wait, refused.RetryAfter)
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-c.root.Done():
 			timer.Stop()
@@ -607,8 +678,14 @@ func dialSocket(ctx context.Context, wsURL, token string) (*websocket.Conn, erro
 	if token != "" {
 		header.Set("Authorization", "Bearer "+token)
 	}
-	conn, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: header})
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{HTTPHeader: header})
 	if err != nil {
+		if resp != nil {
+			return nil, &UpgradeError{
+				Status:     resp.StatusCode,
+				RetryAfter: retryAfter(resp.Header.Get("Retry-After")),
+			}
+		}
 		return nil, err
 	}
 	conn.SetReadLimit(16 << 20)

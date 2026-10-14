@@ -3,6 +3,10 @@ name = "refhir-fhirpath"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FHIRPath 2.0 evaluator over FHIR JSON"
 
 [dependencies]
 regex = "1"

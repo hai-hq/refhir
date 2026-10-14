@@ -341,7 +341,7 @@ fn extension_object(
     (!object.is_empty()).then_some(Json::Object(object))
 }
 
-fn lookup<'a>(elems: &'a BTreeMap<String, Elem>, parent: &str, name: &str) -> Elem {
+fn lookup(elems: &BTreeMap<String, Elem>, parent: &str, name: &str) -> Elem {
     let direct = format!("{parent}.{name}");
     if let Some(elem) = elems.get(&direct) {
         return elem.clone();

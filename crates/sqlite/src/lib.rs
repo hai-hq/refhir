@@ -1,8 +1,6 @@
 //! SQLite document log, index log, and persistence globals.
 //!
-//! Convex: `crates/sqlite/src/lib.rs` (`DOCUMENTS_INIT`, `INDEXES_INIT`,
-//! `PERSISTENCE_GLOBALS_INIT`, `write`, `index_scan`). Here the schema is the versioned
-//! migrations in `migrations/` (see `docs/migrations.md`).
+//! The schema is the versioned migrations in `migrations/` (see `docs/migrations.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -190,7 +188,6 @@ impl PersistenceReader for SqlitePersistence {
         id: &DocumentId,
         at: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
-        // Convex `PREV_REV_QUERY`.
         self.one_document(
             "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
              WHERE table_id = ?1 AND id = ?2 AND ts < ?3 ORDER BY ts DESC LIMIT 1",
@@ -204,7 +201,6 @@ impl PersistenceReader for SqlitePersistence {
         id: &DocumentId,
         ts: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
-        // Convex `EXACT_REV_QUERY`.
         self.one_document(
             "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
              WHERE table_id = ?1 AND id = ?2 AND ts = ?3",
@@ -245,7 +241,6 @@ impl PersistenceReader for SqlitePersistence {
         interval: &Interval,
         order: Order,
     ) -> Result<Vec<IndexScanRow>, PersistError> {
-        // Convex `SqlitePersistence::_index_scan_inner`.
         // Index-only backfill rows use a later commit than the document, so the
         // document join is the latest live revision at the read timestamp.
         let upper = if interval.end.is_some() {
@@ -650,7 +645,7 @@ fn write_in_tx(
                 document.id.tablet.as_bytes(),
                 document.value,
                 deleted,
-                document.prev_ts.map(|ts| ts.to_i64().ok()).flatten(),
+                document.prev_ts.and_then(|ts| ts.to_i64().ok()),
             ])
             .map_err(definite)?;
         }

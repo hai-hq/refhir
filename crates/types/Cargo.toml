@@ -3,5 +3,9 @@ name = "refhir-types"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Identifiers, timestamps and key intervals shared by the ReFHIR engine"
 
 [dependencies]

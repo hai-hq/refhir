@@ -1,4 +1,4 @@
-import { errClosed, errDisconnected, OutcomeError } from "./errors.js";
+import { errClosed, errDisconnected, OutcomeError, UpgradeError } from "./errors.js";
 import { modifyQuerySet, mutationMessage, type QueryModification, type StateModification } from "./protocol.js";
 import type { SocketConnection } from "./socket.js";
 import { SOCKET_OPEN } from "./socket.js";
@@ -32,8 +32,11 @@ type Subscription = {
   sent: boolean;
 };
 
+/**
+ * A change to the query set that is waiting for its answer: the Transition that holds one item for
+ * each modification in it, whichever version it is at.
+ */
 type Flight = {
-  base: number;
   want: Map<number, string>;
 };
 
@@ -56,6 +59,8 @@ export class Client {
   private nextQuery = 1;
   private nextReq = 1;
   private closing = false;
+  /** Why the session ended, when the server ended it (an upgrade it refused for good). */
+  private terminal: Error | null = null;
   private wakeReconnect: (() => void) | null = null;
 
   private readonly subs = new Map<number, Subscription>();
@@ -114,6 +119,7 @@ export class Client {
 
   async mutate(path: string, args: Args): Promise<JsonValue> {
     return this.enqueue(async () => {
+      if (this.terminal) throw this.terminal;
       if (!this.socket) throw errDisconnected;
       const id = this.nextReq++;
       const result = new Promise<JsonValue>((resolve, reject) => {
@@ -131,6 +137,7 @@ export class Client {
       }),
     );
     await this.enqueue(async () => {
+      if (this.terminal) throw this.terminal;
       this.addWatch(path, args, watch);
     });
     try {
@@ -180,13 +187,22 @@ export class Client {
   private async reconnect(): Promise<void> {
     let backoff = RECONNECT_MIN_MS;
     while (!this.closing) {
+      let retryAfter = 0;
       try {
         await this.connectSocket();
         return;
-      } catch {
+      } catch (err) {
+        if (err instanceof UpgradeError) {
+          // A token the server does not accept will not be accepted by asking again.
+          if (err.status === 401 || err.status === 403) {
+            this.end(err);
+            return;
+          }
+          retryAfter = err.retryAfterMs;
+        }
         // fall through to the delay
       }
-      const delay = backoff / 2 + Math.random() * (backoff / 2);
+      const delay = Math.max(backoff / 2 + Math.random() * (backoff / 2), retryAfter);
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, delay);
         this.wakeReconnect = () => {
@@ -197,6 +213,17 @@ export class Client {
       this.wakeReconnect = null;
       backoff = Math.min(backoff * 2, RECONNECT_MAX_MS);
     }
+  }
+
+  /** The server refused the session for good: end it, and say why to everything waiting on it. */
+  private end(err: Error): void {
+    this.terminal = err;
+    this.closing = true;
+    this.failMutations(err);
+    for (const sub of this.subs.values()) {
+      sub.watch.fail(err);
+    }
+    this.subs.clear();
   }
 
   private resubscribe(): void {
@@ -252,7 +279,7 @@ export class Client {
     }
     const base = this.version;
     this.send(modifyQuerySet(base, base + 1, mods));
-    this.flight = { base, want };
+    this.flight = { want };
   }
 
   private onMessage(text: string): void {
@@ -298,12 +325,14 @@ export class Client {
       void this.dropSocket();
       return;
     }
-    const start = msg.startVersion;
     this.version = msg.endVersion;
     for (const mod of msg.modifications) {
       this.apply(mod);
     }
-    if (this.flight && start === this.flight.base && flightMet(this.flight, msg.modifications)) {
+    // A push can land between the change being sent and its answer, so the answer is not at the
+    // version the change was based on. It is found by what it holds: one item for each
+    // modification. The server answers the change before it pushes anything for what it added.
+    if (this.flight && flightMet(this.flight, msg.modifications)) {
       this.flight = null;
       this.flush();
     }

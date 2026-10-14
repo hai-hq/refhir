@@ -3,6 +3,10 @@ name = "refhir-persistence"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage contract for the ReFHIR document and index logs"
 
 [dependencies]
 refhir-types = { path = "../types" }

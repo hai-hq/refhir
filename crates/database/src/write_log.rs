@@ -1,6 +1,5 @@
 //! Write log and pending writes.
 //!
-//! Convex `crates/database/src/write_log.rs`:
 //! `WriteLog::is_stale` checks published commits in `(from, to]`.
 //! `PendingWrites::is_stale` checks commits validated but not yet published.
 

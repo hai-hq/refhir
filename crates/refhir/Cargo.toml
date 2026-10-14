@@ -3,6 +3,10 @@ name = "refhir"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ReFHIR: a reactive FHIR server"
 
 [dependencies]
 refhir-database = { path = "../database" }

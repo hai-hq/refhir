@@ -1,12 +1,21 @@
 //! Identifiers and timestamps shared by the engine.
-//!
-//! Convex equivalent: `Timestamp` and document/index ids in `crates/common`.
-//! ReFHIR keeps the same roles and drops packed Convex values.
 
 use std::fmt;
 
-/// Logical commit timestamp. Convex stores this as a newtype over `u64`
-/// (`Timestamp` in `crates/common`). The committer is the only writer.
+/// A value that does not fit the type it was meant for: a timestamp the database cannot store, or
+/// bytes that are not a valid name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidValue;
+
+impl fmt::Display for InvalidValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("value out of range")
+    }
+}
+
+impl std::error::Error for InvalidValue {}
+
+/// Logical commit timestamp, a newtype over `u64`. The committer is the only writer.
 /// Zero is the empty snapshot. Commits start at 1.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(u64);
@@ -16,22 +25,22 @@ impl Timestamp {
     /// Largest timestamp that still fits in a SQLite/Postgres BIGINT.
     pub const MAX_PERSISTED: Timestamp = Timestamp(i64::MAX as u64);
 
-    pub fn from_u64(value: u64) -> Result<Self, ()> {
+    pub fn from_u64(value: u64) -> Result<Self, InvalidValue> {
         if value > Self::MAX_PERSISTED.0 {
-            return Err(());
+            return Err(InvalidValue);
         }
         Ok(Timestamp(value))
     }
 
-    pub fn from_i64(value: i64) -> Result<Self, ()> {
+    pub fn from_i64(value: i64) -> Result<Self, InvalidValue> {
         if value < 0 {
-            return Err(());
+            return Err(InvalidValue);
         }
         Ok(Timestamp(value as u64))
     }
 
-    pub fn from_version_id(text: &str) -> Result<Self, ()> {
-        let value: u64 = text.parse().map_err(|_| ())?;
+    pub fn from_version_id(text: &str) -> Result<Self, InvalidValue> {
+        let value: u64 = text.parse().map_err(|_| InvalidValue)?;
         Self::from_u64(value)
     }
 
@@ -39,13 +48,13 @@ impl Timestamp {
         self.0
     }
 
-    pub fn to_i64(self) -> Result<i64, ()> {
-        i64::try_from(self.0).map_err(|_| ())
+    pub fn to_i64(self) -> Result<i64, InvalidValue> {
+        i64::try_from(self.0).map_err(|_| InvalidValue)
     }
 
-    /// Convex `Timestamp::succ`.
-    pub fn succ(self) -> Result<Self, ()> {
-        Self::from_u64(self.0.checked_add(1).ok_or(())?)
+    /// The next timestamp. Fails when there is none.
+    pub fn succ(self) -> Result<Self, InvalidValue> {
+        Self::from_u64(self.0.checked_add(1).ok_or(InvalidValue)?)
     }
 }
 
@@ -55,7 +64,7 @@ impl fmt::Display for Timestamp {
     }
 }
 
-/// FHIR resource type, stored as Convex `table_id` / tablet bytes.
+/// FHIR resource type, stored as the `table_id` of a document.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TabletId(String);
 
@@ -72,8 +81,8 @@ impl TabletId {
         self.0.as_bytes()
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
-        let name = std::str::from_utf8(bytes).map_err(|_| ())?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InvalidValue> {
+        let name = std::str::from_utf8(bytes).map_err(|_| InvalidValue)?;
         Ok(Self::new(name))
     }
 }
@@ -84,7 +93,7 @@ impl fmt::Display for TabletId {
     }
 }
 
-/// Index identity. Convex `IndexId`, here a name we declare (`Patient/by_id`).
+/// Index identity: a declared name such as `Patient/by_id`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IndexId(String);
 
@@ -101,8 +110,8 @@ impl IndexId {
         self.0.as_bytes()
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ()> {
-        let name = std::str::from_utf8(bytes).map_err(|_| ())?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, InvalidValue> {
+        let name = std::str::from_utf8(bytes).map_err(|_| InvalidValue)?;
         Ok(Self::new(name))
     }
 }
@@ -113,7 +122,7 @@ impl fmt::Display for IndexId {
     }
 }
 
-/// Convex `InternalDocumentId`: tablet plus id bytes.
+/// Document identity: the resource type (tablet) plus the id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentId {
     pub tablet: TabletId,
@@ -133,15 +142,15 @@ impl DocumentId {
     }
 }
 
-/// Scan direction. Convex `Order`.
+/// Scan direction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {
     Asc,
     Desc,
 }
 
-/// Inclusive start, exclusive end. `None` end means unbounded.
-/// Convex `Interval` over index key bytes.
+/// Interval over index key bytes. Inclusive start, exclusive end. `None` end means
+/// unbounded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Interval {
     pub start: Vec<u8>,
@@ -214,7 +223,7 @@ pub fn prefixable_key(value: &str) -> Vec<u8> {
 }
 
 /// Non-unique index key: field encoding, then the document id.
-/// Convex index keys include the id so `(index_id, key, ts)` stays unique
+/// The key includes the id so `(index_id, key, ts)` stays unique
 /// while a range scan still returns every match.
 pub fn token_key(token: &str, doc_id: &str) -> Vec<u8> {
     let mut key = exact_key(token);
