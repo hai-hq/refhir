@@ -1,11 +1,12 @@
 name: Release
 
 # Pushing a tag such as v0.1.0 builds the binaries and the container image, publishes a GitHub
-# release whose notes come from CHANGELOG.md, and then publishes the two clients: the Go module (by
-# tagging it) and the TypeScript package (to npm). See docs/releasing.md for the whole procedure.
+# release whose notes come from CHANGELOG.md, and then releases the two clients: the Go module (by
+# tagging it) and the TypeScript package (staged on npm, where a maintainer approves it with 2FA).
+# See docs/releasing.md for the whole procedure.
 #
 # "Run workflow" on a branch does a dry run: everything is built and checked, the npm package is
-# packed with `npm publish --dry-run`, and nothing is published.
+# checked with `npm stage publish --dry-run`, and nothing is published or staged.
 on:
   push:
     tags:
@@ -320,12 +321,15 @@ jobs:
           curl -fsS "https://proxy.golang.org/github.com/hai-hq/refhir/clients/go/@v/v${VERSION}.info" \
             || echo "::warning::the Go module proxy could not fetch v${VERSION} (is the repository public?)"
 
-  # The TypeScript client, as @haihq/refhir. Needs an NPM_TOKEN repository secret that may publish
-  # to the @haihq scope (docs/releasing.md, "One-time setup"). Without it the job says so and
-  # skips the publish, so a release is never held up by it. Safe to re-run: a version that is
-  # already on npm is left alone.
-  publish-npm:
-    name: Publish the TypeScript client
+  # The TypeScript client, as @haihq/refhir. npm does not let a CI token publish: the job *stages*
+  # the version with `npm stage publish`, and it goes live only when a maintainer approves it with
+  # two-factor authentication (on npmjs.com, or `npm stage approve`). So NPM_TOKEN should be a
+  # granular token with the "Read and write (stage only)" permission for the @haihq scope
+  # (docs/releasing.md, "One-time setup"); npm rejects a direct publish with such a token.
+  # Without the secret the job says so and stages nothing, so a release is never held up by it.
+  # A version that is already on npm, or already staged, is left alone.
+  stage-npm:
+    name: Stage the TypeScript client on npm
     needs: [verify, publish]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
@@ -343,6 +347,13 @@ jobs:
           node-version: "22"
           registry-url: https://registry.npmjs.org
 
+      # Staging needs npm 11.15 or later. The npm that comes with Node 22 is older.
+      - name: Install an npm that can stage
+        run: |
+          npm install -g "npm@^11.15.0"
+          npm --version
+          npm stage --help > /dev/null
+
       - name: Check for an npm token
         id: token
         env:
@@ -350,7 +361,7 @@ jobs:
         run: |
           if [[ -z "${NODE_AUTH_TOKEN}" ]]; then
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::NPM_TOKEN is not set, so the TypeScript client was not published. See docs/releasing.md."
+            echo "::warning::NPM_TOKEN is not set, so the TypeScript client was not staged. See docs/releasing.md."
           else
             echo "present=true" >> "$GITHUB_OUTPUT"
           fi
@@ -369,25 +380,62 @@ jobs:
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Build
+      # A version cannot be staged twice, and what npm says when you try is not documented, so
+      # look first. The listing is best effort: if it cannot be read, staging is tried anyway.
+      - name: Check whether this version is already staged
+        id: staged
         if: steps.token.outputs.present == 'true' && steps.exists.outputs.published == 'false'
+        continue-on-error: true
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          pattern="(^|[^0-9A-Za-z.-])${VERSION//./\\.}([^0-9A-Za-z.-]|$)"
+          if npm stage list "@haihq/refhir" 2> /dev/null | grep -E -q -- "${pattern}"; then
+            echo "staged=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@haihq/refhir@${VERSION} is already staged and waiting for approval"
+          else
+            echo "staged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.token.outputs.present == 'true' && steps.exists.outputs.published == 'false' && steps.staged.outputs.staged != 'true'
         working-directory: clients/ts
         run: |
           npm ci
           npm run build
 
-      # A pre-release goes under the "next" tag, so `npm install` does not pick it up. Provenance
-      # needs a public repository, so it is left off while the repository is private.
-      - name: Publish
-        if: steps.token.outputs.present == 'true' && steps.exists.outputs.published == 'false'
+      # A pre-release goes under the "next" tag (npm requires one for a pre-release), so
+      # `npm install` does not pick it up; the tag cannot be changed once the version is staged.
+      # Provenance needs a public repository, so it is left off while the repository is private.
+      # The first stage of a package that does not exist yet also creates a public placeholder
+      # version, 0.0.0-stage; the real version stays private until it is approved.
+      - name: Stage
+        if: steps.token.outputs.present == 'true' && steps.exists.outputs.published == 'false' && steps.staged.outputs.staged != 'true'
         working-directory: clients/ts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           DIST_TAG: ${{ needs.verify.outputs.prerelease == 'true' && 'next' || 'latest' }}
           PROVENANCE: ${{ github.event.repository.private && ' ' || '--provenance' }}
-        run: npm publish --access public --tag "${DIST_TAG}" ${PROVENANCE}
+        run: npm stage publish --access public --tag "${DIST_TAG}" ${PROVENANCE}
 
-  # The same package, packed but not published, so the pipeline can be checked on a branch.
+      - name: Say what is left to do
+        if: steps.token.outputs.present == 'true' && steps.exists.outputs.published == 'false'
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          {
+            echo "### @haihq/refhir@${VERSION} is staged, not published"
+            echo
+            echo "npm publishes it only when a maintainer approves it with two-factor authentication."
+            echo
+            echo "- On npmjs.com: open **@haihq/refhir**, then the **Staged Packages** tab, review it and **Approve**."
+            echo '- Or in a terminal: `npm stage list @haihq/refhir`, then `npm stage approve <stage-id>`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::@haihq/refhir@${VERSION} is staged. Approve it on npmjs.com, or with npm stage approve, to publish it."
+
+  # The same package, checked but neither staged nor published, so the pipeline can be tried on a
+  # branch.
   npm-dry-run:
     name: TypeScript client (dry run)
     needs: verify
@@ -403,9 +451,15 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Pack
+      - name: Install an npm that can stage
+        run: |
+          npm install -g "npm@^11.15.0"
+          npm --version
+          npm stage --help > /dev/null
+
+      - name: Check the package
         working-directory: clients/ts
         run: |
           npm ci
           npm run build
-          npm publish --dry-run --access public
+          npm stage publish --dry-run --access public
