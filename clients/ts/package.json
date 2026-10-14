@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hai-hq/refhir.git",
+    "url": "git+https://github.com/hai-hq/refhir.git",
     "directory": "clients/ts"
   },
   "homepage": "https://github.com/hai-hq/refhir/tree/main/clients/ts#readme",
