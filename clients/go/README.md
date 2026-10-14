@@ -4,7 +4,7 @@ Go client for [ReFHIR](https://github.com/hai-hq/refhir): reactive FHIR over the
 
 Module: `github.com/hai-hq/refhir/clients/go`  
 Package name: `refhir`  
-TypeScript sibling: [`clients/ts`](../ts) (`@hai-hq/refhir`)
+TypeScript sibling: [`clients/ts`](../ts) (`@haihq/refhir`)
 
 ## Requirements
 

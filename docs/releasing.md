@@ -14,7 +14,7 @@ after the tag, once the [one-time setup](#one-time-setup) is done.
 | `SHA256SUMS` | the GitHub release. Verify with `shasum -a 256 -c SHA256SUMS` |
 | `ghcr.io/hai-hq/refhir:X.Y.Z` and `:X.Y` (a multi-architecture image for amd64 and arm64), plus `:X` from 1.0 and `:latest` for stable releases | GitHub Container Registry |
 | the Go module `github.com/hai-hq/refhir/clients/go` at `vX.Y.Z` (the workflow creates the tag `clients/go/vX.Y.Z`) | the Go module proxy, on first `go get` |
-| `@hai-hq/refhir@X.Y.Z` (with npm provenance once the repository is public) | npm |
+| `@haihq/refhir@X.Y.Z` (with npm provenance once the repository is public) | npm |
 
 There are no Windows or Intel macOS binaries; build those from source. A pre-release tag such as
 `v0.2.0-rc.1` is marked as a pre-release on GitHub, never moves `:latest`, and is published to npm
@@ -30,7 +30,7 @@ version` in the root `Cargo.toml`, which every crate inherits and `refhir --vers
 1.0, a minor release may change configuration, the HTTP API or the `/sync` protocol, and the
 changelog says so. The clients are released at the same version:
 
-- `clients/ts`: the `version` in `package.json` and `package-lock.json` (`@hai-hq/refhir` on npm).
+- `clients/ts`: the `version` in `package.json` and `package-lock.json` (`@haihq/refhir` on npm).
   The workflow refuses to run if either differs from the server's version.
 - `clients/go`: a Go module in a subdirectory, so its tag carries the path: `clients/go/vX.Y.Z`.
   The workflow creates it at the commit the release tag points to.
@@ -60,7 +60,7 @@ changelog says so. The clients are released at the same version:
    changelog section, or a TypeScript client at another version, before it builds anything.
 5. **Check the result.** The release page lists three archives and `SHA256SUMS`;
    `docker run --rm ghcr.io/hai-hq/refhir:X.Y.Z --version` prints `refhir X.Y.Z`;
-   `npm view @hai-hq/refhir@X.Y.Z version` and
+   `npm view @haihq/refhir@X.Y.Z version` and
    `go list -m github.com/hai-hq/refhir/clients/go@vX.Y.Z` find the clients.
 
 The clients are published after the GitHub release, and only if it succeeded, in two jobs of their
@@ -69,10 +69,10 @@ that already points at the release commit, and a version that is already on npm,
 
 ## One-time setup
 
-1. **npm.** Create the `hai-hq` organization on [npmjs.com](https://www.npmjs.com) (the scope
-   `@hai-hq` has to exist before a package can be published under it), then create a *granular
-   access token* with read and write access to packages in that scope, and with two-factor
-   authentication bypass for automation. Store it as the repository secret `NPM_TOKEN`:
+1. **npm.** The organization is `haihq` on [npmjs.com](https://www.npmjs.com) (not `hai-hq`, which
+   is the GitHub organization), so the package is `@haihq/refhir`. Create a *granular access
+   token* with read and write access to packages in that scope, and with two-factor authentication
+   bypass for automation. Store it as the repository secret `NPM_TOKEN`:
 
    ```bash
    gh secret set NPM_TOKEN --repo hai-hq/refhir

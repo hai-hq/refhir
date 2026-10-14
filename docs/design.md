@@ -66,7 +66,7 @@ ReFHIR aims to provide:
 - real-time synchronization of query results;
 - consistent results across transactions;
 - reconnect and recovery semantics;
-- an ergonomic developer SDK (Go: `github.com/hai-hq/refhir/clients/go`; TypeScript: `@hai-hq/refhir` in `clients/ts`);
+- an ergonomic developer SDK (Go: `github.com/hai-hq/refhir/clients/go`; TypeScript: `@haihq/refhir` in `clients/ts`);
 - standard FHIR REST for existing clients;
 - primitives for AI-agent context synchronization;
 - ways to detect when state an agent depends on has changed.

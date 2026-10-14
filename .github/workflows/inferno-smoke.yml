@@ -3,9 +3,12 @@ name: SMART Inferno smoke
 permissions:
   contents: read
 
+# A conformance run takes about five minutes, so it runs when main changes what it covers, and on
+# demand for a branch (Actions -> SMART Inferno smoke -> Run workflow), not on every pull request.
 on:
   workflow_dispatch:
-  pull_request:
+  push:
+    branches: [main]
     paths:
       - "crates/server/src/auth/**"
       - "crates/server/src/http.rs"

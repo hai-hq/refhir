@@ -35,6 +35,13 @@ CI runs these, so run them first:
 | `clients/ts` | `cd clients/ts && npm ci && npm run build && npm test` |
 | Markdown | `python3 scripts/check-doc-links.py` |
 
+A pull request runs the fast checks: formatting, clippy, build and test, dependency policy, the
+Helm chart and the docs links. The slower ones run on `main`: the Postgres and multi-process
+tests, the release build, the container image, and the SMART Inferno conformance run. If your
+change touches the database code, the Dockerfile or SMART, run those on your branch first, from
+the Actions tab (*CI → Run workflow*, and *SMART Inferno smoke → Run workflow*), or locally with
+the instructions in [docs/development.md](docs/development.md).
+
 Then:
 
 1. **Add a test** that fails without your change. Handlers and the engine have unit tests next to

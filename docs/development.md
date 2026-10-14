@@ -70,6 +70,11 @@ service, and sets `REFHIR_REQUIRE_POSTGRES=1` so that a missing database fails t
   `REFHIR_REQUIRE_POSTGRES_TLS` is set.
 
 The workflow that runs all of this is [.github/workflows/ci.yml](../.github/workflows/ci.yml).
+Which jobs run where: a pull request runs formatting, clippy, build and test, `cargo deny`, the
+Helm chart and the docs links. The jobs marked "main only" there (Postgres tests, the release
+build, the container image) run on every push to `main`, and so does the Inferno conformance
+workflow when SMART code changes. To run them on a branch, use *Run workflow* on the Actions tab;
+tick *perf* to include the 45-minute performance check as well.
 
 ## Changing the schema
 

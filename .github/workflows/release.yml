@@ -320,8 +320,8 @@ jobs:
           curl -fsS "https://proxy.golang.org/github.com/hai-hq/refhir/clients/go/@v/v${VERSION}.info" \
             || echo "::warning::the Go module proxy could not fetch v${VERSION} (is the repository public?)"
 
-  # The TypeScript client, as @hai-hq/refhir. Needs an NPM_TOKEN repository secret that may publish
-  # to the @hai-hq scope (docs/releasing.md, "One-time setup"). Without it the job says so and
+  # The TypeScript client, as @haihq/refhir. Needs an NPM_TOKEN repository secret that may publish
+  # to the @haihq scope (docs/releasing.md, "One-time setup"). Without it the job says so and
   # skips the publish, so a release is never held up by it. Safe to re-run: a version that is
   # already on npm is left alone.
   publish-npm:
@@ -362,9 +362,9 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          if npm view "@hai-hq/refhir@${VERSION}" version > /dev/null 2>&1; then
+          if npm view "@haihq/refhir@${VERSION}" version > /dev/null 2>&1; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "@hai-hq/refhir@${VERSION} is already on npm"
+            echo "@haihq/refhir@${VERSION} is already on npm"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi
