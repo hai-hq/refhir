@@ -2,13 +2,13 @@
 
 Node client for [ReFHIR](https://github.com/hai-hq/refhir): reactive FHIR over `/sync`, plus HTTP for metadata.
 
-Package: `@hai-hq/refhir`  
+Package: `@haihq/refhir`  
 **Node 20+** uses `ws` with `Authorization` on upgrade. **Browsers** use native `WebSocket` and pass SMART tokens as `?access_token=` on `/sync` (server accepts header or query).
 
 ## Install
 
 ```bash
-npm install @hai-hq/refhir
+npm install @haihq/refhir
 ```
 
 From this repo:
@@ -22,7 +22,7 @@ npm run build
 ## Quick start
 
 ```ts
-import { dial } from "@hai-hq/refhir";
+import { dial } from "@haihq/refhir";
 
 const client = await dial("http://127.0.0.1:8080");
 await client.create("Patient", {
@@ -51,7 +51,7 @@ const client = await dial("http://127.0.0.1:8080", { token: accessToken });
 Browser (or explicit runtime):
 
 ```ts
-import { dial, dialBrowser } from "@hai-hq/refhir";
+import { dial, dialBrowser } from "@haihq/refhir";
 
 const client = await dialBrowser("https://refhir.example.com", { token: accessToken });
 // equivalent: dial(url, { token, runtime: "browser" })
@@ -60,7 +60,7 @@ const client = await dialBrowser("https://refhir.example.com", { token: accessTo
 React live search:
 
 ```tsx
-import { useFHIRQuery } from "@hai-hq/refhir/react";
+import { useFHIRQuery } from "@haihq/refhir/react";
 
 function PatientList() {
   const { data, loading, error } = useFHIRQuery({

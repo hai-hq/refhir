@@ -58,7 +58,7 @@ More in [Getting started](docs/getting-started.md): the Docker image, configurat
 ## Live queries from a client
 
 ```ts
-import { dial } from "@hai-hq/refhir";
+import { dial } from "@haihq/refhir";
 
 const client = await dial("http://127.0.0.1:8080");
 const watch = await client.search("Patient", { active: "true" });
@@ -67,7 +67,7 @@ console.log(watch.latest());      // the current matches
 console.log(await watch.next());  // the next committed result
 ```
 
-In React, `useFHIRQuery` from `@hai-hq/refhir/react` does the same and re-renders on every
+In React, `useFHIRQuery` from `@haihq/refhir/react` does the same and re-renders on every
 change. A Go client is in [`clients/go`](clients/go/README.md). Both share the
 [`/sync` wire protocol](docs/sync-protocol.md), so a client in another language is small. The
 packages are published with the first release; until then build them from [`clients/`](clients).

@@ -1,11 +1,19 @@
 name: CI
 
+# Pull requests get the fast checks: formatting, clippy, build and test, dependency policy, the Helm
+# chart and the docs links. The slower ones (Postgres and multi-process tests, the release build and
+# the container image) run on every push to main, and on demand for a branch: Actions -> CI -> Run
+# workflow. Those jobs are marked "main only" below.
 on:
   push:
     branches: [main]
   pull_request:
-  # Run the performance check by hand: Actions -> CI -> Run workflow.
   workflow_dispatch:
+    inputs:
+      perf:
+        description: "Also run the performance check (about 45 minutes)"
+        type: boolean
+        default: false
 
 # Workflows get a read-only token unless a job asks for more.
 permissions:
@@ -99,8 +107,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # Main only.
   postgres:
     name: Postgres tests
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -147,8 +157,10 @@ jobs:
       - name: Test several processes on one database
         run: cargo test -p refhir --locked --test cluster -- --test-threads=4
 
+  # Main only.
   release-binary:
     name: Build release binary
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -167,10 +179,11 @@ jobs:
       - name: Smoke test the binary
         run: target/release/refhir --version
 
-  # The image is what most people run, so build it on every change. It is not pushed: only the
-  # release workflow publishes.
+  # The image is what most people run, so build it on every push to main. It is not pushed: only
+  # the release workflow publishes. Main only.
   docker:
     name: Build container image
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -235,11 +248,11 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
 
   # The plan's performance exit criteria need a quiet machine and a few minutes, so they are not
-  # part of every push. Trigger this job from the Actions tab; it fails if a pool of 8 does not
-  # beat a pool of 1 on the search-heavy workload, and uploads the raw results.
+  # part of every push. Trigger this job from the Actions tab with "perf" ticked; it fails if a pool
+  # of 8 does not beat a pool of 1 on the search-heavy workload, and uploads the raw results.
   perf-smoke:
     name: Perf criteria (manual)
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && inputs.perf
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
