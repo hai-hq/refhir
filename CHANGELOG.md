@@ -4,11 +4,13 @@ All notable changes to ReFHIR are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-While the version is 0.x, a minor release can change configuration, the HTTP API or the `/sync`
+While the version is 0.x, a release can change configuration, the HTTP API or the `/sync`
 protocol. When it does, the entry says so under **Changed**. Database upgrades are forward-only
 ([Schema migrations](docs/migrations.md)): back up before you upgrade.
 
 ## [Unreleased]
+
+## [0.0.1] - 2026-10-15
 
 The first release. Everything below is new.
 
@@ -53,4 +55,5 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/commits/main
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/hai-hq/refhir/releases/tag/v0.0.1
