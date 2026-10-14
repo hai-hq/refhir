@@ -257,9 +257,7 @@ fn optional<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
             }
         }
     }
-    let Some(parameters) = parameters(args) else {
-        return None;
-    };
+    let parameters = parameters(args)?;
     for name in names {
         for parameter in parameters {
             if parameter.get("name").and_then(|value| value.as_str()) != Some(*name) {

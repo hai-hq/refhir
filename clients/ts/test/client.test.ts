@@ -6,7 +6,7 @@ import { attachAccessToken, splitBase } from "../src/url.js";
 import { freePort, startServer } from "./server.js";
 
 describe("wire", () => {
-  it("uses Convex field names", () => {
+  it("uses the sync protocol field names", () => {
     const q = modifyQuerySet(0, 1, [
       { type: "Add", queryId: 1, udfPath: "Patient/search", args: { active: "true" } },
     ]);

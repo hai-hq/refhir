@@ -1,8 +1,7 @@
 //! Postgres `Persistence` implementation.
 //!
-//! Convex: `crates/postgres` implements the same `Persistence` trait as SQLite.
-//! Tables match `DOCUMENTS_INIT` / `INDEXES_INIT` / `PERSISTENCE_GLOBALS_INIT`; the schema is
-//! the versioned migrations in `migrations/` (see `docs/migrations.md`).
+//! It implements the same `Persistence` trait as SQLite. The schema is the versioned
+//! migrations in `migrations/` (see `docs/migrations.md`).
 //! SQLite stays the default for local runs.
 
 use std::sync::Arc;
@@ -713,7 +712,7 @@ fn write_in_tx(
     };
     for document in documents {
         let deleted: i32 = if document.value.is_none() { 1 } else { 0 };
-        let prev = document.prev_ts.map(|ts| ts.to_i64().ok()).flatten();
+        let prev = document.prev_ts.and_then(|ts| ts.to_i64().ok());
         tx.execute(
             document_sql,
             &[
@@ -961,13 +960,15 @@ mod tests {
     /// The Postgres URL for tests. CI sets `REFHIR_REQUIRE_POSTGRES` so a missing database
     /// fails the test instead of letting it pass without running anything.
     pub(crate) fn test_url(what: &str) -> Option<String> {
-        match std::env::var("HAIFHIR_POSTGRES_URL") {
+        match std::env::var("REFHIR_TEST_POSTGRES_URL") {
             Ok(url) => Some(url),
             Err(_) if std::env::var("REFHIR_REQUIRE_POSTGRES").is_ok() => {
-                panic!("REFHIR_REQUIRE_POSTGRES is set but HAIFHIR_POSTGRES_URL is not ({what})")
+                panic!(
+                    "REFHIR_REQUIRE_POSTGRES is set but REFHIR_TEST_POSTGRES_URL is not ({what})"
+                )
             }
             Err(_) => {
-                eprintln!("HAIFHIR_POSTGRES_URL unset, skipping {what}");
+                eprintln!("REFHIR_TEST_POSTGRES_URL unset, skipping {what}");
                 None
             }
         }
@@ -1542,10 +1543,8 @@ mod tests {
             .iter()
             .map(|stored| stored.row.id)
             .collect::<Vec<_>>();
-        sql(format!(
-            "INSERT INTO audit_log (ts, request_id, source, action, subtype, outcome, status, principal) \
-             VALUES (9, 'made-up', 'http', 'R', 'read', 0, 200, 'client:a')"
-        ));
+        sql("INSERT INTO audit_log (ts, request_id, source, action, subtype, outcome, status, principal) \
+             VALUES (9, 'made-up', 'http', 'R', 'read', 0, 200, 'client:a')".to_string());
         let report = verify_audit_chain(&persistence, Some(&key), None).unwrap();
         assert_eq!(report.breaks.len(), 1);
         assert_eq!(report.breaks[0].problem, ChainProblem::Unhashed);

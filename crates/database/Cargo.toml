@@ -3,6 +3,10 @@ name = "refhir-database"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Snapshots, transactions, the committer and subscriptions for ReFHIR"
 
 [dependencies]
 refhir-persistence = { path = "../persistence" }

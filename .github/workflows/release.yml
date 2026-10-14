@@ -1,48 +1,263 @@
 name: Release
 
+# Pushing a tag such as v0.1.0 builds the binaries and the container image, and publishes a GitHub
+# release whose notes come from CHANGELOG.md. See docs/releasing.md for the whole procedure.
+#
+# "Run workflow" on a branch does a dry run: everything is built and checked, nothing is published.
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
-  build-binaries:
-    name: Build release binaries
+  # Stops a bad tag before anything is built: the tag must match the version in Cargo.toml, and
+  # CHANGELOG.md must have a section for it.
+  verify:
+    name: Check the tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release -p refhir
-      - run: |
-          mkdir dist
-          cp target/release/refhir dist/refhir-linux-amd64
-          tar -czf refhir-linux-amd64.tar.gz -C dist refhir-linux-amd64
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: refhir-linux-amd64.tar.gz
+      - name: Checkout
+        uses: actions/checkout@v4
 
-  docker:
-    name: Publish container image
-    runs-on: ubuntu-latest
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Read the version
+        id: version
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "refhir") | .version')"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [[ "${tag_version}" != "${cargo_version}" ]]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match version ${cargo_version} in Cargo.toml"
+              exit 1
+            fi
+          fi
+          echo "version=${cargo_version}" >> "$GITHUB_OUTPUT"
+          if [[ "${cargo_version}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract the release notes
+        run: scripts/release-notes.sh "${{ steps.version.outputs.version }}" > release-notes.md
+
+      - name: Keep the release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  binaries:
+    name: Binary (${{ matrix.name }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            os: ubuntu-latest
+          # Native arm64 runners are free for public repositories.
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+          - name: macos-arm64
+            os: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Build
+        run: cargo build --release --locked -p refhir
+
+      - name: Check the binary reports the version being released
+        run: |
+          got="$(target/release/refhir --version)"
+          want="refhir ${{ needs.verify.outputs.version }}"
+          [[ "${got}" == "${want}" ]] || { echo "::error::binary says '${got}', expected '${want}'"; exit 1; }
+
+      - name: Package
+        run: |
+          name="refhir-${{ needs.verify.outputs.version }}-${{ matrix.name }}"
+          mkdir -p "dist/${name}"
+          cp target/release/refhir LICENSE NOTICE README.md CHANGELOG.md "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      - name: Keep the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+
+  # One image per architecture, each built on a runner of its own (no emulation), then joined into
+  # one multi-architecture tag by the next job.
+  image:
+    name: Image (${{ matrix.platform }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            os: ubuntu-latest
+          - platform: linux/arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=ReFHIR
+            org.opencontainers.image.description=A reactive FHIR R4 server
+            org.opencontainers.image.licenses=Apache-2.0
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.ref_type == 'tag' }}
+
+      - name: Export the digest
+        if: github.ref_type == 'tag'
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Keep the digest
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+
+  image-manifest:
+    name: Image (multi-arch tag)
+    needs: [verify, image]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Collect the digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          # 1.2.3, 1.2 and (from 1.0 on) 1. A pre-release such as 1.2.3-rc.1 gets its own tag
+          # only; "latest" is added for stable releases by the action's default.
           tags: |
-            ghcr.io/hai-hq/refhir:${{ github.ref_name }}
-            ghcr.io/hai-hq/refhir:latest
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref_name, 'v0.') }}
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the manifest list
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.IMAGE }}@sha256:%s ' *)
+
+      - name: Inspect the result
+        run: docker buildx imagetools inspect "${{ env.IMAGE }}:${{ needs.verify.outputs.version }}"
+
+  publish:
+    name: Publish the GitHub release
+    needs: [verify, binaries, image-manifest]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download the archives and notes
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+        run: |
+          cat artifacts/dist-*/*.sha256 > SHA256SUMS
+          flags=()
+          if [[ "${PRERELEASE}" == "true" ]]; then flags+=(--prerelease); fi
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "ReFHIR ${VERSION}" \
+            --notes-file artifacts/release-notes/release-notes.md \
+            "${flags[@]}" \
+            artifacts/dist-*/*.tar.gz SHA256SUMS

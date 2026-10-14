@@ -1,5 +1,6 @@
 import WebSocket from "ws";
 
+import { parseRetryAfter, UpgradeError } from "./errors.js";
 import type { SocketConnection } from "./socket.js";
 
 export async function openNodeSocket(
@@ -11,6 +12,14 @@ export async function openNodeSocket(
   const socket = new WebSocket(wsURL, { headers });
   await new Promise<void>((resolve, reject) => {
     socket.once("open", () => resolve());
+    // The server answered the handshake with an HTTP error: say which, so the client can tell a
+    // token that will never work (401) from a server that is busy (429) or down.
+    socket.once("unexpected-response", (req, res) => {
+      const header = res.headers["retry-after"];
+      const retryAfter = parseRetryAfter(Array.isArray(header) ? header[0] : header);
+      reject(new UpgradeError(res.statusCode ?? 0, retryAfter));
+      req.destroy();
+    });
     socket.once("error", (err) => reject(err));
   });
   return wrapNode(socket);

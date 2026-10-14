@@ -91,7 +91,7 @@ fn parse_element(input: &str) -> Result<(Value, &str), String> {
     let (name, input) = take_name(input)?;
     let (attrs, input) = take_attrs(input)?;
     if let Some(rest) = input.strip_prefix("/>") {
-        return Ok((element_value(&name, &attrs, &Map::new()), rest));
+        return Ok((element_value(name, &attrs, &Map::new()), rest));
     }
     let input = input
         .strip_prefix('>')
@@ -100,14 +100,14 @@ fn parse_element(input: &str) -> Result<(Value, &str), String> {
     let mut input = input;
     loop {
         let trimmed = input.trim_start();
-        if trimmed.starts_with("</") {
-            let trimmed = trimmed[2..].trim_start();
+        if let Some(closing) = trimmed.strip_prefix("</") {
+            let trimmed = closing.trim_start();
             let (end, rest) = take_name(trimmed)?;
             if end != name {
                 return Err(format!("expected </{name}>"));
             }
             let rest = rest.trim_start().strip_prefix('>').unwrap_or(rest);
-            return Ok((element_value(&name, &attrs, &children), rest));
+            return Ok((element_value(name, &attrs, &children), rest));
         }
         if trimmed.starts_with('<') {
             let (child, rest) = parse_element(trimmed)?;

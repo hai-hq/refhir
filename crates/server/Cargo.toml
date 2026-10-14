@@ -3,6 +3,10 @@ name = "refhir-server"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP, SMART on FHIR and /sync WebSocket server for ReFHIR"
 
 [dependencies]
 refhir-database = { path = "../database" }
@@ -30,3 +34,9 @@ refhir-database = { path = "../database", features = ["test-util"] }
 refhir-sqlite = { path = "../sqlite" }
 tokio-tungstenite = { workspace = true }
 tower = { workspace = true }
+
+[lints.clippy]
+# Handlers and guards refuse a request by returning the `Response` they would have sent
+# (`Err(response)`), so it can be returned with `?` or `return`. `Response` is large, and boxing it
+# at every site would only add noise.
+result_large_err = "allow"

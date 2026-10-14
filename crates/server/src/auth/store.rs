@@ -433,7 +433,7 @@ impl SmartStore {
             token.to_string(),
             Token {
                 scopes: scopes.iter().map(|scope| (*scope).to_string()).collect(),
-                patient: patient.map(|id| normalize_patient_id(id)),
+                patient: patient.map(normalize_patient_id),
                 encounter: None,
                 fhir_user: None,
                 client_id: "test".into(),
@@ -730,8 +730,7 @@ mod tests {
             }
         }
         let err = SmartStore::try_open(Arc::new(ReadOnly(Default::default())), "s")
-            .err()
-            .expect("seeding needs a writable database");
+            .expect_err("seeding needs a writable database");
         assert!(err.to_string().contains("read-only"), "{err}");
     }
 

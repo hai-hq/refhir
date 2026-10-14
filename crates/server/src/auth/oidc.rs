@@ -665,35 +665,33 @@ mod tests {
 
     #[test]
     fn allowed_email_domains_match_the_whole_domain_of_a_verified_address() {
-        let oidc = gated(&[], &["boolbyte.com", "@Example.org"]);
+        let oidc = gated(&[], &["example.com", "@Example.org"]);
         let admit = |claims: Value| oidc.admit("u", &claims).is_ok();
         let verified = |email: &str| serde_json::json!({"email": email, "email_verified": true});
-        assert!(admit(verified("a@boolbyte.com")));
-        assert!(admit(verified("A@BoolByte.COM")));
+        assert!(admit(verified("a@example.com")));
+        assert!(admit(verified("A@Example.COM")));
         assert!(admit(verified("a@example.org")));
         // A token that does not say the address is verified does not count.
-        assert!(!admit(serde_json::json!({"email": "a@boolbyte.com"})));
-        assert!(!admit(serde_json::json!({"email": "a@evil-boolbyte.com"})));
-        assert!(!admit(serde_json::json!({"email": "a@mail.boolbyte.com"})));
+        assert!(!admit(serde_json::json!({"email": "a@example.com"})));
+        assert!(!admit(serde_json::json!({"email": "a@evil-example.com"})));
+        assert!(!admit(serde_json::json!({"email": "a@mail.example.com"})));
+        assert!(!admit(serde_json::json!({"email": "example.com@evil.com"})));
         assert!(!admit(
-            serde_json::json!({"email": "boolbyte.com@evil.com"})
+            serde_json::json!({"email": "a@example.com", "email_verified": false})
         ));
         assert!(!admit(
-            serde_json::json!({"email": "a@boolbyte.com", "email_verified": false})
-        ));
-        assert!(!admit(
-            serde_json::json!({"email": "a@boolbyte.com", "email_verified": "false"})
+            serde_json::json!({"email": "a@example.com", "email_verified": "false"})
         ));
         assert!(!admit(serde_json::json!({"sub": "no-email"})));
     }
 
     #[test]
     fn claims_and_email_domains_must_both_pass() {
-        let oidc = gated(&[("organization_id", &["org_a"])], &["boolbyte.com"]);
+        let oidc = gated(&[("organization_id", &["org_a"])], &["example.com"]);
         assert!(oidc
             .admit(
                 "u",
-                &serde_json::json!({"organization_id": "org_a", "email": "a@boolbyte.com", "email_verified": true})
+                &serde_json::json!({"organization_id": "org_a", "email": "a@example.com", "email_verified": true})
             )
             .is_ok());
         assert!(oidc

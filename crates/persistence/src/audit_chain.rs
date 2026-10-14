@@ -326,7 +326,8 @@ mod tests {
         let mut with_id = row();
         with_id.id = 99;
         assert_eq!(base, audit_digest(Some(&key), &CHAIN_GENESIS, &with_id));
-        let edits: Vec<Box<dyn Fn(&mut AuditRow)>> = vec![
+        type Edit = Box<dyn Fn(&mut AuditRow)>;
+        let edits: Vec<Edit> = vec![
             Box::new(|r| r.ts_ms += 1),
             Box::new(|r| r.request_id.push('x')),
             Box::new(|r| r.source = "sync".into()),

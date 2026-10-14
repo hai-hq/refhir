@@ -87,6 +87,9 @@ pub fn evaluate_invariant(
     )
 }
 
+// The evaluator is recursive and passes its traversal context positionally; bundling it would
+// cost an allocation or a copy on every step.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_focused(
     expr: &Expr,
     focus: &Json,
@@ -156,14 +159,10 @@ impl Ctx<'_> {
                 scale: *scale,
                 unit: unit.clone(),
             })),
-            Expr::This => Ok(self
-                .this_item
-                .clone()
-                .map(|item| one(item))
-                .unwrap_or_else(|| Outcome {
-                    items: focus.to_vec(),
-                    ordered,
-                })),
+            Expr::This => Ok(self.this_item.clone().map(one).unwrap_or_else(|| Outcome {
+                items: focus.to_vec(),
+                ordered,
+            })),
             Expr::IndexVar => Ok(self
                 .index
                 .map(|index| one(Value::Integer(index)))
@@ -2427,7 +2426,7 @@ fn node_from_json(
 }
 
 fn extension_siblings(json: &Json, name: &str) -> Vec<Json> {
-    let underscore = json.get(&format!("_{name}")).cloned().unwrap_or(Json::Null);
+    let underscore = json.get(format!("_{name}")).cloned().unwrap_or(Json::Null);
     match underscore {
         Json::Array(items) => items,
         Json::Object(_) => vec![underscore],

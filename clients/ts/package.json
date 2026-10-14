@@ -3,12 +3,24 @@
   "version": "0.1.0",
   "description": "TypeScript client for ReFHIR /sync and FHIR REST",
   "type": "module",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hai-hq/haifhir.git",
+    "url": "https://github.com/hai-hq/refhir.git",
     "directory": "clients/ts"
   },
+  "homepage": "https://github.com/hai-hq/refhir/tree/main/clients/ts#readme",
+  "bugs": {
+    "url": "https://github.com/hai-hq/refhir/issues"
+  },
+  "keywords": [
+    "fhir",
+    "hl7",
+    "healthcare",
+    "smart-on-fhir",
+    "websocket",
+    "reactive"
+  ],
   "browser": "./dist/index-browser.js",
   "exports": {
     ".": {

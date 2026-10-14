@@ -40,6 +40,18 @@ const WIDE: &[&str] = &[
     "identifier",
 ];
 
+/// A search is limited to this compartment (`Patient/p1`), whatever else the caller asks for. Only
+/// the server sets it, to keep a patient-scoped token to its own patient: `_compartment` is the
+/// caller's to choose, so a limit carried there could be replaced by the caller. The two are
+/// combined, so this can only narrow what a search returns.
+pub const PATIENT_COMPARTMENT: &str = "_patientCompartment";
+
+/// The compartment parameters are not part of a search's identity: a paging link or a cursor does
+/// not carry them, because each request gets its limit from the server again.
+fn is_compartment_param(key: &str) -> bool {
+    key == "_compartment" || key == PATIENT_COMPARTMENT
+}
+
 struct Controls {
     count: Option<usize>,
     offset: usize,
@@ -49,7 +61,9 @@ struct Controls {
     total: String,
     include: Vec<IncludeSpec>,
     revinclude: Vec<IncludeSpec>,
-    compartment: Option<(String, String)>,
+    /// Every one of these must contain a match: the caller's own `_compartment`, and the limit the
+    /// server set on the caller (`_patientCompartment`).
+    compartments: Vec<(String, String)>,
 }
 
 /// Most documents a page may have for the index-only path to read them one query each.
@@ -165,7 +179,7 @@ pub(crate) fn search_counted(
     // fetched; otherwise rows are decoded and checked one at a time (the clause the range decided
     // is not checked again), only the page is kept, and the scan stops once nothing more is needed.
     let (page, total, work) = if scan.decides_all(&clauses)
-        && controls.compartment.is_none()
+        && controls.compartments.is_empty()
         && controls.sort.is_empty()
         && controls.page_is_cheap_to_fetch()
     {
@@ -421,6 +435,22 @@ fn controls_from(params: &BTreeMap<String, String>) -> Result<Controls, FhirErro
                 .collect()
         })
         .unwrap_or_default();
+    let mut compartments = Vec::new();
+    // `_compartment` is the caller's to choose. A value that is not `Type/id` names nothing.
+    if let Some((type_name, id)) = params
+        .get("_compartment")
+        .and_then(|text| text.split_once('/'))
+    {
+        compartments.push((type_name.to_string(), id.to_string()));
+    }
+    // The server's limit has to hold or the search must not run: ignoring a malformed one would
+    // search without it.
+    if let Some(text) = params.get(PATIENT_COMPARTMENT) {
+        let (type_name, id) = text
+            .split_once('/')
+            .ok_or_else(|| FhirError::Invalid(format!("{PATIENT_COMPARTMENT} must be Type/id")))?;
+        compartments.push((type_name.to_string(), id.to_string()));
+    }
     Ok(Controls {
         count,
         offset,
@@ -433,10 +463,7 @@ fn controls_from(params: &BTreeMap<String, String>) -> Result<Controls, FhirErro
             .unwrap_or_else(|| "accurate".into()),
         include: split_includes(params.get("_include")),
         revinclude: split_includes(params.get("_revinclude")),
-        compartment: params.get("_compartment").and_then(|text| {
-            let (type_name, id) = text.split_once('/')?;
-            Some((type_name.to_string(), id.to_string()))
-        }),
+        compartments,
     })
 }
 
@@ -559,6 +586,7 @@ fn is_control(name: &str) -> bool {
             | "_include"
             | "_revinclude"
             | "_compartment"
+            | PATIENT_COMPARTMENT
     )
 }
 
@@ -831,7 +859,7 @@ fn row_matches(
         chain_ids,
         has_ids,
     } = *checks;
-    if let Some((type_name, id)) = &controls.compartment {
+    for (type_name, id) in &controls.compartments {
         if !in_compartment(catalog, model, resource, type_name, id, host) {
             return false;
         }
@@ -1267,7 +1295,7 @@ fn page_offset(params: &BTreeMap<String, String>) -> Result<usize, FhirError> {
 fn cursor_canonical(params: &BTreeMap<String, String>) -> String {
     let mut canonical = String::new();
     for (key, value) in params {
-        if key == "_cursor" || key == "_offset" || key == "_compartment" {
+        if key == "_cursor" || key == "_offset" || is_compartment_param(key) {
             continue;
         }
         canonical.push_str(key);
@@ -1369,7 +1397,7 @@ fn links(
 fn query_url(type_name: &str, params: &BTreeMap<String, String>, offset: usize) -> String {
     let mut parts = Vec::new();
     for (key, value) in params {
-        if key == "_offset" || key == "_cursor" || key == "_compartment" {
+        if key == "_offset" || key == "_cursor" || is_compartment_param(key) {
             continue;
         }
         parts.push(format!("{key}={value}"));

@@ -1,6 +1,6 @@
 //! `refhir migrate`, and the server refusing a database it cannot use, through the real binary.
 //!
-//! The SQLite cases need nothing. The Postgres one needs `HAIFHIR_POSTGRES_URL` (a role that
+//! The SQLite cases need nothing. The Postgres one needs `REFHIR_TEST_POSTGRES_URL` (a role that
 //! may `CREATE DATABASE`) and is skipped without it, unless `REFHIR_REQUIRE_POSTGRES` is set.
 
 use std::path::{Path, PathBuf};

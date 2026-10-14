@@ -1,22 +1,22 @@
 # ReFHIR Go client
 
-Go client for [ReFHIR](https://github.com/hai-hq/haifhir): reactive FHIR over the `/sync` WebSocket, with optional HTTP for metadata and one-off REST calls.
+Go client for [ReFHIR](https://github.com/hai-hq/refhir): reactive FHIR over the `/sync` WebSocket, with optional HTTP for metadata and one-off REST calls.
 
-Module: `github.com/hai-hq/haifhir/clients/go`  
+Module: `github.com/hai-hq/refhir/clients/go`  
 Package name: `refhir`  
 TypeScript sibling: [`clients/ts`](../ts) (`@hai-hq/refhir`)
 
 ## Requirements
 
 - Go 1.23+
-- A running `refhir` server (see the repo root README)
+- A running `refhir` server (see [Getting started](../../docs/getting-started.md))
 
 ## Install
 
 From another module:
 
 ```bash
-go get github.com/hai-hq/haifhir/clients/go
+go get github.com/hai-hq/refhir/clients/go
 ```
 
 From a clone of this repo, use a `replace` in your `go.mod` or depend on the published module once it is tagged.
@@ -43,7 +43,7 @@ Default `-dir` resolves `fixtures/mock-fhir/library` from the repo root or `../.
 | `-token` | SMART bearer |
 | `-timeout` | Overall deadline |
 
-Generating ~100 patients with [Synthea](https://github.com/synthetichealth/synthea), custom org names, and folder layout: [fixtures/mock-fhir/README.md](../../../fixtures/mock-fhir/README.md).
+Generating ~100 patients with [Synthea](https://github.com/synthetichealth/synthea), custom org names, and folder layout: [fixtures/mock-fhir/README.md](../../fixtures/mock-fhir/README.md).
 
 ## Quick start
 
@@ -55,7 +55,7 @@ import (
 	"encoding/json"
 	"log"
 
-	"github.com/hai-hq/haifhir/clients/go"
+	"github.com/hai-hq/refhir/clients/go"
 )
 
 func main() {
@@ -68,7 +68,6 @@ func main() {
 
 	patient := json.RawMessage(`{
 		"resourceType": "Patient",
-		"id": "p1",
 		"active": true,
 		"name": [{"family": "Ann"}]
 	}`)
@@ -99,6 +98,8 @@ Run the server without a database file:
 ```bash
 cargo run -p refhir -- --memory
 ```
+
+The server assigns the id of every resource it creates and ignores one in the body (see [Resource ids](../../docs/fhir-api.md#resource-ids)). Later examples use `p1` as a stand-in for an id you already have.
 
 ## Model
 
@@ -263,6 +264,8 @@ If the WebSocket drops or the server sends `FatalError`, the client dials again,
 
 There is no resume token; after reconnect the first watch result is the current committed state.
 
+**A refused upgrade.** If the server answers the redial with HTTP 401 or 403, the token will not work if asked again, so the session ends instead of dialing forever: every `Watch` and `Mutate` returns a `*refhir.UpgradeError` (`Status`, `RetryAfter`), as does `Dial` if the first upgrade is refused. Any other refusal is retried after the longer of the backoff and the server's `Retry-After` (at most a minute). The server ends a socket whose token expired or was revoked, so a long-lived session sees this when its token runs out; dial a new client with a fresh token.
+
 ## Auth (SMART)
 
 When the server runs with `--smart`, complete the SMART App Launch code+PKCE flow (or `POST /oauth/register` with `--smart-dcr-token`, then `client_credentials`), then:
@@ -280,7 +283,7 @@ Server → client: `Transition` (query results), `MutationResponse`, `FatalError
 
 Operation names use the `udfPath` field, for example `Patient/search`, not REST URLs. This matches [crates/server/src/sync.rs](../../crates/server/src/sync.rs).
 
-The client does not send Convex-style `Connect`, `Authenticate`, `Action`, or optimistic updates. Auth is the HTTP `Authorization` header on the WebSocket upgrade.
+The client does not send `Connect`, `Authenticate` or `Action` messages, or optimistic updates. Auth is the HTTP `Authorization` header on the WebSocket upgrade.
 
 ## Testing
 

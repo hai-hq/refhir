@@ -9,12 +9,13 @@ use refhir_fhirpath::evaluate_owned;
 use serde_json::{json, Map, Value as Json};
 use uuid::Uuid;
 
+/// Resolves a ConceptMap lookup for the executor, given `(map, source system, source code)`: which
+/// map to use, the system of the code when it has one, and the code. `None` when the map has no
+/// answer.
+type Translate<'a> = dyn FnMut(&str, Option<&str>, &str) -> Option<Json> + 'a;
+
 /// Transform `source` with `map`. `translate` resolves ConceptMap lookups.
-pub fn apply(
-    map: &Json,
-    source: &Json,
-    translate: &mut dyn FnMut(&str, Option<&str>, &str) -> Option<Json>,
-) -> Result<Json, String> {
+pub fn apply(map: &Json, source: &Json, translate: &mut Translate<'_>) -> Result<Json, String> {
     let map = if map.get("group").is_some() {
         map.clone()
     } else if let Some(text) = map.get("text").and_then(|value| value.as_str()) {
@@ -202,7 +203,7 @@ fn split_path(path: &str) -> (String, String) {
 fn apply_rules(
     rules: &[Json],
     vars: &mut BTreeMap<String, Json>,
-    translate: &mut dyn FnMut(&str, Option<&str>, &str) -> Option<Json>,
+    translate: &mut Translate<'_>,
 ) -> Result<(), String> {
     for rule in rules {
         apply_rule(rule, vars, translate)?;
@@ -213,7 +214,7 @@ fn apply_rules(
 fn apply_rule(
     rule: &Json,
     vars: &mut BTreeMap<String, Json>,
-    translate: &mut dyn FnMut(&str, Option<&str>, &str) -> Option<Json>,
+    translate: &mut Translate<'_>,
 ) -> Result<(), String> {
     let sources = rule
         .get("source")
@@ -298,7 +299,7 @@ fn apply_target(
     target: &Json,
     vars: &mut BTreeMap<String, Json>,
     row: &BTreeMap<String, Json>,
-    translate: &mut dyn FnMut(&str, Option<&str>, &str) -> Option<Json>,
+    translate: &mut Translate<'_>,
 ) -> Result<(), String> {
     let context = target
         .get("context")

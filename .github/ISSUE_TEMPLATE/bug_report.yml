@@ -1,0 +1,71 @@
+name: Bug report
+description: Something does not work the way the documentation says it should.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. **Do not include real patient data**, tokens or passwords; use
+        synthetic resources. For a security problem, use the private form in SECURITY.md instead.
+  - type: input
+    id: version
+    attributes:
+      label: ReFHIR version
+      description: Output of `refhir --version`, the image tag, or a commit hash.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How are you running it?
+      options: [Docker image, Helm chart, Built from source, Other]
+    validations:
+      required: true
+  - type: dropdown
+    id: database
+    attributes:
+      label: Database
+      options: [SQLite file, In memory (--memory), Postgres]
+    validations:
+      required: true
+  - type: dropdown
+    id: smart
+    attributes:
+      label: SMART authorization (--smart)
+      options: ["Off", "On"]
+    validations:
+      required: true
+  - type: dropdown
+    id: topology
+    attributes:
+      label: Processes
+      options: [One process, Primary with standbys or replicas]
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you got instead (status codes and OperationOutcome bodies help).
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of requests or commands that shows it. `curl` commands are ideal.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: The relevant parts of `refhir.toml` and the flags you pass. Remove secrets.
+      render: toml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Server log lines around the problem. Remove tokens and patient data.
+      render: text

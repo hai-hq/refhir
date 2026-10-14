@@ -157,6 +157,8 @@ fn populate_observation(
     )
 }
 
+// A recursive walk over the questionnaire: the arguments are the state it carries down.
+#[allow(clippy::too_many_arguments)]
 fn walk_observation(
     chart: &mut dyn Chart,
     node: &Json,
@@ -260,7 +262,7 @@ fn newest_observation(
         .filter(|row| within_period(row, period, now))
         .filter(|row| row.pointer("/valueQuantity/comparator").is_none())
         .collect();
-    matched.sort_by(|left, right| observation_time(right).cmp(&observation_time(left)));
+    matched.sort_by_key(|row| std::cmp::Reverse(observation_time(row)));
     Ok(matched.into_iter().next())
 }
 

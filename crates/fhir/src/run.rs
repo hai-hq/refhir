@@ -1,7 +1,6 @@
 //! Run a named operation with OCC retry.
 //!
-//! Convex `UDF_EXECUTOR_OCC_MAX_RETRIES` in `crates/common/src/knobs.rs` defaults
-//! to 4. Handlers only touch `Transaction`, so retrying them is safe.
+//! Handlers only touch `Transaction`, so retrying them after an OCC conflict is safe.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -21,10 +20,11 @@ use crate::search;
 
 /// Arguments the server puts beside a caller's own to say what it knows about the caller: the
 /// scopes of the token (`_readScopes`, read by the SDC operations and by stores that must not
-/// read what the token may not), and whether it is an archiver. They are not the client's, so a
-/// search does not take them for search parameters, and the code that adds them (and the code
+/// read what the token may not), whether it is an archiver, and the compartment a patient-scoped
+/// token is limited to (`_patientCompartment`, read by every search). They are not the client's, so
+/// a search does not take them for search parameters, and the code that adds them (and the code
 /// that makes sure a client did not) uses this same list.
-pub const CONTROL_ARGS: [&str; 2] = ["_readScopes", "_sdcArchiver"];
+pub const CONTROL_ARGS: [&str; 3] = ["_readScopes", "_sdcArchiver", search::PATIENT_COMPARTMENT];
 
 /// Retries after an OCC conflict. The first attempt is not counted.
 pub const MAX_OCC_FAILURES: usize = 4;
@@ -402,7 +402,29 @@ fn search_args(args: &Value) -> Result<BTreeMap<String, String>, FhirError> {
         };
         params.insert(key.clone(), text.to_string());
     }
+    limit_to_caller(&mut params, args)?;
     Ok(params)
+}
+
+/// Put the server's limit on the caller, if it set one, on the parameters of a search that was
+/// built from a request. Whatever the request had under that name is replaced, never kept: it is
+/// not the client's to set.
+pub(crate) fn limit_to_caller(
+    params: &mut BTreeMap<String, String>,
+    controls: &Value,
+) -> Result<(), FhirError> {
+    params.remove(search::PATIENT_COMPARTMENT);
+    match controls.get(search::PATIENT_COMPARTMENT) {
+        None => Ok(()),
+        Some(Value::String(compartment)) => {
+            params.insert(search::PATIENT_COMPARTMENT.into(), compartment.clone());
+            Ok(())
+        }
+        Some(_) => Err(FhirError::Invalid(format!(
+            "{} must be a string",
+            search::PATIENT_COMPARTMENT
+        ))),
+    }
 }
 
 fn profile_arg(args: &Value) -> Vec<String> {

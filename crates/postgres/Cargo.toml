@@ -3,6 +3,10 @@ name = "refhir-postgres"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Postgres storage backend for ReFHIR"
 
 [dependencies]
 refhir-persistence = { path = "../persistence" }

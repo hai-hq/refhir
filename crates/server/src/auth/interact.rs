@@ -186,7 +186,7 @@ pub fn oidc_callback(app: &AppState, headers: &HeaderMap, raw_query: &str) -> Re
             .as_ref()
             .is_some_and(|flow| constant_time_eq(&flow.state, &state))
     };
-    let Some(peeked) = app.smart.pending(session_id).filter(|s| flow_matches(s)) else {
+    let Some(peeked) = app.smart.pending(session_id).filter(flow_matches) else {
         return bad_state();
     };
     let same_browser = browser_binder(headers, session_id).is_some_and(|binder| {
@@ -203,11 +203,7 @@ pub fn oidc_callback(app: &AppState, headers: &HeaderMap, raw_query: &str) -> Re
         );
     }
     // Single use: a state value cannot be replayed.
-    let Some(mut session) = app
-        .smart
-        .take_pending(session_id)
-        .filter(|s| flow_matches(s))
-    else {
+    let Some(mut session) = app.smart.take_pending(session_id).filter(flow_matches) else {
         return bad_state();
     };
     let flow = session.oidc.take().expect("checked above");
@@ -661,8 +657,8 @@ fn render_page(
         format!("<p class=\"err\">{}</p>", html_escape(error))
     };
     let context = match (&session.patient, &session.encounter) {
-        (Some(p), Some(e)) => format!("Launch context: patient {}, encounter {}", p, e),
-        (Some(p), None) => format!("Launch context: patient {}", p),
+        (Some(p), Some(e)) => format!("Launch context: patient {p}, encounter {e}"),
+        (Some(p), None) => format!("Launch context: patient {p}"),
         _ => String::new(),
     };
     format!(
@@ -752,7 +748,7 @@ fn list_patients(app: &AppState) -> Vec<(String, String)> {
             .pointer("/name/0/family")
             .and_then(|v| v.as_str())
             .unwrap_or(id);
-        out.push((id.to_string(), format!("{} ({})", name, id)));
+        out.push((id.to_string(), format!("{name} ({id})")));
     }
     out
 }

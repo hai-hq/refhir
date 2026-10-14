@@ -1,4 +1,4 @@
-//! Read set. Convex `crates/database/src/reads.rs` `ReadSet`.
+//! Read set.
 //!
 //! Each read records index intervals. A later write conflicts when one of its
 //! index keys falls inside an interval.
@@ -25,7 +25,6 @@ impl ReadSet {
     }
 
     /// First write key that lands in this read set.
-    /// Convex `ReadSet::writes_overlap_by_index`, without text indexes.
     pub fn first_overlap(&self, writes: &[(IndexId, Vec<u8>)]) -> Option<(IndexId, Vec<u8>)> {
         for (index, key) in writes {
             if self.overlaps(index, key) {

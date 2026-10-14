@@ -1,6 +1,6 @@
 //! A replica wakes when the writer publishes, instead of waiting for its timer.
 //!
-//! Needs `HAIFHIR_POSTGRES_URL` (a role that may `CREATE DATABASE`); skipped without it unless
+//! Needs `REFHIR_TEST_POSTGRES_URL` (a role that may `CREATE DATABASE`); skipped without it unless
 //! `REFHIR_REQUIRE_POSTGRES` is set, as in CI.
 
 use std::sync::Arc;

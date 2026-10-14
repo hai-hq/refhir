@@ -3,6 +3,10 @@ name = "refhir-map"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FHIR mapping language for SDC population and extraction"
 
 [dependencies]
 refhir-fhirpath = { path = "../fhirpath" }

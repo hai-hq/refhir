@@ -1,0 +1,28 @@
+ReFHIR
+Copyright 2026 HAIHQ and ReFHIR contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This repository includes material from other projects. It is used under the licenses
+stated here, and remains the property of its owners.
+
+HL7 FHIR R4 core package (crates/fhir/fixtures/r4)
+  Derived from hl7.fhir.r4.core 4.0.1 by crates/fhir/generate-r4.py, which keeps the
+  StructureDefinition, SearchParameter, CodeSystem, ValueSet and ConceptMap resources.
+  HL7 International publishes the package under CC0-1.0, as its package.json declares.
+  https://hl7.org/fhir/
+
+Other test packages (crates/fhir/fixtures/*)
+  The remaining directories are small packages written for the test suites. Several are
+  named after HL7 packages (hl7.fhir.uv.sdc, hl7.fhir.uv.extensions.r4, hl7.terminology.r4,
+  and others) and are slices or imitations of them, not complete copies. Each has a
+  package.json naming it.
+
+FHIRPath test suite (crates/fhirpath/tests/hl7/)
+  tests-fhir-r4.xml and its input resources are the FHIRPath test suite that HL7 maintains
+  in https://github.com/FHIR/fhir-test-cases (Apache License 2.0).
+
+Trademarks
+  FHIR(R) is the registered trademark of Health Level Seven International (HL7), and is used
+  with the permission of HL7. Use of the FHIR trademark does not constitute endorsement of
+  this project by HL7.

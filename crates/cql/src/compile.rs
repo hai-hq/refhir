@@ -341,7 +341,7 @@ impl<'a> Parser<'a> {
             return false;
         }
         let after = rest[word.len()..].chars().next();
-        if after.is_some_and(|ch| is_ident_continue(ch)) {
+        if after.is_some_and(is_ident_continue) {
             return false;
         }
         self.index += word.len();

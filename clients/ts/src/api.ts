@@ -7,7 +7,7 @@
 export { Client } from "./client.js";
 export type { DialOptions } from "./client.js";
 export { attachAccessToken } from "./url.js";
-export { OutcomeError, HttpError } from "./errors.js";
+export { OutcomeError, HttpError, UpgradeError } from "./errors.js";
 export { Watch } from "./watch.js";
 export type { Args, JsonValue } from "./types.js";
 

@@ -4,7 +4,7 @@ FROM rust:1.88-bookworm AS builder
 WORKDIR /app
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release -p refhir
+RUN cargo build --release --locked -p refhir
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \

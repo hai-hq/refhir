@@ -70,11 +70,7 @@ async fn execute_document(
     if list {
         let mut args = Map::new();
         for (key, value) in &field.args {
-            if key != "_count" {
-                args.insert(key.clone(), Value::String(value.clone()));
-            } else {
-                args.insert(key.clone(), Value::String(value.clone()));
-            }
+            args.insert(key.clone(), Value::String(value.clone()));
         }
         let result = execute(
             &app.db,

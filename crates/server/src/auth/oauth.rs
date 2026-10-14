@@ -812,13 +812,15 @@ fn token_authorization_code(
         app,
         headers,
         &client,
-        record.scopes,
-        record.patient,
-        record.encounter,
-        record.fhir_user,
-        record.sub,
-        record.nonce.clone(),
-        ACCESS_TTL,
+        TokenGrant {
+            scopes: record.scopes,
+            patient: record.patient,
+            encounter: record.encounter,
+            fhir_user: record.fhir_user,
+            sub: record.sub,
+            nonce: record.nonce.clone(),
+            ttl: ACCESS_TTL,
+        },
     )
 }
 
@@ -873,16 +875,18 @@ fn token_refresh(app: &AppState, headers: &HeaderMap, form: &HashMap<String, Str
         app,
         headers,
         &client,
-        scopes,
-        record.patient,
-        record.encounter,
-        record.fhir_user,
-        record
-            .sub
-            .clone()
-            .unwrap_or_else(|| "smart-user".to_string()),
-        None,
-        ACCESS_TTL,
+        TokenGrant {
+            scopes,
+            patient: record.patient,
+            encounter: record.encounter,
+            fhir_user: record.fhir_user,
+            sub: record
+                .sub
+                .clone()
+                .unwrap_or_else(|| "smart-user".to_string()),
+            nonce: None,
+            ttl: ACCESS_TTL,
+        },
     );
     // The old refresh token was consumed; if the new one could not be stored, give it back.
     if response.status() == StatusCode::SERVICE_UNAVAILABLE {
@@ -927,20 +931,22 @@ fn token_client_credentials(
         app,
         headers,
         &client,
-        scopes,
-        None,
-        None,
-        None,
-        "backend".into(),
-        None,
-        BACKEND_TTL,
+        TokenGrant {
+            scopes,
+            patient: None,
+            encounter: None,
+            fhir_user: None,
+            sub: "backend".into(),
+            nonce: None,
+            ttl: BACKEND_TTL,
+        },
     )
 }
 
-fn issue_tokens(
-    app: &AppState,
-    headers: &HeaderMap,
-    client: &Client,
+/// What a token response is made from: the grant's scopes, the launch context and identity it
+/// carries, and how long the access token lives. Named fields, because most of these are
+/// `Option<String>` and would be easy to pass in the wrong order.
+struct TokenGrant {
     scopes: Vec<String>,
     patient: Option<String>,
     encounter: Option<String>,
@@ -948,7 +954,23 @@ fn issue_tokens(
     sub: String,
     nonce: Option<String>,
     ttl: u64,
+}
+
+fn issue_tokens(
+    app: &AppState,
+    headers: &HeaderMap,
+    client: &Client,
+    grant: TokenGrant,
 ) -> Response {
+    let TokenGrant {
+        scopes,
+        patient,
+        encounter,
+        fhir_user,
+        sub,
+        nonce,
+        ttl,
+    } = grant;
     let issuer = issuer(app, headers);
     let now = now();
     let access = format!("tok-{}", uuid::Uuid::new_v4());
@@ -1065,6 +1087,8 @@ fn issue_tokens(
     response
 }
 
+// One call site, and every argument is a claim: a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 fn encode_id_token(
     keys: &super::signing::ServerKeys,
     issuer: &str,
@@ -1379,9 +1403,7 @@ fn scope_permitted(client: &Client, scope: &str, grant: &str) -> bool {
         if !is_system_scope(scope) {
             return false;
         }
-    } else if is_system_scope(scope) {
-        return false;
-    } else if !is_app_scope(scope) {
+    } else if is_system_scope(scope) || !is_app_scope(scope) {
         return false;
     }
     match &client.allowed_scopes {

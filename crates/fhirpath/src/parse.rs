@@ -218,11 +218,11 @@ impl Parser {
         }
         if let Some(Tok::Int(value)) = self.peek().cloned() {
             self.index += 1;
-            return Ok(self.finish_number(Expr::Int(value), true)?);
+            return self.finish_number(Expr::Int(value), true);
         }
         if let Some(Tok::Decimal(value, scale)) = self.peek().cloned() {
             self.index += 1;
-            return Ok(self.finish_number(Expr::Decimal(value, scale), false)?);
+            return self.finish_number(Expr::Decimal(value, scale), false);
         }
         if let Some(Tok::String(value)) = self.peek().cloned() {
             self.index += 1;

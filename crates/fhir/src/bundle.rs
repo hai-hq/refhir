@@ -8,7 +8,7 @@ use crate::catalog::{valid_id, Catalog};
 use crate::error::{outcome_code, FhirError};
 use crate::ops;
 
-/// One FHIR transaction Bundle is one Convex transaction: one begin timestamp, one commit.
+/// One FHIR transaction Bundle is one engine transaction: one begin timestamp, one commit.
 ///
 /// An Observation may name a Patient that another entry in this bundle writes.
 /// That Patient entry is applied first. The response entries stay in request order.
@@ -353,8 +353,9 @@ fn conditional_entry(
             Ok(json!({"response": {"status": "204 No Content"}}))
         }
         "GET" => {
-            let bundle =
-                crate::search::search(tx, catalog, model, &crate::patch::parse_query(query))?;
+            let mut params = crate::patch::parse_query(query);
+            crate::run::limit_to_caller(&mut params, args)?;
+            let bundle = crate::search::search(tx, catalog, model, &params)?;
             Ok(json!({
                 "response": {"status": "200 OK"},
                 "resource": bundle
@@ -535,9 +536,16 @@ fn batch_entry(
     let method = request_method(entry).unwrap_or("");
     let url = request_url(entry).unwrap_or("");
     let (path, mut args) = batch_call(method, url, entry).map_err(crate::run::RunError::Fhir)?;
-    if let Some(scopes) = controls.get("_readScopes") {
-        if let Some(object) = args.as_object_mut() {
-            object.insert("_readScopes".into(), scopes.clone());
+    if let Some(object) = args.as_object_mut() {
+        // What the URL put under a control argument's name is not the server's word, so it is
+        // dropped before the server's own are copied in.
+        for name in crate::run::CONTROL_ARGS {
+            object.remove(name);
+        }
+        for name in ["_readScopes", crate::search::PATIENT_COMPARTMENT] {
+            if let Some(value) = controls.get(name) {
+                object.insert(name.into(), value.clone());
+            }
         }
     }
     let result = crate::run::run(db, catalog, &path, &args)?;

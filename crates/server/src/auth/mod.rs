@@ -49,14 +49,37 @@ pub(crate) struct Token {
     pub smart_style_url: Option<String>,
 }
 
-/// Identity for an authenticated `/sync` socket. Resource scopes are checked per message.
-#[derive(Clone, Debug)]
+/// Identity for an authenticated `/sync` socket. Resource scopes are checked per message, and the
+/// token itself is checked again while the socket is open (see [`SyncSession::is_live`]).
+#[derive(Clone, Debug, Default)]
 pub struct SyncSession {
     scopes: Vec<String>,
     /// `Patient/{id}` when the token is patient-scoped.
     patient: Option<String>,
     /// The server lets a `PUT` create the resource it names, so an update is also a create.
     update_create: bool,
+    /// The token that opened the socket, to look at it again. `None` where SMART is off.
+    credential: Option<Credential>,
+    /// How often an open socket looks at its token again, besides when it receives a message.
+    recheck: std::time::Duration,
+}
+
+/// The bearer token a socket was opened with, and where to ask whether it still stands.
+#[derive(Clone)]
+struct Credential {
+    smart: std::sync::Arc<SmartStore>,
+    token: String,
+    /// When the token expires, in seconds since the epoch.
+    expires_at: u64,
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The token is a secret: it is never printed.
+        f.debug_struct("Credential")
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
 }
 
 fn now() -> u64 {
@@ -147,8 +170,7 @@ pub fn open_sync_session(
     if !app.config.auth {
         return Ok(SyncSession {
             scopes: vec!["*/*.*".into()],
-            patient: None,
-            update_create: false,
+            ..SyncSession::default()
         });
     }
     let Some(token) = resolve_token(headers, query) else {
@@ -165,6 +187,12 @@ pub fn open_sync_session(
     }
     Ok(SyncSession {
         update_create: app.catalog.read().expect("catalog").update_create(),
+        credential: Some(Credential {
+            smart: app.smart.clone(),
+            token,
+            expires_at: record.exp,
+        }),
+        recheck: app.config.sync_token_recheck,
         scopes: record.scopes.clone(),
         patient: record
             .patient
@@ -184,8 +212,41 @@ impl SyncSession {
         self.patient.as_deref()
     }
 
+    /// How often an open socket looks at its token again, and when the token runs out of its own
+    /// accord. Both are `None` for a socket that has no token (SMART is off).
+    pub fn token_checks(&self) -> Option<(std::time::Duration, std::time::Duration)> {
+        let credential = self.credential.as_ref()?;
+        let remaining = credential.expires_at.saturating_sub(now());
+        Some((self.recheck, std::time::Duration::from_secs(remaining)))
+    }
+
+    /// Whether the token that opened this socket still stands: not expired, and not revoked. A
+    /// socket is checked when it is opened and no other time otherwise, so without this a token
+    /// that was revoked, or ran out, would keep its socket for as long as the client held it.
+    /// Where there is no token to check it is `true`.
+    pub async fn is_live(&self) -> bool {
+        let Some(credential) = &self.credential else {
+            return true;
+        };
+        if credential.expires_at <= now() {
+            return false;
+        }
+        let smart = credential.smart.clone();
+        let token = credential.token.clone();
+        let cached = smart.token_is_cached(&token);
+        let lookup = move || smart.token(&token).is_some_and(|record| record.exp > now());
+        if cached {
+            lookup()
+        } else {
+            // Not in the cache, so this reads the database: off the async worker threads. A
+            // lookup that could not finish is a token that could not be vouched for.
+            tokio::task::spawn_blocking(lookup).await.unwrap_or(false)
+        }
+    }
+
     /// Check scopes for one operation. Subscriptions must be reads.
-    /// Search args gain `_compartment` for patient-scoped tokens.
+    /// The args come back with the controls that say who is asking, among them the compartment a
+    /// patient-scoped token is limited to; whatever the client sent under those names is gone.
     pub fn prepare(&self, path: &str, args: &Value, subscribe: bool) -> Result<Value, String> {
         if path == "Bundle/transaction" || path == "Bundle/batch" {
             if subscribe {
@@ -216,15 +277,6 @@ impl SyncSession {
         }
         let mut args = args.clone();
         self.stamp_controls(&mut args);
-        if op == "search" {
-            if let Some(patient) = &self.patient {
-                if let Some(object) = args.as_object_mut() {
-                    object
-                        .entry("_compartment")
-                        .or_insert_with(|| Value::String(patient.clone()));
-                }
-            }
-        }
         Ok(args)
     }
 
@@ -237,6 +289,11 @@ impl SyncSession {
             object.remove(name);
         }
         object.insert("_readScopes".into(), json!(self.scopes));
+        // Every search, a search inside a Bundle included, learns from this which compartment it
+        // is limited to. It is separate from `_compartment`, which the client may set.
+        if let Some(patient) = &self.patient {
+            object.insert(refhir_fhir::PATIENT_COMPARTMENT.into(), json!(patient));
+        }
     }
 
     fn allows(&self, resource_type: &str, interaction: &str) -> bool {
@@ -471,6 +528,12 @@ fn guard_bundle(
             .pointer("/request/method")
             .and_then(|value| value.as_str())
             .unwrap_or("POST");
+        // A request that finds its targets by query (a conditional create, update or delete) can
+        // match what belongs to another patient, and the entry's own resource says nothing about
+        // that. The direct routes refuse these for a patient-scoped token, and so does a Bundle.
+        if entry.pointer("/request/ifNoneExist").is_some() {
+            return Err(OUTSIDE.into());
+        }
         let Some(url) = entry
             .pointer("/request/url")
             .and_then(|value| value.as_str())
@@ -480,6 +543,9 @@ fn guard_bundle(
             }
             continue;
         };
+        if method != "GET" && url.contains('?') {
+            return Err(OUTSIDE.into());
+        }
         let (type_name, id) = split_request_url(url);
         if method == "POST" && id.is_none() && entry.get("resource").is_none() {
             return Err("bundle entry is missing a resource".into());
@@ -555,6 +621,24 @@ fn entry_resource_type(entry: &Value) -> Option<&str> {
         None
     } else {
         Some(resource_type)
+    }
+}
+
+/// A live query is run again whenever a write overlaps it, so it has to be a read. With SMART on
+/// that is part of the scope check; this is the same refusal for a socket with no token, which has
+/// no scopes to check. It runs before the operation does: a write that was found out afterwards
+/// would already have been committed. A name this server does not know is left to the operation,
+/// which says so.
+pub(crate) fn refuse_subscribed_write(path: &str) -> Result<(), String> {
+    if path == "Bundle/transaction" || path == "Bundle/batch" {
+        return Err("bundle cannot be subscribed".into());
+    }
+    let Some((_, op)) = path.split_once('/') else {
+        return Ok(());
+    };
+    match interaction_for(op, true) {
+        Err(reason) if reason.ends_with("cannot be subscribed") => Err(reason),
+        _ => Ok(()),
     }
 }
 
@@ -667,6 +751,21 @@ pub(crate) fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+pub(crate) fn unauthorized(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(
+            header::WWW_AUTHENTICATE,
+            "Bearer realm=\"refhir\", error=\"invalid_token\"",
+        )],
+        Json(json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "login", "diagnostics": message}]
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -698,7 +797,7 @@ mod tests {
         let session = |scopes: &[&str], update_create: bool| SyncSession {
             update_create,
             scopes: scopes.iter().map(|scope| scope.to_string()).collect(),
-            patient: None,
+            ..SyncSession::default()
         };
         let update = json!({"id": "p1"});
         let bundle = json!({"resource": {"resourceType": "Bundle", "type": "transaction", "entry": [
@@ -749,6 +848,7 @@ mod tests {
             update_create: false,
             scopes: vec!["user/*.read".into()],
             patient: None,
+            ..SyncSession::default()
         };
         assert_eq!(
             run(&user, "Patient/search", json!({"active": "true"})).value["total"],
@@ -771,6 +871,7 @@ mod tests {
             update_create: false,
             scopes: vec!["patient/Patient.read".into()],
             patient: Some("Patient/p1".into()),
+            ..SyncSession::default()
         };
         let found = run(&confined, "Patient/search", json!({"active": "true"}));
         assert_eq!(found.value["total"], 1);
@@ -783,6 +884,7 @@ mod tests {
             update_create: false,
             scopes: vec!["user/Patient.read".into()],
             patient: None,
+            ..SyncSession::default()
         };
         assert!(session.prepare("Patient/search", &json!({}), true).is_ok());
         assert!(session
@@ -797,6 +899,7 @@ mod tests {
             update_create: false,
             scopes: vec!["user/Patient.write".into()],
             patient: None,
+            ..SyncSession::default()
         };
         assert!(writer
             .prepare(
@@ -823,11 +926,48 @@ mod tests {
             update_create: false,
             scopes: vec!["patient/Patient.read".into()],
             patient: Some("Patient/p1".into()),
+            ..SyncSession::default()
         };
         let search = patient
             .prepare("Patient/search", &json!({"active": "true"}), true)
             .unwrap();
-        assert_eq!(search["_compartment"], "Patient/p1");
+        assert_eq!(search["_patientCompartment"], "Patient/p1");
+        // What the client sends under the server's name is replaced, not kept, and its own
+        // `_compartment` is left alone: the engine combines the two.
+        let spoofed = patient
+            .prepare(
+                "Patient/search",
+                &json!({"_patientCompartment": "Patient/p2", "_compartment": "Patient/p2"}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(spoofed["_patientCompartment"], "Patient/p1");
+        assert_eq!(spoofed["_compartment"], "Patient/p2");
+        // A Bundle carries the limit too, so the searches inside it are limited.
+        let bundle = patient
+            .prepare(
+                "Bundle/batch",
+                &json!({"resource": {"resourceType": "Bundle", "type": "batch", "entry": []},
+                        "_patientCompartment": "Patient/p2"}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(bundle["_patientCompartment"], "Patient/p1");
+        // A token that is not patient-scoped has no limit, and cannot be given one.
+        let writer = SyncSession {
+            update_create: false,
+            scopes: vec!["user/Patient.read".into()],
+            patient: None,
+            ..SyncSession::default()
+        };
+        let open = writer
+            .prepare(
+                "Patient/search",
+                &json!({"_patientCompartment": "Patient/p2"}),
+                true,
+            )
+            .unwrap();
+        assert!(open.get("_patientCompartment").is_none());
         assert!(patient
             .prepare("Patient/read", &json!({"id": "p2"}), true)
             .is_err());
@@ -839,6 +979,7 @@ mod tests {
             update_create: false,
             scopes: vec!["user/Questionnaire.read".into()],
             patient: None,
+            ..SyncSession::default()
         };
         let prepared = reader
             .prepare(
@@ -857,19 +998,4 @@ mod tests {
             "install"
         );
     }
-}
-
-pub(crate) fn unauthorized(message: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(
-            header::WWW_AUTHENTICATE,
-            "Bearer realm=\"refhir\", error=\"invalid_token\"",
-        )],
-        Json(json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{"severity": "error", "code": "login", "diagnostics": message}]
-        })),
-    )
-        .into_response()
 }

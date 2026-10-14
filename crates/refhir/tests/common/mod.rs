@@ -1,7 +1,7 @@
 //! What the Postgres integration tests share: a database of its own per test.
 //!
 //! The writer lease is an advisory lock and those are per database, so every test that takes the
-//! lease creates a database, and drops it when the test ends. These need `HAIFHIR_POSTGRES_URL`
+//! lease creates a database, and drops it when the test ends. These need `REFHIR_TEST_POSTGRES_URL`
 //! (a role that may `CREATE DATABASE`); without it the test is skipped, unless
 //! `REFHIR_REQUIRE_POSTGRES` is set, as it is in CI.
 
@@ -11,13 +11,13 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub fn admin_url(what: &str) -> Option<String> {
-    match std::env::var("HAIFHIR_POSTGRES_URL") {
+    match std::env::var("REFHIR_TEST_POSTGRES_URL") {
         Ok(url) => Some(url),
         Err(_) if std::env::var("REFHIR_REQUIRE_POSTGRES").is_ok() => {
-            panic!("REFHIR_REQUIRE_POSTGRES is set but HAIFHIR_POSTGRES_URL is not ({what})")
+            panic!("REFHIR_REQUIRE_POSTGRES is set but REFHIR_TEST_POSTGRES_URL is not ({what})")
         }
         Err(_) => {
-            eprintln!("HAIFHIR_POSTGRES_URL unset, skipping {what}");
+            eprintln!("REFHIR_TEST_POSTGRES_URL unset, skipping {what}");
             None
         }
     }

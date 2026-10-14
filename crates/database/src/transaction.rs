@@ -1,7 +1,7 @@
 //! In-memory transaction.
 //!
-//! Convex `crates/database/src/transaction.rs`: `begin_timestamp`, `ReadSet`,
-//! buffered writes. Reads see `begin_ts` plus this transaction's own buffer.
+//! A transaction has a `begin_ts`, a `ReadSet` and buffered writes. Reads see `begin_ts`
+//! plus this transaction's own buffer.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

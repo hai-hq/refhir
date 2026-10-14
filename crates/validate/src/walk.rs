@@ -295,6 +295,8 @@ impl State<'_> {
         }
     }
 
+    // Part of the validator's recursive walk: the arguments are the state it carries down.
+    #[allow(clippy::too_many_arguments)]
     fn repetitions(
         &self,
         value: &Json,
@@ -1125,7 +1127,7 @@ mod ops_setup_tests {
                 {"path":"Extension.value[x]","min":0,"max":"1","type":[{"code":"string"}]}
             ]}}),
         ]);
-        let instance = json!({"resourceType":"Basic","subject":{"reference":"Organization/org"},"extension":[{"url":"https://boolbyte.health/fhir/StructureDefinition/onboarding-json","valueString":"{}"}]});
+        let instance = json!({"resourceType":"Basic","subject":{"reference":"Organization/org"},"extension":[{"url":"https://example.org/fhir/StructureDefinition/onboarding-json","valueString":"{}"}]});
         let outcome = validate_resource(&instance, &schema, &MemoryTerminology::default(), &NoHost);
         assert!(!outcome.has_errors(), "{:?}", outcome.issues);
         let invalid = json!({"resourceType":"Basic","extension":[{"url":"https://example.invalid","valueString":"{}","extension":[{"url":"https://example.invalid/child","valueString":"child"}]}]});

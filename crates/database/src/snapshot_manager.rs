@@ -1,6 +1,5 @@
 //! Published snapshot timestamp.
 //!
-//! Convex `crates/database/src/snapshot_manager.rs`: `latest_ts` and `push`.
 //! Document bytes stay in the log. The manager only advances the repeatable
 //! timestamp readers are allowed to use.
 

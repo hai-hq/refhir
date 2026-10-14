@@ -56,6 +56,10 @@ pub struct ServerConfig {
     pub ready_cache: std::time::Duration,
     /// How long a replica waits for `X-Refhir-Min-Ts` before sending the request to the primary.
     pub min_ts_wait: std::time::Duration,
+    /// How often an open `/sync` socket checks that its token is still valid. It is also checked
+    /// when the socket receives a message and when the token's own expiry passes, so a revoked
+    /// token ends its sockets within this long and an expired one at once.
+    pub sync_token_recheck: std::time::Duration,
     /// Table of background jobs such as `$export`. `refhir` passes the database's own, so jobs
     /// outlive a restart. Without one they live in memory and end with the process.
     pub jobs: Option<crate::jobs::SharedJobStore>,
@@ -104,6 +108,7 @@ impl Default for ServerConfig {
             ready_timeout: std::time::Duration::from_secs(2),
             ready_cache: std::time::Duration::from_secs(1),
             min_ts_wait: std::time::Duration::from_millis(250),
+            sync_token_recheck: std::time::Duration::from_secs(30),
             jobs: None,
             governance: crate::governance::GovernanceConfig::default(),
             governance_store: None,
@@ -662,9 +667,7 @@ async fn reject_patient_http(
         Ok(operation) => operation,
         Err(message) => return Some(forbidden_response(&message)),
     };
-    let Some((operation, args)) = operation else {
-        return None;
-    };
+    let (operation, args) = operation?;
     let catalog = app.catalog.read().expect("catalog");
     if let Err(message) =
         crate::auth::guard_patient_operation(&app.db, &catalog, patient, &operation, &args)
@@ -768,7 +771,12 @@ async fn sync_ws(
     .into_response()
 }
 
-async fn bundle_post(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn bundle_post(
+    State(app): State<AppState>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: Bytes,
+) -> Response {
     let resource = match parse_body(&body) {
         Ok(value) => value,
         Err(response) => return response,
@@ -780,6 +788,9 @@ async fn bundle_post(State(app): State<AppState>, headers: HeaderMap, body: Byte
     };
     let mut args = json!({"resource": resource});
     stamp_sdc(&app, &headers, &mut args);
+    if let Some(object) = args.as_object_mut() {
+        limit_to_patient(&app, &headers, uri.query(), object);
+    }
     match execute(&app.db, &app.catalog, &app.store, path, args).await {
         Ok(result) => render(StatusCode::OK, result.value, prefer_xml(&headers, &[])),
         Err(err) => error_response(err),
@@ -1171,10 +1182,7 @@ async fn search(
     let xml = prefer_xml(&headers, &params);
     let mut args = query_object(params);
     args.remove("access_token");
-    if let Some(compartment) = crate::auth::patient_compartment(&app, &headers, uri.query()) {
-        args.entry("_compartment".to_string())
-            .or_insert(Value::String(compartment));
-    }
+    limit_to_patient(&app, &headers, uri.query(), &mut args);
     let args = Value::Object(args);
     match execute(
         &app.db,
@@ -1405,6 +1413,8 @@ async fn subscription_socket(
 async fn compartment_search(
     State(app): State<AppState>,
     Path((compartment, id, resource_type)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     let mut args = query_object(params);
@@ -1412,6 +1422,7 @@ async fn compartment_search(
         "_compartment".into(),
         Value::String(format!("{compartment}/{id}")),
     );
+    limit_to_patient(&app, &headers, uri.query(), &mut args);
     run_read(
         &app,
         &format!("{resource_type}/search"),
@@ -1675,6 +1686,26 @@ async fn run_read(app: &AppState, path: &str, args: Value) -> Response {
     }
 }
 
+/// Say which compartment a request may touch, in the one place the engine reads it. A
+/// patient-scoped token's compartment replaces whatever the request had under that name; any other
+/// caller has none, and what a request put there is dropped. This is separate from `_compartment`,
+/// which the client may set, because the two are combined: a client can narrow a search but never
+/// widen it past its token.
+fn limit_to_patient(
+    app: &AppState,
+    headers: &HeaderMap,
+    query: Option<&str>,
+    args: &mut serde_json::Map<String, Value>,
+) {
+    args.remove(refhir_fhir::PATIENT_COMPARTMENT);
+    if let Some(compartment) = crate::auth::patient_compartment(app, headers, query) {
+        args.insert(
+            refhir_fhir::PATIENT_COMPARTMENT.into(),
+            Value::String(compartment),
+        );
+    }
+}
+
 pub(crate) fn stamp_sdc(app: &AppState, headers: &HeaderMap, args: &mut Value) {
     if app.config.sdc_archiver {
         args["_sdcArchiver"] = json!(true);
@@ -1889,6 +1920,22 @@ fn outcome(status: StatusCode, code: &str, diagnostics: &str) -> Response {
     )
 }
 
+fn fhir_status(err: &FhirError) -> StatusCode {
+    match err {
+        FhirError::NotFound(_) | FhirError::UnknownResource(_) => StatusCode::NOT_FOUND,
+        FhirError::Gone(_) => StatusCode::GONE,
+        FhirError::Conflict(_) => StatusCode::CONFLICT,
+        FhirError::Precondition(_) => StatusCode::PRECONDITION_FAILED,
+        FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        FhirError::Forbidden(_) => StatusCode::FORBIDDEN,
+        FhirError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        FhirError::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
+        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
+            StatusCode::BAD_REQUEST
+        }
+    }
+}
+
 #[cfg(test)]
 mod query_redaction {
     use super::redact_query;
@@ -1904,21 +1951,5 @@ mod query_redaction {
             Some("active=true")
         );
         assert_eq!(redact_query(None), None);
-    }
-}
-
-fn fhir_status(err: &FhirError) -> StatusCode {
-    match err {
-        FhirError::NotFound(_) | FhirError::UnknownResource(_) => StatusCode::NOT_FOUND,
-        FhirError::Gone(_) => StatusCode::GONE,
-        FhirError::Conflict(_) => StatusCode::CONFLICT,
-        FhirError::Precondition(_) => StatusCode::PRECONDITION_FAILED,
-        FhirError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        FhirError::Forbidden(_) => StatusCode::FORBIDDEN,
-        FhirError::Unprocessable(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        FhirError::MethodNotAllowed(_) => StatusCode::METHOD_NOT_ALLOWED,
-        FhirError::Invalid(_) | FhirError::Outcome(_) | FhirError::Unsupported(_) => {
-            StatusCode::BAD_REQUEST
-        }
     }
 }

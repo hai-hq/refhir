@@ -1,0 +1,43 @@
+# cargo-deny configuration. CI runs `cargo deny check` (the `deny` job in .github/workflows/ci.yml).
+# To run it yourself: `cargo install cargo-deny --locked && cargo deny check`.
+# Reference: https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# Fail on a known vulnerability, and on an unmaintained or yanked crate we depend on directly.
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "Marvin timing attack on the rsa crate's private-key operations; no fixed release exists. ReFHIR uses rsa only to generate, encode and decode the SMART signing key and to read its public parameters for the JWKS. Tokens are signed by jsonwebtoken through ring, and nothing calls an rsa sign or decrypt function. Revisit if that changes." },
+]
+
+[licenses]
+# Every dependency must be under one of these. They are all permissive, so none of them restricts
+# how ReFHIR itself is licensed (Apache-2.0).
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "BSL-1.0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Two versions of one crate usually come from different dependencies lagging each other. Worth
+# seeing, not worth failing the build over.
+multiple-versions = "warn"
+# A version-less dependency on a crate in this workspace is fine; one on crates.io is not.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

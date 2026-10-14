@@ -2163,6 +2163,304 @@ async fn patient_scope_cannot_leave_its_compartment() {
     assert_eq!(create_other.0, StatusCode::FORBIDDEN, "{}", create_other.1);
 }
 
+/// Two patients with one Observation each (`o1` for `p1` with code 8480-6, `o2` for `p2` with
+/// code 8462-4, so a search by code can single one out), and tokens: `p1-reader` and `p1-writer`
+/// are bound to `p1`, `admin` is not.
+fn two_patients_app() -> axum::Router {
+    let (db, catalog, store) = memory();
+    {
+        let loaded = catalog.read().expect("catalog");
+        for (id, subject, code) in [("o1", "p1", "8480-6"), ("o2", "p2", "8462-4")] {
+            refhir_fhir::import_resource(&db, &loaded, &patient(subject)).unwrap();
+            refhir_fhir::import_resource(
+                &db,
+                &loaded,
+                &json!({
+                    "resourceType": "Observation",
+                    "id": id,
+                    "subject": {"reference": format!("Patient/{subject}")},
+                    "code": {"coding": [{"code": code}]}
+                }),
+            )
+            .unwrap();
+        }
+    }
+    let smart = std::sync::Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token("p1-reader", &["patient/*.read"], Some("p1"));
+    smart.install_token(
+        "p1-writer",
+        &["patient/*.read", "patient/*.write"],
+        Some("p1"),
+    );
+    smart.install_token("admin", &["user/*.read", "user/*.write"], None);
+    crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            smart_demo_login: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+            smart: Some(smart),
+            ..Default::default()
+        },
+    )
+}
+
+async fn get_as(app: &axum::Router, token: &str, uri: &str) -> (StatusCode, Value) {
+    let (status, body) = send_text(
+        app,
+        "GET",
+        uri,
+        "",
+        &[("authorization", &format!("Bearer {token}"))],
+    )
+    .await;
+    (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+async fn post_bundle_as(app: &axum::Router, token: &str, bundle: &Value) -> (StatusCode, Value) {
+    let (status, body) = send_text(
+        app,
+        "POST",
+        "/",
+        &bundle.to_string(),
+        &[
+            ("authorization", &format!("Bearer {token}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+/// The ids of every resource anywhere in a response, so a test can say "no resource of `p2`'s came
+/// back" without caring whether it came as a search hit, a Bundle entry or a nested response.
+fn resource_ids(value: &Value) -> Vec<String> {
+    fn walk(value: &Value, found: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if map.contains_key("resourceType") {
+                    if let Some(id) = map.get("id").and_then(Value::as_str) {
+                        found.push(id.to_string());
+                    }
+                }
+                map.values().for_each(|item| walk(item, found));
+            }
+            Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(value, &mut found);
+    found
+}
+
+fn leaks_p2(value: &Value) -> bool {
+    resource_ids(value)
+        .iter()
+        .any(|id| id == "o2" || id == "p2")
+}
+
+#[tokio::test]
+async fn a_patient_token_cannot_point_a_search_at_another_compartment() {
+    let app = two_patients_app();
+    let (status, own) = get_as(&app, "p1-reader", "/Observation").await;
+    assert_eq!(status, StatusCode::OK, "{own}");
+    assert_eq!(resource_ids(&own), ["o1"]);
+    // Naming its own compartment is allowed, and changes nothing.
+    let (status, same) = get_as(&app, "p1-reader", "/Observation?_compartment=Patient/p1").await;
+    assert_eq!(status, StatusCode::OK, "{same}");
+    assert_eq!(resource_ids(&same), ["o1"]);
+
+    for uri in [
+        "/Observation?_compartment=Patient/p2",
+        "/Observation?_compartment=Patient%2Fp2",
+        "/Observation?_compartment=Patient/p1&_compartment=Patient/p2",
+        "/Observation?_compartment=Patient/p2&_compartment=Patient/p1",
+        "/Observation?_id=o2&_compartment=Patient/p2",
+        // The name the server uses for its own restriction is not the client's to set either.
+        "/Observation?_patientCompartment=Patient/p2",
+        "/Observation?_patientCompartment=Patient/p2&_compartment=Patient/p2",
+        "/Patient?_compartment=Patient/p2",
+    ] {
+        let (status, found) = get_as(&app, "p1-reader", uri).await;
+        assert!(!status.is_server_error(), "{uri}: {status} {found}");
+        assert!(
+            !leaks_p2(&found),
+            "{uri} returned another patient's data: {found}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_patient_token_cannot_search_outside_its_compartment_inside_a_bundle() {
+    let app = two_patients_app();
+    for kind in ["batch", "transaction"] {
+        // The first entry is the control: it must come back with the token's own data, which
+        // shows the bundle is reachable and the search ran.
+        let (status, body) = post_bundle_as(
+            &app,
+            "p1-writer",
+            &json!({"resourceType": "Bundle", "type": kind, "entry": [
+                {"request": {"method": "GET", "url": "Observation?_count=100"}}
+            ]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        assert_eq!(resource_ids(&body), ["o1"], "{kind}: {body}");
+
+        for url in [
+            "Observation?code=8462-4",
+            "Observation?_compartment=Patient/p2",
+            "Observation?_patientCompartment=Patient/p2",
+            "Observation?_id=o2",
+        ] {
+            let (status, body) = post_bundle_as(
+                &app,
+                "p1-writer",
+                &json!({"resourceType": "Bundle", "type": kind, "entry": [
+                    {"request": {"method": "GET", "url": url}}
+                ]}),
+            )
+            .await;
+            assert!(!status.is_server_error(), "{kind} {url}: {status} {body}");
+            assert!(
+                !leaks_p2(&body),
+                "{kind} {url} returned another patient's data: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_patient_token_cannot_change_another_patients_data_with_a_conditional_entry() {
+    let app = two_patients_app();
+    let other = "Observation?code=8462-4";
+    let rewrite = json!({
+        "resourceType": "Observation",
+        "subject": {"reference": "Patient/p1"},
+        "code": {"coding": [{"code": "8462-4"}]}
+    });
+    for kind in ["batch", "transaction"] {
+        for entry in [
+            json!({"request": {"method": "DELETE", "url": other}}),
+            json!({"request": {"method": "PUT", "url": other}, "resource": rewrite}),
+            json!({"request": {"method": "POST", "url": "Observation", "ifNoneExist": "code=8462-4"}, "resource": rewrite}),
+        ] {
+            let (status, body) = post_bundle_as(
+                &app,
+                "p1-writer",
+                &json!({"resourceType": "Bundle", "type": kind, "entry": [entry]}),
+            )
+            .await;
+            assert!(!status.is_server_error(), "{kind} {entry}: {status} {body}");
+            // Whatever the answer, p2's observation is untouched and was not handed back.
+            assert!(
+                !leaks_p2(&body),
+                "{kind} {entry} returned another patient's data: {body}"
+            );
+            let (status, kept) = get_as(&app, "admin", "/Observation/o2").await;
+            assert_eq!(status, StatusCode::OK, "{kind} {entry} removed o2: {kept}");
+            assert_eq!(
+                kept["subject"]["reference"], "Patient/p2",
+                "{kind} {entry} rewrote o2: {kept}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_patient_token_cannot_point_a_live_search_at_another_compartment() {
+    let app = two_patients_app();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, served).await.unwrap();
+    });
+    let (mut socket, _) = connect(&format!("ws://{addr}/sync?access_token=p1-writer")).await;
+    let queries = [
+        json!({}),
+        json!({"_compartment": "Patient/p2"}),
+        json!({"_patientCompartment": "Patient/p2"}),
+        json!({"_id": "o2", "_compartment": "Patient/p2"}),
+    ];
+    let mods: Vec<Value> = queries
+        .iter()
+        .enumerate()
+        .map(|(index, args)| {
+            json!({"type": "Add", "queryId": index + 1, "udfPath": "Observation/search", "args": args})
+        })
+        .collect();
+    socket
+        .send(Message::Text(
+            json!({"type": "ModifyQuerySet", "baseVersion": 0, "newVersion": 1, "modifications": mods})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let first = next_json(&mut socket).await;
+    let items = first["modifications"].as_array().expect("modifications");
+    assert_eq!(items.len(), queries.len(), "{first}");
+    // The unrestricted query is the control: it answers, with the token's own data only.
+    assert_eq!(items[0]["type"], "QueryUpdated", "{first}");
+    assert_eq!(resource_ids(&items[0]["value"]), ["o1"], "{first}");
+    for (index, item) in items.iter().enumerate() {
+        assert!(
+            !leaks_p2(item),
+            "query {index} returned another patient's data: {item}"
+        );
+    }
+
+    // The same through a Bundle mutation: a search entry, and a conditional write on `o2`.
+    let other = "Observation?code=8462-4";
+    for (id, bundle) in [
+        (
+            10,
+            json!({"resourceType": "Bundle", "type": "batch", "entry": [
+                {"request": {"method": "GET", "url": "Observation?_compartment=Patient/p2"}},
+                {"request": {"method": "GET", "url": "Observation?_id=o2"}},
+                {"request": {"method": "DELETE", "url": other}},
+            ]}),
+        ),
+        (
+            11,
+            json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+                {"request": {"method": "GET", "url": "Observation?_id=o2"}},
+            ]}),
+        ),
+        (
+            12,
+            json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+                {"request": {"method": "DELETE", "url": other}},
+            ]}),
+        ),
+    ] {
+        socket
+            .send(Message::Text(
+                json!({"type": "Mutation", "requestId": id, "udfPath": format!("Bundle/{}", bundle["type"].as_str().unwrap()), "args": {"resource": bundle}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let reply = next_json(&mut socket).await;
+        assert_eq!(reply["type"], "MutationResponse", "{reply}");
+        assert!(
+            !leaks_p2(&reply),
+            "bundle {id} returned another patient's data: {reply}"
+        );
+    }
+    let (status, kept) = get_as(&app, "admin", "/Observation/o2").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a conditional entry removed o2: {kept}"
+    );
+}
+
 #[tokio::test]
 async fn include_search_invalidates_when_the_included_patient_changes() {
     let (db, catalog, store) = memory();
@@ -3410,8 +3708,7 @@ mod oidc {
         assert_eq!(status, StatusCode::FOUND);
         assert!(
             location(&headers).starts_with("/oauth/interact"),
-            "{:?}",
-            headers
+            "{headers:?}"
         );
         assert!(!location(&headers).contains("code="));
 
@@ -3759,23 +4056,23 @@ mod oidc {
     async fn allowed_email_domains_need_a_verified_address_in_the_domain() {
         let idp = start_idp().await;
         let app = app_with_oidc(&idp, &[], |cfg| {
-            cfg.allowed_email_domains = vec!["boolbyte.com".into()];
+            cfg.allowed_email_domains = vec!["example.com".into()];
         });
         for (claims, admitted) in [
             (
-                json!({"email": "ada@boolbyte.com", "email_verified": true}),
+                json!({"email": "ada@example.com", "email_verified": true}),
                 true,
             ),
             (
-                json!({"email": "Ada@BoolByte.com", "email_verified": true}),
+                json!({"email": "Ada@Example.com", "email_verified": true}),
                 true,
             ),
             // The provider does not say the address is verified.
-            (json!({"email": "ada@boolbyte.com"}), false),
+            (json!({"email": "ada@example.com"}), false),
             (json!({"email": "ada@elsewhere.com"}), false),
-            (json!({"email": "ada@mail.boolbyte.com"}), false),
+            (json!({"email": "ada@mail.example.com"}), false),
             (
-                json!({"email": "ada@boolbyte.com", "email_verified": false}),
+                json!({"email": "ada@example.com", "email_verified": false}),
                 false,
             ),
             (json!({}), false),
@@ -3857,11 +4154,11 @@ mod oidc {
         {
             let mut mock = idp.mock.lock().unwrap();
             mock.omit_fhir_user = true;
-            mock.claims = json!({"email": "ada@boolbyte.com", "email_verified": true});
+            mock.claims = json!({"email": "ada@example.com", "email_verified": true});
         }
         let app = app_with_oidc(
             &idp,
-            &[identified_patient("pr1", "urn:email", "ada@boolbyte.com")],
+            &[identified_patient("pr1", "urn:email", "ada@example.com")],
             |cfg| {
                 cfg.fhir_user_lookup = Some(crate::FhirUserLookup {
                     claim: "email".into(),
@@ -3876,7 +4173,7 @@ mod oidc {
 
         // An address the provider has not verified binds nobody.
         idp.mock.lock().unwrap().claims =
-            json!({"email": "ada@boolbyte.com", "email_verified": false});
+            json!({"email": "ada@example.com", "email_verified": false});
         let (session, cookie) = to_consent(&app, &idp, OPEN_SCOPE).await;
         let (_, headers, _) = approve(&app, &session, &cookie, "").await;
         assert_eq!(
@@ -4530,15 +4827,17 @@ mod cluster {
         let id = created.body["id"].as_str().unwrap().to_string();
 
         // The write is in the shared database, and the primary has it.
-        let loaded = cluster.primary_catalog.read().unwrap();
-        let result = refhir_fhir::run(
-            &cluster.primary_db,
-            &loaded,
-            "Patient/read",
-            &json!({"id": id}),
-        )
-        .unwrap();
-        assert_eq!(result.value["id"], id.as_str());
+        {
+            let loaded = cluster.primary_catalog.read().unwrap();
+            let result = refhir_fhir::run(
+                &cluster.primary_db,
+                &loaded,
+                "Patient/read",
+                &json!({"id": id}),
+            )
+            .unwrap();
+            assert_eq!(result.value["id"], id.as_str());
+        }
         assert!(cluster.primary_db.latest_ts().as_u64() >= ts);
         // The replica itself has not moved, which is why the header exists.
         assert!(cluster.replica_db.latest_ts().as_u64() < ts);
@@ -5067,6 +5366,57 @@ mod cluster {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    #[tokio::test]
+    async fn a_replica_sends_a_batch_that_writes_to_the_primary() {
+        let cluster = pair(|_| {}).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = cluster.replica_app.clone();
+        tokio::spawn(async move {
+            axum::serve(listener, served).await.unwrap();
+        });
+        let (mut socket, _) = connect(&format!("ws://{addr}/sync")).await;
+        let ask = |id: u64, path: &str, args: Value| {
+            json!({"type": "Mutation", "requestId": id, "udfPath": path, "args": args}).to_string()
+        };
+        // A plain write is sent on, which is what a batch has to be too.
+        socket
+            .send(Message::Text(ask(
+                1,
+                "Patient/create",
+                json!({"resource": patient("single")}),
+            )))
+            .await
+            .unwrap();
+        let created = next_json(&mut socket).await;
+        assert_eq!(created["success"], true, "{created}");
+
+        socket
+            .send(Message::Text(ask(
+                2,
+                "Bundle/batch",
+                json!({"resource": {"resourceType": "Bundle", "type": "batch", "entry": [
+                    {"request": {"method": "POST", "url": "Patient"}, "resource": patient("batched")},
+                    {"request": {"method": "GET", "url": "Patient?_count=1"}}
+                ]}}),
+            )))
+            .await
+            .unwrap();
+        let batch = next_json(&mut socket).await;
+        assert_eq!(batch["success"], true, "{batch}");
+        let status = batch["result"]["entry"][0]["response"]["status"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            status.starts_with("201"),
+            "the replica did not send the batch's write on: {batch}"
+        );
+        let loaded = cluster.primary_catalog.read().unwrap();
+        let found =
+            refhir_fhir::run(&cluster.primary_db, &loaded, "Patient/search", &json!({})).unwrap();
+        assert_eq!(found.value["total"], 2, "{}", found.value);
+    }
 }
 
 mod durable_jobs {
@@ -5326,5 +5676,348 @@ mod durable_jobs {
         drop(first);
         let _ = std::fs::remove_file(&blocker);
         remove_sqlite(&sqlite);
+    }
+}
+
+// ---- the /sync protocol: gaps found while documenting it ----
+
+mod sync_gaps {
+    use super::*;
+    use crate::auth::SmartStore;
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn serve(app: axum::Router) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn say(socket: &mut Socket, message: Value) {
+        socket
+            .send(Message::Text(message.to_string()))
+            .await
+            .unwrap();
+    }
+
+    async fn add(socket: &mut Socket, base: u64, query_id: u64, path: &str, args: Value) {
+        say(
+            socket,
+            json!({
+                "type": "ModifyQuerySet",
+                "baseVersion": base,
+                "newVersion": base + 1,
+                "modifications": [{"type": "Add", "queryId": query_id, "udfPath": path, "args": args}]
+            }),
+        )
+        .await;
+    }
+
+    fn mutation(id: u64, path: &str, args: Value) -> Value {
+        json!({"type": "Mutation", "requestId": id, "udfPath": path, "args": args})
+    }
+
+    /// The next message, or `None` when nothing came within `wait` or the connection ended.
+    async fn next_within(socket: &mut Socket, wait: Duration) -> Option<Value> {
+        match timeout(wait, socket.next()).await {
+            Ok(Some(Ok(Message::Text(text)))) => Some(serde_json::from_str(&text).unwrap()),
+            _ => None,
+        }
+    }
+
+    /// Whether the server has ended the connection, reading what is left of it.
+    async fn ended(socket: &mut Socket) -> bool {
+        loop {
+            match timeout(Duration::from_secs(3), socket.next()).await {
+                Ok(Some(Ok(Message::Text(_)))) | Ok(Some(Ok(Message::Ping(_)))) => continue,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn a_live_query_that_names_a_write_is_refused_before_it_runs_even_without_smart() {
+        let (db, catalog, store) = memory();
+        let app = app(db, catalog, store);
+        let addr = serve(app.clone()).await;
+        let (mut socket, _) = connect(&format!("ws://{addr}/sync")).await;
+        let writes = [
+            ("Patient/create", json!({"resource": patient("w1")})),
+            (
+                "Patient/update",
+                json!({"id": "w2", "resource": patient("w2")}),
+            ),
+            (
+                "Bundle/transaction",
+                json!({"resource": {"resourceType": "Bundle", "type": "transaction", "entry": [
+                    {"request": {"method": "POST", "url": "Patient"}, "resource": patient("w3")}
+                ]}}),
+            ),
+        ];
+        for (index, (path, args)) in writes.into_iter().enumerate() {
+            let base = index as u64;
+            add(&mut socket, base, 10 + base, path, args).await;
+            let reply = next_json(&mut socket).await;
+            let item = &reply["modifications"][0];
+            assert_eq!(item["type"], "QueryFailed", "{path}: {reply}");
+            assert!(
+                item["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("cannot be subscribed"),
+                "{path}: {reply}"
+            );
+        }
+        let found = send(&app, "GET", "/Patient", None, None).await;
+        assert_eq!(
+            found.body["total"], 0,
+            "a subscribed write ran: {}",
+            found.body
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_that_failed_is_forgotten_by_the_server() {
+        let (db, catalog, store) = memory();
+        {
+            let loaded = catalog.read().unwrap();
+            refhir_fhir::import_resource(&db, &loaded, &patient("p1")).unwrap();
+        }
+        let addr = serve(app(db, catalog, store)).await;
+        let url = format!("ws://{addr}/sync");
+        let (mut watcher, _) = connect(&url).await;
+        add(&mut watcher, 0, 1, "Patient/read", json!({"id": "p1"})).await;
+        let first = next_json(&mut watcher).await;
+        assert_eq!(first["modifications"][0]["type"], "QueryUpdated", "{first}");
+
+        let (mut writer, _) = connect(&url).await;
+        say(
+            &mut writer,
+            mutation(1, "Patient/delete", json!({"id": "p1"})),
+        )
+        .await;
+        assert_eq!(next_json(&mut writer).await["success"], true);
+        let failed = next_json(&mut watcher).await;
+        assert_eq!(
+            failed["modifications"][0]["type"], "QueryFailed",
+            "{failed}"
+        );
+
+        // The same id is written again. Both clients dropped the query when it failed, so the
+        // server must have too: nothing may revive it, or it would hold a place under
+        // `max_live_queries` for a query nobody is listening to.
+        say(
+            &mut writer,
+            mutation(
+                2,
+                "Patient/update",
+                json!({"id": "p1", "resource": patient("p1")}),
+            ),
+        )
+        .await;
+        let rewritten = next_json(&mut writer).await;
+        assert_eq!(rewritten["success"], true, "{rewritten}");
+        let revived = next_within(&mut watcher, Duration::from_millis(600)).await;
+        assert!(revived.is_none(), "a failed query was revived: {revived:?}");
+    }
+
+    #[tokio::test]
+    async fn a_query_set_change_sent_while_a_push_is_in_flight_is_answered_not_fatal() {
+        let (db, catalog, store) = memory();
+        let addr = serve(app(db, catalog, store)).await;
+        let url = format!("ws://{addr}/sync");
+        let (mut subscriber, _) = connect(&url).await;
+        add(
+            &mut subscriber,
+            0,
+            1,
+            "Patient/search",
+            json!({"active": "true"}),
+        )
+        .await;
+        let first = next_json(&mut subscriber).await;
+        assert_eq!(first["endVersion"], 1, "{first}");
+
+        let (mut writer, _) = connect(&url).await;
+        let mut active = patient("p1");
+        active["active"] = json!(true);
+        say(
+            &mut writer,
+            mutation(1, "Patient/create", json!({"resource": active})),
+        )
+        .await;
+        assert_eq!(next_json(&mut writer).await["success"], true);
+        // The push is on its way to the subscriber, who has not read it yet, and the subscriber
+        // sends a change of its own, based on the version it has.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        add(&mut subscriber, 1, 2, "Patient/search", json!({})).await;
+
+        let push = next_json(&mut subscriber).await;
+        assert_eq!(push["type"], "Transition", "{push}");
+        assert_eq!(push["startVersion"], 1, "{push}");
+        assert_eq!(push["endVersion"], 2, "{push}");
+        assert_eq!(push["modifications"][0]["queryId"], 1, "{push}");
+        let answer = next_json(&mut subscriber).await;
+        assert_eq!(answer["type"], "Transition", "{answer}");
+        // The answer carries on from the push, and says which version the socket is now at.
+        assert_eq!(answer["startVersion"], 2, "{answer}");
+        assert_eq!(answer["endVersion"], 3, "{answer}");
+        assert_eq!(answer["modifications"][0]["queryId"], 2, "{answer}");
+        assert_eq!(
+            answer["modifications"][0]["type"], "QueryUpdated",
+            "{answer}"
+        );
+
+        // The socket carries on from there.
+        add(
+            &mut subscriber,
+            3,
+            3,
+            "Patient/search",
+            json!({"active": "false"}),
+        )
+        .await;
+        let next = next_json(&mut subscriber).await;
+        assert_eq!(next["startVersion"], 3, "{next}");
+        assert_eq!(next["endVersion"], 4, "{next}");
+    }
+
+    #[tokio::test]
+    async fn a_query_set_change_whose_base_the_server_cannot_place_is_still_fatal() {
+        let (db, catalog, store) = memory();
+        let addr = serve(app(db, catalog, store)).await;
+        let url = format!("ws://{addr}/sync");
+        for base in [5u64, 1u64] {
+            // Ahead of the server, and (after one change) behind where the last change left it.
+            let (mut socket, _) = connect(&url).await;
+            if base == 1 {
+                add(&mut socket, 0, 1, "Patient/search", json!({})).await;
+                add(&mut socket, 1, 2, "Patient/search", json!({})).await;
+                next_json(&mut socket).await;
+                next_json(&mut socket).await;
+                add(&mut socket, 0, 3, "Patient/search", json!({})).await;
+            } else {
+                add(&mut socket, base, 1, "Patient/search", json!({})).await;
+            }
+            let reply = next_json(&mut socket).await;
+            assert_eq!(reply["type"], "FatalError", "base {base}: {reply}");
+            assert!(
+                ended(&mut socket).await,
+                "base {base}: the connection stayed open"
+            );
+        }
+    }
+
+    fn smart_app(smart: Arc<SmartStore>, recheck: Duration) -> axum::Router {
+        let (db, catalog, store) = memory();
+        crate::app_with(
+            db,
+            catalog,
+            store,
+            crate::ServerConfig {
+                auth: true,
+                smart_demo_login: true,
+                smart: Some(smart),
+                sync_token_recheck: recheck,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn a_socket_ends_when_its_token_is_revoked_even_if_it_only_listens() {
+        let smart = Arc::new(SmartStore::with_defaults());
+        smart.install_token("listener", &["user/Patient.read"], None);
+        let addr = serve(smart_app(smart.clone(), Duration::from_millis(200))).await;
+        let (mut socket, _) = connect(&format!("ws://{addr}/sync?access_token=listener")).await;
+        add(&mut socket, 0, 1, "Patient/search", json!({})).await;
+        assert_eq!(
+            next_json(&mut socket).await["modifications"][0]["type"],
+            "QueryUpdated"
+        );
+
+        smart.remove_token("listener");
+        let fatal = next_within(&mut socket, Duration::from_secs(5)).await;
+        assert_eq!(
+            fatal.as_ref().map(|message| &message["type"]),
+            Some(&json!("FatalError")),
+            "{fatal:?}"
+        );
+        assert!(ended(&mut socket).await, "the socket stayed open");
+    }
+
+    #[tokio::test]
+    async fn a_message_on_a_socket_whose_token_was_revoked_is_not_run() {
+        let smart = Arc::new(SmartStore::with_defaults());
+        smart.install_token("writer", &["user/Patient.read", "user/Patient.write"], None);
+        // The periodic check is an hour away, so only a check on the message can catch this.
+        let app = smart_app(smart.clone(), Duration::from_secs(3600));
+        let addr = serve(app.clone()).await;
+        let (mut socket, _) = connect(&format!("ws://{addr}/sync?access_token=writer")).await;
+        say(
+            &mut socket,
+            mutation(1, "Patient/create", json!({"resource": patient("a1")})),
+        )
+        .await;
+        assert_eq!(next_json(&mut socket).await["success"], true);
+
+        smart.remove_token("writer");
+        say(
+            &mut socket,
+            mutation(2, "Patient/create", json!({"resource": patient("a2")})),
+        )
+        .await;
+        let reply = next_within(&mut socket, Duration::from_secs(5)).await;
+        assert_eq!(
+            reply.as_ref().map(|message| &message["type"]),
+            Some(&json!("FatalError")),
+            "{reply:?}"
+        );
+        smart.install_token("checker", &["user/Patient.read"], None);
+        let found = send_text(
+            &app,
+            "GET",
+            "/Patient",
+            "",
+            &[("authorization", "Bearer checker")],
+        )
+        .await;
+        let found: Value = serde_json::from_str(&found.1).unwrap();
+        assert_eq!(found["total"], 1, "a revoked token's write ran: {found}");
+    }
+
+    #[tokio::test]
+    async fn a_socket_ends_when_its_token_expires() {
+        let smart = Arc::new(SmartStore::with_defaults());
+        smart.install_token_exp("brief", &["user/Patient.read"], None, now() + 2);
+        // Only the token's own expiry can end this socket in time.
+        let addr = serve(smart_app(smart, Duration::from_secs(3600))).await;
+        let (mut socket, _) = connect(&format!("ws://{addr}/sync?access_token=brief")).await;
+        add(&mut socket, 0, 1, "Patient/search", json!({})).await;
+        assert_eq!(
+            next_json(&mut socket).await["modifications"][0]["type"],
+            "QueryUpdated"
+        );
+        let fatal = next_within(&mut socket, Duration::from_secs(6)).await;
+        assert_eq!(
+            fatal.as_ref().map(|message| &message["type"]),
+            Some(&json!("FatalError")),
+            "{fatal:?}"
+        );
+        assert!(ended(&mut socket).await, "the socket stayed open");
     }
 }

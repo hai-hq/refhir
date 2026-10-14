@@ -1,6 +1,6 @@
 //! Work that runs after `publish_commit`: Subscription delivery, bulk export, remote terminology.
 //!
-//! Convex analogue is a scheduled job after the commit, not another transaction engine.
+//! It runs as a job after the commit, not as another transaction engine.
 //!
 //! Bulk export is a durable job. Its row lives in the database (the `jobs` table behind
 //! [`JobStore`]), not in this process, so a client can ask for the outcome after a restart, and

@@ -334,29 +334,6 @@ fn reject_target(
     Ok(())
 }
 
-#[cfg(test)]
-mod reference_target_tests {
-    use super::reject_target;
-    use crate::catalog::ReferenceElement;
-
-    #[test]
-    fn generic_resource_target_accepts_concrete_fhir_types() {
-        let generic = ReferenceElement {
-            path: "subject".into(),
-            min: 0,
-            targets: vec!["Resource".into()],
-        };
-        assert!(reject_target(&generic, "Organization", "invalid reference").is_ok());
-        assert!(reject_target(&generic, "Appointment", "invalid reference").is_ok());
-        let patient = ReferenceElement {
-            path: "subject".into(),
-            min: 0,
-            targets: vec!["Patient".into()],
-        };
-        assert!(reject_target(&patient, "Organization", "invalid reference").is_err());
-    }
-}
-
 fn absolute_type(reference: &str) -> Option<&str> {
     let path = reference.split(['?', '#']).next().unwrap_or(reference);
     let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -617,4 +594,27 @@ fn parse_if_match(tag: &str) -> Result<Timestamp, FhirError> {
     let trimmed = trimmed.trim_matches('"');
     Timestamp::from_version_id(trimmed)
         .map_err(|_| FhirError::Invalid(format!("invalid If-Match {tag}")))
+}
+
+#[cfg(test)]
+mod reference_target_tests {
+    use super::reject_target;
+    use crate::catalog::ReferenceElement;
+
+    #[test]
+    fn generic_resource_target_accepts_concrete_fhir_types() {
+        let generic = ReferenceElement {
+            path: "subject".into(),
+            min: 0,
+            targets: vec!["Resource".into()],
+        };
+        assert!(reject_target(&generic, "Organization", "invalid reference").is_ok());
+        assert!(reject_target(&generic, "Appointment", "invalid reference").is_ok());
+        let patient = ReferenceElement {
+            path: "subject".into(),
+            min: 0,
+            targets: vec!["Patient".into()],
+        };
+        assert!(reject_target(&patient, "Organization", "invalid reference").is_err());
+    }
 }
