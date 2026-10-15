@@ -1,4 +1,9 @@
-# ReFHIR
+<h1>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/brand/refhir-logo-reversed.svg">
+    <img src="docs/brand/refhir-logo.svg" alt="ReFHIR" height="56">
+  </picture>
+</h1>
 
 > **FHIR defines healthcare state. ReFHIR keeps software and AI synchronized with it.**
 
@@ -103,6 +108,7 @@ packages are published with the first release; until then build them from [`clie
 | [Performance](docs/perf/README.md) | Measurements and how to repeat them |
 | [Design](docs/design.md) | Why it exists and how the engine works |
 | [Development](docs/development.md) | Building, testing, changing it |
+| [Brand](docs/brand/README.md) | Logo files, colors and how to use them |
 
 ## Status
 
