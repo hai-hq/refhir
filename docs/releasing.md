@@ -41,7 +41,9 @@ changelog says so. The clients are released at the same version:
 1. **Check `main` is green** on the commit you want to release.
 2. **Dry run the workflow.** *Actions → Release → Run workflow*, on a branch. It builds every
    binary and the image, checks the versions and the notes, and packs the npm package with
-   `npm publish --dry-run`; it publishes nothing.
+   `npm stage publish --dry-run`; it publishes nothing. It cannot run the jobs that only a tag
+   triggers (the image tags, the GitHub release, the Go tag and the npm stage), so a change to
+   those is first tested by the release itself.
 3. **Prepare the release in a pull request:**
    - Set the new version in the root `Cargo.toml`, then run `cargo check` so `Cargo.lock`
      follows. CI builds with `--locked` and fails on a stale lockfile.
@@ -120,10 +122,14 @@ To change it, reject the staged version and re-run the job.
 
 If a build job fails, nothing is published: the GitHub release is created only when every binary
 and the image have succeeded, and the clients only after that. Fix the problem on `main`, delete
-the tag (`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`), and tag again.
+the tag (`git push --delete origin vX.Y.Z && git tag -d vX.Y.Z`), and tag again. *Re-run failed
+jobs* does not help here: a re-run uses the workflow file as it was at the tag, so a fix on `main`
+is ignored until the tag moves. Retagging rebuilds the image and moves its tags, which is safe only
+while nobody has pulled it, so do it at once.
 
-If only a client job fails (the release is already out), fix the cause and use *Re-run failed jobs*
-on the workflow run. Do not delete the tag for that. A version that is already staged cannot be
+If only a client job fails (the release is already out) for a reason outside the workflow, such as
+a missing secret, fix the cause and use *Re-run failed jobs* on the workflow run. Do not delete the
+tag for that. A version that is already staged cannot be
 staged again: approve it, or reject it (`npm stage reject <stage-id>`) and re-run the job.
 
 If the release was published and is wrong, do not reuse the version: npm and the Go module proxy
