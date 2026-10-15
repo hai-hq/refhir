@@ -9,7 +9,7 @@ rules about contributing see [CONTRIBUTING.md](../CONTRIBUTING.md).
 |------|---------|-----|
 | Rust | 1.88, installed by `rustup` from [rust-toolchain.toml](../rust-toolchain.toml) | the server |
 | Go | 1.23+ | the Go client, `seed` and `loadgen` |
-| Node | 20+ (CI runs 22) | the TypeScript client |
+| Node | 22.12+ (the TypeScript client alone needs 20+) | the website, and the TypeScript client |
 | Docker | any recent | the image, and the Postgres TLS tests |
 | [just](https://github.com/casey/just) | optional | shortcuts in the [justfile](../justfile) |
 | Python 3 | optional | `scripts/` and the fixture generator |
@@ -27,6 +27,17 @@ deploy/     Docker, the Helm chart, an HAProxy cluster, the Inferno SMART profil
 docs/       this documentation
 fixtures/   mock FHIR data for demos
 scripts/    performance checks, the package bundler, the Postgres TLS test helper
+site/       the website: landing page and documentation, built with Astro
+```
+
+## The website
+
+The landing page and the documentation site live in [`site/`](../site/README.md). It is Astro and
+Starlight, fully static. The Markdown under `docs/` stays the source of truth for the pages the
+site shows: the build copies it, so edit the original file, not a copy.
+
+```bash
+(cd site && npm ci && npm run build && npm test)
 ```
 
 ## Build and test

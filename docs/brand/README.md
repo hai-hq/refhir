@@ -31,6 +31,7 @@ SIL Open Font License.
 | Ink | `#0f1d2b` | Text, the dark blocks, dark backgrounds. |
 | Paper | `#faf8f3` | Light backgrounds, and blocks on dark. |
 | Clinical | `#005a8c` | Links and secondary accents. |
+| Clinical on Ink | `#6eb4cd` | Links and accents on dark backgrounds, where Clinical is too dark to read. |
 | Amber | `#ffb81c` | Highlights next to Ember. Optional. |
 
 Ember is the only color in the mark. Keep it that way: the lit block loses its meaning if a second

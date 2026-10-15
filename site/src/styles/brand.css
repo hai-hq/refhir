@@ -1,0 +1,57 @@
+/* ReFHIR brand tokens (docs/brand/README.md). Shared by the landing page and Starlight.
+   Ember is the lit block: one use at a time, a fill or accent, never small text on Paper. */
+:root {
+  --rf-ember: #f2481c;
+  --rf-ink: #0f1d2b;
+  --rf-paper: #faf8f3;
+  --rf-clinical: #005a8c;
+  --rf-amber: #ffb81c;
+  --rf-stone: #d7d7d2;
+  /* Clinical is too dark for links on Ink, so dark mode uses a lighter tint of it. */
+  --rf-clinical-on-ink: #6eb4cd;
+
+  --sl-font: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+}
+
+/* Starlight names its greys by role: in dark mode white is the strongest text and black the page
+   background; in light mode the scale is inverted. */
+:root[data-theme='dark'] {
+  --sl-color-white: var(--rf-paper);
+  --sl-color-gray-1: #e6e3da;
+  --sl-color-gray-2: #c4c8cc;
+  --sl-color-gray-3: #8f9ba6;
+  --sl-color-gray-4: #5e6d7b;
+  --sl-color-gray-5: #2b3b4c;
+  --sl-color-gray-6: #172637;
+  --sl-color-gray-7: #0b1622;
+  --sl-color-black: var(--rf-ink);
+  --sl-color-accent-low: #0b3552;
+  --sl-color-accent: #3c93c4;
+  --sl-color-accent-high: var(--rf-clinical-on-ink);
+}
+
+:root[data-theme='light'] {
+  --sl-color-white: var(--rf-ink);
+  --sl-color-gray-1: #1e2c3b;
+  --sl-color-gray-2: #34424f;
+  --sl-color-gray-3: #55626e;
+  --sl-color-gray-4: #7f8a94;
+  --sl-color-gray-5: var(--rf-stone);
+  --sl-color-gray-6: #ece9e0;
+  --sl-color-gray-7: #f4f1e9;
+  --sl-color-black: var(--rf-paper);
+  --sl-color-accent-low: #d5e7f1;
+  --sl-color-accent: var(--rf-clinical);
+  --sl-color-accent-high: #00415f;
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
+}
+
+.sl-markdown-content :is(h1, h2, h3, h4) {
+  font-weight: 700;
+}

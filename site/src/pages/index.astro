@@ -1,0 +1,152 @@
+---
+// Placeholder landing page. Phase 3 of the website plan replaces this with the full page
+// (hero demo, how it works, code, compatibility, status). It already carries the brand, the
+// canonical headline and the trademark notice so that the site is never shown unbranded.
+import '@fontsource-variable/inter/index.css';
+import '@fontsource/ibm-plex-mono/500.css';
+import '../styles/brand.css';
+
+const title = 'ReFHIR: live FHIR queries for apps and AI agents';
+const description =
+  'ReFHIR is an open-source FHIR R4 server that keeps query results live. Run a query, stay subscribed, and get the new result when a commit changes it.';
+const canonical = new URL('/', Astro.site ?? 'https://refhir.haihq.org').href;
+const image = new URL('/brand/social-preview.png', canonical).href;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href="/brand/refhir-icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/brand/refhir-icon-512.png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={image} />
+    <meta property="og:image:width" content="1280" />
+    <meta property="og:image:height" content="640" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:image" content={image} />
+  </head>
+  <body>
+    <main>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="/brand/refhir-logo-reversed.svg" />
+        <img src="/brand/refhir-logo.svg" alt="ReFHIR" width="210" height="56" />
+      </picture>
+      <h1>Subscribe to a FHIR query, not a stream of events.</h1>
+      <p class="lede">
+        ReFHIR is an open-source FHIR R4 server that keeps query results live. Run a query, stay
+        subscribed, and get the new result when a commit changes it. Plain REST and SMART still work
+        on the same server.
+      </p>
+      <p class="actions">
+        <a class="button" href="/docs/getting-started/">Get started</a>
+        <a class="button quiet" href="https://github.com/hai-hq/refhir">View on GitHub</a>
+      </p>
+    </main>
+    <footer>
+      <p>
+        ReFHIR is open source under the Apache License 2.0, from <a href="https://haihq.org">HAIHQ</a>.
+        FHIR® is the registered trademark of HL7 and is used with the permission of HL7. Use of the FHIR
+        trademark does not constitute endorsement of this project by HL7.
+      </p>
+    </footer>
+  </body>
+</html>
+
+<style is:global>
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--rf-paper);
+    color: var(--rf-ink);
+    font-family: var(--sl-font);
+    line-height: 1.6;
+  }
+  @media (prefers-color-scheme: dark) {
+    body {
+      background: var(--rf-ink);
+      color: var(--rf-paper);
+    }
+  }
+  main {
+    flex: 1;
+    box-sizing: border-box;
+    width: min(100% - 3rem, 46rem);
+    margin: 0 auto;
+    padding: 6rem 0 3rem;
+  }
+  main img {
+    display: block;
+    margin-bottom: 3rem;
+  }
+  h1 {
+    margin: 0 0 1.25rem;
+    font-size: clamp(2.25rem, 6vw, 3.5rem);
+    font-weight: 800;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+  }
+  .lede {
+    margin: 0 0 2rem;
+    font-size: 1.2rem;
+    max-width: 38rem;
+  }
+  .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+  .button {
+    display: inline-block;
+    padding: 0.7rem 1.2rem;
+    border: 2px solid var(--rf-ink);
+    border-radius: 0.5rem;
+    background: var(--rf-ink);
+    color: var(--rf-paper);
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .button.quiet {
+    background: transparent;
+    color: inherit;
+    border-color: currentColor;
+  }
+  @media (prefers-color-scheme: dark) {
+    .button {
+      background: var(--rf-paper);
+      border-color: var(--rf-paper);
+      color: var(--rf-ink);
+    }
+    .button.quiet {
+      background: transparent;
+      color: inherit;
+      border-color: currentColor;
+    }
+  }
+  .button:focus-visible,
+  footer a:focus-visible {
+    outline: 3px solid var(--rf-clinical);
+    outline-offset: 3px;
+  }
+  footer {
+    box-sizing: border-box;
+    width: min(100% - 3rem, 46rem);
+    margin: 0 auto;
+    padding: 1.5rem 0 2.5rem;
+    border-top: 1px solid var(--rf-stone);
+    font-size: 0.85rem;
+    opacity: 0.85;
+  }
+  footer a {
+    color: inherit;
+  }
+</style>
