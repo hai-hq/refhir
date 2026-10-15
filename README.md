@@ -74,8 +74,10 @@ console.log(await watch.next());  // the next committed result
 
 In React, `useFHIRQuery` from `@haihq/refhir/react` does the same and re-renders on every
 change. A Go client is in [`clients/go`](clients/go/README.md). Both share the
-[`/sync` wire protocol](docs/sync-protocol.md), so a client in another language is small. The
-packages are published with the first release; until then build them from [`clients/`](clients).
+[`/sync` wire protocol](docs/sync-protocol.md), so a client in another language is small. The Go
+client is published (`go get github.com/hai-hq/refhir/clients/go@v0.0.1`). The npm package
+`@haihq/refhir` is not published yet; until it is, build the TypeScript client from
+[`clients/ts`](clients/ts).
 
 ## What is in it
 

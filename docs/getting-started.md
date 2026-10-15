@@ -17,7 +17,7 @@ Use this when you only want to **run** ReFHIR, not build it from source.
 
 **1. Get an image**
 
-- **Release image** (after a `v*` tag on GitHub): `ghcr.io/hai-hq/refhir:latest`
+- **Release image**: `ghcr.io/hai-hq/refhir:latest`, or pin a version such as `ghcr.io/hai-hq/refhir:0.0.1`
 - **Build from the repo** (no registry needed):
 
   ```bash
@@ -94,7 +94,15 @@ Equivalent with [just](https://github.com/casey/just): `just run` or `just memor
 
 **4. Load demo data (optional)**
 
-With the server up on port 8080 and Go 1.23+ installed:
+The demo files name their own ids, so they are loaded with `PUT [type]/[id]`. A server accepts that only
+when it is started with `--update-as-create` (or `update_as_create = true` under `[conformance]`), so
+start it that way:
+
+```bash
+cargo run -p refhir -- --memory --update-as-create
+```
+
+Then, with Go 1.23+ installed:
 
 ```bash
 cd clients/go && go run ./cmd/seed -url http://127.0.0.1:8080

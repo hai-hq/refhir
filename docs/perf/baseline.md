@@ -1,8 +1,9 @@
 # Performance baseline and exit criteria
 
 Measured with `clients/go/cmd/loadgen` against `refhir --postgres` (how to run: `README.md` in this
-directory). The numbers below are the plan's measured exit criteria for Phases 0, 2 and 3, plus two
-decisions that were measured before being made.
+directory). The numbers below come from three stages of the project's performance work (Phases 0, 2
+and 3, each with an exit criterion that is restated where it is used), plus two decisions that were
+measured before being made.
 
 ## Setup
 
@@ -150,8 +151,9 @@ before applying `_count`; it was not needed to meet the criterion and the profil
 ### Notes
 
 - The default pool stays at 8. `--db-pool` (or `REFHIR_DB_POOL`) tunes it.
-- Not tested: Postgres across a network, where each query holds its connection longer and a pool
-  matters more, and a machine with a very different core count.
+- Not tested: Postgres on a real network (the 5 ms run above only simulates one on a single
+  machine), where each query holds its connection longer and a pool matters more, and a machine
+  with a very different core count.
 - An earlier version of the script started its servers inside a command substitution, lost track
   of the first one, and measured it over and over (its "pool of 8" runs reported `max: 1`); those
   results (+31 %, +13 %, -9 %, and a -66 % pair) were noise between identical servers and are

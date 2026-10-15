@@ -43,20 +43,21 @@ and the process exits with the error. Fix the cause and start again.
 
 ## Databases from before versioning
 
-Releases before this one created their tables at startup with no record of a version. A database
-that has no `schema_migrations` table is **adopted** as version 1, the baseline: the current
-schema.
+Development builds before 0.0.1 created their tables at startup with no record of a version. A
+database that has no `schema_migrations` table is **adopted** as version 1, the baseline: the
+current schema. Only a database made by such a build needs this; a database created by 0.0.1 or
+later already has the table.
 
 - If it already has every table, index and column of the baseline, version 1 is **recorded and
   not run**. No DDL touches your tables. (On Postgres even `ALTER TABLE ... ADD COLUMN IF NOT
   EXISTS` takes a lock that waits for open writes, so a restart cannot stall a live database.)
-- If it was made by an older release and lacks something (a `claimed_epoch` column on
+- If it was made by an older build and lacks something (a `claimed_epoch` column on
   `index_backfills`, the lease columns on `jobs`, the `indexes_by_ts` index), exactly what every
   earlier release did on every start is done once: the missing objects are added, nothing is
   altered or dropped, and then version 1 is recorded.
 
-On Postgres, adding a missing `indexes_by_ts` builds it inside the migration transaction. Releases
-before this one built it `CONCURRENTLY`, outside a transaction, so writes could continue; Postgres
+On Postgres, adding a missing `indexes_by_ts` builds it inside the migration transaction. Builds
+before 0.0.1 built it `CONCURRENTLY`, outside a transaction, so writes could continue; Postgres
 refuses that inside a transaction, and a migration that is not one transaction is not atomic.
 This only affects a database from before that index existed, and the build blocks writes to
 `indexes` while it runs. Upgrade such a database in a maintenance window.

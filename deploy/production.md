@@ -61,14 +61,14 @@ With `verify-full` the certificate must be valid for the host name in the URL (f
 the `-rw` Service name and its namespaced forms are in its server certificate; use the one you
 connect with). `sslmode=require` encrypts but does not verify the server, and a URL with no
 `sslmode` does not use TLS at all, so production should use `verify-full`. Client certificates
-(`sslcert`, `sslkey`) are supported for servers that require them. Details: README,
+(`sslcert`, `sslkey`) are supported for servers that require them. Details:
 [Postgres and TLS](../docs/operations.md#postgres-and-tls).
 
 Helm chart: [helm/refhir](helm/refhir/README.md) (`values.yaml` + optional `secretEnv`).
 
 ## Rate limits, quotas, metering and audit
 
-What each setting does is in the [README](../docs/governance.md#rate-limits-quotas-metering-and-audit); this is what to decide when you run it. [refhir.production.toml](refhir.production.toml) turns the rate limit on and leaves quotas for you to size.
+What each setting does is in the [governance guide](../docs/governance.md#rate-limits-quotas-metering-and-audit); this is what to decide when you run it. [refhir.production.toml](refhir.production.toml) turns the rate limit on and leaves quotas for you to size.
 
 ### Tell it how many proxies are in front
 
@@ -290,8 +290,10 @@ Tested against MinIO. Installing the default packages on a fresh database took a
 ## Availability and read scaling
 
 One process is a single point of failure. On Postgres you can run a **standby** that takes over
-within about a second when the primary is gone (it keeps its catalog loaded while it waits, so
-takeover does not wait for that), and **replicas** that serve reads:
+within a few seconds when the primary is gone (it keeps its catalog loaded while it waits, so
+takeover does not wait for that; in the [Compose failover test](cluster/README.md) clients saw 3 to 7
+seconds between acknowledged writes, most of it noticing the failure and the load balancer), and
+**replicas** that serve reads:
 
 - `refhir --postgres $URL` is the primary. It holds a lease on the database and refuses to start
   while another primary has it.

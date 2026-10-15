@@ -24,10 +24,9 @@ Subscribe to the **result of a query**, not only to per-resource change events.
 
 ```ts
 const observations = useFHIRQuery({
+  baseURL: "http://127.0.0.1:8080",
   resourceType: "Observation",
-  patient: patientId,
-  status: "final",
-  _sort: "-date",
+  params: { patient: patientId, status: "final", _sort: "-date" },
 });
 ```
 
