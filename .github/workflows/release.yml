@@ -143,6 +143,10 @@ jobs:
     permissions:
       contents: read
       packages: write
+    env:
+      # The build record is a debugging aid that nothing here reads, and it lands in the run's
+      # artifacts as a *.dockerbuild file that cannot be downloaded again.
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
     strategy:
       fail-fast: false
       matrix:
@@ -258,10 +262,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download the archives and notes
+      # Ask for these by name. A bare download fetches every artifact of the run, including the
+      # Docker build records, which cannot be downloaded and fail the step.
+      - name: Download the archives
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: dist-*
+
+      - name: Download the release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: artifacts/release-notes
 
       - name: Create the release
         env:
