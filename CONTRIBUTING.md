@@ -48,7 +48,8 @@ Then:
    them; behavior over HTTP and `/sync` is covered in `crates/server/src/tests.rs`, and
    multi-process behavior in `crates/refhir/tests/`.
 2. **Update the docs** if a flag, endpoint, setting or behavior changes. Setting names live in
-   [`refhir.toml.example`](refhir.toml.example), which should document every setting.
+   [`refhir.toml.example`](refhir.toml.example), which should document every setting. The website
+   publishes these docs; [site/README.md](site/README.md) says how to preview or add a page.
 3. **Add a line to [CHANGELOG.md](CHANGELOG.md)** under *Unreleased*, in the section that fits
    (Added, Changed, Fixed, Security). Say what a user notices, not how you did it.
 4. **Keep the change focused.** A bug fix does not need a refactor alongside it; send that
@@ -62,7 +63,7 @@ commit message.
 
 - **Schema changes.** Migrations are forward-only and shipped ones are frozen: a database refuses
   to start if a migration's checksum changed. Add a new numbered migration to **both** SQLite and
-  Postgres, and never edit an old one. Read [Schema migrations](docs/migrations.md#adding-a-migration).
+  Postgres, and never edit an old one. Read [Changing the schema](docs/development.md#changing-the-schema).
 - **The `/sync` protocol and HTTP API.** Existing clients depend on them. Add fields rather than
   change or remove them, and note any break in the changelog.
 - **Authorization.** Anything that reads or writes a resource must go through scope and

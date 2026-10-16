@@ -2,7 +2,7 @@
 
 `/sync` is a WebSocket on which a client subscribes to the result of a FHIR query. When a committed write changes that result, the server re-runs the query and sends the new result. The unit of subscription is a query (an operation name plus arguments), not an event: the client never receives "Patient p1 changed", it receives the current answer to the question it asked. The same socket also carries writes.
 
-This page is for someone writing a client in a language other than Go or TypeScript. The server side is [`crates/server/src/sync.rs`](../crates/server/src/sync.rs). The shipped clients are [Go](../clients/go/README.md) and [TypeScript](../clients/ts/README.md). Every shape and behavior below comes from that code or from its tests, mainly [`crates/server/src/tests.rs`](../crates/server/src/tests.rs). Where the server does not specify something, this page says so.
+This page is for someone writing a client in a language other than Go or TypeScript. The shipped clients are [Go](../clients/go/README.md) and [TypeScript](../clients/ts/README.md). Where the server does not specify something, this page says so.
 
 `/sync` is not `/{type}/{id}/$websocket`, which is a different endpoint that delivers FHIR Subscription notifications.
 
@@ -18,7 +18,7 @@ All frames are WebSocket text frames holding one JSON object with a `type` field
 | server to client | `MutationResponse` | The answer to one `Mutation` |
 | server to client | `FatalError` | The server is about to drop the connection |
 
-These are all the message types the code defines. There is no hello or connect message, no authenticate message (authentication happens on the HTTP upgrade), no application-level ping, no acknowledgement other than the `Transition` that answers a `ModifyQuerySet`, and no resume message. The server ignores binary frames, answers a Ping with a Pong, and treats a Close frame as the end of the session. It never sends pings of its own.
+These are all the message types. There is no hello or connect message, no authenticate message (authentication happens on the HTTP upgrade), no application-level ping, no acknowledgement other than the `Transition` that answers a `ModifyQuerySet`, and no resume message. The server ignores binary frames, answers a Ping with a Pong, and treats a Close frame as the end of the session. It never sends pings of its own.
 
 The server reads fields with default JSON rules: unknown extra fields are ignored, and every field listed below as required must be present.
 
@@ -48,7 +48,7 @@ A 401 carries a `WWW-Authenticate` header and an `OperationOutcome` body. No Web
 
 With SMART on, scopes are checked per message, not at the upgrade. A token that may open the socket can still be refused every operation.
 
-- Each `udfPath` is mapped to an interaction (`search`, `read`, `create`, `update`, `delete`, `install`) and checked against the token's scopes. `search` needs `search`. The read-type operations (`read`, `vread`, `history` and the `$` operations such as `$everything`) need `read`. `create` and `conditional-create` need `create`. `update`, `patch`, `conditional-update`, `$meta-add` and `$meta-delete` need `update`. The mapping is in [`auth/scopes.rs`](../crates/server/src/auth/scopes.rs).
+- Each `udfPath` is mapped to an interaction (`search`, `read`, `create`, `update`, `delete`, `install`) and checked against the token's scopes. `search` needs `search`. The read-type operations (`read`, `vread`, `history` and the `$` operations such as `$everything`) need `read`. `create` and `conditional-create` need `create`. `update`, `patch`, `conditional-update`, `$meta-add` and `$meta-delete` need `update`.
 - `Bundle/transaction` and `Bundle/batch` are checked entry by entry, from each entry's resource type and `request.method`.
 - A patient-scoped token is limited to its patient's compartment: operations on another patient's data are refused, and a pushed result that falls outside the compartment removes the query (see [Errors](#errors)).
 - The server never trusts `_readScopes` or `_sdcArchiver` from a client. It removes them and, with SMART on, sets `_readScopes` itself.
@@ -117,7 +117,7 @@ The server handles one incoming message at a time per connection and finishes it
 
 ### Operation names
 
-`udfPath` is `{ResourceType}/{operation}`. These are the names the engine dispatches ([`crates/fhir/src/run.rs`](../crates/fhir/src/run.rs)). Arguments are read from the JSON object `args`.
+`udfPath` is `{ResourceType}/{operation}`. Arguments are read from the JSON object `args`.
 
 Names you may subscribe to (read-only):
 
@@ -310,7 +310,7 @@ Messages go one per line. `...` marks a part left out. Versions continue across 
 
 ### 1. Subscribe to a search
 
-The server holds one patient, `p1`, which is active. This is `sync_subscription_transitions_after_mutation` in `tests.rs`.
+The server holds one patient, `p1`, which is active.
 
 ```text
 client -> server
@@ -353,7 +353,7 @@ Later writes no longer produce pushes for query 1.
 
 ### 4. A write the token may not make
 
-With SMART on and a token that holds only `user/Patient.read`, as in `a_sync_write_outside_the_callers_scope_is_audited_as_refused`. The socket stays open.
+With SMART on and a token that holds only `user/Patient.read`. The socket stays open.
 
 ```text
 client -> server
@@ -363,16 +363,14 @@ server -> client
 {"type":"MutationResponse","requestId":1,"success":false,"result":{"resourceType":"OperationOutcome","issue":[{"severity":"error","code":"forbidden","diagnostics":"scope does not allow Patient/create"}]},"ts":null}
 ```
 
-For a live query refused by the connection's query cap (`a_websocket_does_not_get_around_the_limits_the_audit_or_the_meter`), the first `Add` (query 1) was accepted at version 1. A second `Add` (query 2, `baseVersion` 1) on a connection limited to one query returns:
+For a live query refused by the connection's query cap, the first `Add` (query 1) was accepted at version 1. A second `Add` (query 2, `baseVersion` 1) on a connection limited to one query returns:
 
 ```text
 server -> client
 {"type":"Transition","startVersion":1,"endVersion":2,"modifications":[{"type":"QueryFailed","queryId":2,"error":"too many live queries: a connection may hold 1","logLines":[]}]}
 ```
 
-## Where to read further
+## Related
 
-- [`crates/server/src/sync.rs`](../crates/server/src/sync.rs): the whole server side of the protocol.
-- [`crates/server/src/governance/integration.rs`](../crates/server/src/governance/integration.rs): `/sync` under rate limits, quotas and audit.
-- [`clients/ts/src/client.ts`](../clients/ts/src/client.ts) and [`clients/go/client.go`](../clients/go/client.go): batching, version tracking and reconnect.
 - [SMART on FHIR](smart.md) for tokens and scopes.
+- [Rate limits, quotas, metering and audit](governance.md) for the limits that apply to `/sync`.

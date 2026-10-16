@@ -9,7 +9,7 @@ rules about contributing see [CONTRIBUTING.md](../CONTRIBUTING.md).
 |------|---------|-----|
 | Rust | 1.88, installed by `rustup` from [rust-toolchain.toml](../rust-toolchain.toml) | the server |
 | Go | 1.23+ | the Go client, `seed` and `loadgen` |
-| Node | 20+ (CI runs 22) | the TypeScript client |
+| Node | 22.12+ (the TypeScript client alone needs 20+) | the website, and the TypeScript client |
 | Docker | any recent | the image, and the Postgres TLS tests |
 | [just](https://github.com/casey/just) | optional | shortcuts in the [justfile](../justfile) |
 | Python 3 | optional | `scripts/` and the fixture generator |
@@ -27,6 +27,17 @@ deploy/     Docker, the Helm chart, an HAProxy cluster, the Inferno SMART profil
 docs/       this documentation
 fixtures/   mock FHIR data for demos
 scripts/    performance checks, the package bundler, the Postgres TLS test helper
+site/       the website: landing page and documentation, built with Astro
+```
+
+## The website
+
+The landing page and the documentation site live in [`site/`](../site/README.md). It is Astro and
+Starlight, fully static. The Markdown under `docs/` stays the source of truth for the pages the
+site shows: the build copies it, so edit the original file, not a copy.
+
+```bash
+(cd site && npm ci && npm run build && npm test)
 ```
 
 ## Build and test
@@ -78,8 +89,24 @@ tick *perf* to include the 45-minute performance check as well.
 
 ## Changing the schema
 
-Read [Schema migrations](migrations.md#adding-a-migration) first. The short version: add a new
-numbered migration to both backends and never edit one that has shipped.
+Migrations are forward-only. [Schema migrations](migrations.md) explains how they run. To add one:
+
+1. Add `NNNN_short_name.sql` to **both** `crates/sqlite/migrations/` and
+   `crates/postgres/migrations/`, and an entry to `MIGRATIONS` in each backend's `migrate.rs`.
+   The next version number is the last one plus one, with no gaps.
+2. **Never edit a migration that has shipped.** Its checksum is in every database that applied it,
+   and they would refuse to start. `the_baseline_is_frozen` pins version 1's checksum; pin new
+   ones the same way.
+3. A migration runs inside a transaction, together with any other pending ones. Do not use
+   statements Postgres refuses there (`CREATE INDEX CONCURRENTLY`, `VACUUM`). It does not have to
+   be idempotent: it runs once. Take care with statements that lock a busy table, since a
+   standby or replica starting up waits for them.
+4. Keep it additive where you can (new tables, new nullable columns, new indexes). A migration
+   that rewrites data is not undone by anything but a restore.
+5. Add a test that starts from a database at the previous version.
+
+New SQLite and Postgres migrations should leave the two backends with the same logical schema,
+and neither may change what a query returns without a code change that says so.
 
 ## Regenerating fixtures
 

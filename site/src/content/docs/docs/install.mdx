@@ -1,0 +1,113 @@
+---
+title: Install
+description: Install ReFHIR with Docker, a release binary, from source, or on Kubernetes.
+---
+
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
+
+Choose the way that suits where you will run it. They all start the same server.
+
+<Aside type="note" title="The first start needs the network">
+  ReFHIR ships no FHIR packages. On the first start it installs `hl7.fhir.r4.core` 4.0.1 and the
+  Structured Data Capture package from [packages.fhir.org](https://packages.fhir.org), and caches
+  them. If that source is unreachable on a first start, the server does not start. You can point it
+  at a mirror or at an `s3://` bundle you host yourself; see
+  [Production deployment](/docs/operate/production/#package-source).
+</Aside>
+
+<Tabs>
+  <TabItem label="Docker">
+    A multi-architecture image (amd64 and arm64) is published for every release.
+
+    ```bash
+    docker run --rm -p 8080:8080 -v refhir-data:/data ghcr.io/hai-hq/refhir:0.0.1
+    ```
+
+    The tags are `0.0.1`, `0.0` and `latest`. Pin a version in anything you keep.
+
+    The image's default configuration listens on `0.0.0.0:8080`, keeps a SQLite database at
+    `/data/refhir.sqlite` and caches packages in `/data/package-cache`, so mount a volume at `/data`
+    or the data goes when the container does. To use your own settings, mount a file at
+    `/etc/refhir/refhir.toml`; it replaces the default.
+  </TabItem>
+  <TabItem label="Release binary">
+    Archives are published for Linux on amd64 and arm64, and for macOS on Apple silicon. Each
+    holds one folder with the `refhir` binary, `LICENSE`, `NOTICE`, `README.md` and `CHANGELOG.md`.
+
+    ```bash
+    VERSION=0.0.1
+    PLATFORM=linux-amd64        # or linux-arm64, or macos-arm64
+    BASE=https://github.com/hai-hq/refhir/releases/download/v$VERSION
+
+    curl -LO $BASE/refhir-$VERSION-$PLATFORM.tar.gz
+    curl -LO $BASE/SHA256SUMS
+    grep "refhir-$VERSION-$PLATFORM" SHA256SUMS | shasum -a 256 -c
+
+    tar -xzf refhir-$VERSION-$PLATFORM.tar.gz
+    ./refhir-$VERSION-$PLATFORM/refhir --version
+    ```
+
+    There are no Windows or Intel macOS binaries; build those from source. Start a throwaway
+    server with `./refhir-$VERSION-$PLATFORM/refhir --memory`.
+  </TabItem>
+  <TabItem label="From source">
+    You need Rust 1.88. In a clone, `rustup` installs it from `rust-toolchain.toml`.
+
+    ```bash
+    git clone https://github.com/hai-hq/refhir.git
+    cd refhir
+    cargo run -p refhir -- --memory
+    ```
+
+    To install the binary instead of running it from the clone:
+
+    ```bash
+    cargo install --git https://github.com/hai-hq/refhir.git refhir
+    refhir --memory
+    ```
+
+    The crate is not on crates.io, so install it from GitHub.
+  </TabItem>
+  <TabItem label="Kubernetes">
+    The Helm chart is in the repository.
+
+    ```bash
+    git clone https://github.com/hai-hq/refhir.git
+    helm install refhir ./refhir/deploy/helm/refhir \
+      --set image.repository=ghcr.io/hai-hq/refhir \
+      --set image.tag=latest
+    ```
+
+    A single pod uses SQLite. To run several processes, use Postgres and `cluster.enabled=true`.
+    See the [Helm chart](/docs/operate/helm/) and [Several processes](/docs/operate/clustering/).
+  </TabItem>
+</Tabs>
+
+## Check that it works
+
+While the server installs packages and builds its search indexes it answers `503` with
+`"status":"starting"`. When it is ready, `/readyz` returns 200:
+
+```bash
+curl -s http://127.0.0.1:8080/readyz
+# {"status":"ok"}
+
+curl -s http://127.0.0.1:8080/metadata | head -c 300
+```
+
+`/metadata` is the CapabilityStatement, built from what is installed, so it is the authority on
+what this server supports. Without `--bind`, the server listens on `127.0.0.1:8080`.
+
+## Where the data lives
+
+| How you started it | Where the data goes |
+|---|---|
+| `--memory` | In RAM. It is gone when the process exits. Good for trying things. |
+| `--sqlite path` | A SQLite file. Without a path the default is `refhir.sqlite` in the working directory. |
+| `--postgres url` | Postgres, for production and for several processes on one database. |
+
+## Next
+
+- [Getting started](/docs/getting-started/) covers configuration, the Docker details and demo data.
+- [Tutorial: a live patient list](/docs/tutorial/) builds something that updates as the data changes.
+- [Production deployment](/docs/operate/production/) is what to decide before you run it for real.

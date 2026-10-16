@@ -19,7 +19,7 @@ From another module:
 go get github.com/hai-hq/refhir/clients/go
 ```
 
-From a clone of this repo, use a `replace` in your `go.mod` or depend on the published module once it is tagged.
+`go get` fetches the latest tagged version. To use a clone of this repository instead, add a `replace` directive to your `go.mod`.
 
 ## Demo data (seed script)
 
@@ -172,7 +172,7 @@ err := watch.Close()              // send Remove on the socket
 
 `Next` only returns values you have not already consumed via a prior `Watch` / `Next`. After `Close`, `Next` returns an error.
 
-Two `Search` calls with the same parameters are two subscriptions (two query IDs). The client does not dedupe them yet.
+Two `Search` calls with the same parameters are two subscriptions (two query IDs). The client does not dedupe them.
 
 ## Writes
 
@@ -204,7 +204,7 @@ Paths are `{ResourceType}/{operation}` for any type the server catalog includes,
 
 ### Operation arguments
 
-The server expects the same JSON `args` as the Rust engine (`crates/fhir/src/run.rs`):
+The server expects these JSON `args`:
 
 | Path | `args` |
 |------|--------|
@@ -281,21 +281,9 @@ Dial without a token is rejected on protected routes.
 Client → server: `ModifyQuerySet` (add/remove queries), `Mutation` (writes).  
 Server → client: `Transition` (query results), `MutationResponse`, `FatalError`.
 
-Operation names use the `udfPath` field, for example `Patient/search`, not REST URLs. This matches [crates/server/src/sync.rs](../../crates/server/src/sync.rs).
+Operation names use the `udfPath` field, for example `Patient/search`, not REST URLs.
 
-The client does not send `Connect`, `Authenticate` or `Action` messages, or optimistic updates. Auth is the HTTP `Authorization` header on the WebSocket upgrade.
-
-## Testing
-
-Integration tests start the `refhir` binary:
-
-```bash
-cargo build -p refhir
-cd clients/go
-go test ./...
-```
-
-Set `REFHIR_BIN` if the binary is not at `../../target/debug/refhir` (paths are resolved from the test file).
+Authentication is the HTTP `Authorization` header on the WebSocket upgrade.
 
 ## REST vs sync
 

@@ -27,6 +27,16 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **Naming more than one database on the command line is now an error.** `--sqlite`, `--memory`
+  and `--postgres` are alternatives, but ReFHIR used to start without complaint and use one of
+  them: `refhir --memory --sqlite x.db` ran in memory and never created `x.db`. It now exits with
+  `pass only one of --sqlite, --memory, or --postgres`, as the
+  [CLI reference](docs/configuration.md#cli-reference) has always said, and that includes the same
+  flag twice. `--sqlite` or `--postgres` followed directly by another flag is refused too, where
+  it used to take the flag as its value (`--sqlite --memory` opened a file called `--memory`).
+  `refhir migrate` does the same for `--sqlite` and `--postgres` (exit status 2). A single flag
+  still overrides the database the config file or the environment names. If a script passes two,
+  remove the one you did not mean.
 - **A `rest-hook` endpoint that redirects has not received the notification.** Redirects are no
   longer followed, and a `3xx` is a failed delivery. A `301`, `302` or `303` used to turn the
   `POST` into a `GET`, and the notification counted as delivered.

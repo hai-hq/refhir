@@ -4,8 +4,7 @@
 //! may `CREATE DATABASE`) and is skipped without it, unless `REFHIR_REQUIRE_POSTGRES` is set.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Command, Output};
 
 mod common;
 
@@ -136,6 +135,129 @@ fn it_needs_to_be_told_what_to_do() {
     assert_eq!(both.status.code(), Some(2));
 }
 
+/// The flags used to be applied in a fixed order (`--sqlite`, then `--postgres`), each clearing the
+/// other, so `--postgres` won whatever order the command line gave.
+#[test]
+fn naming_more_than_one_database_is_refused_in_any_order() {
+    let dir = common::Scratch::new("migrate-both");
+    let file = dir.join("refhir.sqlite");
+    let file = file.to_str().unwrap();
+    let url = common::UNUSABLE_POSTGRES;
+    for args in [
+        ["--status", "--sqlite", file, "--postgres", url],
+        ["--status", "--postgres", url, "--sqlite", file],
+        ["--status", "--sqlite", file, "--sqlite", file],
+        ["--status", "--postgres", url, "--postgres", url],
+    ] {
+        let output = migrate(&args);
+        // The exit code for arguments that were wrong.
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(
+            stderr(&output),
+            "refhir: pass only one of --sqlite or --postgres\n",
+            "{args:?}"
+        );
+        assert!(stdout(&output).is_empty(), "{args:?}: {}", stdout(&output));
+    }
+}
+
+/// A database flag followed by another flag has no value, and was read as the value instead.
+#[test]
+fn a_database_flag_does_not_take_the_next_flag_as_its_value() {
+    for (args, said) in [
+        (
+            ["--status", "--sqlite", "--postgres"],
+            "refhir: --sqlite needs a value, not the flag --postgres\n",
+        ),
+        (
+            ["--status", "--postgres", "--sqlite"],
+            "refhir: --postgres needs a value, not the flag --sqlite\n",
+        ),
+    ] {
+        let output = migrate(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert_eq!(stderr(&output), said, "{args:?}");
+    }
+}
+
+/// "CLI flags override the file", and the environment: one flag replaces the database the
+/// settings name, and is not a conflict with it.
+#[test]
+fn one_database_flag_still_overrides_the_settings() {
+    let dir = common::Scratch::new("migrate-override");
+    let from_file = dir.join("from-file.sqlite");
+    let from_flag = dir.join("from-flag.sqlite");
+    let config = dir.join("settings.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[database]\nkind = \"sqlite\"\nsqlite_path = '{}'\n",
+            from_file.display()
+        ),
+    )
+    .unwrap();
+    let config = config.to_str().unwrap();
+
+    let output = migrate(&[
+        "--status",
+        "--config",
+        config,
+        "--sqlite",
+        from_flag.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with(&format!("database: sqlite {}\n", from_flag.display())),
+        "{}",
+        stdout(&output)
+    );
+
+    // The file's SQLite database is replaced by Postgres, which here is refused at once.
+    let output = migrate(&[
+        "--status",
+        "--config",
+        config,
+        "--postgres",
+        common::UNUSABLE_POSTGRES,
+    ]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("pass only one"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stdout(&output).contains("database: sqlite"),
+        "{}",
+        stdout(&output)
+    );
+
+    // The environment's Postgres is replaced by SQLite.
+    let output = Command::new(env!("CARGO_BIN_EXE_refhir"))
+        .args([
+            "migrate",
+            "--status",
+            "--sqlite",
+            from_flag.to_str().unwrap(),
+        ])
+        .env("REFHIR_POSTGRES_URL", common::UNUSABLE_POSTGRES)
+        .env_remove("REFHIR_CONFIG")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with(&format!("database: sqlite {}\n", from_flag.display())),
+        "{}",
+        stdout(&output)
+    );
+}
+
 /// The server, not just the report, refuses: it exits without serving.
 #[test]
 fn the_server_refuses_to_start_on_a_database_from_a_newer_version() {
@@ -146,30 +268,11 @@ fn the_server_refuses_to_start_on_a_database_from_a_newer_version() {
         "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'future')",
     );
     let dir = path.parent().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_refhir"))
-        .current_dir(dir)
-        .args(["--sqlite", path.to_str().unwrap(), "--bind", "127.0.0.1:0"])
-        .env("REFHIR_SKIP_DEFAULT_PACKAGES", "1")
-        .env("REFHIR_PACKAGE_CACHE", dir.join("packages"))
-        .env_remove("REFHIR_CONFIG")
-        .env_remove("REFHIR_POSTGRES_URL")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("start refhir");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("the server was still running on a database from a newer version");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(status.code(), Some(1));
+    let output = common::exits(
+        dir,
+        &["--sqlite", path.to_str().unwrap(), "--bind", "127.0.0.1:0"],
+    );
+    assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains("newer ReFHIR"),
         "{}",
