@@ -36,6 +36,23 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - Chaining (`Observation?subject:Patient.name=ann`), reverse chaining (`_has`), `_include` and
   `_revinclude`, and compartment search (`GET /Patient/123/Observation`) all work. Name the target
   type in a chain when a reference parameter can point at more than one type.
+- A comma between the values of one parameter is OR, for every kind of parameter:
+  `Slot?status=free,busy`, `HealthcareService?_id=a,b`. Write `\,` for a comma that is part of a
+  value. A value lists at most 1000 alternatives. With `:not` and `:not-in`, a list leaves out
+  every value in it, and `:missing` takes one value.
+- Giving a parameter twice is AND (`date=ge2026-01-01&date=lt2026-02-01`) in a query string, in the
+  URL of a Bundle entry and in Subscription criteria. A GraphQL argument or a live query's
+  arguments have one value per name, so they cannot say it.
+- `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`. The `:iterate` forms
+  (`_include=Slot:schedule&_include:iterate=Schedule:actor`) apply a rule to the matches and to
+  every resource the rules have added, until none is added. A search that would add more than
+  1000 resources that way is a `400`; name the parameters to follow instead of `*`, or search for
+  fewer resources.
+- Under a patient-scoped token, `_include` and `_revinclude` leave out the resources of other
+  patients, as a search does. Resource types that are in no patient's compartment (a Practitioner,
+  an Organization) are still included.
+- `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
+  `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
 
 ## Operations

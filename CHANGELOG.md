@@ -10,6 +10,35 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Fixed
+
+- **A comma between the values of one search parameter is OR.** `Slot?status=free,busy` and
+  `HealthcareService?_id=a,b` matched nothing, because the whole value was compared as one. This
+  holds for ids and every parameter type, with `\,` for a literal comma, and a value lists at most
+  1000 alternatives. `:not` and `:not-in` with a list leave out every value in it.
+- **`_include:iterate` and `_revinclude:iterate` are accepted** instead of refused as an unknown
+  parameter. They apply a rule to the matches and to the resources already added, until none is
+  added, and a search that would add more than 1000 resources that way is a `400`.
+
+### Changed
+
+- A comma in a search value now separates alternatives wherever the value comes from: a query
+  string, `If-None-Exist`, a conditional update or delete, a Bundle entry. A client that sent a
+  value holding a comma without escaping it (`identifier=a,b` for the identifier `a,b`) now matches
+  the resources with `a` or with `b` instead, so a conditional create can be blocked by, and a
+  conditional update or delete can act on, a different resource than before. Write `\,` for a
+  comma that is part of a value.
+- A search parameter given more than once is AND, as FHIR defines it, in a query string, in the
+  URL of a Bundle entry and in Subscription criteria (only the last one counted in the last two).
+  The values were joined with a comma, which now means OR, so
+  `date=ge2026-01-01&date=lt2026-02-01` would have become a match on either bound.
+- `_revinclude=*` is a `400` naming the problem. It used to return no reverse includes and say
+  nothing.
+- `_include` and `_revinclude` no longer add another patient's resources for a patient-scoped
+  token, as a search does not return them. A match that another match refers to is no longer
+  repeated as an include. The CapabilityStatement's `rest.documentation` states how search treats
+  commas, repeated parameters, `:iterate` and the limits above.
+
 ## [0.0.1] - 2026-10-15
 
 The first release. Everything below is new.

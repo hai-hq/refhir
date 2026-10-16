@@ -935,7 +935,7 @@ pub(crate) fn jobs_query(query: &str) -> BTreeMap<String, String> {
             continue;
         }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        params.insert(key.to_string(), value.to_string());
+        refhir_fhir::add_param(&mut params, key.to_string(), value.to_string());
     }
     params
 }

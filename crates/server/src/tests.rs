@@ -106,6 +106,109 @@ pub(crate) fn patient(id: &str) -> Value {
     })
 }
 
+/// The searches a booking client sends: a comma between values is OR, a parameter given twice is
+/// AND, and `_include:iterate` is a control of the search, not an unknown parameter.
+#[tokio::test]
+async fn http_search_takes_comma_or_repeated_and_and_iterate_includes() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    for (id, family) in [("p1", "Ann"), ("p2", "Bee")] {
+        let created = put(
+            &app,
+            json!({"resourceType": "Patient", "id": id, "name": [{"family": family}]}),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    }
+    for (id, subject, code, date) in [
+        ("o1", "p1", "8480-6", "2020-01-02"),
+        ("o2", "p2", "8462-4", "2018-01-02"),
+        ("o3", "p1", "8867-4", "2022-01-02"),
+    ] {
+        let created = put(
+            &app,
+            json!({
+                "resourceType": "Observation", "id": id,
+                "subject": {"reference": format!("Patient/{subject}")},
+                "code": {"coding": [{"code": code}]},
+                "effectiveDateTime": date
+            }),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    }
+    let ids = |reply: &Reply, mode: &str| -> Vec<String> {
+        let mut found: Vec<String> = reply.body["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == mode)
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        found
+    };
+    let search = |uri: &'static str| {
+        let app = app.clone();
+        async move {
+            let reply = send(&app, "GET", uri, None, None).await;
+            assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.body);
+            reply
+        }
+    };
+
+    // Ids: a comma is OR.
+    assert_eq!(search("/Patient?_id=p1").await.body["total"], 1);
+    assert_eq!(search("/Patient?_id=p1,zzz").await.body["total"], 1);
+    assert_eq!(search("/Patient?_id=p1,p2").await.body["total"], 2);
+    assert_eq!(search("/Patient?_id=zzz,yyy").await.body["total"], 0);
+    // A token: a comma is OR, and a page is a page of the union.
+    assert_eq!(search("/Observation?code=8480-6").await.body["total"], 1);
+    let either = search("/Observation?code=8480-6,8462-4&_count=1").await;
+    assert_eq!(either.body["total"], 2);
+    assert_eq!(either.body["entry"].as_array().unwrap().len(), 1);
+    // Repeated, it is AND: no observation has both codes.
+    assert_eq!(
+        search("/Observation?code=8480-6&code=8462-4").await.body["total"],
+        0
+    );
+    // A range written as two bounds, with and without a list in the same query.
+    let range = search("/Observation?date=ge2019-01-01&date=lt2023-01-01").await;
+    assert_eq!(ids(&range, "match"), ["o1", "o3"]);
+    let narrowed = search("/Observation?code=8480-6,8867-4&date=ge2021-01-01").await;
+    assert_eq!(ids(&narrowed, "match"), ["o3"]);
+
+    // Includes: `:iterate` is accepted, alone or after a plain rule.
+    let included = search("/Observation?_id=o1&_include:iterate=Observation:subject").await;
+    assert_eq!(ids(&included, "match"), ["o1"]);
+    assert_eq!(ids(&included, "include"), ["p1"]);
+    let both =
+        search("/Observation?_id=o1&_include=Observation:subject&_include:iterate=Patient:link")
+            .await;
+    assert_eq!(ids(&both, "include"), ["p1"]);
+    let reverse = search(
+        "/Patient?_id=p1&_revinclude=Observation:subject&_revinclude:iterate=Observation:subject",
+    )
+    .await;
+    assert_eq!(ids(&reverse, "include"), ["o1", "o3"]);
+    // A reverse wildcard is refused by name, not answered with nothing.
+    let refused = send(&app, "GET", "/Patient?_revinclude=*", None, None).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+    assert!(
+        refused.body.to_string().contains("not supported"),
+        "{}",
+        refused.body
+    );
+
+    // The CapabilityStatement says what is and is not supported.
+    let metadata = send(&app, "GET", "/metadata", None, None).await;
+    let notes = metadata.body["rest"][0]["documentation"].as_str().unwrap();
+    assert!(
+        notes.contains(":iterate") && notes.contains("`_revinclude=*`"),
+        "{notes}"
+    );
+}
+
 #[tokio::test]
 async fn http_crud_search_history_and_bundle() {
     let (db, catalog, store) = memory();
