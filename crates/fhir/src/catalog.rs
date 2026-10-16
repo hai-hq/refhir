@@ -10,7 +10,7 @@ use refhir_fhirpath::{Host, Model};
 use refhir_persistence::{
     ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
 };
-use refhir_types::{exact_key, IndexId, TabletId};
+use refhir_types::{exact_key, valid_id, IndexId, TabletId};
 use refhir_validate::{expansion_is_current, MemoryTerminology, Schema};
 use serde_json::{json, Value};
 
@@ -302,9 +302,17 @@ impl Catalog {
             let Ok(json) = serde_json::from_str::<Value>(&parameter.json) else {
                 continue;
             };
-            let Some(extractor) = extract::compile_parameter(&json, &component_types) else {
+            let Some(mut extractor) = extract::compile_parameter(&json, &component_types) else {
                 continue;
             };
+            // What the parameter can point at in this type, not in every type it is defined for.
+            extractor.narrow_targets(&parameter.base, |path| {
+                model
+                    .references
+                    .iter()
+                    .find(|element| element.path == path)
+                    .map(|element| element.targets.as_slice())
+            });
             if model
                 .params
                 .iter()
@@ -508,14 +516,6 @@ fn annotate_install(statement: &mut Value) {
             }]);
         }
     }
-}
-
-pub fn valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 64
-        && id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
 }
 
 pub fn index_keys(

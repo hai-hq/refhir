@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
 use crate::error::FhirError;
-use crate::extract::Probe;
+use crate::extract::{Probe, ReferenceId};
 use crate::ops::decorate;
 use crate::resolve::TxHost;
 
@@ -216,16 +216,13 @@ fn page_from_index(
     // there instead of listing the whole range.
     let (rows, total) = match controls.count {
         Some(count) if !controls.needs_total() => {
-            let (rows, more) = tx.index_range_first(
-                &scan.index,
-                scan.interval.clone(),
-                offset.saturating_add(count),
-            )?;
+            let (rows, more) =
+                tx.index_ranges_first(&scan.index, &scan.intervals, offset.saturating_add(count))?;
             let total = rows.len() + usize::from(more);
             (rows, total)
         }
         _ => {
-            let rows = tx.index_range_entries(&scan.index, scan.interval.clone())?;
+            let rows = tx.index_ranges_entries(&scan.index, &scan.intervals)?;
             let total = rows.len();
             (rows, total)
         }
@@ -268,7 +265,7 @@ fn page_by_checking(
     checks: &Checks<'_>,
     controls: &Controls,
 ) -> Result<Page, FhirError> {
-    let rows = tx.index_range_text(&scan.index, scan.interval.clone())?;
+    let rows = tx.index_ranges_text(&scan.index, &scan.intervals)?;
     let mut work = Work {
         rows: rows.len(),
         ..Work::default()
@@ -364,24 +361,22 @@ pub(crate) fn search_reference(
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
-    let rows = tx.index_range(&scan.index, scan.interval.clone())?;
+    let rows = tx.index_ranges_text(&scan.index, &scan.intervals)?;
     let host = TxHost::new(tx, catalog);
     let mut matched = Vec::new();
     for row in rows {
+        let json = row.json()?;
         let checks = Checks {
             clauses: &clauses,
             proven: None,
             chain_ids: &chain_ids,
             has_ids: &has_ids,
         };
-        if !row_matches(catalog, model, &row.json, &checks, &controls, &host) {
+        if !row_matches(catalog, model, &json, &checks, &controls, &host) {
             continue;
         }
         let id = row.id.id_str().unwrap_or("").to_string();
-        matched.push((
-            id,
-            decorate(row.json, row.id.id_str().unwrap_or(""), row.ts),
-        ));
+        matched.push((id, decorate(json, row.id.id_str().unwrap_or(""), row.ts)));
     }
     sort_matches(catalog, model, &mut matched, &controls.sort);
     let total = matched.len();
@@ -535,7 +530,8 @@ fn clauses_from(
             continue;
         }
         if name == "_filter" {
-            parse_filter(value).map_err(FhirError::Invalid)?;
+            let filter = parse_filter(value).map_err(FhirError::Invalid)?;
+            check_filter_ids(model, &filter)?;
             clauses.push(Clause::Filter(value.clone()));
             continue;
         }
@@ -556,11 +552,17 @@ fn clauses_from(
             continue;
         }
         let (base, modifier) = split_modifier(name);
-        if model.ready_param(&base).is_none() {
+        let Some(param) = model.ready_param(&base) else {
             return Err(FhirError::Invalid(format!(
                 "unsupported search parameter {name} on {}",
                 model.name
             )));
+        };
+        // Only a plain value or `:not` is an id to look for; `:missing` takes true or false.
+        if matches!(modifier.as_deref(), None | Some("not")) {
+            if let ReferenceId::Open(types) = param.extractor.reference_id(value) {
+                return Err(open_reference(&base, value, types));
+            }
         }
         clauses.push(Clause::Param {
             name: base,
@@ -569,6 +571,40 @@ fn clauses_from(
         });
     }
     Ok(clauses)
+}
+
+/// Why a bare id cannot be searched for through a reference parameter, and what to send instead.
+/// It is `Unsupported` (still a 400) so that a caller that runs searches on someone else's behalf,
+/// as SDC population does, can tell it from a malformed query.
+fn open_reference(name: &str, id: &str, types: usize) -> FhirError {
+    let why = if types == 0 {
+        "does not say which resource types it can point at".to_string()
+    } else {
+        format!("can point at any of {types} resource types")
+    };
+    FhirError::Unsupported(format!(
+        "reference parameter {name} {why}, so the id {id} alone is not enough: use Type/{id}"
+    ))
+}
+
+/// A `_filter` comparison reads an id as a plain parameter does, so it is refused the same way.
+fn check_filter_ids(model: &ResourceModel, filter: &Filter) -> Result<(), FhirError> {
+    match filter {
+        Filter::And(parts) | Filter::Or(parts) => parts
+            .iter()
+            .try_for_each(|part| check_filter_ids(model, part)),
+        Filter::Cmp { name, op, value } => {
+            if let Some(param) = model
+                .ready_param(name)
+                .filter(|_| matches!(op.as_str(), "eq" | "ne"))
+            {
+                if let ReferenceId::Open(types) = param.extractor.reference_id(value) {
+                    return Err(open_reference(name, value, types));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn is_control(name: &str) -> bool {
@@ -641,8 +677,10 @@ fn split_modifier(name: &str) -> (String, Option<String>) {
 /// Where `search` reads, and what that read already settles.
 struct Scan {
     index: IndexId,
-    interval: Interval,
-    /// The clause whose match every row of `interval` already proves, if there is one.
+    /// The key ranges read, one for almost every search. A bare id for a reference that can point
+    /// at several types is one range for each type.
+    intervals: Vec<Interval>,
+    /// The clause whose match every row of `intervals` already proves, if there is one.
     proven: Option<usize>,
 }
 
@@ -658,12 +696,12 @@ fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
         if let Clause::Id(id) = clause {
             return Scan {
                 index: model.by_id(),
-                interval: Interval::point(exact_key(id)),
+                intervals: vec![Interval::point(exact_key(id))],
                 proven: None,
             };
         }
     }
-    let mut chosen: Option<(u8, String, Interval, usize, bool)> = None;
+    let mut chosen: Option<(u8, String, Vec<Interval>, usize, bool)> = None;
     for (position, clause) in clauses.iter().enumerate() {
         let Clause::Param {
             name,
@@ -680,12 +718,13 @@ fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
             continue;
         };
         let probe = param.extractor.probe(value);
-        let (rank, interval) = match probe {
-            Probe::Token(text) => (0, token_interval(text)),
-            Probe::Prefix(text) => (1, string_interval(text)),
-            Probe::AtLeast(text) => (2, string_at_least(text)),
-            Probe::AtMost(text) => (2, string_at_most(text)),
-            Probe::Range(interval) => (2, interval),
+        let (rank, intervals) = match probe {
+            Probe::Token(text) => (0, vec![token_interval(text)]),
+            Probe::Tokens(tokens) => (0, tokens.iter().map(|text| token_interval(text)).collect()),
+            Probe::Prefix(text) => (1, vec![string_interval(text)]),
+            Probe::AtLeast(text) => (2, vec![string_at_least(text)]),
+            Probe::AtMost(text) => (2, vec![string_at_most(text)]),
+            Probe::Range(interval) => (2, vec![interval]),
             Probe::Scan => continue,
         };
         let replace = chosen
@@ -695,19 +734,19 @@ fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
         if replace {
             // A modifier changes what a match is, so only a plain parameter can be proven.
             let proven = modifier.is_none() && param.extractor.index_proves(value);
-            chosen = Some((rank, name.clone(), interval, position, proven));
+            chosen = Some((rank, name.clone(), intervals, position, proven));
         }
     }
-    if let Some((_, name, interval, position, proven)) = chosen {
+    if let Some((_, name, intervals, position, proven)) = chosen {
         return Scan {
             index: model.search_index(&name),
-            interval,
+            intervals,
             proven: proven.then_some(position),
         };
     }
     Scan {
         index: model.by_id(),
-        interval: Interval::all(),
+        intervals: vec![Interval::all()],
         proven: None,
     }
 }

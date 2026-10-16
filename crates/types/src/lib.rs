@@ -205,6 +205,15 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Whether `id` is a FHIR resource id: one to 64 of letters, digits, `-` and `.`.
+pub fn valid_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+}
+
 /// Exact token / id key. Length-prefixed so one key is never a prefix of another.
 pub fn exact_key(value: &str) -> Vec<u8> {
     let bytes = value.as_bytes();
@@ -378,6 +387,18 @@ mod tests {
         assert!(mg.contains(&quantity_key("mg", 5.4, "o1")));
         assert!(!mg.contains(&quantity_key("mg", 4.0, "o1")));
         assert!(!mg.contains(&quantity_key("g", 9.0, "o1")));
+    }
+
+    #[test]
+    fn a_resource_id_is_up_to_64_letters_digits_dashes_and_dots() {
+        assert!(valid_id("p1"));
+        assert!(valid_id("a-1.b"));
+        assert!(valid_id(&"x".repeat(64)));
+        assert!(!valid_id(""));
+        assert!(!valid_id(&"x".repeat(65)));
+        assert!(!valid_id("Patient/1"));
+        assert!(!valid_id("urn:uuid:1"));
+        assert!(!valid_id("a b"));
     }
 
     #[test]

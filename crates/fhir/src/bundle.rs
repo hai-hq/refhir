@@ -1,10 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use refhir_database::Transaction;
-use refhir_types::Timestamp;
+use refhir_types::{valid_id, Timestamp};
 use serde_json::{json, Value};
 
-use crate::catalog::{valid_id, Catalog};
+use crate::catalog::Catalog;
 use crate::error::{outcome_code, FhirError};
 use crate::ops;
 

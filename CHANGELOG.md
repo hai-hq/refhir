@@ -10,6 +10,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reference search given just an id found nothing.** `Observation?patient=123` now returns
+  what `Observation?patient=Patient/123` returns. A bare id is looked up as a reference to each
+  type the search parameter can point at, so `subject=123` finds a `Patient/123` or a `Group/123`.
+  Live queries over `/sync` read ids the same way, and are woken only by writes that reference
+  that id.
+
+### Changed
+
+- A bare id given to a reference parameter that can point at any resource (`Task?subject=123`) or
+  that lists no `target` is now a `400` that asks for `Type/id`; it used to find nothing.
+
 ## [0.0.1] - 2026-10-15
 
 The first release. Everything below is new.

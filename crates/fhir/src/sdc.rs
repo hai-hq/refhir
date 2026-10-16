@@ -16,10 +16,10 @@ use crate::error::FhirError;
 use crate::ops;
 use crate::search;
 
-struct Bridge<'a> {
-    tx: &'a mut Transaction,
-    catalog: &'a Catalog,
-    scopes: Option<Vec<String>>,
+pub(crate) struct Bridge<'a> {
+    pub(crate) tx: &'a mut Transaction,
+    pub(crate) catalog: &'a Catalog,
+    pub(crate) scopes: Option<Vec<String>>,
 }
 
 impl Chart for Bridge<'_> {
@@ -49,8 +49,13 @@ impl Chart for Bridge<'_> {
             return Ok(Vec::new());
         };
         let (indexed, rest) = split_params(model, params);
-        let bundle = search::search(self.tx, self.catalog, model, &indexed)
-            .map_err(|err| err.to_string())?;
+        let bundle = match search::search(self.tx, self.catalog, model, &indexed) {
+            Ok(bundle) => bundle,
+            // An id the parameter cannot place found nothing before the server read bare ids; a
+            // form's query should not fail the whole operation for it.
+            Err(FhirError::Unsupported(_)) => return Ok(Vec::new()),
+            Err(err) => return Err(err.to_string()),
+        };
         let mut rows = bundle_resources(&bundle);
         rows.retain(|row| {
             rest.iter()

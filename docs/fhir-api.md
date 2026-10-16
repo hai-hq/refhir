@@ -36,6 +36,17 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - Chaining (`Observation?subject:Patient.name=ann`), reverse chaining (`_has`), `_include` and
   `_revinclude`, and compartment search (`GET /Patient/123/Observation`) all work. Name the target
   type in a chain when a reference parameter can point at more than one type.
+- A reference parameter takes `Type/id` or just the id: `Observation?patient=Patient/123` and
+  `Observation?patient=123` return the same resources. A bare id is looked up as a reference to
+  each type the parameter can point at in that resource: the types its `SearchParameter` lists as
+  `target`, limited to those the element it reads allows. So `patient=123` finds `Patient/123`,
+  and `subject=123`, which can point at a Patient, a Group, a Device or a Location, finds a
+  reference to any of them with that id. Write `Type/id` to name the type. An absolute URL is
+  compared as written, so a bare id never matches a reference that is stored as a URL. A parameter
+  that can point at more than 16 types in the resource (`Task?subject` points at any resource) or
+  lists no `target` cannot place a bare id: that search, and a `_filter` comparison, is a `400`
+  that asks for `Type/id`. A [live query](sync-protocol.md) re-runs the same search, so it reads
+  ids the same way.
 - An unknown search parameter is a `400`, not silently ignored.
 
 ## Operations

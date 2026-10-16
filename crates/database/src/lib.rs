@@ -868,7 +868,9 @@ mod tests {
         PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader, TimestampRange,
     };
     use refhir_sqlite::SqlitePersistence;
-    use refhir_types::{exact_key, DocumentId, IndexId, Interval, Order, TabletId};
+    use refhir_types::{
+        exact_key, token_interval, token_key, DocumentId, IndexId, Interval, Order, TabletId,
+    };
     use serde_json::json;
 
     fn memory_db() -> Database {
@@ -894,6 +896,128 @@ mod tests {
             prev_ts: prev,
         })
         .unwrap();
+    }
+
+    fn tag() -> IndexId {
+        IndexId::new("t/tag")
+    }
+
+    /// A document under the token key of each of `tags`, in the `tag` index.
+    fn put_tagged(tx: &mut Transaction, id: &str, tags: &[&str]) {
+        let mut keys = vec![(by_id(), exact_key(id))];
+        keys.extend(tags.iter().map(|name| (tag(), token_key(name, id))));
+        tx.stage_put(Put {
+            tablet: tablet(),
+            id: id.into(),
+            json: json!({"id": id}),
+            new_keys: keys,
+            old_keys: vec![],
+            prev_ts: None,
+        })
+        .unwrap();
+    }
+
+    /// `a` and `c` are tagged x, `a` and `b` are tagged y.
+    fn tagged_db() -> Database {
+        let db = memory_db();
+        let mut seed = db.begin();
+        put_tagged(&mut seed, "a", &["x", "y"]);
+        put_tagged(&mut seed, "b", &["y"]);
+        put_tagged(&mut seed, "c", &["x"]);
+        db.commit(seed).unwrap();
+        db
+    }
+
+    fn ids<P>(rows: &[ScannedRow<P>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.id.id_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn several_intervals_read_as_one_list_in_key_order_with_each_document_once() {
+        let db = tagged_db();
+        let mut tx = db.begin();
+        // Given out of order. The x rows come first, then the y rows, and `a` is in both.
+        let intervals = [token_interval("y"), token_interval("x")];
+        let text = tx.index_ranges_text(&tag(), &intervals).unwrap();
+        assert_eq!(ids(&text), ["a", "c", "b"]);
+        let entries = tx.index_ranges_entries(&tag(), &intervals).unwrap();
+        assert_eq!(ids(&entries), ["a", "c", "b"]);
+        // One interval is what the single read returns.
+        let one = tx.index_range_text(&tag(), token_interval("y")).unwrap();
+        let many = tx
+            .index_ranges_text(&tag(), &[token_interval("y")])
+            .unwrap();
+        assert_eq!(ids(&one), ids(&many));
+        assert!(tx.index_ranges_text(&tag(), &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_first_rows_of_several_intervals_are_those_of_the_whole_list() {
+        let db = tagged_db();
+        let mut tx = db.begin();
+        // Disjoint intervals, which are read one after the other and stop when the page is full,
+        // and overlapping ones, which are read whole.
+        for intervals in [
+            vec![token_interval("y"), token_interval("x")],
+            vec![
+                token_interval("x"),
+                token_interval("y"),
+                token_interval("q"),
+            ],
+            vec![Interval::all(), token_interval("x")],
+        ] {
+            let all = ids(&tx.index_ranges_entries(&tag(), &intervals).unwrap());
+            for wanted in 0..=all.len() + 1 {
+                let (rows, more) = tx.index_ranges_first(&tag(), &intervals, wanted).unwrap();
+                assert_eq!(ids(&rows), all[..wanted.min(all.len())], "{wanted}");
+                assert_eq!(more, all.len() > wanted, "{wanted}");
+            }
+        }
+        // A page the size of the whole list asks for more than there is.
+        let (rows, more) = tx
+            .index_ranges_first(&tag(), &[token_interval("x")], usize::MAX)
+            .unwrap();
+        assert_eq!(ids(&rows), ["a", "c"]);
+        assert!(!more);
+    }
+
+    #[test]
+    fn a_transaction_that_has_written_merges_what_it_staged_into_every_interval() {
+        let db = tagged_db();
+        let mut tx = db.begin();
+        put_tagged(&mut tx, "d", &["x", "y"]);
+        let intervals = [token_interval("x"), token_interval("y")];
+        let (rows, more) = tx.index_ranges_first(&tag(), &intervals, 3).unwrap();
+        assert_eq!(ids(&rows), ["a", "c", "d"]);
+        assert!(more, "b is the fourth");
+    }
+
+    #[test]
+    fn reading_stops_at_the_interval_that_fills_the_page_and_records_only_what_it_read() {
+        // Asking for one row is answered by the x interval alone, so a write into y cannot change
+        // the answer and is not a conflict. A write into x can, and three rows need y as well.
+        for (wanted, written, conflicts) in [(1, "y", false), (1, "x", true), (3, "y", true)] {
+            let db = tagged_db();
+            let mut reader = db.begin();
+            let intervals = [token_interval("x"), token_interval("y")];
+            reader
+                .index_ranges_first(&tag(), &intervals, wanted)
+                .unwrap();
+            // A transaction that wrote nothing has nothing to validate.
+            put_tagged(&mut reader, "e", &["unrelated"]);
+            let mut writer = db.begin();
+            put_tagged(&mut writer, "w", &[written]);
+            db.commit(writer).unwrap();
+            match db.commit(reader) {
+                Ok(_) => assert!(!conflicts, "{wanted} {written}"),
+                Err(err) => {
+                    assert!(conflicts, "{wanted} {written}: {err}");
+                    assert!(err.is_occ(), "{err}");
+                }
+            }
+        }
     }
 
     #[test]

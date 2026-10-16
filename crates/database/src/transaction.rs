@@ -326,6 +326,78 @@ impl Transaction {
         }
     }
 
+    /// `index_range_text` over several intervals of one index, as one list: in key order, and a
+    /// document once however many of the intervals hold it. Every interval is recorded as read.
+    pub fn index_ranges_text(
+        &mut self,
+        index: &IndexId,
+        intervals: &[Interval],
+    ) -> Result<Vec<ScannedText>, PersistError> {
+        let parts = intervals
+            .iter()
+            .map(|interval| self.index_range_text(index, interval.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(merge_ranges(parts))
+    }
+
+    /// `index_range_entries` over several intervals, merged as `index_ranges_text` merges them.
+    pub fn index_ranges_entries(
+        &mut self,
+        index: &IndexId,
+        intervals: &[Interval],
+    ) -> Result<Vec<ScannedEntry>, PersistError> {
+        let parts = intervals
+            .iter()
+            .map(|interval| self.index_range_entries(index, interval.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(merge_ranges(parts))
+    }
+
+    /// The first `wanted` rows of `index_ranges_entries` and whether there are more, reading no
+    /// further than that from storage.
+    ///
+    /// Intervals that do not overlap are read one after the other in key order, and the reading
+    /// ends with the interval that fills the page. The ones after it are not recorded as read: the
+    /// first rows and the `more` flag are settled by the intervals before them, so a write into a
+    /// later one cannot change the answer. Intervals that overlap, and a transaction that has
+    /// written already (which needs every row to merge what it staged), read them all.
+    pub fn index_ranges_first(
+        &mut self,
+        index: &IndexId,
+        intervals: &[Interval],
+        wanted: usize,
+    ) -> Result<(Vec<ScannedEntry>, bool), PersistError> {
+        if let [interval] = intervals {
+            return self.index_range_first(index, interval.clone(), wanted);
+        }
+        let Some(ordered) = in_key_order(intervals).filter(|_| !self.has_writes()) else {
+            let mut rows = self.index_ranges_entries(index, intervals)?;
+            let more = rows.len() > wanted;
+            rows.truncate(wanted);
+            return Ok((rows, more));
+        };
+        let mut rows: Vec<ScannedEntry> = Vec::new();
+        let mut seen = BTreeSet::new();
+        for interval in ordered {
+            // One row past the page shows there is more. A document an earlier interval returned
+            // can come back from this one and does not count, so ask for that many extra.
+            let needed = wanted.saturating_add(1) - rows.len();
+            let (found, _) =
+                self.index_range_first(index, interval.clone(), needed.saturating_add(seen.len()))?;
+            for row in found {
+                if seen.insert(row.id.clone()) {
+                    rows.push(row);
+                }
+            }
+            if rows.len() > wanted {
+                break;
+            }
+        }
+        let more = rows.len() > wanted;
+        rows.truncate(wanted);
+        Ok((rows, more))
+    }
+
     /// The document of a row from `index_range_entries`, and the timestamp of the revision read
     /// (`None` for one this transaction staged). A staged document is its staged JSON; any other is
     /// read from the snapshot as `get` reads it. This records no read of its own: the range the
@@ -644,4 +716,31 @@ fn revision_from_entry(entry: DocumentLogEntry) -> Result<Revision, PersistError
         deleted: json.is_none(),
         json,
     })
+}
+
+/// The rows of several ranges of one index as one list: in key order, a document once however many
+/// of the ranges hold it. A single range is returned as it was read.
+fn merge_ranges<P>(mut parts: Vec<Vec<ScannedRow<P>>>) -> Vec<ScannedRow<P>> {
+    if parts.len() == 1 {
+        return parts.pop().unwrap_or_default();
+    }
+    let mut rows: Vec<_> = parts.into_iter().flatten().collect();
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut seen = BTreeSet::new();
+    rows.retain(|row| seen.insert(row.id.clone()));
+    rows
+}
+
+/// The intervals by where they start, when none of them overlaps another: then every key of one
+/// comes before every key of the next, and reading them in this order reads keys in order.
+fn in_key_order(intervals: &[Interval]) -> Option<Vec<&Interval>> {
+    let mut ordered: Vec<&Interval> = intervals.iter().collect();
+    ordered.sort_by(|left, right| left.start.cmp(&right.start));
+    let apart = ordered.windows(2).all(|pair| {
+        pair[0]
+            .end
+            .as_ref()
+            .is_some_and(|end| end <= &pair[1].start)
+    });
+    apart.then_some(ordered)
 }
