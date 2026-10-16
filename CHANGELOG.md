@@ -218,14 +218,17 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
     the `persistence_globals` table, created by the first write. It takes effect when the
     primary, the replicas and the standbys all run this version: an older replica or standby does
     not follow it, and an older primary does not move it, so those behave as before.
-- **A write whose announcement failed is announced again.** When the server has committed a
-  CodeSystem, ValueSet, ConceptMap or SearchParameter and then fails to tell the other processes
-  (the counter write after the tables were in order), the repair that follows used to find
-  nothing to fix and say nothing, so replicas and standbys stayed on the old catalog until the
-  next change, and the request still succeeded. The repair now tells them again, and they reload
-  everything. If that fails too, the request fails with an error that says the write was
-  committed and the other processes could not be told; they catch up at the next change to the
-  catalog, or at their next start.
+- **A write whose announcement failed is announced again, and a primary announces when it
+  starts.** When the server has committed a CodeSystem, ValueSet, ConceptMap or SearchParameter
+  and then fails to tell the other processes (the counter write after the tables were in order),
+  the repair that follows used to find nothing to fix and say nothing, so replicas and standbys
+  stayed on the old catalog until the next change. The repair now tells them again, and they
+  reload everything, unless it published, which tells them. The request succeeds either way,
+  because the write is committed and right: a failure to tell the others is logged, and they
+  catch up at the next change to the catalog or at their next start. The repair that runs as a
+  primary starts does the same, so a primary that stopped between writing and telling is made up
+  for. The cost is that every replica and standby loads the whole catalog (a few seconds of one
+  thread each) when a primary starts or a standby takes over.
 
 ## [0.0.1] - 2026-10-15
 

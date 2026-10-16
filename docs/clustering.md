@@ -26,7 +26,9 @@ refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
   search parameter until its backfill has finished. A CodeSystem, ValueSet or ConceptMap reloads
   only the terminology, which takes a fraction of that and does not wait for a backfill. Writing
   many of them one by one keeps replicas reloading; a `transaction` Bundle or a package is one
-  change, and so one reload.
+  change, and so one reload. A primary also tells them when it starts, in case the process before
+  it stopped between writing and telling, so each replica and standby reloads everything once
+  when a primary starts or a standby takes over.
 - **Load balancers.** `GET /healthz` is 200 when a process can take traffic and 503 when it
   cannot: a standby, a process still starting, or a replica that has stopped following the
   primary. `?verbose=1` adds connection pool and commit timing counters.

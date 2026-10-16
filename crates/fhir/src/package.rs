@@ -549,9 +549,8 @@ pub(crate) fn announce_terminology(store: &dyn ConformanceStore) -> Result<(), F
 }
 
 /// Tell the other processes that something may have changed that they have not been told of, so
-/// each loads the whole catalog again. For a write that failed part of the way and was repaired:
-/// the failure may have been the announcement itself, and a repair that finds nothing to fix says
-/// nothing.
+/// each loads the whole catalog again. For a repair that published nothing: what made it
+/// necessary may have been the announcement itself.
 pub(crate) fn announce_all(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
@@ -594,7 +593,7 @@ pub fn reload_catalog(
         return Ok(loaded);
     }
     if now.clock == loaded.clock {
-        let (mut terminology, stamp) = Catalog::open_terminology(store, clock)?;
+        let mut terminology = Catalog::open_terminology(store)?;
         // Read what a request would otherwise wait for now, while the catalog being replaced is
         // still answering. The definitions it holds are the ones these hold terminology for.
         catalog
@@ -605,7 +604,10 @@ pub fn reload_catalog(
             .write()
             .expect("catalog")
             .replace_terminology(terminology);
-        return Ok(stamp);
+        // `now` was read before the load, and it is what is recorded: a write that lands during
+        // the load moves a counter past it, so the next call loads again. A publish that lands
+        // during it is found the same way, not recorded as loaded when only terminology was read.
+        return Ok(now);
     }
     let (fresh, stamp) = Catalog::open_consistent(store, clock)?;
     let mut fresh = fresh;

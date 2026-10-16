@@ -4152,6 +4152,8 @@ mod takeover {
         }
 
         /// What the watcher does when it sees the counters differ from the ones it loaded at.
+        /// The `Reload` is what the stamps say moved, not what was read: a test that cares counts
+        /// the reads with a `WatchedStore`.
         fn catch_up(&mut self, store: &dyn rp::ConformanceStore) -> Reload {
             let now =
                 crate::package::reload_catalog(store, &self.catalog, self.at, self.clock).unwrap();
@@ -4496,7 +4498,7 @@ mod takeover {
     }
 
     #[test]
-    fn an_announcement_that_keeps_failing_says_the_write_happened() {
+    fn an_announcement_that_keeps_failing_does_not_fail_the_write() {
         let db = with_resource_types();
         let watched = WatchedStore::new(db.store.clone());
         let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
@@ -4509,22 +4511,18 @@ mod takeover {
         .unwrap();
         assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
 
-        // Nothing can be announced, not even by the repair.
+        // Nothing can be announced, not even by the repair. The write is committed and right on
+        // the primary, so the request succeeds: a client that retried a failed one would write
+        // it twice. Only the replica is not told.
         watched.fail_bump_terminology.store(1, Ordering::SeqCst);
         watched.fail_bump_catalog.store(100, Ordering::SeqCst);
-        let told = watched_commit(
+        watched_commit(
             &db,
             &watched,
             "ValueSet/create",
             json!({"resource": pets()}),
         )
-        .unwrap_err();
-        let message = format!("{told:?}");
-        assert!(
-            message.contains("was committed") && message.contains("telling the other processes"),
-            "{message}"
-        );
-        // The write is there, on the primary and in the store, whatever the request said.
+        .unwrap();
         assert_eq!(codes_of_pets(&db.catalog), Some(vec!["dog".into()]));
         assert_eq!(replica.catch_up(&db.store), Reload::Nothing);
         assert_eq!(replica.pets(), None);
@@ -4540,6 +4538,116 @@ mod takeover {
         .unwrap();
         assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
         assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+    }
+
+    #[test]
+    fn a_repair_that_publishes_announces_once() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let (version, revision, terminology) = counters(&db);
+
+        // The projection fails after the commit, so the repair finds a row missing, rebuilds and
+        // publishes. That is the announcement: the repair does not make a second one.
+        watched.fail_upsert_terminology.store(1, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": color_value_set("repaired", &["a"], "http://example.org/s")}),
+        )
+        .unwrap();
+        assert_eq!(counters(&db), (version + 1, revision + 1, terminology));
+    }
+
+    #[test]
+    fn a_repair_that_finds_nothing_to_fix_still_announces() {
+        let db = with_resource_types();
+        write_pets(&db, &["dog"]);
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        let (version, revision, terminology) = counters(&db);
+
+        // What a primary does as it starts: the process before it may have stopped after writing
+        // and before telling anyone, and the tables alone cannot say whether it did.
+        repair_conformance(&db.store, &db.db, &db.catalog).unwrap();
+        assert_eq!(counters(&db), (version + 1, revision + 1, terminology));
+        for follower in [&mut replica, &mut standby] {
+            assert_eq!(follower.catch_up(&db.store), Reload::Everything);
+        }
+    }
+
+    #[test]
+    fn a_publish_that_lands_while_terminology_is_loading_is_loaded_afterwards() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&watched, crate::CatalogClock::Stable);
+        write_pets(&db, &["dog"]);
+
+        // A publish lands while the replica reads the terminology: here only its version bump.
+        let store = db.store.clone();
+        *watched.on_terminology_load.lock().unwrap() = Some(Box::new(move || {
+            store.bump_catalog_version().unwrap();
+        }));
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Terminology);
+        assert_eq!(WatchedStore::count(&watched.definition_loads), 0);
+
+        // The clock that moved was not read into the catalog, so it is not recorded as loaded:
+        // the next call loads everything, and the one after finds nothing to do.
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Everything);
+        assert!(WatchedStore::count(&watched.definition_loads) > 0);
+        assert_eq!(replica.catch_up(&watched), Reload::Nothing);
+    }
+
+    #[test]
+    fn the_watcher_loads_the_terminology_for_a_terminology_write_and_everything_for_a_package() {
+        let db = with_resource_types();
+        let watched = Arc::new(WatchedStore::new(db.store.clone()));
+        let (loaded, started) =
+            Catalog::open_consistent(watched.as_ref(), crate::CatalogClock::Stable).unwrap();
+        let catalog = Arc::new(std::sync::RwLock::new(loaded));
+        let store: Arc<dyn rp::ConformanceStore> = watched.clone();
+        let watcher = crate::package::watch_catalog(
+            store,
+            &catalog,
+            started,
+            std::time::Duration::from_millis(20),
+            crate::CatalogClock::Stable,
+        );
+        let resource_types = || {
+            catalog.read().unwrap().capability_statement()["rest"][0]["resource"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "never saw {what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // A terminology write: the watcher reads the terminology and nothing else.
+        watched.reset();
+        write_pets(&db, &["dog"]);
+        until("the terminology", &|| {
+            codes_of_pets(&catalog) == Some(vec!["dog".into()])
+        });
+        assert_eq!(WatchedStore::count(&watched.definition_loads), 0);
+        assert_eq!(WatchedStore::count(&watched.full_search_parameter_loads), 0);
+
+        // A package moves the clock: it reads everything.
+        let types = resource_types();
+        install_package_dir(&db.store, &db.db, &db.catalog, extra_dir()).unwrap();
+        until("the package", &|| resource_types() > types);
+        assert!(WatchedStore::count(&watched.definition_loads) > 0);
+
+        let stopped = watcher.stop();
+        assert_eq!(stopped.clock, db.store.catalog_version().unwrap());
+        assert_eq!(stopped.terminology, db.store.terminology_version().unwrap());
+        assert!(stopped.clock > started.clock && stopped.terminology > started.terminology);
     }
 }
 
@@ -5927,6 +6035,8 @@ struct WatchedStore {
     full_expansion_loads: AtomicUsize,
     full_search_parameter_loads: AtomicUsize,
     definition_loads: AtomicUsize,
+    /// Run once, as the next terminology read begins: a change another process makes meanwhile.
+    on_terminology_load: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Rewrites of a whole package's expansions.
     package_expansion_rewrites: AtomicUsize,
     expansion_changes: AtomicUsize,
@@ -5948,6 +6058,7 @@ impl WatchedStore {
             full_expansion_loads: AtomicUsize::new(0),
             full_search_parameter_loads: AtomicUsize::new(0),
             definition_loads: AtomicUsize::new(0),
+            on_terminology_load: std::sync::Mutex::new(None),
             package_expansion_rewrites: AtomicUsize::new(0),
             expansion_changes: AtomicUsize::new(0),
             fail_upsert_terminology: AtomicUsize::new(0),
@@ -6031,6 +6142,10 @@ impl ConformanceStore for WatchedStore {
         self.full_terminology_loads.fetch_add(1, Ordering::SeqCst);
         if Self::should_fail(&self.fail_load_terminology) {
             return Err(PersistError::Definite("injected failure".into()));
+        }
+        let hook = self.on_terminology_load.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
         }
         self.inner.load_terminology()
     }

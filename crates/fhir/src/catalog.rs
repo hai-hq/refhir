@@ -213,25 +213,6 @@ pub struct Catalog {
     stale_expansions: bool,
 }
 
-/// `load`, run until the counters hold still across it (at most five times; see
-/// [`Catalog::open_consistent`]).
-fn consistent<T>(
-    store: &dyn ConformanceStore,
-    clock: CatalogClock,
-    load: impl Fn() -> Result<T, PersistError>,
-) -> Result<(T, CatalogStamp), PersistError> {
-    let mut attempts = 0;
-    loop {
-        let before = clock.stamp(store)?;
-        let loaded = load()?;
-        let after = clock.stamp(store)?;
-        attempts += 1;
-        if before == after || attempts >= 5 {
-            return Ok((loaded, before));
-        }
-    }
-}
-
 impl Catalog {
     /// Whether any search parameter is still waiting for its backfill.
     pub fn has_pending_parameters(&self) -> bool {
@@ -295,33 +276,45 @@ impl Catalog {
     }
 
     /// The catalog and the counters it reflects. `open` reads five tables one after another, so a
-    /// change made in between could give a catalog that mixes two states; this reads the counters
-    /// before and after and tries again if they moved. If they never hold still the catalog is
-    /// returned with the *older* reading, so a caller that watches the counters sees them differ
-    /// and loads again, rather than trusting a catalog that may mix two states.
+    /// change made in between could give a catalog that mixes two states; this reads the clock
+    /// before and after and tries again if it moved. If it never holds still the catalog is
+    /// returned with the *older* reading, so a caller that watches the clock sees it differ and
+    /// loads again, rather than trusting a catalog that may mix two states.
+    ///
+    /// Only the clock decides. A terminology write that lands during the load leaves that counter
+    /// ahead of the stamp returned, which is read before the load, so whoever watches it loads the
+    /// terminology again: much cheaper than loading everything again here.
     pub fn open_consistent(
         store: &dyn ConformanceStore,
         clock: CatalogClock,
     ) -> Result<(Self, CatalogStamp), PersistError> {
-        consistent(store, clock, || Self::open(store))
+        let mut attempts = 0;
+        loop {
+            let before = clock.stamp(store)?;
+            let catalog = Self::open(store)?;
+            let after = clock.read(store)?;
+            attempts += 1;
+            if before.clock == after || attempts >= 5 {
+                return Ok((catalog, before));
+            }
+        }
     }
 
-    /// What the terminology and expansion tables hold now, with the counters it reflects, for a
-    /// process that was told only the terminology changed. Nothing else is read.
+    /// What the terminology and expansion tables hold now, for a process that was told only the
+    /// terminology changed. Nothing else is read, and the counters are not: the caller read them
+    /// before this, so that a change made during the load is found by the next poll (see
+    /// [`crate::package::reload_catalog`]).
     pub(crate) fn open_terminology(
         store: &dyn ConformanceStore,
-        clock: CatalogClock,
-    ) -> Result<(CompiledTerminology, CatalogStamp), PersistError> {
-        consistent(store, clock, || {
-            let fhir_version = store
-                .load_packages()?
-                .first()
-                .map(|package| package.fhir_version.clone());
-            let source = store
-                .shared()
-                .map(|shared| Arc::new(StoreSource::new(shared)) as Arc<dyn TermSource>);
-            CompiledTerminology::open(store, fhir_version.as_deref(), source)
-        })
+    ) -> Result<CompiledTerminology, PersistError> {
+        let fhir_version = store
+            .load_packages()?
+            .first()
+            .map(|package| package.fhir_version.clone());
+        let source = store
+            .shared()
+            .map(|shared| Arc::new(StoreSource::new(shared)) as Arc<dyn TermSource>);
+        CompiledTerminology::open(store, fhir_version.as_deref(), source)
     }
 
     /// Make terminology read by [`Self::open_terminology`] ready to replace this catalog's own: it
