@@ -1021,13 +1021,14 @@ pub trait ConformanceStore: Send + Sync {
     /// stored in one transaction, so it is there whole or not at all. Installing the largest R4
     /// package this way takes the memory of a few rows, not of the package. If `feed` fails, so
     /// does the install and nothing is stored. The default gathers the rows and stores them with
-    /// [`ConformanceStore::install_package`].
+    /// [`ConformanceStore::install_package`]. `feed` is `Send` because a store that talks to its
+    /// database from a thread of its own calls it there.
     fn install_package_in_pieces(
         &self,
         name: &str,
         version: &str,
         fhir_version: &str,
-        feed: &mut dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError>,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
     ) -> Result<InstallOutcome, InstallError> {
         let mut package = NewPackage {
             name: name.to_string(),
@@ -2544,6 +2545,7 @@ pub mod conformance {
         let topped = store
             .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
                 rows.structure_definitions(&definitions(0, 3))?;
+                rows.search_parameters(&parameters("pieces"))?;
                 rows.terminology(&terminology(25, 33))?;
                 rows.terminology(&terminology(33, 40))?;
                 rows.expansions(&expansions(18, 22))?;
@@ -2572,6 +2574,184 @@ pub mod conformance {
         );
         assert_eq!(held("whole"), held("pieces"));
         assert!(held("pieces").2.is_empty());
+
+        // Search parameters that meet inside one package (a draft and the real definition that
+        // replaces it, a draft that yields to a real one stored before it, two spellings of one
+        // expression) end up as they do whole, wherever the pieces are cut, and report the same
+        // ones as waiting for a backfill.
+        let parameter = |name: &str, key: &str, code: &str, expression: Option<&str>, draft| {
+            NewSearchParameter {
+                url: format!("http://example.org/{tag}/{name}/param/{key}"),
+                base: "Patient".into(),
+                code: format!("{name}-{code}-{tag}"),
+                param_type: "string".into(),
+                expression: expression.map(str::to_string),
+                status: ParamStatus::Pending,
+                json: format!(r#"{{"experimental":{draft}}}"#),
+            }
+        };
+        let meeting = |name: &str| -> Vec<NewSearchParameter> {
+            vec![
+                parameter(name, "bare", "bare", None, false),
+                parameter(name, "draft", "replaced", Some("Patient.draft"), true),
+                parameter(name, "real", "replaced", Some("Patient.real"), false),
+                parameter(name, "plain", "plain", Some("Patient.plain"), false),
+                parameter(name, "kept", "kept", Some("Patient.kept"), false),
+                parameter(name, "sketch", "kept", Some("Patient.sketch"), true),
+                parameter(name, "again", "plain", Some("plain"), false),
+            ]
+        };
+        let pending = |name: &str, outcome: &InstallOutcome| -> Vec<String> {
+            let mut codes: Vec<String> = outcome
+                .newly_pending
+                .iter()
+                .map(|param| {
+                    param
+                        .code
+                        .strip_prefix(&format!("{name}-"))
+                        .and_then(|code| code.strip_suffix(&format!("-{tag}")))
+                        .unwrap_or_else(|| panic!("{} is not {name}'s", param.code))
+                        .to_string()
+                })
+                .collect();
+            codes.sort();
+            codes
+        };
+        let stored_parameters = |name: &str| -> Vec<(String, Option<String>, ParamStatus)> {
+            let id = store
+                .load_packages()
+                .unwrap()
+                .into_iter()
+                .find(|package| package.name == format!("{name}.{tag}"))
+                .map(|package| package.id)
+                .unwrap_or_else(|| panic!("{name} is not installed"));
+            let mut rows: Vec<(String, Option<String>, ParamStatus)> = store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| {
+                    let key = row.url.rsplit('/').next().unwrap_or_default().to_string();
+                    (key, row.expression, row.status)
+                })
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        };
+        let package_of = |name: &str, parameters| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: parameters,
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        let reference = store
+            .install_package(&package_of("meetwhole", meeting("meetwhole")))
+            .unwrap();
+        let expected_pending = pending("meetwhole", &reference);
+        assert_eq!(
+            expected_pending,
+            ["bare", "kept", "plain", "replaced", "replaced"]
+        );
+        let expected_rows = stored_parameters("meetwhole");
+        let keys: Vec<&str> = expected_rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(keys, ["again", "bare", "kept", "plain", "real"]);
+        let count = meeting("shape").len();
+        let mut cut_sets: Vec<Vec<usize>> = (0..=count).map(|cut| vec![cut]).collect();
+        cut_sets.push((1..count).collect());
+        for (number, cuts) in cut_sets.iter().enumerate() {
+            let name = format!("meetpieces{number}");
+            let all = meeting(&name);
+            let outcome = store
+                .install_package_in_pieces(
+                    &format!("{name}.{tag}"),
+                    "1.0.0",
+                    "4.0.1",
+                    &mut |rows| {
+                        let mut from = 0;
+                        for &to in cuts.iter().chain(&[all.len()]) {
+                            rows.search_parameters(&all[from..to])?;
+                            from = to;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                pending(&name, &outcome),
+                expected_pending,
+                "cut at {cuts:?}"
+            );
+            assert_eq!(stored_parameters(&name), expected_rows, "cut at {cuts:?}");
+        }
+
+        // Against a parameter another package has installed, in pieces: the same definition is
+        // found there and is not waiting for a backfill, and one that disagrees refuses the
+        // install after earlier pieces were stored, which leaves nothing behind.
+        let shared = |name: &str, key: &str, expression: &str| NewSearchParameter {
+            url: format!("http://example.org/{tag}/{name}/param/{key}"),
+            base: "Patient".into(),
+            code: format!("shared-{tag}"),
+            param_type: "string".into(),
+            expression: Some(format!("Patient.{expression}")),
+            status: ParamStatus::Pending,
+            json: r#"{"experimental":false}"#.into(),
+        };
+        let owner = store
+            .install_package(&package_of(
+                "owner",
+                vec![shared("owner", "owned", "owned")],
+            ))
+            .unwrap();
+        assert_eq!(owner.newly_pending.len(), 1);
+        let agreeing = store
+            .install_package_in_pieces(&format!("agreeing.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
+                rows.search_parameters(&[parameter(
+                    "agreeing",
+                    "other",
+                    "other",
+                    Some("o"),
+                    false,
+                )])?;
+                rows.search_parameters(&[shared("agreeing", "owned", "owned")])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(pending("agreeing", &agreeing), ["other"]);
+        assert_eq!(stored_parameters("agreeing").len(), 2);
+        let refused = store.install_package_in_pieces(
+            &format!("disagreeing.{tag}"),
+            "1.0.0",
+            "4.0.1",
+            &mut |rows| {
+                rows.structure_definitions(&definitions(0, 2))?;
+                rows.search_parameters(&[parameter(
+                    "disagreeing",
+                    "other",
+                    "other",
+                    Some("o"),
+                    false,
+                )])?;
+                rows.search_parameters(&[shared("disagreeing", "elsewhere", "elsewhere")])?;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(refused, Err(InstallError::Expression { .. })),
+            "{refused:?}"
+        );
+        assert!(!store
+            .load_packages()
+            .unwrap()
+            .iter()
+            .any(|package| package.name == format!("disagreeing.{tag}")));
+        assert!(!store
+            .load_search_parameters()
+            .unwrap()
+            .iter()
+            .any(|row| row.code == format!("disagreeing-other-{tag}")));
     }
 
     /// Reading terminology by URL and changing one stored expansion at a time. `tag` keeps this

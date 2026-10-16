@@ -275,7 +275,7 @@ pub(crate) fn stage_package_in_pieces(
     db: &Database,
     catalog: &RwLock<Catalog>,
     head: &PackageHead,
-    feed: &mut dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError>,
+    feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
     publish_now: bool,
 ) -> Result<Option<PendingBackfill>, FhirError> {
     let started = std::time::Instant::now();

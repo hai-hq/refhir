@@ -30,3 +30,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 refhir-sqlite = { path = "../sqlite" }
+refhir-postgres = { path = "../postgres" }
+postgres = { workspace = true }

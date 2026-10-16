@@ -522,7 +522,7 @@ impl ConformanceStore for SqlitePersistence {
         name: &str,
         version: &str,
         fhir_version: &str,
-        feed: &mut dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError>,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
     ) -> Result<InstallOutcome, InstallError> {
         let guard = self.inner.lock()?;
         let tx = guard.connection.unchecked_transaction().map_err(definite)?;

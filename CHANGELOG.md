@@ -69,11 +69,15 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 - **A first start stores each package as it reads it.** The prepared file (see below) holds a
   package as values of about 4 MB of rows, and the database takes them one at a time inside one
   transaction, so a package is stored whole or not at all, as before. The largest default package
-  is over 120 MB of JSON, and a first start used to hold all of it; on SQLite it now holds a few
-  megabytes of it at a time, and the heap peaks at about 42 MB where it peaked at about 129 MB
-  (resident memory 120 MB where it was 300 MB). A prepared file made by an earlier build of this
-  version has another format and is refused with an error that says so: make it again with
-  `refhir package-bundle`. Postgres still reads each package whole.
+  is over 120 MB of JSON, and a first start used to hold all of it; it now holds a few megabytes
+  of it at a time, on SQLite and on Postgres. On SQLite the heap peaks at about 42 MB where it
+  peaked at about 129 MB (resident memory 120 MB where it was 300 MB); on Postgres at about
+  51 MB where it peaked at about 164 MB. Postgres keeps a buffer as large as the biggest
+  statement a connection has sent for as long as the connection lives, which after storing the
+  default packages would be about 16 MB for the life of the server, so a connection that stored
+  a large package is closed afterwards and the pool opens another. A prepared file made by an
+  earlier build of this version has another format and is refused with an error that says so:
+  make it again with `refhir package-bundle`.
 - **The server downloads packages only if it is told it may.** It used to fetch the release's
   packages from packages.fhir.org on a first start, and anything named in `[conformance].packages`
   or `$install`. Now nothing is downloaded unless `[conformance].package_download = true` (or

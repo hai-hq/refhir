@@ -2,9 +2,9 @@ use postgres::Transaction;
 use refhir_persistence::{
     plan_package_parameters, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
     InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
-    NewTerminology, ParamStatus, PersistError, PersistenceGlobalKey, StoredBackfill,
-    StoredExpansion, StoredPackage, StoredParameterRow, StoredSearchParameter,
-    StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
+    NewTerminology, PackageRows, ParamStatus, PendingParam, PersistError, PersistenceGlobalKey,
+    PoolGuard, StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow,
+    StoredSearchParameter, StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 
 use crate::{definite, PostgresPersistence};
@@ -470,8 +470,30 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
-            let outcome = install_in_tx(&mut tx, package)?;
+            let (outcome, heaviest) = install_in_tx(&mut tx, package)?;
             tx.commit().map_err(definite)?;
+            retire_if_swollen(&mut guard, heaviest);
+            Ok(outcome)
+        })
+    }
+
+    fn install_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        crate::off_runtime(|| {
+            let _gate = self.gate();
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            self.fence(&mut tx)?;
+            let mut installer = Installer::begin(&mut tx, name, version, fhir_version)?;
+            feed(&mut installer)?;
+            let (outcome, heaviest) = installer.finish()?;
+            tx.commit().map_err(definite)?;
+            retire_if_swollen(&mut guard, heaviest);
             Ok(outcome)
         })
     }
@@ -966,51 +988,168 @@ impl ConformanceStore for PostgresPersistence {
 fn install_in_tx(
     tx: &mut Transaction<'_>,
     package: &NewPackage,
-) -> Result<InstallOutcome, InstallError> {
-    let existing = tx
-        .query_opt(
-            "SELECT id FROM packages WHERE name = $1 AND version = $2",
-            &[&package.name, &package.version],
-        )
-        .map_err(definite)?;
-    if let Some(row) = existing {
-        let package_id: i64 = row.get(0);
-        insert_terminology(tx, package_id, package)?;
-        replace_expansions(tx, package_id, package)?;
-        return Ok(InstallOutcome {
-            package_id,
-            inserted: false,
-            newly_pending: Vec::new(),
-        });
-    }
-    let current = tx
-        .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
-        .map_err(definite)?;
-    if let Some(row) = current {
-        let existing: String = row.get(0);
-        if existing != package.fhir_version {
-            return Err(InstallError::FhirVersion {
-                existing,
-                incoming: package.fhir_version.clone(),
+) -> Result<(InstallOutcome, usize), InstallError> {
+    let mut installer =
+        Installer::begin(tx, &package.name, &package.version, &package.fhir_version)?;
+    installer.structure_definitions(&package.structure_definitions)?;
+    installer.search_parameters(&package.search_parameters)?;
+    installer.terminology(&package.terminology)?;
+    installer.expansions(&package.expansions)?;
+    installer.finish()
+}
+
+/// A package being stored inside a transaction, a few rows at a time.
+///
+/// A package the store already has (same name and version) takes only terminology, which is added
+/// to what it has, and expansions, which replace what it has. A package it does not have gets its
+/// definitions and search parameters too, and the search parameters are checked against the ones
+/// installed. Each call stores the rows it is given in statements of its own, so what is held at
+/// once is the rows of one call, however large the package.
+struct Installer<'a, 'c> {
+    tx: &'a mut Transaction<'c>,
+    package_id: i64,
+    /// Whether the package was there before this install.
+    existing: bool,
+    newly_pending: Vec<PendingParam>,
+    /// Whether the package's earlier expansions have been cleared for this install's.
+    expansions_cleared: bool,
+    /// The most JSON text any one call was given.
+    heaviest: usize,
+}
+
+impl<'a, 'c> Installer<'a, 'c> {
+    fn begin(
+        tx: &'a mut Transaction<'c>,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+    ) -> Result<Self, InstallError> {
+        let existing = tx
+            .query_opt(
+                "SELECT id FROM packages WHERE name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .map_err(definite)?;
+        if let Some(row) = existing {
+            let package_id: i64 = row.get(0);
+            return Ok(Self {
+                tx,
+                package_id,
+                existing: true,
+                newly_pending: Vec::new(),
+                expansions_cleared: false,
+                heaviest: 0,
             });
         }
+        let current = tx
+            .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
+            .map_err(definite)?;
+        if let Some(row) = current {
+            let existing: String = row.get(0);
+            if existing != fhir_version {
+                return Err(InstallError::FhirVersion {
+                    existing,
+                    incoming: fhir_version.to_string(),
+                });
+            }
+        }
+        let inserted = tx
+            .query_one(
+                "INSERT INTO packages (name, version, fhir_version) VALUES ($1, $2, $3) \
+                 RETURNING id",
+                &[&name, &version, &fhir_version],
+            )
+            .map_err(definite)?;
+        let package_id: i64 = inserted.get(0);
+        Ok(Self {
+            tx,
+            package_id,
+            existing: false,
+            newly_pending: Vec::new(),
+            expansions_cleared: false,
+            heaviest: 0,
+        })
     }
-    let inserted = tx
-        .query_one(
-            "INSERT INTO packages (name, version, fhir_version) VALUES ($1, $2, $3) RETURNING id",
-            &[&package.name, &package.version, &package.fhir_version],
-        )
-        .map_err(definite)?;
-    let package_id: i64 = inserted.get(0);
-    insert_structure_definitions(tx, package_id, &package.structure_definitions)?;
-    let newly_pending = insert_search_parameters(tx, package_id, &package.search_parameters)?;
-    insert_terminology(tx, package_id, package)?;
-    replace_expansions(tx, package_id, package)?;
-    Ok(InstallOutcome {
-        package_id,
-        inserted: true,
-        newly_pending,
-    })
+
+    fn note(&mut self, bytes: usize) {
+        self.heaviest = self.heaviest.max(bytes);
+    }
+
+    fn clear_expansions(&mut self) -> Result<(), InstallError> {
+        if !self.expansions_cleared {
+            self.tx
+                .execute(
+                    "DELETE FROM value_set_expansion WHERE package_id = $1",
+                    &[&self.package_id],
+                )
+                .map_err(definite)?;
+            self.expansions_cleared = true;
+        }
+        Ok(())
+    }
+
+    /// The outcome, and the most JSON text any one call was given.
+    fn finish(mut self) -> Result<(InstallOutcome, usize), InstallError> {
+        // A package that is installed again and brings no expansions has none afterwards.
+        self.clear_expansions()?;
+        Ok((
+            InstallOutcome {
+                package_id: self.package_id,
+                inserted: !self.existing,
+                newly_pending: self.newly_pending,
+            },
+            self.heaviest,
+        ))
+    }
+}
+
+impl PackageRows for Installer<'_, '_> {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        if self.existing {
+            return Ok(());
+        }
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_structure_definitions(self.tx, self.package_id, rows)
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        if self.existing {
+            return Ok(());
+        }
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        let pending = insert_search_parameters(self.tx, self.package_id, rows)?;
+        self.newly_pending.extend(pending);
+        Ok(())
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_terminology(self.tx, self.package_id, rows)
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.clear_expansions()?;
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_expansions(self.tx, self.package_id, rows)
+    }
+}
+
+/// How much JSON text one call of an install may carry before the connection it went over is
+/// closed once the install is stored. A connection copies each statement into a buffer that it
+/// keeps at the size of the largest it has sent, for as long as it lives, so a connection that
+/// has stored a package of 100 MB in pieces of several megabytes keeps about 16 MB, which the
+/// server would then hold for as long as it ran. A small install is not worth a new connection.
+const RETIRE_AFTER_BYTES: usize = 1024 * 1024;
+
+/// Close the connection of an install that was large (see [`RETIRE_AFTER_BYTES`]); the pool
+/// opens another when it is next asked for one.
+fn retire_if_swollen(connection: &mut PoolGuard<'_, crate::Inner>, heaviest: usize) {
+    if heaviest > RETIRE_AFTER_BYTES {
+        connection.discard();
+    }
 }
 
 /// The most JSON text one statement carries. A package is thousands of rows and tens of
@@ -1160,9 +1299,9 @@ fn insert_search_parameters(
 fn insert_terminology(
     tx: &mut Transaction<'_>,
     package_id: i64,
-    package: &NewPackage,
+    rows: &[NewTerminology],
 ) -> Result<(), InstallError> {
-    for run in runs(&package.terminology, |row| row.json.len() + row.url.len()) {
+    for run in runs(rows, |row| row.json.len() + row.url.len()) {
         let types: Vec<&str> = run.iter().map(|row| row.resource_type.as_str()).collect();
         let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
         let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
@@ -1179,17 +1318,12 @@ fn insert_terminology(
     Ok(())
 }
 
-fn replace_expansions(
+fn insert_expansions(
     tx: &mut Transaction<'_>,
     package_id: i64,
-    package: &NewPackage,
+    rows: &[NewExpansion],
 ) -> Result<(), InstallError> {
-    tx.execute(
-        "DELETE FROM value_set_expansion WHERE package_id = $1",
-        &[&package_id],
-    )
-    .map_err(definite)?;
-    for run in runs(&package.expansions, |row| row.json.len() + row.url.len()) {
+    for run in runs(rows, |row| row.json.len() + row.url.len()) {
         let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
         let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         tx.execute(
