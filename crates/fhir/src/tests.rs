@@ -5997,6 +5997,182 @@ fn a_run_of_terminology_writes_leaves_the_store_as_a_full_rebuild_would() {
     }
 }
 
+/// A catalog that reads definitions and terminology when they are first used, kept current by
+/// writes as it is by a rebuild, and by a reload on a replica.
+#[test]
+fn a_catalog_read_when_used_follows_terminology_writes_and_reloads() {
+    let harness = r4();
+    let store = &harness.store;
+    // Read before the writes: what a replica holds, and what it has read so far.
+    let (replica, replica_at) =
+        Catalog::open_consistent(store, crate::CatalogClock::Stable).unwrap();
+    let replica = std::sync::RwLock::new(replica);
+    let gender = "http://hl7.org/fhir/ValueSet/administrative-gender";
+    let genders = |catalog: &std::sync::RwLock<Catalog>| -> Vec<String> {
+        let expanded = catalog
+            .read()
+            .unwrap()
+            .terms()
+            .expand(gender, None)
+            .unwrap();
+        let mut codes: Vec<String> = expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect();
+        codes.sort();
+        codes
+    };
+    assert_eq!(genders(&replica), ["female", "male", "other", "unknown"]);
+
+    let write = |path: &str, resource: Value, id: Option<&str>| {
+        let mut args = json!({"resource": resource});
+        if let Some(id) = id {
+            args["id"] = json!(id);
+        }
+        commit_operation(store, &harness.db, &harness.catalog, path, &args)
+            .unwrap()
+            .value
+    };
+    let shapes = |codes: &[&str], id: Option<&str>| {
+        let mut system = json!({"resourceType": "CodeSystem", "url": "http://example.org/shapes",
+            "status": "active", "content": "complete",
+            "concept": codes.iter().map(|code| json!({"code": code})).collect::<Vec<_>>()});
+        if let Some(id) = id {
+            system["id"] = json!(id);
+        }
+        system
+    };
+    let first = write(
+        "ValueSet/create",
+        color_value_set("first", &["a"], "http://example.org/s"),
+        None,
+    );
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let system = write("CodeSystem/create", shapes(&["round", "flat"], None), None);
+    let system_id = system["id"].as_str().unwrap().to_string();
+    write(
+        "ValueSet/create",
+        json!({"resourceType": "ValueSet", "url": "http://example.org/over", "status": "active",
+               "compose": {"include": [
+                   {"valueSet": ["http://example.org/first"]},
+                   {"system": "http://example.org/shapes"},
+                   {"valueSet": [gender]}]}}),
+        None,
+    );
+    write(
+        "CodeSystem/update",
+        shapes(&["round", "flat", "tall"], Some(&system_id)),
+        Some(&system_id),
+    );
+    let mut edited = color_value_set("first", &["a", "b"], "http://example.org/s");
+    edited["id"] = json!(first_id);
+    write("ValueSet/update", edited, Some(&first_id));
+    assert_expansions_match(store, "after the writes");
+
+    // What the live catalog says is what one that holds everything, opened from the store, says.
+    let whole = Catalog::open_whole(store).unwrap();
+    let live = harness.catalog.read().unwrap();
+    for url in [
+        "http://example.org/over",
+        "http://example.org/first",
+        gender,
+    ] {
+        assert_eq!(
+            live.terms().expand(url, None),
+            whole.terms().expand(url, None),
+            "{url}"
+        );
+    }
+    let codes = |catalog: &Catalog| -> Vec<String> {
+        let expanded = catalog
+            .terms()
+            .expand("http://example.org/over", None)
+            .unwrap();
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for expected in ["a", "b", "round", "flat", "tall", "male"] {
+        assert!(codes(&live).contains(&expected.to_string()), "{expected}");
+    }
+    assert_eq!(
+        live.terms()
+            .lookup("http://example.org/shapes", None, "tall"),
+        whole
+            .terms()
+            .lookup("http://example.org/shapes", None, "tall")
+    );
+    assert!(live
+        .terms()
+        .lookup("http://example.org/shapes", None, "tall")
+        .is_some());
+    drop(live);
+
+    // The replica has not seen any of it. A change that publishes the catalog (a package, a
+    // search parameter) moves the version it follows, and it reloads: what it had read does not
+    // outlive the catalog it was read for.
+    assert!(replica
+        .read()
+        .unwrap()
+        .terms()
+        .expand("http://example.org/over", None)
+        .is_none());
+    publish(store, &harness.catalog).unwrap();
+    let now =
+        crate::package::reload_catalog(store, &replica, replica_at, crate::CatalogClock::Stable)
+            .unwrap();
+    assert!(now > replica_at);
+    assert_eq!(genders(&replica), ["female", "male", "other", "unknown"]);
+    let replicated = replica.read().unwrap();
+    assert_eq!(
+        replicated.terms().expand("http://example.org/over", None),
+        whole.terms().expand("http://example.org/over", None)
+    );
+    assert_eq!(
+        replicated
+            .terms()
+            .lookup("http://example.org/shapes", None, "tall"),
+        whole
+            .terms()
+            .lookup("http://example.org/shapes", None, "tall")
+    );
+    drop(replicated);
+
+    // Deleting a code system leaves what includes it unable to expand, in the live catalog and
+    // in one reloaded from the store.
+    write_delete(&harness, "CodeSystem/delete", &system_id);
+    let whole = Catalog::open_whole(store).unwrap();
+    let live = harness.catalog.read().unwrap();
+    assert_eq!(
+        live.terms().why_not_expanded("http://example.org/over"),
+        whole.terms().why_not_expanded("http://example.org/over")
+    );
+    assert!(live
+        .terms()
+        .why_not_expanded("http://example.org/over")
+        .is_some());
+    assert!(live
+        .terms()
+        .lookup("http://example.org/shapes", None, "tall")
+        .is_none());
+}
+
+fn write_delete(harness: &Harness, path: &str, id: &str) {
+    commit_operation(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        path,
+        &json!({"id": id}),
+    )
+    .unwrap();
+}
+
 #[test]
 fn a_failed_incremental_update_falls_back_to_a_full_rebuild() {
     let (harness, watched) = watched_r4();
@@ -7407,12 +7583,9 @@ fn as_strs(names: &[String]) -> Vec<&str> {
     names.iter().map(String::as_str).collect()
 }
 
-#[test]
-fn a_package_installed_from_a_prepared_file_is_stored_as_one_installed_from_its_directory() {
-    let scratch = temp_dir("prepared");
-    let (file, names) = prepared_fixtures(&scratch);
-    assert_eq!(names.len(), 2);
-
+/// Installing the packages in `file` stores every table as installing them from their directories
+/// does, and publishes the catalog.
+fn assert_a_prepared_file_installs_as_its_directories_do(file: &Path, names: &[String]) {
     let from_directories = empty();
     install_package_dir(
         &from_directories.store,
@@ -7434,8 +7607,8 @@ fn a_package_installed_from_a_prepared_file_is_stored_as_one_installed_from_its_
         &from_file.store,
         &from_file.db,
         &from_file.catalog,
-        &file,
-        &as_strs(&names),
+        file,
+        &as_strs(names),
     )
     .unwrap();
     assert_eq!(installed, Some(2));
@@ -7458,6 +7631,44 @@ fn a_package_installed_from_a_prepared_file_is_stored_as_one_installed_from_its_
     let catalog = from_file.catalog.read().expect("catalog");
     assert!(catalog.contains("Patient"));
     assert!(catalog.contains("Encounter"));
+}
+
+#[test]
+fn a_package_installed_from_a_prepared_file_is_stored_as_one_installed_from_its_directory() {
+    let scratch = temp_dir("prepared");
+    let (file, names) = prepared_fixtures(&scratch);
+    assert_eq!(names.len(), 2);
+    assert_a_prepared_file_installs_as_its_directories_do(&file, &names);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_package_cut_into_many_values_is_stored_as_one_installed_from_its_directory() {
+    let scratch = temp_dir("prepared-pieces");
+    let file = scratch.join("packages.bundle");
+    let specs = [minir4_dir(), extra_dir()].map(|dir| dir.to_str().unwrap().to_string());
+    // Values of a few hundred bytes: each kind of row is cut into several, and a row is larger
+    // than a value.
+    let names = crate::prepared::write_prepared_in_pieces(
+        &file,
+        &specs,
+        &NoNetwork,
+        &scratch.join("cache"),
+        700,
+    )
+    .unwrap();
+    assert_a_prepared_file_installs_as_its_directories_do(&file, &names);
+    // Read whole, each package is what its directory makes.
+    let mut bundle = crate::PreparedBundle::open(&file).unwrap();
+    let first = bundle.next().unwrap().unwrap();
+    let from_directory = crate::package::read_package(minir4_dir()).unwrap();
+    assert_eq!(first.name, from_directory.name);
+    assert_eq!(
+        first.structure_definitions.len(),
+        from_directory.structure_definitions.len()
+    );
+    assert_eq!(first.terminology.len(), from_directory.terminology.len());
+    assert_eq!(first.expansions.len(), from_directory.expansions.len());
     let _ = std::fs::remove_dir_all(scratch);
 }
 
@@ -7630,14 +7841,9 @@ fn a_prepared_file_that_holds_fewer_packages_than_its_header_lists_is_refused() 
     use std::io::Write;
     let scratch = temp_dir("prepared-short");
     let file = scratch.join("packages.bundle");
-    let package = |name: &str| NewPackage {
-        name: name.into(),
-        version: "1.0.0".into(),
-        fhir_version: "4.0.1".into(),
-        structure_definitions: Vec::new(),
-        search_parameters: Vec::new(),
-        terminology: Vec::new(),
-        expansions: Vec::new(),
+    // A package with no rows is one value that names it.
+    let package = |name: &str| {
+        format!(r#"{{"Package":{{"name":"{name}","version":"1.0.0","fhir_version":"4.0.1"}}}}"#)
     };
     // The header promises two packages, and the stream ends cleanly after one: nothing says the
     // second is missing except the count.
@@ -7647,15 +7853,10 @@ fn a_prepared_file_that_holds_fewer_packages_than_its_header_lists_is_refused() 
     );
     writeln!(
         encoder,
-        r#"{{"format":1,"refhir":"0.0.1","packages":["example.a@1.0.0","example.b@1.0.0"]}}"#
+        r#"{{"format":2,"refhir":"0.0.1","packages":["example.a@1.0.0","example.b@1.0.0"]}}"#
     )
     .unwrap();
-    writeln!(
-        encoder,
-        "{}",
-        serde_json::to_string(&package("example.a")).unwrap()
-    )
-    .unwrap();
+    writeln!(encoder, "{}", package("example.a")).unwrap();
     encoder.finish().unwrap();
 
     let db = empty();

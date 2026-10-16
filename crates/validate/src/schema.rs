@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use refhir_fhirpath::{parse, Expr, Model, ModelBuilder};
 use serde_json::Value as Json;
 
+use crate::cache::Cache;
 use crate::outcome::Severity;
 use crate::primitive::compiled_regex_ok;
 
@@ -118,7 +119,53 @@ pub struct Structure {
     pub elements: Vec<ElementDef>,
 }
 
+/// Bytes a parsed JSON value takes, roughly: enough to weigh what a cache holds.
+pub(crate) fn json_bytes(value: &Json) -> usize {
+    match value {
+        Json::String(text) => text.len() + 24,
+        Json::Array(items) => 24 + items.iter().map(json_bytes).sum::<usize>(),
+        Json::Object(fields) => {
+            48 + fields
+                .iter()
+                .map(|(name, item)| name.len() + 24 + json_bytes(item))
+                .sum::<usize>()
+        }
+        _ => 32,
+    }
+}
+
+impl ElementDef {
+    /// Bytes this element takes, roughly. The types, constraints and bindings it points at are
+    /// shared between elements, so only the pointers count.
+    fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.id.len()
+            + self.path.len()
+            + self.slice_name.as_ref().map_or(0, String::len)
+            + self.content_reference.as_ref().map_or(0, String::len)
+            + 8 * (self.types.len() + self.constraints.len())
+            + [&self.fixed, &self.pattern, &self.min_value, &self.max_value]
+                .into_iter()
+                .flatten()
+                .map(json_bytes)
+                .sum::<usize>()
+    }
+}
+
 impl Structure {
+    /// Bytes this structure takes, roughly: what a cache weighs it by.
+    pub fn approx_bytes(&self) -> usize {
+        self.elements
+            .iter()
+            .map(ElementDef::approx_bytes)
+            .sum::<usize>()
+            + self.url.len()
+            + self.type_name.len()
+            + self.kind.len()
+            + self.derivation.len()
+            + 128
+    }
+
     pub fn root_path(&self) -> &str {
         self.elements
             .first()
@@ -202,12 +249,58 @@ pub fn is_direct_child(parent: &str, path: &str) -> bool {
     !rest.is_empty() && !rest.contains('.')
 }
 
+/// Where a [`Schema`] reads the definitions it holds only an index of.
+pub trait DefinitionSource: Send + Sync {
+    /// The StructureDefinition with this URL that package `package` stores, as JSON.
+    fn definition(&self, package: i64, url: &str) -> Option<Json>;
+}
+
+/// What a schema holds of one structure.
+#[derive(Clone, Debug)]
+enum Entry {
+    Held(Arc<Structure>),
+    /// Read from the source when first used. `elements` is how many elements it has, which says
+    /// which of two definitions of one URL describes the type better, as it does for a held one.
+    Stored {
+        package: i64,
+        elements: usize,
+    },
+}
+
+impl Entry {
+    fn elements(&self) -> usize {
+        match self {
+            Entry::Held(structure) => structure.elements.len(),
+            Entry::Stored { elements, .. } => *elements,
+        }
+    }
+}
+
+/// How a schema that holds an index reads what it does not hold: the source, a cache of what it
+/// read, and the constraints and types the structures read have in common.
+struct Loading {
+    source: Arc<dyn DefinitionSource>,
+    cache: Cache<String, Structure>,
+    shared: Mutex<Shared>,
+}
+
+impl std::fmt::Debug for Loading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Loading")
+    }
+}
+
+/// What the structures a schema has read may weigh together. The common types are a few hundred
+/// kilobytes each; a request touches a few dozen of the 3,600 definitions of the R4 packages.
+const STRUCTURE_CACHE_BYTES: usize = 8 << 20;
+
 #[derive(Clone, Debug)]
 pub struct Schema {
-    by_url: BTreeMap<String, Structure>,
+    by_url: BTreeMap<String, Entry>,
     type_url: BTreeMap<String, String>,
     model: Model,
     primitive_regex: BTreeMap<String, String>,
+    lazy: Option<Arc<Loading>>,
 }
 
 impl Default for Schema {
@@ -217,6 +310,7 @@ impl Default for Schema {
             type_url: BTreeMap::new(),
             model: Model::new(),
             primitive_regex: BTreeMap::new(),
+            lazy: None,
         }
     }
 }
@@ -249,53 +343,125 @@ fn share<T: Hash + Eq>(held: &mut HashSet<Arc<T>>, value: T) -> Arc<T> {
 
 /// Builds a [`Schema`] from StructureDefinitions handed over one at a time, so a caller that
 /// reads its definitions one by one does not have to keep them all parsed at once.
+///
+/// A builder made by [`SchemaBuilder::lazy`] goes further: it keeps no structure, only what
+/// says where each is stored, and the schema it finishes reads a structure when it is first
+/// used. The R4 packages hold 3,600 definitions of which a server uses a few dozen.
 #[derive(Default)]
 pub struct SchemaBuilder {
     model: ModelBuilder,
-    by_url: BTreeMap<String, Structure>,
+    by_url: BTreeMap<String, Entry>,
     type_url: BTreeMap<String, String>,
     primitive_regex: BTreeMap<String, String>,
     shared: Shared,
+    source: Option<Arc<dyn DefinitionSource>>,
+    /// What the finished schema's cache may weigh, when not the default.
+    budget: Option<usize>,
+}
+
+/// What a StructureDefinition says about itself before its elements are compiled.
+struct Head {
+    url: String,
+    type_name: String,
+    kind: String,
+    derivation: String,
+    /// How many elements the structure has once compiled.
+    elements: usize,
 }
 
 impl SchemaBuilder {
+    /// A builder that keeps an index, with `source` to read each structure from when it is used.
+    pub fn lazy(source: Arc<dyn DefinitionSource>) -> Self {
+        Self {
+            source: Some(source),
+            ..Self::default()
+        }
+    }
+
+    /// Let the finished schema's cache weigh at most `bytes`.
+    #[cfg(test)]
+    fn cache_bytes(mut self, bytes: usize) -> Self {
+        self.budget = Some(bytes);
+        self
+    }
+
+    /// Add a definition and keep the structure compiled from it.
     pub fn add(&mut self, definition: &Json) {
         self.model.add(definition);
         let Some(structure) = compile_structure(definition, &mut self.shared) else {
             return;
         };
-        if structure.kind == "primitive-type" {
+        let head = Head {
+            url: structure.url.clone(),
+            type_name: structure.type_name.clone(),
+            kind: structure.kind.clone(),
+            derivation: structure.derivation.clone(),
+            elements: structure.elements.len(),
+        };
+        self.index(definition, &head, Entry::Held(Arc::new(structure)));
+    }
+
+    /// Add a definition that package `package` stores. On a builder made by [`Self::lazy`] only an
+    /// index of it is kept; on any other the structure is compiled and kept, as [`Self::add`] does.
+    pub fn add_stored(&mut self, package: i64, definition: &Json) {
+        if self.source.is_none() {
+            self.add(definition);
+            return;
+        }
+        self.model.add(definition);
+        let Some(head) = head_of(definition) else {
+            return;
+        };
+        let elements = head.elements;
+        self.index(definition, &head, Entry::Stored { package, elements });
+    }
+
+    fn index(&mut self, definition: &Json, head: &Head, entry: Entry) {
+        if head.kind == "primitive-type" {
             if let Some(pattern) = regex_from(definition) {
                 if compiled_regex_ok(&pattern) {
-                    self.primitive_regex
-                        .insert(structure.type_name.clone(), pattern);
+                    self.primitive_regex.insert(head.type_name.clone(), pattern);
                 }
             }
         }
-        if structure.derivation != "constraint" {
+        if head.derivation != "constraint" {
             self.type_url
-                .entry(structure.type_name.clone())
-                .or_insert_with(|| structure.url.clone());
+                .entry(head.type_name.clone())
+                .or_insert_with(|| head.url.clone());
         }
         // A later package may repeat a core URL with a root-only snapshot.
         // Keep the definition that actually describes the type.
         let keep_existing = self
             .by_url
-            .get(&structure.url)
-            .is_some_and(|existing: &Structure| {
-                existing.elements.len() >= structure.elements.len()
-            });
+            .get(&head.url)
+            .is_some_and(|existing| existing.elements() >= head.elements);
         if !keep_existing {
-            self.by_url.insert(structure.url.clone(), structure);
+            self.by_url.insert(head.url.clone(), entry);
         }
     }
 
     pub fn finish(self) -> Schema {
+        let Self {
+            model,
+            by_url,
+            type_url,
+            primitive_regex,
+            shared,
+            source,
+            budget,
+        } = self;
         Schema {
-            by_url: self.by_url,
-            type_url: self.type_url,
-            model: self.model.finish(),
-            primitive_regex: self.primitive_regex,
+            by_url,
+            type_url,
+            model: model.finish(),
+            primitive_regex,
+            lazy: source.map(|source| {
+                Arc::new(Loading {
+                    source,
+                    cache: Cache::new(budget.unwrap_or(STRUCTURE_CACHE_BYTES)),
+                    shared: Mutex::new(shared),
+                })
+            }),
         }
     }
 }
@@ -313,13 +479,37 @@ impl Schema {
         &self.model
     }
 
-    pub fn structure(&self, url: &str) -> Option<&Structure> {
-        self.by_url.get(canonical(url))
+    /// The structure with this URL (a `|version` is ignored). One the schema holds only an index
+    /// of is read now, and kept for the next request while it is among the most recently used.
+    pub fn structure(&self, url: &str) -> Option<Arc<Structure>> {
+        let url = canonical(url);
+        match self.by_url.get(url)? {
+            Entry::Held(structure) => Some(structure.clone()),
+            Entry::Stored { package, .. } => {
+                let loading = self.lazy.as_ref()?;
+                loading.cache.get_or_load(
+                    url,
+                    |url| url.to_string(),
+                    || {
+                        let definition = loading.source.definition(*package, url)?;
+                        let structure = {
+                            let mut shared = loading
+                                .shared
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner);
+                            compile_structure(&definition, &mut shared)?
+                        };
+                        let weight = structure.approx_bytes();
+                        Some((structure, weight))
+                    },
+                )
+            }
+        }
     }
 
-    pub fn base_type(&self, name: &str) -> Option<&Structure> {
+    pub fn base_type(&self, name: &str) -> Option<Arc<Structure>> {
         let url = self.type_url.get(name)?;
-        self.by_url.get(url)
+        self.structure(url)
     }
 
     pub fn primitive_regex(&self, code: &str) -> Option<&str> {
@@ -331,7 +521,8 @@ fn canonical(url: &str) -> &str {
     url.split('|').next().unwrap_or(url)
 }
 
-fn compile_structure(definition: &Json, shared: &mut Shared) -> Option<Structure> {
+/// What `definition` says about itself, or `None` when it names neither a URL nor a type.
+fn head_of(definition: &Json) -> Option<Head> {
     let url = definition.get("url")?.as_str()?.to_string();
     let type_name = definition
         .get("type")
@@ -344,11 +535,11 @@ fn compile_structure(definition: &Json, shared: &mut Shared) -> Option<Structure
         .map(|elements| {
             elements
                 .iter()
-                .filter_map(|element| compile_element(element, shared))
-                .collect()
+                .filter(|element| element.get("path").is_some_and(Json::is_string))
+                .count()
         })
-        .unwrap_or_default();
-    Some(Structure {
+        .unwrap_or(0);
+    Some(Head {
         url,
         type_name,
         kind: definition
@@ -361,6 +552,27 @@ fn compile_structure(definition: &Json, shared: &mut Shared) -> Option<Structure
             .and_then(|value| value.as_str())
             .unwrap_or("specialization")
             .to_string(),
+        elements,
+    })
+}
+
+fn compile_structure(definition: &Json, shared: &mut Shared) -> Option<Structure> {
+    let head = head_of(definition)?;
+    let elements = definition
+        .pointer("/snapshot/element")
+        .and_then(|value| value.as_array())
+        .map(|elements| {
+            elements
+                .iter()
+                .filter_map(|element| compile_element(element, shared))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(Structure {
+        url: head.url,
+        type_name: head.type_name,
+        kind: head.kind,
+        derivation: head.derivation,
         elements,
     })
 }
@@ -609,5 +821,192 @@ fn walk_regex(value: &Json, found: &mut Option<String>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// The definitions of some packages, by package id, as a store would hold them.
+    struct Packages(Vec<(i64, Json)>);
+
+    impl DefinitionSource for Packages {
+        fn definition(&self, package: i64, url: &str) -> Option<Json> {
+            self.0
+                .iter()
+                .find(|(held, definition)| *held == package && definition["url"] == url)
+                .map(|(_, definition)| definition.clone())
+        }
+    }
+
+    fn definition(url: &str, name: &str, kind: &str, elements: &[(&str, &str)]) -> Json {
+        let elements: Vec<Json> = elements
+            .iter()
+            .map(|(path, code)| {
+                json!({"path": path, "min": 0, "max": "1", "type": [{"code": code}],
+                       "constraint": [{"key": "ele-1", "severity": "error",
+                                       "human": "no empty elements", "expression": "hasValue()"}]})
+            })
+            .collect();
+        json!({"resourceType": "StructureDefinition", "url": url, "name": name, "type": name,
+               "kind": kind, "snapshot": {"element": elements}})
+    }
+
+    /// What a store holds of some packages: a type, a second package that repeats its URL with
+    /// less (and with the same, which the first keeps), a profile of it, a primitive with a
+    /// pattern, and an extension.
+    fn packages() -> Vec<(i64, Json)> {
+        let patient = definition(
+            "http://hl7.org/fhir/StructureDefinition/Patient",
+            "Patient",
+            "resource",
+            &[
+                ("Patient", "Patient"),
+                ("Patient.active", "boolean"),
+                ("Patient.gender", "code"),
+            ],
+        );
+        let mut root_only = patient.clone();
+        root_only["snapshot"]["element"] = json!([{"path": "Patient"}]);
+        let mut tie = patient.clone();
+        tie["snapshot"]["element"][1]["max"] = json!("*");
+        let mut profile = definition(
+            "http://example.org/StructureDefinition/my-patient",
+            "MyPatient",
+            "resource",
+            &[("Patient", "Patient"), ("Patient.active", "boolean")],
+        );
+        profile["type"] = json!("Patient");
+        profile["derivation"] = json!("constraint");
+        let mut id = definition(
+            "http://hl7.org/fhir/StructureDefinition/id",
+            "id",
+            "primitive-type",
+            &[("id", "string")],
+        );
+        id["snapshot"]["element"][0]["extension"] = json!([{
+            "url": "http://hl7.org/fhir/StructureDefinition/structuredefinition-regex",
+            "valueString": "[A-Za-z0-9\\-\\.]{1,64}"
+        }]);
+        let extension = definition(
+            "http://hl7.org/fhir/StructureDefinition/Extension",
+            "Extension",
+            "complex-type",
+            &[("Extension", "Extension"), ("Extension.url", "uri")],
+        );
+        vec![
+            (1, patient),
+            (2, root_only),
+            (3, tie),
+            (2, profile),
+            (1, id),
+            (1, extension),
+            (
+                1,
+                json!({"resourceType": "StructureDefinition", "name": "no url"}),
+            ),
+        ]
+    }
+
+    fn eager(packages: &[(i64, Json)]) -> Schema {
+        let definitions: Vec<Json> = packages
+            .iter()
+            .map(|(_, definition)| definition.clone())
+            .collect();
+        Schema::from_definitions(&definitions)
+    }
+
+    fn lazy(packages: &[(i64, Json)], budget: usize) -> Schema {
+        let mut builder =
+            SchemaBuilder::lazy(Arc::new(Packages(packages.to_vec()))).cache_bytes(budget);
+        for (package, definition) in packages {
+            builder.add_stored(*package, definition);
+        }
+        builder.finish()
+    }
+
+    fn assert_same(eager: &Schema, lazy: &Schema) {
+        for url in [
+            "http://hl7.org/fhir/StructureDefinition/Patient",
+            "http://hl7.org/fhir/StructureDefinition/Patient|4.0.1",
+            "http://example.org/StructureDefinition/my-patient",
+            "http://hl7.org/fhir/StructureDefinition/id",
+            "http://hl7.org/fhir/StructureDefinition/Extension",
+            "http://example.org/nothing",
+        ] {
+            assert_eq!(
+                format!("{:?}", eager.structure(url)),
+                format!("{:?}", lazy.structure(url)),
+                "{url}"
+            );
+        }
+        for name in ["Patient", "MyPatient", "id", "Extension", "Nothing"] {
+            assert_eq!(
+                format!("{:?}", eager.base_type(name)),
+                format!("{:?}", lazy.base_type(name)),
+                "{name}"
+            );
+        }
+        for code in ["id", "string", "Patient"] {
+            assert_eq!(eager.primitive_regex(code), lazy.primitive_regex(code));
+        }
+        assert!(eager.model().is_type("Patient") && lazy.model().is_type("Patient"));
+    }
+
+    #[test]
+    fn a_schema_that_reads_its_structures_gives_what_one_that_holds_them_gives() {
+        let packages = packages();
+        let eager = eager(&packages);
+        assert_same(&eager, &lazy(&packages, STRUCTURE_CACHE_BYTES));
+        // The tie goes to the package loaded first, and a root-only copy never replaces a
+        // fuller one, in both.
+        let patient = lazy(&packages, STRUCTURE_CACHE_BYTES)
+            .structure("http://hl7.org/fhir/StructureDefinition/Patient")
+            .unwrap();
+        assert_eq!(patient.elements.len(), 3);
+        assert_eq!(patient.elements[1].max, Cardinality::One);
+    }
+
+    #[test]
+    fn what_is_read_again_after_the_cache_let_it_go_is_the_same() {
+        let packages = packages();
+        let eager = eager(&packages);
+        // A budget that holds almost nothing: every other lookup reads from the source.
+        let tight = lazy(&packages, 1);
+        for _ in 0..3 {
+            assert_same(&eager, &tight);
+        }
+        let held = lazy(&packages, STRUCTURE_CACHE_BYTES);
+        let url = "http://hl7.org/fhir/StructureDefinition/Patient";
+        assert!(Arc::ptr_eq(
+            &held.structure(url).unwrap(),
+            &held.structure(url).unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_definition_the_source_does_not_have_is_not_found() {
+        let packages = packages();
+        let mut builder = SchemaBuilder::lazy(Arc::new(Packages(Vec::new())));
+        for (package, definition) in &packages {
+            builder.add_stored(*package, definition);
+        }
+        let schema = builder.finish();
+        assert!(schema
+            .structure("http://hl7.org/fhir/StructureDefinition/Patient")
+            .is_none());
+    }
+
+    #[test]
+    fn a_builder_without_a_source_keeps_what_it_is_given() {
+        let packages = packages();
+        let mut builder = SchemaBuilder::default();
+        for (package, definition) in &packages {
+            builder.add_stored(*package, definition);
+        }
+        assert_same(&eager(&packages), &builder.finish());
     }
 }

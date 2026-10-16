@@ -9,6 +9,7 @@ mod conform;
 mod error;
 mod extract;
 mod history;
+mod lazy;
 mod memory;
 mod meta;
 mod npm;

@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::{json, Value as Json};
+
+use crate::cache::Cache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TermAnswer {
@@ -49,7 +53,7 @@ pub trait Terminology {
 /// (`from_resources`) is all one scope.
 pub type Scope = i64;
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Hash)]
 struct Concept {
     display: Option<String>,
     definition: Option<String>,
@@ -58,7 +62,7 @@ struct Concept {
     properties: Vec<(String, String)>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Hash)]
 struct SystemIndex {
     /// A complete system is closed. A missing code is really absent.
     closed: bool,
@@ -67,6 +71,47 @@ struct SystemIndex {
     content: String,
     name: Option<String>,
     codes: BTreeMap<String, Concept>,
+}
+
+impl SystemIndex {
+    /// A number that is the same for two indexes with the same content, and that no two with
+    /// different content are likely to share (128 bits). It says whether two packages hold the
+    /// same copy of a system without the copies having to be at hand together.
+    fn digest(&self) -> u128 {
+        let mut low = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut low);
+        let mut high = std::collections::hash_map::DefaultHasher::new();
+        0x5a_u8.hash(&mut high);
+        self.hash(&mut high);
+        (u128::from(high.finish()) << 64) | u128::from(low.finish())
+    }
+
+    /// Bytes this index takes, roughly: what a cache weighs it by.
+    fn approx_bytes(&self) -> usize {
+        let text = |text: &Option<String>| text.as_ref().map_or(0, String::len);
+        self.codes
+            .iter()
+            .map(|(code, concept)| {
+                std::mem::size_of::<Concept>()
+                    + 64
+                    + code.len()
+                    + text(&concept.display)
+                    + text(&concept.definition)
+                    + concept
+                        .parents
+                        .iter()
+                        .map(|parent| parent.len() + 24)
+                        .sum::<usize>()
+                    + concept
+                        .properties
+                        .iter()
+                        .map(|(name, value)| name.len() + value.len() + 48)
+                        .sum::<usize>()
+            })
+            .sum::<usize>()
+            + self.content.len()
+            + 128
+    }
 }
 
 /// `system|version` is the canonical form of a versioned reference.
@@ -132,8 +177,19 @@ fn version_order(left: &str, right: &str) -> std::cmp::Ordering {
 /// `examples`), and then they share one copy; when they differ, each content is kept.
 #[derive(Clone, Debug)]
 struct Variant {
-    scopes: BTreeSet<Scope>,
-    index: SystemIndex,
+    /// The packages that hold exactly this content, each with the key its row is stored under
+    /// (empty for content that is held).
+    holders: BTreeMap<Scope, String>,
+    /// [`SystemIndex::digest`] of the content: what says whether another copy is the same.
+    digest: u128,
+    /// The content, or `None` when it is read from the store when used.
+    index: Option<Arc<SystemIndex>>,
+}
+
+impl Variant {
+    fn held_by(&self, scope: Scope) -> bool {
+        self.holders.contains_key(&scope)
+    }
 }
 
 /// Code systems by URL and version. Every version that is installed is kept, so a reference that
@@ -146,25 +202,33 @@ struct Systems {
     /// package such as `hl7.fhir.uv.xver-r5.r4` carries `5.0.0` copies of R4's own code systems,
     /// and a value set written for R4 does not mean R5's codes.
     release: Option<String>,
+    /// Where a variant that is not held is read from.
+    loader: Option<Loading>,
 }
 
-/// The content `scope` holds, or the one loaded last when it holds none.
-fn variant_for(variants: &[Variant], scope: Option<Scope>) -> Option<&SystemIndex> {
+/// The variant `scope` holds, or the one loaded last when it holds none.
+fn variant_for(variants: &[Variant], scope: Option<Scope>) -> Option<&Variant> {
     scope
-        .and_then(|scope| variants.iter().rev().find(|v| v.scopes.contains(&scope)))
+        .and_then(|scope| variants.iter().rev().find(|v| v.held_by(scope)))
         .or_else(|| variants.last())
-        .map(|variant| &variant.index)
 }
 
 fn held_by(variants: &[Variant], scope: Scope) -> bool {
-    variants
-        .iter()
-        .any(|variant| variant.scopes.contains(&scope))
+    variants.iter().any(|variant| variant.held_by(scope))
 }
 
 impl Systems {
-    /// What `scope` held under this URL and version is replaced by `index`.
-    fn insert(&mut self, scope: Scope, url: &str, version: &str, index: SystemIndex) {
+    /// What `scope` held under this URL and version is replaced by content with this `digest`,
+    /// stored under `key` (`index` is that content when it is held).
+    fn insert(
+        &mut self,
+        scope: Scope,
+        url: &str,
+        version: &str,
+        key: &str,
+        digest: u128,
+        index: Option<Arc<SystemIndex>>,
+    ) {
         let variants = self
             .by_url
             .entry(url.to_string())
@@ -172,19 +236,20 @@ impl Systems {
             .entry(version.to_string())
             .or_default();
         for variant in variants.iter_mut() {
-            variant.scopes.remove(&scope);
+            variant.holders.remove(&scope);
         }
-        variants.retain(|variant| !variant.scopes.is_empty());
+        variants.retain(|variant| !variant.holders.is_empty());
         // The variant loaded last answers a lookup that names no package, so one that matches
         // moves to the end rather than staying where it was.
-        let mut variant = match variants.iter().position(|held| held.index == index) {
+        let mut variant = match variants.iter().position(|held| held.digest == digest) {
             Some(position) => variants.remove(position),
             None => Variant {
-                scopes: BTreeSet::new(),
+                holders: BTreeMap::new(),
+                digest,
                 index,
             },
         };
-        variant.scopes.insert(scope);
+        variant.holders.insert(scope, key.to_string());
         variants.push(variant);
     }
 
@@ -199,9 +264,9 @@ impl Systems {
                 continue;
             }
             for variant in variants.iter_mut() {
-                variant.scopes.remove(&scope);
+                variant.holders.remove(&scope);
             }
-            variants.retain(|variant| !variant.scopes.is_empty());
+            variants.retain(|variant| !variant.holders.is_empty());
         }
         versions.retain(|_, variants| !variants.is_empty());
         if versions.is_empty() {
@@ -210,8 +275,8 @@ impl Systems {
     }
 
     /// The version asked for, or, when none is, the installed version that is the server's
-    /// release, or else the latest installed. Returns the version found.
-    fn resolve(&self, url: &str, version: Option<&str>) -> Option<(&str, &SystemIndex)> {
+    /// release, or else the latest installed. Returns the version found, and its content.
+    fn resolve(&self, url: &str, version: Option<&str>) -> Option<(&str, Arc<SystemIndex>)> {
         self.resolve_in(None, false, url, version)
     }
 
@@ -228,7 +293,21 @@ impl Systems {
         strict: bool,
         url: &str,
         version: Option<&str>,
-    ) -> Option<(&str, &SystemIndex)> {
+    ) -> Option<(&str, Arc<SystemIndex>)> {
+        let (version, variant) = self.pick_in(scope, strict, url, version)?;
+        Some((version, self.content(variant)?))
+    }
+
+    /// [`Self::resolve_in`] as far as saying which version answers, and which variant of it:
+    /// the content is not read. A caller that only needs the version, or whether there is one,
+    /// does not make a stored system be read.
+    fn pick_in(
+        &self,
+        scope: Option<Scope>,
+        strict: bool,
+        url: &str,
+        version: Option<&str>,
+    ) -> Option<(&str, &Variant)> {
         let versions = self.by_url.get(url)?;
         let found = match version.filter(|version| !version.is_empty()) {
             Some(version) => versions.get_key_value(version).filter(|(_, variants)| {
@@ -254,8 +333,20 @@ impl Systems {
             .and_then(|(version, variants)| Some((version.as_str(), variant_for(variants, scope)?)))
     }
 
+    /// The content of `variant`: held, or read from the store now (or taken from what was read
+    /// lately). `None` when it cannot be read.
+    fn content(&self, variant: &Variant) -> Option<Arc<SystemIndex>> {
+        match &variant.index {
+            Some(index) => Some(index.clone()),
+            None => {
+                let (scope, key) = variant.holders.iter().next()?;
+                self.loader.as_ref()?.0.system(*scope, key)
+            }
+        }
+    }
+
     /// `system` or `system|version` as a reference, resolved the same way.
-    fn find(&self, system: &str, version: Option<&str>) -> Option<&SystemIndex> {
+    fn find(&self, system: &str, version: Option<&str>) -> Option<Arc<SystemIndex>> {
         let (url, suffix) = split_system(system);
         self.resolve(canonical(url), version.or(suffix))
             .map(|(_, index)| index)
@@ -278,6 +369,228 @@ struct Expansion {
     scope: Option<Scope>,
 }
 
+impl Expansion {
+    /// Bytes this expansion takes, roughly: what a cache weighs it by.
+    fn approx_bytes(&self) -> usize {
+        self.codes
+            .iter()
+            .map(|((system, code), display)| {
+                96 + system.len() + code.len() + display.as_ref().map_or(0, String::len)
+            })
+            .sum::<usize>()
+            + self
+                .systems
+                .iter()
+                .map(|(system, version)| 48 + system.len() + version.len())
+                .sum::<usize>()
+            + 64
+    }
+}
+
+/// Where the codes of an expansion that is not held are stored. A key that is the URL of the
+/// value set is not kept, because the value set is what the expansion is looked up by.
+#[derive(Clone, Debug)]
+enum Origin {
+    /// An expansion document, stored for `package` under `key`.
+    Expansion { package: Scope, key: Option<String> },
+    /// The `expansion` inside the value set that `package` stores under `key`.
+    Definition { package: Scope, key: Option<String> },
+}
+
+/// What answers for a value set: its expansion, held, or what says where to read it from. What
+/// is asked of an expansion without its codes (the package it was made for, the code systems it
+/// drew on) is kept with the pointer, so it is answered without a read.
+#[derive(Clone, Debug)]
+enum Answer {
+    Held(Arc<Expansion>),
+    Stored {
+        scope: Option<Scope>,
+        /// The code systems the expansion drew on, with versions, in order.
+        systems: Box<[(String, String)]>,
+        origin: Origin,
+    },
+}
+
+impl Answer {
+    fn held(expansion: Expansion) -> Self {
+        Answer::Held(Arc::new(expansion))
+    }
+
+    /// The pointer to an expansion that is stored, keeping what is asked without its codes.
+    fn stored(expansion: &Expansion, origin: Origin) -> Self {
+        Answer::Stored {
+            scope: expansion.scope,
+            systems: expansion.systems.iter().cloned().collect(),
+            origin,
+        }
+    }
+
+    fn scope(&self) -> Option<Scope> {
+        match self {
+            Answer::Held(expansion) => expansion.scope,
+            Answer::Stored { scope, .. } => *scope,
+        }
+    }
+
+    /// The version of the code system `url` that the expansion was made from, when it drew on it.
+    fn version_of(&self, url: &str) -> Option<&str> {
+        fn find<'a>(
+            mut systems: impl Iterator<Item = &'a (String, String)>,
+            url: &str,
+        ) -> Option<&'a str> {
+            systems
+                .find(|(used, _)| used == url)
+                .map(|(_, version)| version.as_str())
+        }
+        match self {
+            Answer::Held(expansion) => find(expansion.systems.iter(), url),
+            Answer::Stored { systems, .. } => find(systems.iter(), url),
+        }
+    }
+}
+
+/// Where the terminology a [`MemoryTerminology`] holds only an index of is read from, a row at
+/// a time. A key is the one the row is stored under, which is not always the canonical URL: a
+/// code system with a version is `url|version`.
+pub trait TermSource: Send + Sync {
+    /// The CodeSystem, ValueSet or ConceptMap stored under `key` for package `package`.
+    fn resource(&self, package: Scope, key: &str) -> Option<Json>;
+
+    /// The expansion document stored under `key` for package `package`.
+    fn expansion(&self, package: Scope, key: &str) -> Option<Json>;
+}
+
+/// What a concept map says, by source system and code: the targets, in the order they were read.
+type MapTargets = BTreeMap<(String, String), Vec<Target>>;
+
+/// What the caches of terminology that is read when used may weigh, each. The systems and
+/// expansions a request touches are a few hundred kilobytes; the largest single ones in the R4
+/// packages are a few megabytes and are kept while they are the most recently used.
+const SYSTEM_CACHE_BYTES: usize = 8 << 20;
+const EXPANSION_CACHE_BYTES: usize = 8 << 20;
+const DEFINITION_CACHE_BYTES: usize = 2 << 20;
+const MAP_CACHE_BYTES: usize = 2 << 20;
+
+/// Reads terminology from a [`TermSource`] and keeps what it read, up to a budget.
+struct Loader {
+    source: Arc<dyn TermSource>,
+    systems: Cache<(Scope, String), SystemIndex>,
+    expansions: Cache<(Scope, String, bool), Expansion>,
+    definitions: Cache<(Scope, String), Json>,
+    maps: Cache<(Scope, String), MapTargets>,
+    /// Why a value set that has no expansion has none, once worked out.
+    reasons: Mutex<BTreeMap<String, Vec<ExpansionFailure>>>,
+}
+
+impl Loader {
+    fn new(source: Arc<dyn TermSource>) -> Self {
+        Self {
+            source,
+            systems: Cache::new(SYSTEM_CACHE_BYTES),
+            expansions: Cache::new(EXPANSION_CACHE_BYTES),
+            definitions: Cache::new(DEFINITION_CACHE_BYTES),
+            maps: Cache::new(MAP_CACHE_BYTES),
+            reasons: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Forget what was read: the rows it came from may have changed.
+    fn clear(&self) {
+        self.systems.forget(|_| true);
+        self.expansions.forget(|_| true);
+        self.definitions.forget(|_| true);
+        self.maps.forget(|_| true);
+        self.reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    fn system(&self, package: Scope, key: &str) -> Option<Arc<SystemIndex>> {
+        self.systems.get_or_load(
+            &(package, key.to_string()),
+            |held| held.clone(),
+            || {
+                let resource = self.source.resource(package, key)?;
+                let (_, _, index) = system_index(&resource)?;
+                let weight = index.approx_bytes();
+                Some((index, weight))
+            },
+        )
+    }
+
+    /// The expansion of the value set `url`, read from where `origin` says.
+    fn expansion(&self, url: &str, origin: &Origin) -> Option<Arc<Expansion>> {
+        let (package, key, inline) = match origin {
+            Origin::Expansion { package, key } => (*package, key, false),
+            Origin::Definition { package, key } => (*package, key, true),
+        };
+        let key = key.as_deref().unwrap_or(url);
+        self.expansions.get_or_load(
+            &(package, key.to_string(), inline),
+            |held| held.clone(),
+            || {
+                let mut expansion = if inline {
+                    let resource = self.source.resource(package, key)?;
+                    let contains = resource
+                        .pointer("/expansion/contains")
+                        .and_then(|value| value.as_array())?;
+                    expansion_from_contains(contains)
+                } else {
+                    let document = self.source.expansion(package, key)?;
+                    expansion_from_document(&document)?.1
+                };
+                expansion.scope = Some(package);
+                let weight = expansion.approx_bytes();
+                Some((expansion, weight))
+            },
+        )
+    }
+
+    /// The value set stored under `key` for `package`, with only what expanding it reads.
+    fn definition(&self, package: Scope, key: &str) -> Option<Arc<Json>> {
+        self.definitions.get_or_load(
+            &(package, key.to_string()),
+            |held| held.clone(),
+            || {
+                let definition = slim_value_set(self.source.resource(package, key)?);
+                let weight = json_weight(&definition);
+                Some((definition, weight))
+            },
+        )
+    }
+
+    fn map(&self, package: Scope, key: &str) -> Option<Arc<MapTargets>> {
+        self.maps.get_or_load(
+            &(package, key.to_string()),
+            |held| held.clone(),
+            || {
+                let resource = self.source.resource(package, key)?;
+                let targets = map_targets(&resource);
+                let weight = map_weight(&targets);
+                Some((targets, weight))
+            },
+        )
+    }
+}
+
+/// A handle to the [`Loader`] of a terminology. A copy of a terminology reads from the same
+/// source with caches of its own, so what one has read cannot be taken for what the other's
+/// index describes.
+struct Loading(Arc<Loader>);
+
+impl Clone for Loading {
+    fn clone(&self) -> Self {
+        Loading(Arc::new(Loader::new(self.0.source.clone())))
+    }
+}
+
+impl std::fmt::Debug for Loading {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Loading")
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Target {
     map_url: String,
@@ -286,20 +599,72 @@ struct Target {
     equivalence: String,
 }
 
-#[derive(Clone, Debug, Default)]
+/// One concept map, as the terminology holds it.
+#[derive(Clone, Debug)]
+struct MapRef {
+    scope: Scope,
+    /// Its canonical URL.
+    url: String,
+    /// The systems its groups translate from, which says whether a translation needs it read.
+    sources: BTreeSet<String>,
+    body: MapBody,
+}
+
+#[derive(Clone, Debug)]
+enum MapBody {
+    Held(Arc<MapTargets>),
+    /// Read from the store, under this key, when used.
+    Stored {
+        key: String,
+    },
+}
+
+/// A definition of a value set that has no expansion: held, or read when used.
+#[derive(Clone, Debug)]
+enum Def {
+    Held(Arc<Json>),
+    /// Read from the store, under this key, when used.
+    Stored(String),
+}
+
+/// The value sets that have no expansion, each with every definition of it and the package it is
+/// from, ordered for use like [`Definitions`].
+type Unexpanded = BTreeMap<String, Vec<(Scope, Def)>>;
+
+#[derive(Debug, Default)]
 pub struct MemoryTerminology {
     systems: Systems,
-    expansions: BTreeMap<String, Expansion>,
-    /// Source system and code to translation targets.
-    maps: BTreeMap<(String, String), Vec<Target>>,
+    expansions: BTreeMap<String, Answer>,
+    /// Concept maps, in the order they were read, which is the order their translations come in.
+    maps: Vec<MapRef>,
     /// Value sets that have no expansion, kept so a refusal can say why.
-    unexpanded: Definitions,
+    unexpanded: Unexpanded,
     /// Why each of those has none. Worked out when the terminology is built or changed, so that
-    /// a check against one of them is a lookup, not an expansion.
+    /// a check against one of them is a lookup, not an expansion. Terminology that is read when
+    /// used leaves it to the loader, which works one out when it is first asked for.
     reasons: BTreeMap<String, Vec<ExpansionFailure>>,
     /// For each value set, the code systems and value sets its `compose` draws on. It says which
     /// expansions a change to a code system or value set can alter.
     uses: BTreeMap<String, BTreeSet<String>>,
+    /// Where what is not held is read from, for terminology that holds an index.
+    loader: Option<Loading>,
+}
+
+impl Clone for MemoryTerminology {
+    fn clone(&self) -> Self {
+        let loader = self.loader.clone();
+        let mut systems = self.systems.clone();
+        systems.loader = loader.clone();
+        Self {
+            systems,
+            expansions: self.expansions.clone(),
+            maps: self.maps.clone(),
+            unexpanded: self.unexpanded.clone(),
+            reasons: self.reasons.clone(),
+            uses: self.uses.clone(),
+            loader,
+        }
+    }
 }
 
 /// Builds a [`MemoryTerminology`] from resources handed over one at a time, so that a caller that
@@ -317,10 +682,13 @@ pub struct TerminologyBuilder {
     /// the value sets, then the stored ones. A package has one per value set, the last it offered,
     /// because that is the only one of its own that is ever chosen. `None` when value sets are to
     /// be expanded instead.
-    offered: Option<BTreeMap<String, Vec<(Scope, Expansion)>>>,
+    offered: Option<BTreeMap<String, Vec<(Scope, Answer)>>>,
     /// The value sets of terminology that is loaded as stored, in the form that holds them
     /// cheaply (see [`Held`]). Value sets to be expanded are held by `index`, parsed.
     held: BTreeMap<String, Vec<(Scope, Held)>>,
+    /// Where what the terminology does not hold is read from, when it is built to be read when
+    /// used (see [`Self::for_source`]).
+    source: Option<Arc<dyn TermSource>>,
 }
 
 /// A value set definition held by terminology that is loaded as stored. Nothing is expanded
@@ -332,8 +700,14 @@ pub struct TerminologyBuilder {
 struct Held {
     version: Option<String>,
     references: BTreeSet<String>,
+    text: Text,
+}
+
+enum Text {
     /// The definition, without the expansion inside it: that is on offer, or absent.
-    text: String,
+    Inline(String),
+    /// The key the definition is stored under: it is read from the store when used.
+    Stored(String),
 }
 
 impl TerminologyBuilder {
@@ -344,9 +718,24 @@ impl TerminologyBuilder {
     /// whichever package was installed last.
     pub fn for_stored(release: Option<&str>) -> Self {
         Self {
-            index: Index::new(release),
+            index: Index::new(release, None),
             offered: Some(BTreeMap::new()),
             held: BTreeMap::new(),
+            source: None,
+        }
+    }
+
+    /// [`Self::for_stored`], for terminology that keeps an index of what is stored and reads
+    /// each code system, expansion, value set and concept map from `source` when it is used.
+    /// Resources and expansions are added with [`Self::add_stored_resource`] and
+    /// [`Self::add_stored_expansion`], which say what each is stored under, and nothing of them
+    /// is kept but what answers a question without reading them.
+    pub fn for_source(release: Option<&str>, source: Arc<dyn TermSource>) -> Self {
+        Self {
+            index: Index::new(release, Some(source.clone())),
+            offered: Some(BTreeMap::new()),
+            held: BTreeMap::new(),
+            source: Some(source),
         }
     }
 
@@ -354,9 +743,10 @@ impl TerminologyBuilder {
     /// code system versions its own package holds.
     pub fn for_package(release: Option<&str>) -> Self {
         Self {
-            index: Index::new(release),
+            index: Index::new(release, None),
             offered: None,
             held: BTreeMap::new(),
+            source: None,
         }
     }
 
@@ -369,7 +759,7 @@ impl TerminologyBuilder {
     /// Add a resource of package `scope`. Only code systems, concept maps and value sets count.
     pub fn add_resource(&mut self, scope: Scope, resource: Json) {
         if resource_type(&resource) == Some("ValueSet") {
-            self.offer_inline(scope, &resource);
+            self.offer_inline(scope, &resource, None);
             self.add_value_set(scope, slim_value_set(resource));
         } else {
             self.index.add_indexed(scope, &resource);
@@ -380,10 +770,25 @@ impl TerminologyBuilder {
     /// is copied.
     pub fn add_resource_ref(&mut self, scope: Scope, resource: &Json) {
         if resource_type(resource) == Some("ValueSet") {
-            self.offer_inline(scope, resource);
+            self.offer_inline(scope, resource, None);
             self.add_value_set(scope, slim_value_set_copy(resource));
         } else {
             self.index.add_indexed(scope, resource);
+        }
+    }
+
+    /// Add a resource that package `scope` stores under `key`. On a builder made by
+    /// [`Self::for_source`] only what says where the resource is, and what is asked of it
+    /// without reading it, is kept; on any other it is added as [`Self::add_resource`] adds it.
+    pub fn add_stored_resource(&mut self, scope: Scope, key: &str, resource: Json) {
+        if self.source.is_none() {
+            return self.add_resource(scope, resource);
+        }
+        if resource_type(&resource) == Some("ValueSet") {
+            self.offer_inline(scope, &resource, Some(key));
+            self.add_stored_value_set(scope, key, &resource);
+        } else {
+            self.index.add_indexed_stored(scope, key, &resource);
         }
     }
 
@@ -408,9 +813,33 @@ impl TerminologyBuilder {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
             references: compose_references(&value_set),
-            text: value_set.to_string(),
+            text: Text::Inline(value_set.to_string()),
         };
-        // What this package defined before is replaced; the definition loaded last stays last.
+        self.hold(scope, url, held);
+    }
+
+    /// A value set that package `scope` stores under `key`, to be read again when it is used.
+    fn add_stored_value_set(&mut self, scope: Scope, key: &str, value_set: &Json) {
+        let Some(url) = value_set
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(|url| canonical(url).to_string())
+        else {
+            return;
+        };
+        let held = Held {
+            version: value_set
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            references: compose_references(value_set),
+            text: Text::Stored(key.to_string()),
+        };
+        self.hold(scope, url, held);
+    }
+
+    /// What this package defined before is replaced; the definition loaded last stays last.
+    fn hold(&mut self, scope: Scope, url: String, held: Held) {
         let definitions = self.held.entry(url).or_default();
         definitions.retain(|(owner, _)| *owner != scope);
         definitions.push((scope, held));
@@ -426,11 +855,33 @@ impl TerminologyBuilder {
             return;
         };
         expansion.scope = Some(scope);
-        offer(offered, url, scope, expansion);
+        offer(offered, url, scope, Answer::held(expansion));
     }
 
-    /// The expansion inside a value set's own definition.
-    fn offer_inline(&mut self, scope: Scope, resource: &Json) {
+    /// [`Self::add_expansion`] for a document that package `scope` stores under `key`. On a
+    /// builder made by [`Self::for_source`] the codes are not kept: they are read from `source`
+    /// when the expansion is used.
+    pub fn add_stored_expansion(&mut self, scope: Scope, key: &str, document: &Json) {
+        if self.source.is_none() {
+            return self.add_expansion(scope, document);
+        }
+        let Some(offered) = self.offered.as_mut() else {
+            return;
+        };
+        let Some((url, mut expansion)) = expansion_from_document(document) else {
+            return;
+        };
+        expansion.scope = Some(scope);
+        let origin = Origin::Expansion {
+            package: scope,
+            key: Some(key).filter(|key| *key != url).map(str::to_string),
+        };
+        offer(offered, url, scope, Answer::stored(&expansion, origin));
+    }
+
+    /// The expansion inside a value set's own definition. `key` is what the definition is
+    /// stored under, when it is to be read from there again and not held.
+    fn offer_inline(&mut self, scope: Scope, resource: &Json, key: Option<&str>) {
         let Some(offered) = self.offered.as_mut() else {
             return;
         };
@@ -449,7 +900,18 @@ impl TerminologyBuilder {
         };
         let mut expansion = expansion_from_contains(contains);
         expansion.scope = Some(scope);
-        offer(offered, canonical(url).to_string(), scope, expansion);
+        let url = canonical(url);
+        let answer = match key {
+            Some(key) => Answer::stored(
+                &expansion,
+                Origin::Definition {
+                    package: scope,
+                    key: Some(key).filter(|key| *key != url).map(str::to_string),
+                },
+            ),
+            None => Answer::held(expansion),
+        };
+        offer(offered, url.to_string(), scope, answer);
     }
 
     pub fn finish(self) -> MemoryTerminology {
@@ -457,6 +919,7 @@ impl TerminologyBuilder {
             index,
             offered,
             mut held,
+            source: _,
         } = self;
         let release = index.release.clone();
         let (mut terms, value_sets) = index.finish();
@@ -483,6 +946,7 @@ impl TerminologyBuilder {
             index,
             offered,
             mut held,
+            source: _,
         } = self;
         let release = index.release.clone();
         let (mut terms, value_sets) = index.finish();
@@ -497,7 +961,12 @@ impl TerminologyBuilder {
         let MemoryTerminology { expansions, .. } = terms;
         expansions
             .into_iter()
-            .map(|(url, expansion)| expansion_document(&url, &expansion))
+            .filter_map(|(url, answer)| match answer {
+                Answer::Held(expansion) => Some(expansion_document(&url, &expansion)),
+                // A terminology that is read when used is never turned into documents: they
+                // are what it reads.
+                Answer::Stored { .. } => None,
+            })
     }
 }
 
@@ -547,16 +1016,16 @@ fn slim_value_set_copy(value_set: &Json) -> Json {
     }
 }
 
-/// Record `expansion` as what package `scope` offers for `url`, in place of any it offered before.
+/// Record `answer` as what package `scope` offers for `url`, in place of any it offered before.
 fn offer(
-    offered: &mut BTreeMap<String, Vec<(Scope, Expansion)>>,
+    offered: &mut BTreeMap<String, Vec<(Scope, Answer)>>,
     url: String,
     scope: Scope,
-    expansion: Expansion,
+    answer: Answer,
 ) {
     let candidates = offered.entry(url).or_default();
     candidates.retain(|(owner, _)| *owner != scope);
-    candidates.push((scope, expansion));
+    candidates.push((scope, answer));
 }
 
 fn resource_type(resource: &Json) -> Option<&str> {
@@ -569,7 +1038,7 @@ fn resource_type(resource: &Json) -> Option<&str> {
 /// `order_for_use`): the one in use is last, which is the one at the server's release, or with
 /// none the one loaded last. It answers a reference that comes from nowhere in particular; a
 /// reference from a package prefers that package's own definition, as installing the package did.
-type Definitions = BTreeMap<String, Vec<(Scope, Json)>>;
+type Definitions = BTreeMap<String, Vec<(Scope, Arc<Json>)>>;
 
 impl MemoryTerminology {
     pub fn from_resources(resources: &[Json]) -> Self {
@@ -600,10 +1069,14 @@ impl MemoryTerminology {
             cache: BTreeMap::new(),
             stack: Vec::new(),
         };
+        let mut expanded = Vec::new();
         for url in value_sets.keys() {
             if let Ok(expansion) = expander.expand_in_use(url) {
-                self.expansions.insert(url.clone(), expansion);
+                expanded.push((url.clone(), expansion));
             }
+        }
+        for (url, expansion) in expanded {
+            self.expansions.insert(url, Answer::held(expansion));
         }
     }
 
@@ -612,7 +1085,7 @@ impl MemoryTerminology {
     fn choose_offered(
         &mut self,
         owners: &BTreeMap<String, Vec<Scope>>,
-        offered: BTreeMap<String, Vec<(Scope, Expansion)>>,
+        offered: BTreeMap<String, Vec<(Scope, Answer)>>,
     ) {
         for (url, mut candidates) in offered {
             let chosen = owners
@@ -624,13 +1097,14 @@ impl MemoryTerminology {
                         .find_map(|owner| candidates.iter().rposition(|(scope, _)| scope == owner))
                 })
                 .unwrap_or(candidates.len() - 1);
-            let (_, expansion) = candidates.swap_remove(chosen);
-            self.expansions.insert(url, expansion);
+            let (_, answer) = candidates.swap_remove(chosen);
+            self.expansions.insert(url, answer);
         }
     }
 
     /// [`Self::keep_unexpanded`] for value sets that were held as text. Only the ones that have
-    /// no expansion are parsed again.
+    /// no expansion are parsed again, and when the terminology is read when used not even those:
+    /// each is read when it is asked about, and why it has no expansion is worked out then.
     fn keep_unexpanded_held(&mut self, held: BTreeMap<String, Vec<(Scope, Held)>>) {
         self.uses = held
             .iter()
@@ -649,18 +1123,25 @@ impl MemoryTerminology {
                 let parsed = definitions
                     .into_iter()
                     .filter_map(|(scope, definition)| {
-                        Some((scope, serde_json::from_str(&definition.text).ok()?))
+                        let definition = match definition.text {
+                            Text::Inline(text) => {
+                                Def::Held(Arc::new(serde_json::from_str(&text).ok()?))
+                            }
+                            Text::Stored(key) => Def::Stored(key),
+                        };
+                        Some((scope, definition))
                     })
                     .collect();
                 (url, parsed)
             })
             .collect();
-        let reasons = self
-            .unexpanded
-            .keys()
-            .map(|url| (url.clone(), self.explain(url)))
-            .collect();
-        self.reasons = reasons;
+        if self.loader.is_none() {
+            self.reasons = self
+                .unexpanded
+                .keys()
+                .map(|url| (url.clone(), self.explain(url)))
+                .collect();
+        }
     }
 
     fn keep_unexpanded(&mut self, value_sets: Definitions) {
@@ -668,6 +1149,13 @@ impl MemoryTerminology {
         self.unexpanded = value_sets
             .into_iter()
             .filter(|(url, _)| !self.expansions.contains_key(url))
+            .map(|(url, definitions)| {
+                let definitions = definitions
+                    .into_iter()
+                    .map(|(scope, definition)| (scope, Def::Held(definition)))
+                    .collect();
+                (url, definitions)
+            })
             .collect();
         let reasons = self
             .unexpanded
@@ -679,12 +1167,13 @@ impl MemoryTerminology {
 
     /// Why `url`, which is loaded and has no expansion, has none.
     fn explain(&self, url: &str) -> Vec<ExpansionFailure> {
+        let pool = UnexpandedPool(self);
         let mut expander = Expander {
             systems: &self.systems,
-            value_sets: &self.unexpanded,
+            value_sets: &pool,
             scope: None,
             strict: false,
-            known: &self.expansions,
+            known: self,
             cache: BTreeMap::new(),
             stack: Vec::new(),
         };
@@ -694,6 +1183,28 @@ impl MemoryTerminology {
             }],
             Err(failures) => failures,
         }
+    }
+
+    /// The expansion that answers for `url`: held, or read now.
+    fn expansion_of(&self, url: &str) -> Option<Arc<Expansion>> {
+        match self.expansions.get(url)? {
+            Answer::Held(expansion) => Some(expansion.clone()),
+            Answer::Stored { origin, .. } => self.loader.as_ref()?.0.expansion(url, origin),
+        }
+    }
+
+    /// A definition of a value set that has no expansion.
+    fn definition_of(&self, package: Scope, definition: &Def) -> Option<Arc<Json>> {
+        match definition {
+            Def::Held(json) => Some(json.clone()),
+            Def::Stored(key) => self.loader.as_ref()?.0.definition(package, key),
+        }
+    }
+
+    /// The URLs of the value sets that have no expansion: every one `unexpandable` lists, without
+    /// working out why.
+    pub fn unexpandable_urls(&self) -> Vec<String> {
+        self.unexpanded.keys().cloned().collect()
     }
 
     /// Membership comes from `expansions`. Code systems and concept maps still come from `resources`.
@@ -733,12 +1244,32 @@ impl MemoryTerminology {
                 value_set: url.to_string(),
             }]);
         }
-        Some(
-            self.reasons
-                .get(url)
-                .cloned()
-                .unwrap_or_else(|| self.explain(url)),
-        )
+        if let Some(reasons) = self.reasons.get(url) {
+            return Some(reasons.clone());
+        }
+        let Some(loader) = &self.loader else {
+            return Some(self.explain(url));
+        };
+        // Terminology that is read when used works the reasons out when first asked, and keeps
+        // them: a check against a value set that has no expansion is then a lookup.
+        let remembered = loader
+            .0
+            .reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(url)
+            .cloned();
+        if let Some(reasons) = remembered {
+            return Some(reasons);
+        }
+        let reasons = self.explain(url);
+        loader
+            .0
+            .reasons
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(url.to_string(), reasons.clone());
+        Some(reasons)
     }
 
     /// Every loaded value set that has no expansion, with the reasons. This is what a
@@ -785,13 +1316,16 @@ impl MemoryTerminology {
     #[cfg(test)]
     fn documents(&self) -> Vec<Json> {
         self.expansions
-            .iter()
-            .map(|(url, expansion)| expansion_document(url, expansion))
+            .keys()
+            .filter_map(|url| {
+                let expansion = self.expansion_of(url)?;
+                Some(expansion_document(url, &expansion))
+            })
             .collect()
     }
 
     pub fn expand(&self, url: &str, text_filter: Option<&str>) -> Option<Json> {
-        let expansion = self.expansions.get(canonical(url))?;
+        let expansion = self.expansion_of(canonical(url))?;
         let mut contains = Vec::new();
         for ((system, code), display) in &expansion.codes {
             if let Some(filter) = text_filter {
@@ -834,7 +1368,11 @@ impl MemoryTerminology {
                 (system, version.filter(|version| !version.is_empty()))
             {
                 let base = canonical(split_system(system).0);
-                if self.systems.resolve(base, Some(requested)).is_none() {
+                if self
+                    .systems
+                    .pick_in(None, false, base, Some(requested))
+                    .is_none()
+                {
                     return self.system_not_loaded(base, Some(requested));
                 }
             }
@@ -869,7 +1407,7 @@ impl MemoryTerminology {
         match self.systems.resolve(url, requested) {
             Some((_, index)) if index.codes.contains_key(code) => code_parameters(
                 true,
-                display_message(describe_index(index, code), display),
+                display_message(describe_index(&index, code), display),
                 None,
             ),
             Some((_, index)) if index.closed => {
@@ -919,7 +1457,7 @@ impl MemoryTerminology {
         let Some(index) = self.systems.find(system, version) else {
             return false;
         };
-        is_a(index, code, ancestor)
+        is_a(&index, code, ancestor)
     }
 
     pub fn expand_page(
@@ -985,26 +1523,43 @@ impl MemoryTerminology {
         target_system: Option<&str>,
     ) -> Json {
         let key = (canonical(system).to_string(), code.to_string());
-        let targets = self.maps.get(&key).map(Vec::as_slice).unwrap_or(&[]);
         let mut matches = Vec::new();
-        for target in targets {
-            if map_url.is_some_and(|url| canonical(url) != target.map_url) {
+        // The maps in the order they were read, so the matches come in the order the targets of
+        // the code were added.
+        for map in &self.maps {
+            if !map.sources.contains(&key.0) {
                 continue;
             }
-            if target_system.is_some_and(|url| canonical(url) != target.system) {
+            if map_url.is_some_and(|url| canonical(url) != map.url) {
                 continue;
             }
-            matches.push(json!({
-                "name": "match",
-                "part": [
-                    {"name": "equivalence", "valueCode": target.equivalence},
-                    {"name": "concept", "valueCoding": {"system": target.system, "code": target.code}}
-                ]
-            }));
+            let Some(targets) = self.targets_of(map) else {
+                continue;
+            };
+            for target in targets.get(&key).map(Vec::as_slice).unwrap_or(&[]) {
+                if target_system.is_some_and(|url| canonical(url) != target.system) {
+                    continue;
+                }
+                matches.push(json!({
+                    "name": "match",
+                    "part": [
+                        {"name": "equivalence", "valueCode": target.equivalence},
+                        {"name": "concept", "valueCoding": {"system": target.system, "code": target.code}}
+                    ]
+                }));
+            }
         }
         let mut parameter = vec![json!({"name": "result", "valueBoolean": !matches.is_empty()})];
         parameter.extend(matches);
         json!({"resourceType": "Parameters", "parameter": parameter})
+    }
+
+    /// What a concept map translates: held, or read now.
+    fn targets_of(&self, map: &MapRef) -> Option<Arc<MapTargets>> {
+        match &map.body {
+            MapBody::Held(targets) => Some(targets.clone()),
+            MapBody::Stored { key } => self.loader.as_ref()?.0.map(map.scope, key),
+        }
     }
 
     /// Target code for a StructureMap `translate` transform.
@@ -1020,19 +1575,30 @@ impl MemoryTerminology {
     ) -> Option<Json> {
         let map_url = canonical(map_url);
         let mut codes = Vec::new();
-        for ((source_system, stored), targets) in &self.maps {
-            if stored != code {
+        for map in &self.maps {
+            if map.url != map_url {
                 continue;
             }
-            if system.is_some_and(|item| canonical(item) != source_system) {
+            if system.is_some_and(|item| !map.sources.contains(canonical(item))) {
                 continue;
             }
-            for target in targets {
-                if target.map_url != map_url || !usable_equivalence(&target.equivalence) {
+            let Some(targets) = self.targets_of(map) else {
+                continue;
+            };
+            for ((source_system, stored), targets) in targets.iter() {
+                if stored != code {
                     continue;
                 }
-                if !codes.iter().any(|found| found == &target.code) {
-                    codes.push(target.code.clone());
+                if system.is_some_and(|item| canonical(item) != source_system) {
+                    continue;
+                }
+                for target in targets {
+                    if !usable_equivalence(&target.equivalence) {
+                        continue;
+                    }
+                    if !codes.iter().any(|found| found == &target.code) {
+                        codes.push(target.code.clone());
+                    }
                 }
             }
         }
@@ -1045,7 +1611,7 @@ impl MemoryTerminology {
 
 impl Terminology for MemoryTerminology {
     fn contains(&self, value_set: &str, system: Option<&str>, code: &str) -> TermAnswer {
-        let Some(expansion) = self.expansions.get(canonical(value_set)) else {
+        let Some(expansion) = self.expansion_of(canonical(value_set)) else {
             return TermAnswer::Unknown;
         };
         let found = match system.map(canonical) {
@@ -1082,7 +1648,8 @@ impl Terminology for MemoryTerminology {
     }
 
     fn describe(&self, system: &str, code: &str) -> Option<CodeDescription> {
-        describe_index(self.systems.find(system, None)?, code)
+        let index = self.systems.find(system, None)?;
+        describe_index(&index, code)
     }
 
     fn describe_bound(
@@ -1094,7 +1661,7 @@ impl Terminology for MemoryTerminology {
         if let Some(system) = system {
             return self.describe_as_expanded(value_set, system, code);
         }
-        let expansion = self.expansions.get(canonical(value_set))?;
+        let expansion = self.expansion_of(canonical(value_set))?;
         let mut matched: Option<&str> = None;
         for (system, item) in expansion.codes.keys() {
             if item != code || system.is_empty() {
@@ -1120,22 +1687,18 @@ impl MemoryTerminology {
         code: &str,
     ) -> Option<CodeDescription> {
         let url = canonical(split_system(system).0);
+        // Which version of the system it was expanded from, and for whom, is kept with the
+        // answer: no expansion is read for it.
         let expansion = self.expansions.get(canonical(value_set));
-        let version = expansion.and_then(|expansion| {
-            expansion
-                .systems
-                .iter()
-                .find(|(used, _)| used == url)
-                .map(|(_, version)| version.as_str())
-        });
-        let made_from = expansion.and_then(|expansion| expansion.scope);
+        let version = expansion.and_then(|expansion| expansion.version_of(url));
+        let made_from = expansion.and_then(Answer::scope);
         match version
             .filter(|version| !version.is_empty())
             .and_then(|version| {
                 self.systems
                     .resolve_in(made_from, false, url, Some(version))
             }) {
-            Some((_, index)) => describe_index(index, code),
+            Some((_, index)) => describe_index(&index, code),
             None => self.describe(system, code),
         }
     }
@@ -1371,7 +1934,7 @@ pub struct ExpansionUpdate {
 /// The canonical URLs a value set's `compose` draws on: code systems and other value sets.
 /// What any definition of a value set includes: whichever one answers for it, a change to
 /// something it includes can alter the answer.
-fn references_of(definitions: &[(Scope, Json)]) -> BTreeSet<String> {
+fn references_of(definitions: &[(Scope, Arc<Json>)]) -> BTreeSet<String> {
     definitions
         .iter()
         .flat_map(|(_, definition)| compose_references(definition))
@@ -1464,6 +2027,10 @@ impl MemoryTerminology {
         scope: Scope,
         dependents: &[(Scope, &Json)],
     ) -> Vec<ExpansionUpdate> {
+        // What was read may be what this changes, so it is read again.
+        if let Some(loader) = &self.loader {
+            loader.0.clear();
+        }
         // Every definition of each value set that is read again, with its package.
         let mut changed = Definitions::new();
         let mut gone: BTreeSet<String> = BTreeSet::new();
@@ -1495,16 +2062,16 @@ impl MemoryTerminology {
                 .get("resourceType")
                 .and_then(|value| value.as_str())
             {
-                Some("CodeSystem") => self.add_system(resource, scope),
+                Some("CodeSystem") => self.add_written_system(resource, scope),
                 Some("ConceptMap") => {
                     self.remove_map(&url);
-                    self.add_map(resource);
+                    self.add_written_map(resource, scope);
                 }
                 Some("ValueSet") => {
                     gone.remove(&url);
                     let definitions = changed.entry(url).or_default();
                     definitions.retain(|(owner, _)| *owner != scope);
-                    definitions.push((scope, resource.clone()));
+                    definitions.push((scope, Arc::new(resource.clone())));
                 }
                 _ => {}
             }
@@ -1513,7 +2080,7 @@ impl MemoryTerminology {
             if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
                 let definitions = changed.entry(canonical(url).to_string()).or_default();
                 definitions.retain(|(held, _)| held != owner);
-                definitions.push((*owner, (*resource).clone()));
+                definitions.push((*owner, Arc::new((*resource).clone())));
             }
         }
         let release = self.systems.release.clone();
@@ -1531,18 +2098,17 @@ impl MemoryTerminology {
         }
         // A value set that cannot be expanded may be what a changed one includes, and its own
         // reasons are worked out from its resource, so those are in scope too.
-        let mut pool: Definitions = changed.clone();
-        for (url, definitions) in &self.unexpanded {
-            pool.entry(url.clone())
-                .or_insert_with(|| definitions.clone());
-        }
         let results: Vec<(String, Result<Expansion, Failures>)> = {
+            let pool = Layered {
+                changed: &changed,
+                terms: self,
+            };
             let mut expander = Expander {
                 systems: &self.systems,
                 value_sets: &pool,
                 scope: None,
                 strict: false,
-                known: &self.expansions,
+                known: self,
                 cache: BTreeMap::new(),
                 stack: Vec::new(),
             };
@@ -1559,11 +2125,15 @@ impl MemoryTerminology {
                         url: url.clone(),
                         document: Some(expansion_document(&url, &expansion)),
                     });
-                    self.expansions.insert(url, expansion);
+                    self.expansions.insert(url, Answer::held(expansion));
                 }
                 Err(failures) => {
                     if let Some(definitions) = changed.get(&url) {
-                        self.unexpanded.insert(url.clone(), definitions.clone());
+                        let definitions = definitions
+                            .iter()
+                            .map(|(owner, definition)| (*owner, Def::Held(definition.clone())))
+                            .collect();
+                        self.unexpanded.insert(url.clone(), definitions);
                         self.reasons.insert(url.clone(), failures);
                     }
                     updates.push(ExpansionUpdate {
@@ -1583,10 +2153,7 @@ impl MemoryTerminology {
     }
 
     fn remove_map(&mut self, map_url: &str) {
-        for targets in self.maps.values_mut() {
-            targets.retain(|target| target.map_url != map_url);
-        }
-        self.maps.retain(|_, targets| !targets.is_empty());
+        self.maps.retain(|map| map.url != map_url);
     }
 }
 
@@ -1599,9 +2166,100 @@ fn versioned(system: &str, version: &Option<String>) -> String {
 
 type Failures = Vec<ExpansionFailure>;
 
+/// The definitions of value sets an [`Expander`] may read, by URL.
+trait Pool {
+    /// The packages that define `url`, in the order for use: the one in use is last.
+    fn owners(&self, url: &str) -> Vec<Scope>;
+
+    /// `url` as package `owner` defines it, with only what expanding it reads.
+    fn definition(&self, url: &str, owner: Scope) -> Option<Arc<Json>>;
+}
+
+impl Pool for Definitions {
+    fn owners(&self, url: &str) -> Vec<Scope> {
+        self.get(url)
+            .map(|definitions| definitions.iter().map(|(owner, _)| *owner).collect())
+            .unwrap_or_default()
+    }
+
+    fn definition(&self, url: &str, owner: Scope) -> Option<Arc<Json>> {
+        self.get(url)?
+            .iter()
+            .find(|(held, _)| *held == owner)
+            .map(|(_, definition)| definition.clone())
+    }
+}
+
+/// The value sets of a terminology that have no expansion, which is what a value set that
+/// cannot be expanded is explained from.
+struct UnexpandedPool<'a>(&'a MemoryTerminology);
+
+impl Pool for UnexpandedPool<'_> {
+    fn owners(&self, url: &str) -> Vec<Scope> {
+        self.0
+            .unexpanded
+            .get(url)
+            .map(|definitions| definitions.iter().map(|(owner, _)| *owner).collect())
+            .unwrap_or_default()
+    }
+
+    fn definition(&self, url: &str, owner: Scope) -> Option<Arc<Json>> {
+        let (_, definition) = self
+            .0
+            .unexpanded
+            .get(url)?
+            .iter()
+            .find(|(held, _)| *held == owner)?;
+        self.0.definition_of(owner, definition)
+    }
+}
+
+/// The definitions a change reads again, and for any other value set the ones that have no
+/// expansion.
+struct Layered<'a> {
+    changed: &'a Definitions,
+    terms: &'a MemoryTerminology,
+}
+
+impl Pool for Layered<'_> {
+    fn owners(&self, url: &str) -> Vec<Scope> {
+        if self.changed.contains_key(url) {
+            self.changed.owners(url)
+        } else {
+            UnexpandedPool(self.terms).owners(url)
+        }
+    }
+
+    fn definition(&self, url: &str, owner: Scope) -> Option<Arc<Json>> {
+        if self.changed.contains_key(url) {
+            self.changed.definition(url, owner)
+        } else {
+            UnexpandedPool(self.terms).definition(url, owner)
+        }
+    }
+}
+
+/// The expansions that already exist, which an [`Expander`] uses as they are.
+trait Known {
+    fn known(&self, url: &str) -> Option<Expansion>;
+}
+
+impl Known for BTreeMap<String, Expansion> {
+    fn known(&self, url: &str) -> Option<Expansion> {
+        self.get(url).cloned()
+    }
+}
+
+impl Known for MemoryTerminology {
+    fn known(&self, url: &str) -> Option<Expansion> {
+        self.expansion_of(url)
+            .map(|expansion| Expansion::clone(&expansion))
+    }
+}
+
 struct Expander<'a> {
     systems: &'a Systems,
-    value_sets: &'a Definitions,
+    value_sets: &'a dyn Pool,
     /// The scope of the value set being expanded, which says whose code system versions and
     /// value set definitions come first. At the top level, where it is not known, it is `None`.
     scope: Option<Scope>,
@@ -1609,16 +2267,24 @@ struct Expander<'a> {
     /// the package alone did. Expansions that already exist are not used either.
     strict: bool,
     /// Expansions that already exist. They are used as they are rather than recomputed.
-    known: &'a BTreeMap<String, Expansion>,
+    known: &'a dyn Known,
     cache: BTreeMap<(String, Scope, bool), Result<Expansion, Failures>>,
     stack: Vec<String>,
 }
 
 impl Expander<'_> {
     /// A system, read as the value set being expanded reads it.
-    fn resolve(&self, system: &str, version: Option<&str>) -> Option<(&str, &SystemIndex)> {
+    fn resolve(&self, system: &str, version: Option<&str>) -> Option<(&str, Arc<SystemIndex>)> {
         self.systems
             .resolve_in(self.scope, self.strict, system, version)
+    }
+
+    /// The version of a system, read as the value set being expanded reads it, without reading
+    /// the system.
+    fn version_of(&self, system: &str, version: Option<&str>) -> Option<String> {
+        self.systems
+            .pick_in(self.scope, self.strict, system, version)
+            .map(|(version, _)| version.to_string())
     }
 
     /// A value set asked for by its URL alone: the definition in use, or, when that cannot be
@@ -1630,11 +2296,8 @@ impl Expander<'_> {
     /// is the definition in use that is explained.
     fn expand_in_use(&mut self, url: &str) -> Result<Expansion, Failures> {
         let url = canonical(url).to_string();
-        let owners: Vec<Scope> = self
-            .value_sets
-            .get(&url)
-            .map(|definitions| definitions.iter().rev().map(|(owner, _)| *owner).collect())
-            .unwrap_or_default();
+        let mut owners = self.value_sets.owners(&url);
+        owners.reverse();
         let outer_strict = self.strict;
         let mut first = None;
         for strict in [true, false] {
@@ -1665,29 +2328,26 @@ impl Expander<'_> {
     fn expand(&mut self, url: &str) -> Result<Expansion, Failures> {
         let url = canonical(url).to_string();
         if !self.strict {
-            if let Some(known) = self.known.get(&url) {
-                return Ok(known.clone());
+            if let Some(known) = self.known.known(&url) {
+                return Ok(known);
             }
         }
         // The definition of a value set named from a package is that package's own, when it has
         // one; otherwise the one in use, which is the last. A package read alone has only its
-        // own. The definitions are borrowed from the data, not from `self`, so they are not
-        // copied to be read.
-        let value_sets = self.value_sets;
-        let definition = value_sets.get(&url).and_then(|definitions| {
-            let own = self
-                .scope
-                .and_then(|scope| definitions.iter().rev().find(|(owner, _)| *owner == scope));
-            if self.strict && self.scope.is_some() {
-                own
-            } else {
-                own.or_else(|| definitions.last())
-            }
-        });
-        let Some((owner, value_set)) = definition else {
+        // own.
+        let owners = self.value_sets.owners(&url);
+        let own = self.scope.filter(|scope| owners.contains(scope));
+        let owner = if self.strict && self.scope.is_some() {
+            own
+        } else {
+            own.or_else(|| owners.last().copied())
+        };
+        let Some(owner) = owner else {
             return Err(vec![ExpansionFailure::NotLoaded { value_set: url }]);
         };
-        let owner = *owner;
+        let Some(value_set) = self.value_sets.definition(&url, owner) else {
+            return Err(vec![ExpansionFailure::NotLoaded { value_set: url }]);
+        };
         let key = (url.clone(), owner, self.strict);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
@@ -1698,7 +2358,7 @@ impl Expander<'_> {
         self.stack.push(url.clone());
         // Its own includes are read as its own package reads them.
         let outer = self.scope.replace(owner);
-        let mut expansion = expand_value_set(self, &url, value_set);
+        let mut expansion = expand_value_set(self, &url, &value_set);
         self.scope = outer;
         self.stack.pop();
         if let Ok(expansion) = &mut expansion {
@@ -1855,8 +2515,12 @@ fn expand_include(
                     system.as_ref().and_then(|system| {
                         expander
                             .resolve(system, version.as_deref())
-                            .and_then(|(_, index)| index.codes.get(code))
-                            .and_then(|concept| concept.display.clone())
+                            .and_then(|(_, index)| {
+                                index
+                                    .codes
+                                    .get(code)
+                                    .and_then(|concept| concept.display.clone())
+                            })
                     })
                 });
             let system_name = system.clone().unwrap_or_default();
@@ -1914,7 +2578,7 @@ fn expand_include(
         if !index.closed {
             return Err(incomplete(Some(describe_filters(filters))));
         }
-        let matched = filter_codes(index, filters);
+        let matched = filter_codes(&index, filters);
         if !expansion.codes.is_empty() {
             expansion.codes.retain(|(item_system, code), _| {
                 item_system == &system && matched.iter().any(|candidate| candidate == code)
@@ -1959,8 +2623,7 @@ fn note_system(
     requested: Option<&str>,
 ) {
     let version = expander
-        .resolve(system, requested)
-        .map(|(version, _)| version.to_string())
+        .version_of(system, requested)
         .unwrap_or_else(|| requested.unwrap_or("").to_string());
     expansion.systems.insert((system.to_string(), version));
 }
@@ -2087,7 +2750,7 @@ fn order_for_use<T>(definitions: &mut Vec<(Scope, T)>, at_release: impl Fn(&T) -
     *definitions = rest;
 }
 
-fn prefer_release(definitions: &mut Vec<(Scope, Json)>, release: Option<&str>) {
+fn prefer_release(definitions: &mut Vec<(Scope, Arc<Json>)>, release: Option<&str>) {
     order_for_use(definitions, |definition| at_release(definition, release));
 }
 
@@ -2141,8 +2804,12 @@ struct Index {
 }
 
 impl Index {
-    fn new(release: Option<&str>) -> Self {
-        let mut terms = MemoryTerminology::default();
+    /// With a `source`, code systems and concept maps are indexed to be read from it when used.
+    fn new(release: Option<&str>, source: Option<Arc<dyn TermSource>>) -> Self {
+        let mut terms = match source {
+            Some(source) => MemoryTerminology::reading_from(source),
+            None => MemoryTerminology::default(),
+        };
         terms.set_release(release);
         Self {
             terms,
@@ -2159,8 +2826,18 @@ impl Index {
     /// A code system or concept map: indexed, nothing of it is kept. Anything else is ignored.
     fn add_indexed(&mut self, scope: Scope, resource: &Json) {
         match resource_type(resource) {
-            Some("CodeSystem") => self.terms.add_system(resource, scope),
-            Some("ConceptMap") => self.terms.add_map(resource),
+            Some("CodeSystem") => self.terms.add_system(resource, scope, None),
+            Some("ConceptMap") => self.terms.add_map(resource, scope, None),
+            _ => {}
+        }
+    }
+
+    /// [`Self::add_indexed`] for a resource stored under `key`, which is read again from there
+    /// when it is used.
+    fn add_indexed_stored(&mut self, scope: Scope, key: &str, resource: &Json) {
+        match resource_type(resource) {
+            Some("CodeSystem") => self.terms.add_system(resource, scope, Some(key)),
+            Some("ConceptMap") => self.terms.add_map(resource, scope, Some(key)),
             _ => {}
         }
     }
@@ -2176,7 +2853,7 @@ impl Index {
         // What this package defined before is replaced; the definition loaded last stays last.
         let definitions = self.value_sets.entry(url).or_default();
         definitions.retain(|(owner, _)| *owner != scope);
-        definitions.push((scope, resource));
+        definitions.push((scope, Arc::new(resource)));
     }
 
     fn finish(mut self) -> (MemoryTerminology, Definitions) {
@@ -2187,86 +2864,233 @@ impl Index {
     }
 }
 
-impl MemoryTerminology {
-    fn add_system(&mut self, resource: &Json, scope: Scope) {
-        let Some((url, version)) = code_system_key(resource) else {
-            return;
-        };
-        let content = resource
-            .get("content")
-            .and_then(|value| value.as_str())
-            .unwrap_or("complete");
-        let closed = !matches!(
-            content,
-            "fragment" | "example" | "not-present" | "supplement"
-        );
-        let content = content.to_string();
-        let mut codes = BTreeMap::new();
-        if let Some(concepts) = resource.get("concept").and_then(|value| value.as_array()) {
-            collect_concepts(concepts, None, &mut codes);
-        }
-        self.systems.insert(
-            scope,
-            &url,
-            &version,
-            SystemIndex {
-                closed,
-                content,
-                name: resource
-                    .get("name")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.to_string()),
-                codes,
-            },
-        );
+/// The index a CodeSystem makes: its URL and version, and its concepts.
+fn system_index(resource: &Json) -> Option<(String, String, SystemIndex)> {
+    let (url, version) = code_system_key(resource)?;
+    let content = resource
+        .get("content")
+        .and_then(|value| value.as_str())
+        .unwrap_or("complete");
+    let closed = !matches!(
+        content,
+        "fragment" | "example" | "not-present" | "supplement"
+    );
+    let content = content.to_string();
+    let mut codes = BTreeMap::new();
+    if let Some(concepts) = resource.get("concept").and_then(|value| value.as_array()) {
+        collect_concepts(concepts, None, &mut codes);
     }
+    Some((
+        url,
+        version,
+        SystemIndex {
+            closed,
+            content,
+            name: resource
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string()),
+            codes,
+        },
+    ))
+}
 
-    fn add_map(&mut self, resource: &Json) {
-        let Some(url) = resource.get("url").and_then(|value| value.as_str()) else {
-            return;
+/// What a ConceptMap translates: its canonical URL, and its targets by source system and code.
+/// Nothing comes of a map that has no URL, no group or no target.
+fn map_of(resource: &Json) -> Option<(String, MapTargets)> {
+    let url = canonical(resource.get("url").and_then(|value| value.as_str())?).to_string();
+    let groups = resource.get("group").and_then(|value| value.as_array())?;
+    let mut targets = MapTargets::new();
+    for group in groups {
+        let Some(source) = group.get("source").and_then(|value| value.as_str()) else {
+            continue;
         };
-        let url = canonical(url).to_string();
-        let Some(groups) = resource.get("group").and_then(|value| value.as_array()) else {
-            return;
+        let Some(target_system) = group.get("target").and_then(|value| value.as_str()) else {
+            continue;
         };
-        for group in groups {
-            let Some(source) = group.get("source").and_then(|value| value.as_str()) else {
+        let Some(elements) = group.get("element").and_then(|value| value.as_array()) else {
+            continue;
+        };
+        for element in elements {
+            let Some(code) = element.get("code").and_then(|value| value.as_str()) else {
                 continue;
             };
-            let Some(target_system) = group.get("target").and_then(|value| value.as_str()) else {
+            let Some(listed) = element.get("target").and_then(|value| value.as_array()) else {
                 continue;
             };
-            let Some(elements) = group.get("element").and_then(|value| value.as_array()) else {
-                continue;
-            };
-            for element in elements {
-                let Some(code) = element.get("code").and_then(|value| value.as_str()) else {
+            for target in listed {
+                let Some(target_code) = target.get("code").and_then(|value| value.as_str()) else {
                     continue;
                 };
-                let Some(targets) = element.get("target").and_then(|value| value.as_array()) else {
-                    continue;
-                };
-                for target in targets {
-                    let Some(target_code) = target.get("code").and_then(|value| value.as_str())
-                    else {
-                        continue;
-                    };
-                    let equivalence = target
-                        .get("equivalence")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("equivalent");
-                    self.maps
-                        .entry((canonical(source).to_string(), code.to_string()))
-                        .or_default()
-                        .push(Target {
-                            map_url: url.clone(),
-                            system: canonical(target_system).to_string(),
-                            code: target_code.to_string(),
-                            equivalence: equivalence.to_string(),
-                        });
-                }
+                let equivalence = target
+                    .get("equivalence")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("equivalent");
+                targets
+                    .entry((canonical(source).to_string(), code.to_string()))
+                    .or_default()
+                    .push(Target {
+                        map_url: url.clone(),
+                        system: canonical(target_system).to_string(),
+                        code: target_code.to_string(),
+                        equivalence: equivalence.to_string(),
+                    });
             }
         }
+    }
+    Some((url, targets))
+}
+
+/// What a concept map's targets take, roughly: what a cache weighs them by.
+fn map_weight(targets: &MapTargets) -> usize {
+    targets
+        .iter()
+        .map(|((system, code), list)| {
+            96 + system.len()
+                + code.len()
+                + list
+                    .iter()
+                    .map(|target| {
+                        128 + target.map_url.len()
+                            + target.system.len()
+                            + target.code.len()
+                            + target.equivalence.len()
+                    })
+                    .sum::<usize>()
+        })
+        .sum::<usize>()
+        + 64
+}
+
+fn map_targets(resource: &Json) -> MapTargets {
+    map_of(resource)
+        .map(|(_, targets)| targets)
+        .unwrap_or_default()
+}
+
+fn json_weight(value: &Json) -> usize {
+    crate::schema::json_bytes(value)
+}
+
+impl MemoryTerminology {
+    /// Terminology that keeps an index and reads what it does not hold from `source`.
+    fn reading_from(source: Arc<dyn TermSource>) -> Self {
+        let loader = Loading(Arc::new(Loader::new(source)));
+        Self {
+            systems: Systems {
+                loader: Some(Loading(loader.0.clone())),
+                ..Systems::default()
+            },
+            loader: Some(loader),
+            ..Self::default()
+        }
+    }
+
+    /// Give the caches budgets so small that almost nothing is kept, so that what is read is
+    /// read again. Only for checking that a second read gives what the first did.
+    #[cfg(test)]
+    fn squeeze(&mut self) {
+        if let Some(loading) = &self.loader {
+            let source = loading.0.source.clone();
+            let mut loader = Loader::new(source);
+            loader.systems = Cache::new(1);
+            loader.expansions = Cache::new(1);
+            loader.definitions = Cache::new(1);
+            loader.maps = Cache::new(1);
+            let loading = Loading(Arc::new(loader));
+            self.systems.loader = Some(Loading(loading.0.clone()));
+            self.loader = Some(loading);
+        }
+    }
+
+    /// Add a code system. `stored` is the key it is stored under when it is to be read again from
+    /// there when used, and then none of it is kept but its digest.
+    fn add_system(&mut self, resource: &Json, scope: Scope, stored: Option<&str>) {
+        let Some((url, version, index)) = system_index(resource) else {
+            return;
+        };
+        let digest = index.digest();
+        match stored {
+            Some(key) => self
+                .systems
+                .insert(scope, &url, &version, key, digest, None),
+            None => self
+                .systems
+                .insert(scope, &url, &version, "", digest, Some(Arc::new(index))),
+        }
+    }
+
+    /// A code system that was just written. Terminology that is read when used has it in the
+    /// store already, under the key a write stores it under, and keeps what was just made of it
+    /// for the next lookup.
+    fn add_written_system(&mut self, resource: &Json, scope: Scope) {
+        let Some(loader) = self.loader.as_ref().map(|loading| loading.0.clone()) else {
+            return self.add_system(resource, scope, None);
+        };
+        let (Some((url, version, index)), Some(key)) =
+            (system_index(resource), code_system_row_key(resource))
+        else {
+            return;
+        };
+        let digest = index.digest();
+        let weight = index.approx_bytes();
+        loader
+            .systems
+            .insert((scope, key.clone()), Arc::new(index), weight);
+        self.systems
+            .insert(scope, &url, &version, &key, digest, None);
+    }
+
+    /// Add a concept map. `stored` is as for [`Self::add_system`].
+    fn add_map(&mut self, resource: &Json, scope: Scope, stored: Option<&str>) {
+        let Some((url, targets)) = map_of(resource) else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let sources = targets.keys().map(|(source, _)| source.clone()).collect();
+        let body = match stored {
+            Some(key) => MapBody::Stored {
+                key: key.to_string(),
+            },
+            None => MapBody::Held(Arc::new(targets)),
+        };
+        self.maps.push(MapRef {
+            scope,
+            url,
+            sources,
+            body,
+        });
+    }
+
+    /// A concept map that was just written: see [`Self::add_written_system`].
+    fn add_written_map(&mut self, resource: &Json, scope: Scope) {
+        let Some(loader) = self.loader.as_ref().map(|loading| loading.0.clone()) else {
+            return self.add_map(resource, scope, None);
+        };
+        let Some(key) = resource.get("url").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some((url, targets)) = map_of(resource) else {
+            return;
+        };
+        if targets.is_empty() {
+            return;
+        }
+        let sources = targets.keys().map(|(source, _)| source.clone()).collect();
+        let weight = map_weight(&targets);
+        loader
+            .maps
+            .insert((scope, key.to_string()), Arc::new(targets), weight);
+        self.maps.push(MapRef {
+            scope,
+            url,
+            sources,
+            body: MapBody::Stored {
+                key: key.to_string(),
+            },
+        });
     }
 }
 
@@ -3847,53 +4671,99 @@ mod tests {
     }
 
     /// A full rebuild of the changed terminology and the incremental result agree on every
-    /// expansion, on why each value set cannot expand, and on concept map translation.
+    /// expansion, on why each value set cannot expand, and on concept map translation. So does
+    /// terminology that reads what it does not hold from a store, when the change is applied to
+    /// it after the store has the rows it writes.
     fn assert_matches_a_rebuild(base: &[serde_json::Value], change: TerminologyChange) {
         let (inc, rows) = incremental(base, &change);
         let final_resources = after(base, &change);
         let full = MemoryTerminology::from_resources(&final_resources);
         assert_eq!(inc.documents(), full.documents(), "expansions differ");
         assert_eq!(rows, full.documents(), "rows to store differ");
-        let reasons = |terms: &MemoryTerminology| -> Vec<(String, Vec<String>)> {
-            terms
-                .unexpandable()
-                .into_iter()
-                .map(|(url, failures)| (url, failures.iter().map(|f| f.message()).collect()))
-                .collect()
-        };
-        assert_eq!(reasons(&inc), reasons(&full), "reasons differ");
-        for resource in &final_resources {
-            if resource["resourceType"] == "ConceptMap" {
-                for code in ["a", "b", "c"] {
-                    assert_eq!(
-                        inc.translate(
-                            Some(&url_of(resource)),
-                            "http://example.org/src",
-                            code,
-                            None
-                        ),
-                        full.translate(
-                            Some(&url_of(resource)),
-                            "http://example.org/src",
-                            code,
-                            None
-                        ),
-                        "translation of {code} differs"
-                    );
+        let lazy = lazily_changed(base, &change);
+        for (what, terms) in [
+            ("incremental", &inc),
+            ("incremental, read when used", &lazy),
+        ] {
+            assert_eq!(
+                terms.documents(),
+                full.documents(),
+                "{what}: expansions differ"
+            );
+            let reasons = |terms: &MemoryTerminology| -> Vec<(String, Vec<String>)> {
+                terms
+                    .unexpandable()
+                    .into_iter()
+                    .map(|(url, failures)| (url, failures.iter().map(|f| f.message()).collect()))
+                    .collect()
+            };
+            assert_eq!(reasons(terms), reasons(&full), "{what}: reasons differ");
+            for resource in &final_resources {
+                if resource["resourceType"] == "ConceptMap" {
+                    for code in ["a", "b", "c"] {
+                        assert_eq!(
+                            terms.translate(
+                                Some(&url_of(resource)),
+                                "http://example.org/src",
+                                code,
+                                None
+                            ),
+                            full.translate(
+                                Some(&url_of(resource)),
+                                "http://example.org/src",
+                                code,
+                                None
+                            ),
+                            "{what}: translation of {code} differs"
+                        );
+                    }
+                }
+            }
+            // The same answer comes back for membership.
+            for resource in &final_resources {
+                if resource["resourceType"] == "ValueSet" {
+                    for code in ["a", "b", "c", "x"] {
+                        assert_eq!(
+                            terms.contains(&url_of(resource), None, code),
+                            full.contains(&url_of(resource), None, code),
+                            "{what}: membership of {code} differs"
+                        );
+                    }
                 }
             }
         }
-        // The same answer comes back for membership.
-        for resource in &final_resources {
-            if resource["resourceType"] == "ValueSet" {
-                for code in ["a", "b", "c", "x"] {
-                    assert_eq!(
-                        inc.contains(&url_of(resource), None, code),
-                        full.contains(&url_of(resource), None, code)
-                    );
-                }
-            }
+    }
+
+    /// `base` as stored, read when used, with `change` written to the store and then applied.
+    fn lazily_changed(base: &[serde_json::Value], change: &TerminologyChange) -> MemoryTerminology {
+        let documents = MemoryTerminology::expansion_documents(base);
+        let resources: Vec<(super::Scope, serde_json::Value)> =
+            base.iter().map(|resource| (0, resource.clone())).collect();
+        let stored: Vec<(super::Scope, serde_json::Value)> = documents
+            .iter()
+            .map(|document| (0, document.clone()))
+            .collect();
+        let (mut terms, shelf) = lazily(&resources, &stored, None);
+        for (_, key) in &change.removed {
+            shelf.resources.lock().unwrap().remove(&(0, key.clone()));
         }
+        for resource in &change.upserted {
+            shelf
+                .resources
+                .lock()
+                .unwrap()
+                .insert((0, row_key(resource)), resource.clone());
+        }
+        let dependents = terms.dependents_of(&change.urls());
+        let loaded: Vec<serde_json::Value> = base
+            .iter()
+            .filter(|resource| {
+                resource["resourceType"] == "ValueSet" && dependents.contains(&url_of(resource))
+            })
+            .cloned()
+            .collect();
+        terms.apply(change, &loaded);
+        terms
     }
 
     fn change(upserted: Vec<serde_json::Value>, removed: &[(&str, &str)]) -> TerminologyChange {
@@ -4437,5 +5307,449 @@ mod tests {
             read(&[], &[(1, stored(&["b"])), (2, stored(&["c"]))]),
             ["c"]
         );
+    }
+
+    // Terminology that is read when used ---------------------------------------------------
+
+    use std::collections::{BTreeMap as Rows, BTreeSet as Names};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+    use std::sync::{Arc, Mutex};
+
+    use super::{code_system_row_key, Scope, TermSource, TerminologyBuilder};
+
+    /// The terminology rows of a store, and how many were read from it.
+    #[derive(Default)]
+    struct Shelf {
+        resources: Mutex<Rows<(Scope, String), serde_json::Value>>,
+        expansions: Mutex<Rows<(Scope, String), serde_json::Value>>,
+        reads: AtomicUsize,
+    }
+
+    impl TermSource for Shelf {
+        fn resource(&self, package: Scope, key: &str) -> Option<serde_json::Value> {
+            self.reads.fetch_add(1, Relaxed);
+            self.resources
+                .lock()
+                .unwrap()
+                .get(&(package, key.to_string()))
+                .cloned()
+        }
+
+        fn expansion(&self, package: Scope, key: &str) -> Option<serde_json::Value> {
+            self.reads.fetch_add(1, Relaxed);
+            self.expansions
+                .lock()
+                .unwrap()
+                .get(&(package, key.to_string()))
+                .cloned()
+        }
+    }
+
+    /// The key a resource is stored under: a code system by its URL and version.
+    fn row_key(resource: &serde_json::Value) -> String {
+        if resource["resourceType"] == "CodeSystem" {
+            code_system_row_key(resource).unwrap()
+        } else {
+            url_of(resource)
+        }
+    }
+
+    /// Terminology that holds an index and reads the rest from a store holding `resources` and
+    /// `expansions`, each with the package it is stored for.
+    fn lazily(
+        resources: &[(Scope, serde_json::Value)],
+        expansions: &[(Scope, serde_json::Value)],
+        release: Option<&str>,
+    ) -> (MemoryTerminology, Arc<Shelf>) {
+        let shelf = Arc::new(Shelf::default());
+        let mut builder = TerminologyBuilder::for_source(release, shelf.clone());
+        for (scope, resource) in resources {
+            let key = row_key(resource);
+            shelf
+                .resources
+                .lock()
+                .unwrap()
+                .insert((*scope, key.clone()), resource.clone());
+            builder.add_stored_resource(*scope, &key, resource.clone());
+        }
+        for (scope, document) in expansions {
+            let key = url_of(document);
+            shelf
+                .expansions
+                .lock()
+                .unwrap()
+                .insert((*scope, key.clone()), document.clone());
+            builder.add_stored_expansion(*scope, &key, document);
+        }
+        (builder.finish(), shelf)
+    }
+
+    /// The same terminology, every resource and expansion held.
+    fn held(
+        resources: &[(Scope, serde_json::Value)],
+        expansions: &[(Scope, serde_json::Value)],
+        release: Option<&str>,
+    ) -> MemoryTerminology {
+        let resources: Vec<(Scope, &serde_json::Value)> = resources
+            .iter()
+            .map(|(scope, item)| (*scope, item))
+            .collect();
+        let expansions: Vec<(Scope, &serde_json::Value)> = expansions
+            .iter()
+            .map(|(scope, item)| (*scope, item))
+            .collect();
+        MemoryTerminology::from_stored_scoped(&resources, &expansions, release)
+    }
+
+    /// What installing the packages stores: the expansion of every value set, for the package
+    /// whose definition of it is in use.
+    fn stored_expansions(
+        resources: &[(Scope, serde_json::Value)],
+        release: Option<&str>,
+    ) -> Vec<(Scope, serde_json::Value)> {
+        let tagged: Vec<(Scope, &serde_json::Value)> = resources
+            .iter()
+            .map(|(scope, item)| (*scope, item))
+            .collect();
+        let owners = super::winning_scopes(&tagged, release);
+        MemoryTerminology::expansion_documents_scoped(&tagged, release)
+            .into_iter()
+            .filter_map(|document| {
+                let owner = *owners.get(document["url"].as_str()?)?;
+                Some((owner, document))
+            })
+            .collect()
+    }
+
+    /// Every question terminology answers, asked of both, and the answers compared.
+    fn assert_alike(held: &MemoryTerminology, lazy: &MemoryTerminology) {
+        let reasons = |terms: &MemoryTerminology| -> Vec<(String, Vec<String>)> {
+            terms
+                .unexpandable()
+                .into_iter()
+                .map(|(url, failures)| (url, messages(&failures)))
+                .collect()
+        };
+        assert_eq!(held.documents(), lazy.documents(), "expansions differ");
+        assert_eq!(reasons(held), reasons(lazy), "reasons differ");
+        assert_eq!(held.unexpandable_urls(), lazy.unexpandable_urls());
+        let mut urls: Names<String> = held
+            .expansions
+            .keys()
+            .chain(held.unexpanded.keys())
+            .cloned()
+            .collect();
+        urls.insert("http://example.org/not-loaded".to_string());
+        let systems: Vec<(String, Vec<String>)> = held
+            .systems
+            .by_url
+            .iter()
+            .map(|(url, versions)| (url.clone(), versions.keys().cloned().collect()))
+            .collect();
+        let mut codes: Names<String> = held
+            .systems
+            .by_url
+            .values()
+            .flat_map(|versions| versions.values().flatten())
+            .flat_map(|variant| {
+                variant
+                    .index
+                    .iter()
+                    .flat_map(|index| index.codes.keys().cloned())
+            })
+            .collect();
+        codes.insert("no-such-code".to_string());
+        for url in &urls {
+            assert_eq!(held.expand(url, None), lazy.expand(url, None), "{url}");
+            assert_eq!(
+                held.expand_page(url, Some("a"), 0, Some(2)),
+                lazy.expand_page(url, Some("a"), 0, Some(2)),
+                "{url}"
+            );
+            assert_eq!(
+                held.why_not_expanded(url)
+                    .map(|failures| messages(&failures)),
+                lazy.why_not_expanded(url)
+                    .map(|failures| messages(&failures)),
+                "{url}"
+            );
+            assert_eq!(
+                held.expansion_problem(url),
+                lazy.expansion_problem(url),
+                "{url}"
+            );
+            for code in &codes {
+                assert_eq!(
+                    held.contains(url, None, code),
+                    lazy.contains(url, None, code)
+                );
+                assert_eq!(
+                    held.describe_bound(url, None, code),
+                    lazy.describe_bound(url, None, code),
+                    "{url} {code}"
+                );
+                for (system, _) in &systems {
+                    assert_eq!(
+                        held.contains(url, Some(system), code),
+                        lazy.contains(url, Some(system), code),
+                        "{url} {system} {code}"
+                    );
+                    assert_eq!(
+                        held.describe_bound(url, Some(system), code),
+                        lazy.describe_bound(url, Some(system), code),
+                        "{url} {system} {code}"
+                    );
+                    assert_eq!(
+                        held.validate_code(Some(url), Some(system), None, code, None),
+                        lazy.validate_code(Some(url), Some(system), None, code, None),
+                        "{url} {system} {code}"
+                    );
+                }
+            }
+        }
+        for (system, versions) in &systems {
+            for code in &codes {
+                assert_eq!(held.describe(system, code), lazy.describe(system, code));
+                assert_eq!(
+                    held.validate_code(None, Some(system), None, code, Some("display")),
+                    lazy.validate_code(None, Some(system), None, code, Some("display")),
+                    "{system} {code}"
+                );
+                assert_eq!(
+                    held.lookup(system, None, code),
+                    lazy.lookup(system, None, code),
+                    "{system} {code}"
+                );
+                for version in versions {
+                    assert_eq!(
+                        held.lookup(system, Some(version), code),
+                        lazy.lookup(system, Some(version), code),
+                        "{system} {version} {code}"
+                    );
+                    assert_eq!(
+                        held.validate_code(None, Some(system), Some(version), code, None),
+                        lazy.validate_code(None, Some(system), Some(version), code, None),
+                        "{system} {version} {code}"
+                    );
+                }
+                for other in &codes {
+                    assert_eq!(
+                        held.subsumes(system, None, other, code),
+                        lazy.subsumes(system, None, other, code),
+                        "{system} {other} {code}"
+                    );
+                }
+            }
+            assert_eq!(
+                held.validate_code(None, Some(system), Some("9.9.9"), "a", None),
+                lazy.validate_code(None, Some(system), Some("9.9.9"), "a", None)
+            );
+        }
+        for map in &held.maps {
+            for (system, code) in map
+                .sources
+                .iter()
+                .flat_map(|system| codes.iter().map(move |code| (system.clone(), code.clone())))
+            {
+                for map_url in [None, Some(map.url.as_str())] {
+                    assert_eq!(
+                        held.translate(map_url, &system, &code, None),
+                        lazy.translate(map_url, &system, &code, None),
+                        "{system} {code}"
+                    );
+                }
+                for system in [None, Some(system.as_str())] {
+                    assert_eq!(
+                        held.translate_coding(&map.url, system, &code),
+                        lazy.translate_coding(&map.url, system, &code),
+                        "{system:?} {code}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The resources of some packages, each with its package, and the release they are read for.
+    type Scenario = (Vec<(Scope, serde_json::Value)>, Option<&'static str>);
+
+    /// Terminology of the kinds the rest of these tests build, each as the packages that make it.
+    fn lazy_scenarios() -> Vec<Scenario> {
+        let tree = "http://example.org/tree";
+        let mut scenarios: Vec<Scenario> = Vec::new();
+        scenarios.push((catalog().into_iter().map(|item| (0, item)).collect(), None));
+        let (r4, copy) = r4_and_its_r5_style_copy();
+        scenarios.push((together(&[&r4, &copy]), Some("4.0.1")));
+        scenarios.push((together(&[&r4, &copy]), None));
+        scenarios.push((together(&[&copy, &r4]), Some("4.0.1")));
+        let own = package(
+            1,
+            vec![
+                versioned_system(SYS, "1", &["a", "b"]),
+                value_set(SET, json!({"include": [{"system": SYS}]})),
+            ],
+        );
+        let newer = package(2, vec![versioned_system(SYS, "2", &["c"])]);
+        scenarios.push((together(&[&own, &newer]), None));
+        scenarios.push((together(&[&newer, &own]), Some("1")));
+        // Two packages that hold one version of a system, with the same content and with not.
+        let same = package(2, vec![versioned_system(SYS, "1", &["a", "b"])]);
+        scenarios.push((together(&[&own, &same]), None));
+        let differ = package(3, vec![versioned_system(SYS, "1", &["a", "z"])]);
+        scenarios.push((together(&[&own, &same, &differ]), Some("1")));
+        // A hierarchy and the filters over it, a value set with its expansion inside it, a cycle,
+        // a filter that is not supported, and concept maps two packages hold.
+        let hierarchy = package(
+            1,
+            vec![
+                json!({"resourceType": "CodeSystem", "url": tree, "content": "complete",
+                       "name": "Tree",
+                       "concept": [{"code": "root", "display": "Root", "concept": [
+                           {"code": "leaf", "display": "Leaf"},
+                           {"code": "twig", "concept": [{"code": "bud"}]}]}]}),
+                value_set(
+                    "http://example.org/under-twig",
+                    json!({"include": [{"system": tree, "filter": [
+                        {"property": "concept", "op": "is-a", "value": "twig"}]}]}),
+                ),
+                json!({"resourceType": "ValueSet", "url": "http://example.org/inline",
+                       "expansion": {"contains": [
+                           {"system": tree, "code": "leaf", "display": "Leaf"}]}}),
+                value_set(
+                    "http://example.org/c1",
+                    json!({"include": [{"valueSet": ["http://example.org/c2"]}]}),
+                ),
+                value_set(
+                    "http://example.org/c2",
+                    json!({"include": [{"valueSet": ["http://example.org/c1"]}]}),
+                ),
+                value_set(
+                    "http://example.org/odd",
+                    json!({"include": [{"system": tree, "filter": [
+                        {"property": "p", "op": "regex", "value": "x"}]}]}),
+                ),
+                json!({"resourceType": "ConceptMap", "url": "http://example.org/map",
+                       "group": [{"source": tree, "target": "http://example.org/dst",
+                                  "element": [{"code": "leaf", "target": [
+                                      {"code": "x", "equivalence": "equivalent"},
+                                      {"code": "y", "equivalence": "wider"}]}]}]}),
+            ],
+        );
+        let again = package(
+            2,
+            vec![
+                json!({"resourceType": "ConceptMap", "url": "http://example.org/map",
+                        "group": [{"source": tree, "target": "http://example.org/dst",
+                                   "element": [{"code": "leaf", "target": [
+                                       {"code": "z", "equivalence": "equivalent"}]}]}]}),
+            ],
+        );
+        scenarios.push((together(&[&hierarchy, &again]), None));
+        scenarios
+    }
+
+    #[test]
+    fn terminology_read_when_used_answers_what_held_terminology_answers() {
+        for (resources, release) in lazy_scenarios() {
+            let stored = stored_expansions(&resources, release);
+            let held = held(&resources, &stored, release);
+            let (mut lazy, shelf) = lazily(&resources, &stored, release);
+            // Building it reads no row: what it needs is handed to it.
+            assert_eq!(shelf.reads.load(Relaxed), 0);
+            assert_alike(&held, &lazy);
+            assert_alike(&held, &lazy);
+            // With caches that keep almost nothing, everything is read again each time.
+            lazy.squeeze();
+            assert_alike(&held, &lazy);
+            assert_alike(&held, &lazy);
+        }
+    }
+
+    #[test]
+    fn a_question_reads_only_what_it_needs() {
+        let (r4, _) = r4_and_its_r5_style_copy();
+        let extra = package(
+            1,
+            vec![
+                versioned_system("http://example.org/other", "1", &["q"]),
+                value_set(
+                    "http://example.org/other-set",
+                    json!({"include": [{"system": "http://example.org/other"}]}),
+                ),
+            ],
+        );
+        let resources = together(&[&r4, &extra]);
+        let stored = stored_expansions(&resources, Some("4.0.1"));
+        let (lazy, shelf) = lazily(&resources, &stored, Some("4.0.1"));
+        let reads = || shelf.reads.load(Relaxed);
+        // Membership reads that value set's expansion, once.
+        assert_eq!(lazy.contains(SET, None, "a"), TermAnswer::Yes);
+        assert_eq!(reads(), 1);
+        assert_eq!(lazy.contains(SET, None, "b"), TermAnswer::Yes);
+        assert_eq!(reads(), 1);
+        // Which version of a system an expansion was made from is known without reading it, so
+        // describing a code reads the system and nothing more.
+        assert!(lazy
+            .describe_bound(SET, Some(R4_SYSTEM), "a")
+            .is_some_and(|described| described.display.is_none()));
+        assert_eq!(reads(), 2);
+        // A version that is not installed is refused without reading the system.
+        let refused = lazy.validate_code(
+            Some(SET),
+            Some("http://example.org/other"),
+            Some("9"),
+            "q",
+            None,
+        );
+        assert_eq!(refused["issue"][0]["code"], "not-found");
+        assert_eq!(reads(), 2);
+        // A value set no question was asked about is not read.
+        assert_eq!(
+            lazy.contains("http://example.org/other-set", None, "q"),
+            TermAnswer::Yes
+        );
+        assert_eq!(reads(), 3);
+        // Nor is the reason a value set has no expansion, until it is asked for.
+        assert_eq!(lazy.unexpandable_urls(), Vec::<String>::new());
+        assert_eq!(reads(), 3);
+    }
+
+    #[test]
+    fn packages_that_hold_the_same_system_share_one_copy_read_when_used_as_well() {
+        let own = package(1, vec![versioned_system(SYS, "1", &["a", "b"])]);
+        let same = package(2, vec![versioned_system(SYS, "1", &["a", "b"])]);
+        let differ = package(3, vec![versioned_system(SYS, "1", &["a", "z"])]);
+        let resources = together(&[&own, &same, &differ]);
+        let (lazy, _) = lazily(&resources, &[], None);
+        let variants = &lazy.systems.by_url[SYS]["1"];
+        assert_eq!(variants.len(), 2);
+        let holders: Vec<Vec<Scope>> = variants
+            .iter()
+            .map(|variant| variant.holders.keys().copied().collect())
+            .collect();
+        assert!(holders.contains(&vec![1, 2]) && holders.contains(&vec![3]));
+        // Held and read-when-used terminology agree on which package gets which content.
+        let held = held(&resources, &[], None);
+        for scope in [1, 2, 3] {
+            let by_scope = |terms: &MemoryTerminology| {
+                terms
+                    .systems
+                    .resolve_in(Some(scope), false, SYS, Some("1"))
+                    .map(|(_, index)| index.codes.keys().cloned().collect::<Vec<_>>())
+            };
+            assert_eq!(by_scope(&held), by_scope(&lazy), "package {scope}");
+        }
+    }
+
+    #[test]
+    fn a_copy_of_terminology_reads_from_the_same_store_with_caches_of_its_own() {
+        let (r4, _) = r4_and_its_r5_style_copy();
+        let stored = stored_expansions(&r4, None);
+        let (lazy, shelf) = lazily(&r4, &stored, None);
+        assert_eq!(lazy.contains(SET, None, "a"), TermAnswer::Yes);
+        assert_eq!(shelf.reads.load(Relaxed), 1);
+        let copy = lazy.clone();
+        assert_eq!(copy.contains(SET, None, "a"), TermAnswer::Yes);
+        assert_eq!(shelf.reads.load(Relaxed), 2);
+        assert_eq!(copy.documents(), lazy.documents());
     }
 }

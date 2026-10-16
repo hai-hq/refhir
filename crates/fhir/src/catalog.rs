@@ -5,6 +5,7 @@
 //! parameters writers and search may use.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use refhir_fhirpath::{Host, Model, ModelBuilder};
 use refhir_persistence::{
@@ -12,13 +13,15 @@ use refhir_persistence::{
 };
 use refhir_types::{exact_key, valid_id, IndexId, TabletId};
 use refhir_validate::{
-    expansion_is_current, MemoryTerminology, Schema, SchemaBuilder, TerminologyBuilder,
+    expansion_is_current, DefinitionSource, MemoryTerminology, Schema, SchemaBuilder, TermSource,
+    TerminologyBuilder,
 };
 use serde_json::{json, Value};
 
 use crate::compartment::{self, Compartment};
 use crate::error::FhirError;
 use crate::extract::{self, Extractor, SearchKind};
+use crate::lazy::StoreSource;
 
 /// Parse `rows` into JSON values, in order, spread over the available cores.
 fn parse_all<T: Sync>(
@@ -232,15 +235,39 @@ impl Catalog {
     /// JSON at once is what made loading the R4 packages take several times the memory the
     /// finished catalog uses. The terminology goes first because it has the most to hold while
     /// it is built: loaded before the schema exists, its peak does not sit on top of the schema.
+    ///
+    /// A store that can give a handle to itself (see [`ConformanceStore::shared`]) gets a catalog
+    /// that keeps an index of its definitions and reads each from the store when it is first
+    /// used; any other is read whole, as [`Self::open_whole`] does.
     pub fn open(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
+        let source = store
+            .shared()
+            .map(|shared| Arc::new(StoreSource::new(shared)));
+        Self::open_from(store, source)
+    }
+
+    /// [`Self::open`] with every definition read and compiled now, whatever the store can do. It
+    /// answers what `open` answers, and is what that is checked against.
+    pub fn open_whole(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
+        Self::open_from(store, None)
+    }
+
+    fn open_from(
+        store: &dyn ConformanceStore,
+        source: Option<Arc<StoreSource>>,
+    ) -> Result<Self, PersistError> {
         let packages = store.load_packages()?;
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
         drop(packages);
-        let mut terminology = TerminologyCompiler::new(fhir_version.as_deref());
+        let mut terminology = TerminologyCompiler::new(
+            fhir_version.as_deref(),
+            source.clone().map(|source| source as Arc<dyn TermSource>),
+        );
         store.visit_terminology(&mut |rows| terminology.add_resources(&rows))?;
         store.visit_expansions(&mut |rows| terminology.add_expansions(&rows))?;
         let terminology = terminology.finish();
-        let mut definitions = DefinitionsCompiler::default();
+        let mut definitions =
+            DefinitionsCompiler::new(source.map(|source| source as Arc<dyn DefinitionSource>));
         store.visit_structure_definitions(&mut |rows| definitions.add(&rows))?;
         let mut definitions = definitions.finish();
         add_parameters(&mut definitions.types, &store.load_search_parameters()?);
@@ -507,9 +534,10 @@ fn target_name(profile: &str) -> String {
 
 /// Stored JSON is parsed this much text at a time. A parsed document is several times the size of
 /// its text and the catalog keeps a fraction of it, so the batch is what bounds the memory loading
-/// takes. It is by size rather than by count because a code system can be thousands of times the
-/// size of another.
-const PARSE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// takes: about eight times this much. It is by size rather than by count because a code system
+/// can be thousands of times the size of another. A catalog that keeps only an index of what it
+/// loads keeps none of the parse, so its peak is this.
+const PARSE_BATCH_BYTES: usize = 1024 * 1024;
 
 /// `rows` in runs of about [`PARSE_BATCH_BYTES`] of text, at least one row each.
 fn batches<'a, T>(
@@ -546,7 +574,6 @@ struct CompiledDefinitions {
 /// Compiles StructureDefinitions handed over a page at a time into the schema, the FHIRPath type
 /// model and the reference elements of each resource type. Only one batch of them is parsed at
 /// any moment.
-#[derive(Default)]
 struct DefinitionsCompiler {
     schema: SchemaBuilder,
     path_model: ModelBuilder,
@@ -554,11 +581,23 @@ struct DefinitionsCompiler {
 }
 
 impl DefinitionsCompiler {
+    /// With a `source`, the schema keeps an index and reads each structure from it when used.
+    fn new(source: Option<Arc<dyn DefinitionSource>>) -> Self {
+        Self {
+            schema: match source {
+                Some(source) => SchemaBuilder::lazy(source),
+                None => SchemaBuilder::default(),
+            },
+            path_model: ModelBuilder::default(),
+            types: BTreeMap::new(),
+        }
+    }
+
     fn add(&mut self, rows: &[StoredStructureDefinition]) -> Result<(), PersistError> {
         for batch in batches(rows, |row| row.json.len()) {
             let parsed = parse_all(batch, |row| &row.json, "structure definition json")?;
             for (definition, json) in batch.iter().zip(&parsed) {
-                self.schema.add(json);
+                self.schema.add_stored(definition.package_id, json);
                 if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
                     continue;
                 }
@@ -666,12 +705,21 @@ struct TerminologyCompiler {
     builder: TerminologyBuilder,
     compartment_definitions: Vec<Value>,
     stale_expansions: bool,
+    /// Set when terminology is to be read from the store when used: then the builder is told
+    /// what each row is stored under, and keeps no more than an index.
+    stored: bool,
 }
 
 impl TerminologyCompiler {
-    fn new(fhir_version: Option<&str>) -> Self {
+    /// With a `source`, nothing of a code system, value set or expansion is kept but what answers
+    /// a question without reading it; the rest is read from the source when used.
+    fn new(fhir_version: Option<&str>, source: Option<Arc<dyn TermSource>>) -> Self {
         Self {
-            builder: TerminologyBuilder::for_stored(fhir_version),
+            stored: source.is_some(),
+            builder: match source {
+                Some(source) => TerminologyBuilder::for_source(fhir_version, source),
+                None => TerminologyBuilder::for_stored(fhir_version),
+            },
             compartment_definitions: Vec::new(),
             stale_expansions: false,
         }
@@ -688,6 +736,9 @@ impl TerminologyCompiler {
                     == Some("CompartmentDefinition")
                 {
                     self.compartment_definitions.push(json);
+                } else if self.stored {
+                    self.builder
+                        .add_stored_resource(row.package_id, &row.url, json);
                 } else {
                     self.builder.add_resource(row.package_id, json);
                 }
@@ -704,7 +755,12 @@ impl TerminologyCompiler {
             let parsed = parse_all(batch, |row| &row.json, "value set expansion json")?;
             for (row, document) in batch.iter().zip(&parsed) {
                 self.stale_expansions |= !expansion_is_current(document);
-                self.builder.add_expansion(row.package_id, document);
+                if self.stored {
+                    self.builder
+                        .add_stored_expansion(row.package_id, &row.url, document);
+                } else {
+                    self.builder.add_expansion(row.package_id, document);
+                }
             }
         }
         Ok(())

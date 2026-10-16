@@ -235,9 +235,8 @@ pub fn unexpandable_value_sets(catalog: &RwLock<Catalog>) -> std::collections::B
         .read()
         .expect("catalog")
         .terms()
-        .unexpandable()
+        .unexpandable_urls()
         .into_iter()
-        .map(|(url, _)| url)
         .collect()
 }
 

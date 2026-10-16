@@ -45,6 +45,31 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **A running server keeps an index of its definitions and terminology, and reads each one the
+  first time a request needs it.** It used to hold every StructureDefinition, code system, value
+  set expansion and concept map of the installed packages in memory: about 100 MB for R4 core,
+  SDC and what they depend on, nearly all of what the process used. It now holds an index of them,
+  about 15 MB, and reads a definition, code system, expansion or concept map from the database when
+  a request first uses it. What it read stays, up to about 8 MB of each kind, until other reads
+  push it out: a server that has validated a mix of requests holds a few megabytes more, and one
+  that has been asked about every value set the packages define holds about 40 MB. On macOS the
+  running server's private memory went from about 90 MB to about 17 MB. What a request is
+  answered does not change, and a catalog loaded this way is checked against one that holds
+  everything, for every definition and expansion of R4 core. What changes is that the first
+  request to use a profile, value set or code system waits for a read (a first `Patient`
+  validation takes about 16 ms, about 8 ms more than before, and the next takes about 2 ms), and
+  that validating a resource is about a third faster once its definitions are read, because they
+  are shared and no longer copied for each request. A replica or standby that reloads its catalog
+  when the primary changes it starts with nothing read; between the change and the reload it can
+  read a row the primary has just written that its index does not describe yet.
+- **A first start stores each package as it reads it.** The prepared file (see below) holds a
+  package as values of about 4 MB of rows, and the database takes them one at a time inside one
+  transaction, so a package is stored whole or not at all, as before. The largest default package
+  is over 120 MB of JSON, and a first start used to hold all of it; on SQLite it now holds a few
+  megabytes of it at a time, and the heap peaks at about 42 MB where it peaked at about 129 MB
+  (resident memory 120 MB where it was 300 MB). A prepared file made by an earlier build of this
+  version has another format and is refused with an error that says so: make it again with
+  `refhir package-bundle`. Postgres still reads each package whole.
 - **The server downloads packages only if it is told it may.** It used to fetch the release's
   packages from packages.fhir.org on a first start, and anything named in `[conformance].packages`
   or `$install`. Now nothing is downloaded unless `[conformance].package_download = true` (or

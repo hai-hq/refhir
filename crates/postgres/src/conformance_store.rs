@@ -80,6 +80,27 @@ impl PostgresPersistence {
         }
     }
 
+    /// The `json` of the row of `table` (a conformance table keyed by `(package_id, url)`) with
+    /// this key.
+    fn row_json(
+        &self,
+        table: &str,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let row = guard
+                .client
+                .query_opt(
+                    format!("SELECT json FROM {table} WHERE package_id = $1 AND url = $2").as_str(),
+                    &[&package_id, &url],
+                )
+                .map_err(definite)?;
+            Ok(row.map(|row| row.get(0)))
+        })
+    }
+
     fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
         let mut guard = self.inner.lock()?;
         let row = guard
@@ -164,6 +185,34 @@ impl ConformanceStore for PostgresPersistence {
                 })
                 .collect())
         })
+    }
+
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("structure_definitions", package_id, url)
+    }
+
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("terminology", package_id, url)
+    }
+
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("value_set_expansion", package_id, url)
+    }
+
+    fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
+        Some(std::sync::Arc::new(self.clone()))
     }
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {

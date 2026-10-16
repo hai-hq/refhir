@@ -10,7 +10,10 @@
 //! The rows are what [`read_package`] makes, so a package installed from the file and one
 //! installed from the registry are stored the same. The file is a gzip stream of JSON values, one
 //! after another: a header that says which packages follow, in the order to install them, and
-//! then one value for each package.
+//! then, for each package, a value that names it and values that hold its rows a few megabytes
+//! at a time. A package is stored as the file is read, so installing the largest of them takes
+//! the memory of one of those values and not of the package: the default packages' largest is
+//! over a hundred megabytes of JSON.
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Write};
@@ -22,7 +25,10 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use refhir_database::Database;
-use refhir_persistence::{ConformanceStore, NewPackage};
+use refhir_persistence::{
+    ConformanceStore, InstallError, NewExpansion, NewPackage, NewSearchParameter,
+    NewStructureDefinition, NewTerminology, PackageRows, PersistError,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
@@ -32,8 +38,8 @@ use crate::npm::{
     Resolver,
 };
 use crate::package::{
-    finish_install, package_identity, read_package, run_backfills, stage_new_package,
-    PendingBackfill,
+    finish_install, package_identity, read_package, run_backfills, stage_package_in_pieces,
+    PackageHead, PendingBackfill,
 };
 
 /// The name a prepared file is given when nothing else names it, and the one looked for next to
@@ -41,10 +47,15 @@ use crate::package::{
 pub const BUNDLE_FILE: &str = "refhir-packages.bundle";
 
 /// Bumped when what the file holds changes in a way an older server cannot read. The bytes are
-/// the serde form of [`NewPackage`] and its rows, which is why a test below freezes them: a file
-/// made by one build is read by another (a release's archive beside a newer binary, an image
-/// layer), and a field added to those types without a bump would make every such file unreadable.
-const FORMAT: u32 = 1;
+/// the serde form of the header, of [`PieceRef`] and of the row types in `refhir-persistence`,
+/// which is why a test below freezes them: a file made by one build is read by another (a
+/// release's archive beside a newer binary, an image layer), and a field added to those without a
+/// bump would make every such file unreadable.
+const FORMAT: u32 = 2;
+
+/// About how much JSON text one value of rows holds. It bounds what installing a package from the
+/// file holds at once; a row larger than that is a value of its own.
+const PIECE_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 struct Header {
@@ -67,6 +78,95 @@ struct Source {
     sha256: String,
 }
 
+/// A value of the file after its header, as it is read. A `Package` says which package the rows
+/// that follow belong to, up to the next `Package`.
+#[derive(Deserialize)]
+enum Piece {
+    Package {
+        name: String,
+        version: String,
+        fhir_version: String,
+    },
+    StructureDefinitions(Vec<NewStructureDefinition>),
+    SearchParameters(Vec<NewSearchParameter>),
+    Terminology(Vec<NewTerminology>),
+    Expansions(Vec<NewExpansion>),
+}
+
+/// [`Piece`] as it is written, over rows that are borrowed. The two are the same in the file.
+#[derive(Serialize)]
+enum PieceRef<'a> {
+    Package {
+        name: &'a str,
+        version: &'a str,
+        fhir_version: &'a str,
+    },
+    StructureDefinitions(&'a [NewStructureDefinition]),
+    SearchParameters(&'a [NewSearchParameter]),
+    Terminology(&'a [NewTerminology]),
+    Expansions(&'a [NewExpansion]),
+}
+
+/// `rows` in runs of about `piece_bytes` of text, at least one row each.
+fn pieces_of<T>(rows: &[T], text_len: impl Fn(&T) -> usize, piece_bytes: usize) -> Vec<&[T]> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < rows.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < rows.len() {
+            let next = text_len(&rows[end]);
+            if end > start && bytes + next > piece_bytes {
+                break;
+            }
+            bytes += next;
+            end += 1;
+        }
+        pieces.push(&rows[start..end]);
+        start = end;
+    }
+    pieces
+}
+
+/// The values a package is written as: it is named, and then its rows follow, a few megabytes at
+/// a time, in the order they are stored.
+fn pieces_of_package(package: &NewPackage, piece_bytes: usize) -> Vec<PieceRef<'_>> {
+    let mut pieces = vec![PieceRef::Package {
+        name: &package.name,
+        version: &package.version,
+        fhir_version: &package.fhir_version,
+    }];
+    pieces.extend(
+        pieces_of(
+            &package.structure_definitions,
+            |row| row.json.len(),
+            piece_bytes,
+        )
+        .into_iter()
+        .map(PieceRef::StructureDefinitions),
+    );
+    pieces.extend(
+        pieces_of(
+            &package.search_parameters,
+            |row| row.json.len(),
+            piece_bytes,
+        )
+        .into_iter()
+        .map(PieceRef::SearchParameters),
+    );
+    pieces.extend(
+        pieces_of(&package.terminology, |row| row.json.len(), piece_bytes)
+            .into_iter()
+            .map(PieceRef::Terminology),
+    );
+    pieces.extend(
+        pieces_of(&package.expansions, |row| row.json.len(), piece_bytes)
+            .into_iter()
+            .map(PieceRef::Expansions),
+    );
+    pieces
+}
+
 /// Prepare `specs` and everything they depend on, and write them to `out`. Each spec is a
 /// package spec as `$install` takes it (`name@version`, a `.tgz`, or a directory). Returns the
 /// `name@version` of each package written, in the order they are stored.
@@ -80,6 +180,18 @@ pub fn write_prepared(
     specs: &[String],
     fetcher: &dyn PackageFetcher,
     cache: &Path,
+) -> Result<Vec<String>, FhirError> {
+    write_prepared_in_pieces(out, specs, fetcher, cache, PIECE_BYTES)
+}
+
+/// [`write_prepared`], with the rows of a package cut into values of about `piece_bytes` of
+/// text.
+pub(crate) fn write_prepared_in_pieces(
+    out: &Path,
+    specs: &[String],
+    fetcher: &dyn PackageFetcher,
+    cache: &Path,
+    piece_bytes: usize,
 ) -> Result<Vec<String>, FhirError> {
     let mut installed: Vec<(String, String)> = Vec::new();
     let mut order = Vec::new();
@@ -120,7 +232,7 @@ pub fn write_prepared(
     let mut partial = out.as_os_str().to_owned();
     partial.push(".partial");
     let partial = PathBuf::from(partial);
-    let written = write_file(&partial, &header, &order)
+    let written = write_file(&partial, &header, &order, piece_bytes)
         .and_then(|()| fs::rename(&partial, out).map_err(|err| failed(&err)));
     if written.is_err() {
         let _ = fs::remove_file(&partial);
@@ -135,7 +247,12 @@ fn label(node: &Node) -> String {
 
 /// The header, then each of `order` read and written in turn, to `path`, which is flushed to the
 /// disk before this returns.
-fn write_file(path: &Path, header: &Header, order: &[Node]) -> Result<(), FhirError> {
+fn write_file(
+    path: &Path,
+    header: &Header,
+    order: &[Node],
+    piece_bytes: usize,
+) -> Result<(), FhirError> {
     let failed = |err: &dyn std::fmt::Display| {
         FhirError::Storage(format!("prepared packages {}: {err}", path.display()))
     };
@@ -147,7 +264,9 @@ fn write_file(path: &Path, header: &Header, order: &[Node]) -> Result<(), FhirEr
     for node in order {
         let started = Instant::now();
         let package = read_package(&node.staged.dir)?;
-        write_value(&mut writer, &package).map_err(|err| failed(&err))?;
+        for piece in pieces_of_package(&package, piece_bytes) {
+            write_value(&mut writer, &piece).map_err(|err| failed(&err))?;
+        }
         tracing::info!(
             target: "refhir_engine",
             "prepared {}@{}: {} definitions, {} search parameters, {} terminology resources, {} expansions in {:.1?}{}",
@@ -176,18 +295,23 @@ fn write_value(writer: &mut impl Write, value: &impl Serialize) -> std::io::Resu
     writer.write_all(b"\n")
 }
 
-type Packages = serde_json::StreamDeserializer<
+type Pieces = serde_json::StreamDeserializer<
     'static,
     serde_json::de::IoRead<BufReader<GzDecoder<File>>>,
-    NewPackage,
+    Piece,
 >;
 
-/// A prepared file being read. It is an iterator over its packages, one at a time, so reading
-/// holds a package and not the file.
+/// A prepared file being read. It is read a value at a time, so reading holds a few megabytes of
+/// rows and not the file. Iterating gives each package whole; [`install_prepared`] stores them a
+/// few rows at a time instead.
 pub struct PreparedBundle {
     names: Vec<String>,
-    packages: Packages,
+    pieces: Pieces,
     origin: String,
+    /// The value that was read to find where the last package ended, which starts the next.
+    ahead: Option<Piece>,
+    /// Why the last read failed, when it did: the file is damaged or cannot be read.
+    failure: Option<FhirError>,
 }
 
 impl PreparedBundle {
@@ -207,8 +331,10 @@ impl PreparedBundle {
         }
         Ok(Self {
             names: header.packages,
-            packages: values.into_iter(),
+            pieces: values.into_iter(),
             origin,
+            ahead: None,
+            failure: None,
         })
     }
 
@@ -223,18 +349,112 @@ impl PreparedBundle {
             .iter()
             .all(|spec| self.names.iter().any(|name| name == spec))
     }
+
+    fn damaged(&self, what: impl std::fmt::Display) -> FhirError {
+        FhirError::Invalid(format!("prepared packages {}: {what}", self.origin))
+    }
+
+    /// The next value of the file, or `None` at its end.
+    fn next_piece(&mut self) -> Result<Option<Piece>, FhirError> {
+        if let Some(piece) = self.ahead.take() {
+            return Ok(Some(piece));
+        }
+        match self.pieces.next() {
+            None => Ok(None),
+            Some(Ok(piece)) => Ok(Some(piece)),
+            Some(Err(err)) => Err(self.damaged(err)),
+        }
+    }
+
+    /// The package that comes next, or `None` when there is none. What is left of the last one
+    /// must have been taken by [`Self::feed`] or [`Self::skip_package`] first.
+    pub(crate) fn next_package(&mut self) -> Result<Option<PackageHead>, FhirError> {
+        match self.next_piece()? {
+            None => Ok(None),
+            Some(Piece::Package {
+                name,
+                version,
+                fhir_version,
+            }) => Ok(Some(PackageHead {
+                name,
+                version,
+                fhir_version,
+            })),
+            Some(_) => Err(self.damaged("rows come before the package they belong to")),
+        }
+    }
+
+    /// Hand the rows of the package just named to `rows`, up to where the next package starts.
+    /// A file that cannot be read fails the install it is feeding, and the reason is kept for
+    /// [`Self::take_failure`], which says it better than the install can.
+    pub(crate) fn feed(&mut self, rows: &mut dyn PackageRows) -> Result<(), InstallError> {
+        loop {
+            let piece = match self.next_piece() {
+                Ok(piece) => piece,
+                Err(err) => {
+                    let reason = err.to_string();
+                    self.failure = Some(err);
+                    return Err(InstallError::Persist(PersistError::Definite(reason)));
+                }
+            };
+            match piece {
+                None => return Ok(()),
+                Some(piece @ Piece::Package { .. }) => {
+                    self.ahead = Some(piece);
+                    return Ok(());
+                }
+                Some(Piece::StructureDefinitions(batch)) => rows.structure_definitions(&batch)?,
+                Some(Piece::SearchParameters(batch)) => rows.search_parameters(&batch)?,
+                Some(Piece::Terminology(batch)) => rows.terminology(&batch)?,
+                Some(Piece::Expansions(batch)) => rows.expansions(&batch)?,
+            }
+        }
+    }
+
+    /// Pass over the rows of the package just named.
+    pub(crate) fn skip_package(&mut self) -> Result<(), FhirError> {
+        loop {
+            match self.next_piece()? {
+                None => return Ok(()),
+                Some(piece @ Piece::Package { .. }) => {
+                    self.ahead = Some(piece);
+                    return Ok(());
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// Why the last [`Self::feed`] could not read the file, if that is what failed it.
+    pub(crate) fn take_failure(&mut self) -> Option<FhirError> {
+        self.failure.take()
+    }
 }
 
+/// Each package of the file, whole.
 impl Iterator for PreparedBundle {
     type Item = Result<NewPackage, FhirError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next = self.packages.next()?;
-        Some(
-            next.map_err(|err| {
+        let head = match self.next_package() {
+            Ok(head) => head?,
+            Err(err) => return Some(Err(err)),
+        };
+        let mut package = NewPackage {
+            name: head.name,
+            version: head.version,
+            fhir_version: head.fhir_version,
+            structure_definitions: Vec::new(),
+            search_parameters: Vec::new(),
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        match self.feed(&mut package) {
+            Ok(()) => Some(Ok(package)),
+            Err(err) => Some(Err(self.take_failure().unwrap_or_else(|| {
                 FhirError::Invalid(format!("prepared packages {}: {err}", self.origin))
-            }),
-        )
+            }))),
+        }
     }
 }
 
@@ -245,8 +465,8 @@ impl Iterator for PreparedBundle {
 /// back, which is none when the database has them all.
 ///
 /// A package is stored as installing it from the registry would store it, and a version at least
-/// as new as the one in the file that is already installed is used as it is. A file that holds
-/// a different number of packages than its header lists is damaged and is refused. If the file
+/// as new as the one in the file that is already installed is used as it is. A file that holds a
+/// different number of packages than its header lists is damaged and is refused. If the file
 /// turns out to be damaged part of the way through, the packages before the damage are installed
 /// and published, and the error comes back.
 pub fn install_prepared(
@@ -275,35 +495,38 @@ pub fn install_prepared(
     let mut pending: Vec<PendingBackfill> = Vec::new();
     let mut result = Ok(());
     loop {
-        let started = Instant::now();
-        let package = match bundle.next() {
-            None => break,
-            Some(Ok(package)) => package,
-            Some(Err(err)) => {
+        let head = match bundle.next_package() {
+            Ok(None) => break,
+            Ok(Some(head)) => head,
+            Err(err) => {
                 result = Err(err);
                 break;
             }
         };
         seen += 1;
         if newest
-            .get(&package.name)
-            .is_some_and(|have| compare_versions(have, &package.version).is_ge())
+            .get(&head.name)
+            .is_some_and(|have| compare_versions(have, &head.version).is_ge())
         {
+            if let Err(err) = bundle.skip_package() {
+                result = Err(err);
+                break;
+            }
             continue;
         }
         staged += 1;
-        match stage_new_package(
+        match stage_package_in_pieces(
             store,
             db,
             catalog,
-            package,
-            started.elapsed(),
-            "load",
+            &head,
+            &mut |rows| bundle.feed(rows),
             false,
         ) {
             Ok(backfill) => pending.extend(backfill),
             Err(err) => {
-                result = Err(err);
+                // A file that cannot be read says why better than the install it failed.
+                result = Err(bundle.take_failure().unwrap_or(err));
                 break;
             }
         }
@@ -311,9 +534,8 @@ pub fn install_prepared(
     // A stream that ends before the header's list does, or goes on past it, is not the file that
     // was made: the packages it was made to carry may not be in it.
     if result.is_ok() && seen != expected {
-        result = Err(FhirError::Invalid(format!(
-            "prepared packages {}: its header lists {expected} packages and it holds {seen}",
-            bundle.origin
+        result = Err(bundle.damaged(format!(
+            "its header lists {expected} packages and it holds {seen}"
         )));
     }
     if staged == 0 {
@@ -327,11 +549,81 @@ pub fn install_prepared(
 
 #[cfg(test)]
 mod tests {
-    use refhir_persistence::{
-        NewExpansion, NewSearchParameter, NewStructureDefinition, NewTerminology, ParamStatus,
-    };
+    use refhir_persistence::ParamStatus;
 
     use super::*;
+
+    fn text(len: usize) -> NewTerminology {
+        NewTerminology {
+            resource_type: "CodeSystem".into(),
+            url: "http://example.org/s".into(),
+            json: "x".repeat(len),
+        }
+    }
+
+    #[test]
+    fn rows_are_cut_by_the_text_they_hold_and_every_row_goes_somewhere() {
+        let lens = |pieces: Vec<&[NewTerminology]>| -> Vec<Vec<usize>> {
+            pieces
+                .into_iter()
+                .map(|piece| piece.iter().map(|row| row.json.len()).collect())
+                .collect()
+        };
+        let rows: Vec<NewTerminology> = [3, 4, 5, 20, 1, 1].into_iter().map(text).collect();
+        let cut = |bytes| lens(pieces_of(&rows, |row| row.json.len(), bytes));
+        // A value takes rows while they fit, a row that does not fit starts the next, and one
+        // larger than the limit is a value of its own.
+        assert_eq!(cut(8), vec![vec![3, 4], vec![5], vec![20], vec![1, 1]]);
+        assert_eq!(
+            cut(1),
+            vec![vec![3], vec![4], vec![5], vec![20], vec![1], vec![1]]
+        );
+        assert_eq!(cut(1000), vec![vec![3, 4, 5, 20, 1, 1]]);
+        assert!(pieces_of::<NewTerminology>(&[], |row| row.json.len(), 8).is_empty());
+        // Whatever the limit, the rows come back in order.
+        for bytes in [1, 7, 9, 29, 34] {
+            assert_eq!(cut(bytes).concat(), vec![3, 4, 5, 20, 1, 1]);
+        }
+    }
+
+    #[test]
+    fn a_package_is_named_first_and_its_rows_follow_in_the_order_they_are_stored() {
+        let package = NewPackage {
+            name: "example.pkg".into(),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: Vec::new(),
+            terminology: (0..6).map(|_| text(100)).collect(),
+            expansions: vec![NewExpansion {
+                url: "http://example.org/vs".into(),
+                json: "{}".into(),
+            }],
+        };
+        let kinds = |bytes| -> Vec<&'static str> {
+            pieces_of_package(&package, bytes)
+                .iter()
+                .map(|piece| match piece {
+                    PieceRef::Package { .. } => "package",
+                    PieceRef::StructureDefinitions(_) => "definitions",
+                    PieceRef::SearchParameters(_) => "parameters",
+                    PieceRef::Terminology(_) => "terminology",
+                    PieceRef::Expansions(_) => "expansions",
+                })
+                .collect()
+        };
+        assert_eq!(kinds(PIECE_BYTES), ["package", "terminology", "expansions"]);
+        assert_eq!(
+            kinds(250),
+            [
+                "package",
+                "terminology",
+                "terminology",
+                "terminology",
+                "expansions"
+            ]
+        );
+    }
 
     /// A registry that must not be reached.
     struct Refuses;
@@ -377,11 +669,30 @@ mod tests {
                 json: "{}".into(),
             }],
         };
-        let frozen = r#"{"name":"example.pkg","version":"1.0.0","fhir_version":"4.0.1","structure_definitions":[{"url":"http://example.org/sd","type_name":"Thing","kind":"resource","is_abstract":false,"json":"{}"}],"search_parameters":[{"url":"http://example.org/sp","base":"Thing","code":"x","param_type":"token","expression":"Thing.x","status":"pending","json":"{}"}],"terminology":[{"resource_type":"CodeSystem","url":"http://example.org/cs","json":"{}"}],"expansions":[{"url":"http://example.org/vs","json":"{}"}]}"#;
-        assert_eq!(serde_json::to_string(&package).unwrap(), frozen);
-        let read: NewPackage = serde_json::from_str(frozen).unwrap();
-        assert_eq!(read.search_parameters[0].status, ParamStatus::Pending);
-        assert_eq!(read.expansions[0].url, "http://example.org/vs");
+        let frozen = [
+            r#"{"Package":{"name":"example.pkg","version":"1.0.0","fhir_version":"4.0.1"}}"#,
+            r#"{"StructureDefinitions":[{"url":"http://example.org/sd","type_name":"Thing","kind":"resource","is_abstract":false,"json":"{}"}]}"#,
+            r#"{"SearchParameters":[{"url":"http://example.org/sp","base":"Thing","code":"x","param_type":"token","expression":"Thing.x","status":"pending","json":"{}"}]}"#,
+            r#"{"Terminology":[{"resource_type":"CodeSystem","url":"http://example.org/cs","json":"{}"}]}"#,
+            r#"{"Expansions":[{"url":"http://example.org/vs","json":"{}"}]}"#,
+        ];
+        let written: Vec<String> = pieces_of_package(&package, PIECE_BYTES)
+            .iter()
+            .map(|piece| serde_json::to_string(piece).unwrap())
+            .collect();
+        assert_eq!(written, frozen);
+        // And what was written reads back as the rows it was made from.
+        let read: Vec<Piece> = frozen
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(matches!(&read[0], Piece::Package { name, .. } if name == "example.pkg"));
+        assert!(
+            matches!(&read[2], Piece::SearchParameters(rows) if rows[0].status == ParamStatus::Pending)
+        );
+        assert!(
+            matches!(&read[4], Piece::Expansions(rows) if rows[0].url == "http://example.org/vs")
+        );
 
         let header = Header {
             format: FORMAT,
@@ -395,12 +706,20 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&header).unwrap(),
             format!(
-                r#"{{"format":1,"refhir":"0.0.1","packages":["example.pkg@1.0.0"],"sources":[{{"package":"example.pkg@1.0.0","sha256":"{}"}}]}}"#,
+                r#"{{"format":2,"refhir":"0.0.1","packages":["example.pkg@1.0.0"],"sources":[{{"package":"example.pkg@1.0.0","sha256":"{}"}}]}}"#,
                 "ab".repeat(32)
             )
         );
-        // The header written for a package that came from a registry carries the digest of the
-        // tarball it was downloaded from.
+        // A header written without the digests reads, and says it has none.
+        let old: Header =
+            serde_json::from_str(r#"{"format":2,"refhir":"0.0.1","packages":[]}"#).unwrap();
+        assert!(old.sources.is_empty());
+    }
+
+    /// The header written for a package that came from a registry carries the digest of the
+    /// tarball it was downloaded from.
+    #[test]
+    fn the_header_records_the_digest_of_a_downloaded_package() {
         let scratch =
             std::env::temp_dir().join(format!("refhir-prepared-{}", uuid::Uuid::new_v4()));
         let cached = scratch.join("cache").join("example.pkg").join("1.0.0");
@@ -427,10 +746,5 @@ mod tests {
         assert_eq!(written.sources[0].package, "example.pkg@1.0.0");
         assert_eq!(written.sources[0].sha256, "ab".repeat(32));
         let _ = fs::remove_dir_all(scratch);
-
-        // A header written without the digests reads, and says it has none.
-        let old: Header =
-            serde_json::from_str(r#"{"format":1,"refhir":"0.0.1","packages":[]}"#).unwrap();
-        assert!(old.sources.is_empty());
     }
 }

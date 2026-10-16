@@ -639,8 +639,8 @@ pub struct ExpansionChange {
     pub json: Option<String>,
 }
 
-/// A package as it is stored. It is also what a prepared file of packages holds, in its serde
-/// form: adding, removing or renaming a field here, or in the row types it holds, changes the
+/// A package as it is stored. The row types it holds are also what a prepared file of packages
+/// holds, in their serde form: adding, removing or renaming a field of one of them changes the
 /// bytes of every such file, so it needs a bump of `FORMAT` in `refhir-fhir`'s `prepared.rs`
 /// (a test there fails when the bytes change).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -693,6 +693,53 @@ impl std::error::Error for InstallError {}
 impl From<PersistError> for InstallError {
     fn from(err: PersistError) -> Self {
         InstallError::Persist(err)
+    }
+}
+
+/// Where the rows of a package go when they are handed over a few at a time, by
+/// [`ConformanceStore::install_package_in_pieces`]. They are stored as
+/// [`ConformanceStore::install_package`] stores the same rows given at once, in the order they
+/// are handed over: a package a store already has takes only terminology and expansions, as it does
+/// there.
+pub trait PackageRows {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError>;
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError>;
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError>;
+
+    /// The expansions replace those the package already had, once, whatever the number of calls:
+    /// a package with none is told so by never calling this.
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError>;
+}
+
+/// A package held whole is what [`ConformanceStore::install_package`] takes, so a store that does
+/// not store in pieces can be given the pieces one after another and then the whole.
+impl PackageRows for NewPackage {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        self.structure_definitions.extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        self.search_parameters.extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.terminology.extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.expansions.extend_from_slice(rows);
+        Ok(())
     }
 }
 
@@ -757,6 +804,56 @@ pub trait ConformanceStore: Send + Sync {
         visit(self.load_expansions()?)
     }
 
+    /// The JSON of the structure definition stored under `url` for package `package_id`, or
+    /// `None` when there is no such row. A catalog that keeps an index of the definitions reads
+    /// the one a request needs with this, when it needs it. The default reads them all; a
+    /// backend should override it with a lookup by key.
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        Ok(self
+            .load_structure_definitions()?
+            .into_iter()
+            .find(|row| row.package_id == package_id && row.url == url)
+            .map(|row| row.json))
+    }
+
+    /// The JSON of the terminology row stored under `url` for package `package_id`. See
+    /// [`ConformanceStore::load_structure_definition_json`].
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        Ok(self
+            .load_terminology()?
+            .into_iter()
+            .find(|row| row.package_id == package_id && row.url == url)
+            .map(|row| row.json))
+    }
+
+    /// The JSON of the stored expansion under `url` for package `package_id`. See
+    /// [`ConformanceStore::load_structure_definition_json`].
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        Ok(self
+            .load_expansions()?
+            .into_iter()
+            .find(|row| row.package_id == package_id && row.url == url)
+            .map(|row| row.json))
+    }
+
+    /// A handle to this store that a catalog can keep, to read from it later. `None` for a store
+    /// that cannot give one, and a catalog then loads everything it needs when it is built.
+    fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
+        None
+    }
+
     /// The terminology rows of one package. The full load returns every installed package's
     /// JSON (the whole R4 core is thousands of resources); a caller that only wants the rows
     /// written through the API, which are few, should not pay for that. Backends override this
@@ -815,6 +912,32 @@ pub trait ConformanceStore: Send + Sync {
     ) -> Result<(), PersistError>;
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
+
+    /// [`ConformanceStore::install_package`] for a package that is not held whole: `feed` is
+    /// given the place the rows go and hands them over a few at a time, and the package is
+    /// stored in one transaction, so it is there whole or not at all. Installing the largest R4
+    /// package this way takes the memory of a few rows, not of the package. If `feed` fails, so
+    /// does the install and nothing is stored. The default gathers the rows and stores them with
+    /// [`ConformanceStore::install_package`].
+    fn install_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        feed: &mut dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError>,
+    ) -> Result<InstallOutcome, InstallError> {
+        let mut package = NewPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            fhir_version: fhir_version.to_string(),
+            structure_definitions: Vec::new(),
+            search_parameters: Vec::new(),
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        feed(&mut package)?;
+        self.install_package(&package)
+    }
 
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError>;
 
@@ -1875,8 +1998,10 @@ pub mod conformance {
 
     /// Reading structure definitions, terminology and expansions a page at a time gives the rows
     /// the full loads give, in the same order, in pages no larger than
-    /// [`CONFORMANCE_PAGE_ROWS`], and leaves the store free while the caller works on a page.
-    /// `tag` keeps this run's rows apart on a database that already holds earlier runs.
+    /// [`CONFORMANCE_PAGE_ROWS`], and leaves the store free while the caller works on a page. A
+    /// row read by its key is the row the full load has, and a handle the store gives reads the
+    /// same rows. `tag` keeps this run's rows apart on a database that already holds earlier
+    /// runs.
     pub fn exercise_paged_reads(store: &dyn ConformanceStore, tag: &str) {
         let rows = CONFORMANCE_PAGE_ROWS * 2 + 5;
         let url = |kind: &str, index: usize| format!("http://example.org/{tag}/{kind}/{index:05}");
@@ -1917,7 +2042,7 @@ pub mod conformance {
 
         // One macro for the three tables, which differ only in their row type and loaders.
         macro_rules! check {
-            ($load:ident, $visit:ident) => {{
+            ($load:ident, $visit:ident, $row:ident) => {{
                 let full: Vec<_> = store
                     .$load()
                     .unwrap()
@@ -1948,11 +2073,219 @@ pub mod conformance {
                 });
                 assert!(matches!(stopped, Err(PersistError::Definite(text)) if text == "stop"));
                 assert_eq!(calls, 1);
+                // A row by its key is the row the full load has, and a key that is not a row
+                // (a URL, or a package, that has none) is not found.
+                let reader = store.shared();
+                for row in [full.first().unwrap(), full.last().unwrap()] {
+                    let found = store.$row(row.package_id, &row.url).unwrap();
+                    assert_eq!(found.as_deref(), Some(row.json.as_str()));
+                    if let Some(reader) = &reader {
+                        let found = reader.$row(row.package_id, &row.url).unwrap();
+                        assert_eq!(found.as_deref(), Some(row.json.as_str()));
+                    }
+                    assert_eq!(store.$row(row.package_id, "http://example.org/none").unwrap(), None);
+                    assert_eq!(store.$row(i64::MAX, &row.url).unwrap(), None);
+                }
             }};
         }
-        check!(load_structure_definitions, visit_structure_definitions);
-        check!(load_terminology, visit_terminology);
-        check!(load_expansions, visit_expansions);
+        check!(
+            load_structure_definitions,
+            visit_structure_definitions,
+            load_structure_definition_json
+        );
+        check!(load_terminology, visit_terminology, load_terminology_json);
+        check!(load_expansions, visit_expansions, load_expansion_json);
+    }
+
+    /// Installing a package a few rows at a time stores what installing it whole stores, is all
+    /// or nothing, and tops up a package that is already there as installing it again does. `tag`
+    /// keeps this run's URLs and package names apart on a database that already holds earlier
+    /// runs.
+    pub fn exercise_install_in_pieces(store: &dyn ConformanceStore, tag: &str) {
+        let url = |kind: &str, index: usize| format!("http://example.org/{tag}/{kind}/{index:03}");
+        let json = |kind: &str, url: &str| format!(r#"{{"resourceType":"{kind}","url":"{url}"}}"#);
+        let definitions = |from: usize, to: usize| -> Vec<NewStructureDefinition> {
+            (from..to)
+                .map(|index| NewStructureDefinition {
+                    url: url("definition", index),
+                    type_name: "Thing".into(),
+                    kind: "complex-type".into(),
+                    is_abstract: index % 2 == 0,
+                    json: json("StructureDefinition", &url("definition", index)),
+                })
+                .collect()
+        };
+        let parameters = |name: &str| -> Vec<NewSearchParameter> {
+            (0..4)
+                .map(|index| NewSearchParameter {
+                    url: format!("http://example.org/{tag}/{name}/param/{index}"),
+                    base: "Patient".into(),
+                    code: format!("{tag}-{name}-{index}"),
+                    param_type: "token".into(),
+                    expression: Some(format!("Patient.{tag}{name}{index}")),
+                    status: ParamStatus::Pending,
+                    json: "{}".into(),
+                })
+                .collect()
+        };
+        let terminology = |from: usize, to: usize| -> Vec<NewTerminology> {
+            (from..to)
+                .map(|index| NewTerminology {
+                    resource_type: "CodeSystem".into(),
+                    url: url("system", index),
+                    json: json("CodeSystem", &url("system", index)),
+                })
+                .collect()
+        };
+        let expansions = |from: usize, to: usize| -> Vec<NewExpansion> {
+            (from..to)
+                .map(|index| NewExpansion {
+                    url: url("set", index),
+                    json: json("ValueSet", &url("set", index)),
+                })
+                .collect()
+        };
+        let whole = |name: &str, definitions, terminology, expansions| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: definitions,
+            search_parameters: parameters(name),
+            terminology,
+            expansions,
+        };
+        // What a package holds, apart from its id.
+        let held = |name: &str| {
+            let id = store
+                .load_packages()
+                .unwrap()
+                .into_iter()
+                .find(|package| package.name == format!("{name}.{tag}"))
+                .map(|package| package.id)
+                .unwrap_or_else(|| panic!("{name} is not installed"));
+            let mut definitions: Vec<(String, String, bool)> = store
+                .load_structure_definitions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| (row.url, row.json, row.is_abstract))
+                .collect();
+            definitions.sort();
+            let mut terminology: Vec<(String, String)> = store
+                .load_terminology()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| (row.url, row.json))
+                .collect();
+            terminology.sort();
+            let mut expansions: Vec<(String, String)> = store
+                .load_expansions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| (row.url, row.json))
+                .collect();
+            expansions.sort();
+            let parameters = store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .count();
+            (definitions, terminology, expansions, parameters)
+        };
+
+        // Whole, and in pieces that cut each kind of row in two, give the same rows and the
+        // same search parameters to index.
+        let at_once = store
+            .install_package(&whole(
+                "whole",
+                definitions(0, 40),
+                terminology(0, 30),
+                expansions(0, 20),
+            ))
+            .unwrap();
+        let all_parameters = parameters("pieces");
+        let outcome = store
+            .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
+                rows.structure_definitions(&definitions(0, 17))?;
+                rows.structure_definitions(&definitions(17, 40))?;
+                rows.search_parameters(&all_parameters[..2])?;
+                rows.search_parameters(&all_parameters[2..])?;
+                rows.terminology(&terminology(0, 11))?;
+                rows.terminology(&terminology(11, 30))?;
+                rows.expansions(&expansions(0, 9))?;
+                rows.expansions(&expansions(9, 20))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(at_once.inserted && outcome.inserted);
+        assert_eq!(at_once.newly_pending.len(), outcome.newly_pending.len());
+        assert_eq!(held("whole"), held("pieces"));
+        assert_eq!(held("pieces").3, 4);
+
+        // All or nothing: a failure part of the way through leaves no package and no row.
+        let failed = store.install_package_in_pieces(
+            &format!("failed.{tag}"),
+            "1.0.0",
+            "4.0.1",
+            &mut |rows| {
+                rows.structure_definitions(&definitions(0, 5))?;
+                rows.terminology(&terminology(0, 5))?;
+                Err(InstallError::Persist(PersistError::Definite("stop".into())))
+            },
+        );
+        assert!(
+            matches!(failed, Err(InstallError::Persist(PersistError::Definite(text))) if text == "stop")
+        );
+        assert!(!store
+            .load_packages()
+            .unwrap()
+            .iter()
+            .any(|package| package.name == format!("failed.{tag}")));
+
+        // A package that is there takes terminology on top of what it has (a row it already
+        // has stays as it is) and its expansions replace the old ones, as installing it again
+        // does.
+        let again = whole(
+            "whole",
+            definitions(0, 3),
+            terminology(25, 40),
+            expansions(18, 26),
+        );
+        assert!(!store.install_package(&again).unwrap().inserted);
+        let topped = store
+            .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
+                rows.structure_definitions(&definitions(0, 3))?;
+                rows.terminology(&terminology(25, 33))?;
+                rows.terminology(&terminology(33, 40))?;
+                rows.expansions(&expansions(18, 22))?;
+                rows.expansions(&expansions(22, 26))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!topped.inserted);
+        assert_eq!(held("whole"), held("pieces"));
+        assert_eq!(held("pieces").1.len(), 40);
+        assert_eq!(held("pieces").2.len(), 8);
+        // One that brings no expansions leaves it with none, as installing it again does.
+        assert!(
+            !store
+                .install_package(&whole("whole", Vec::new(), Vec::new(), Vec::new()))
+                .unwrap()
+                .inserted
+        );
+        assert!(
+            !store
+                .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |_| Ok(
+                    ()
+                ))
+                .unwrap()
+                .inserted
+        );
+        assert_eq!(held("whole"), held("pieces"));
+        assert!(held("pieces").2.is_empty());
     }
 
     /// Reading terminology by URL and changing one stored expansion at a time. `tag` keeps this

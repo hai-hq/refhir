@@ -8,8 +8,8 @@ use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    same_expression, ConformanceStore, InstallError, NewExpansion, NewPackage, NewSearchParameter,
-    NewStructureDefinition, NewTerminology, ParamStatus,
+    same_expression, ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage,
+    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamStatus,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::TerminologyBuilder;
@@ -215,6 +215,118 @@ pub(crate) fn stage_new_package(
     // under the rebuild.
     drop(package);
     crate::memory::release_unused_memory();
+    finish_staging(
+        store,
+        db,
+        catalog,
+        (&name, &version),
+        counts,
+        &format!("{read_label} {read_time:.1?}, store {stored:.1?}"),
+        (started, stored),
+        outcome,
+        publish_now,
+    )
+}
+
+/// The name and version a package is stored under, and the release it is for.
+pub(crate) struct PackageHead {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) fhir_version: String,
+}
+
+/// How many rows of each kind a package brought, counted as they pass.
+struct Counting<'a> {
+    rows: &'a mut dyn PackageRows,
+    definitions: usize,
+    parameters: usize,
+    terminology: usize,
+}
+
+impl PackageRows for Counting<'_> {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        self.definitions += rows.len();
+        self.rows.structure_definitions(rows)
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        self.parameters += rows.len();
+        self.rows.search_parameters(rows)
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.terminology += rows.len();
+        self.rows.terminology(rows)
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.rows.expansions(rows)
+    }
+}
+
+/// [`stage_new_package`] for a package that is not held whole: `feed` hands its rows over a few
+/// at a time as the store asks for them, so storing the largest package takes the memory of a few
+/// rows and not of the package. The package is stored in one transaction, as it is when it is held
+/// whole, so it is there whole or not at all.
+pub(crate) fn stage_package_in_pieces(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    head: &PackageHead,
+    feed: &mut dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError>,
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
+    let started = std::time::Instant::now();
+    let mut counts = (0, 0, 0);
+    let outcome = store
+        .install_package_in_pieces(&head.name, &head.version, &head.fhir_version, &mut |rows| {
+            let mut counting = Counting {
+                rows,
+                definitions: 0,
+                parameters: 0,
+                terminology: 0,
+            };
+            let fed = feed(&mut counting);
+            counts = (
+                counting.definitions,
+                counting.parameters,
+                counting.terminology,
+            );
+            fed
+        })
+        .map_err(install_error)?;
+    let stored = started.elapsed();
+    crate::memory::release_unused_memory();
+    finish_staging(
+        store,
+        db,
+        catalog,
+        (&head.name, &head.version),
+        counts,
+        &format!("read and store {stored:.1?}"),
+        (started, stored),
+        outcome,
+        publish_now,
+    )
+}
+
+/// What follows storing a package, whichever way it was stored: publish it, say where the time
+/// went, and note the search parameters that still need their index built.
+#[allow(clippy::too_many_arguments)]
+fn finish_staging(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    (name, version): (&str, &str),
+    counts: (usize, usize, usize),
+    stored_note: &str,
+    (started, stored): (std::time::Instant, std::time::Duration),
+    outcome: InstallOutcome,
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
     if publish_now {
         publish(store, catalog)?;
     }
@@ -228,7 +340,7 @@ pub(crate) fn stage_new_package(
     };
     tracing::info!(
         target: "refhir_engine",
-        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; {read_label} {read_time:.1?}, store {stored:.1?}{catalog_time}",
+        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; {stored_note}{catalog_time}",
         counts.0,
         counts.1,
         counts.2,

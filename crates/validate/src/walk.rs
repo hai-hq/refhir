@@ -158,7 +158,7 @@ impl State<'_> {
             return;
         }
         for url in urls {
-            let Some(structure) = self.schema.structure(&url).cloned() else {
+            let Some(structure) = self.schema.structure(&url) else {
                 self.issue(
                     Severity::Error,
                     "not-found",
@@ -547,7 +547,7 @@ impl State<'_> {
                 .base_type(code)
                 .map(|nested| (nested.url.clone(), nested.root_path().to_string()));
             if let Some((url, root_path)) = nested_info {
-                if let Some(nested) = self.schema.structure(&url).cloned() {
+                if let Some(nested) = self.schema.structure(&url) {
                     self.enter();
                     self.walk_object(value, &nested, &root_path, root, resource);
                     self.leave();
@@ -865,8 +865,7 @@ impl State<'_> {
             let structure = self
                 .schema
                 .structure(url)
-                .or_else(|| self.schema.base_type("Extension"))
-                .cloned();
+                .or_else(|| self.schema.base_type("Extension"));
             if let Some(structure) = structure {
                 let root_path = structure.root_path().to_string();
                 self.enter();

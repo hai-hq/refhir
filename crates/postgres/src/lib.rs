@@ -1721,6 +1721,16 @@ mod tests {
     }
 
     #[test]
+    fn postgres_installs_a_package_in_pieces_when_configured() {
+        let Some(url) = test_url("postgres install in pieces") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let tag = format!("pgpieces{}", std::process::id());
+        refhir_persistence::conformance::exercise_install_in_pieces(&persistence, &tag);
+    }
+
+    #[test]
     fn postgres_parameter_clashes_when_configured() {
         let Some(url) = test_url("postgres parameter clashes") else {
             return;

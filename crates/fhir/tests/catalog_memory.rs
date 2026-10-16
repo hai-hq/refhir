@@ -1,58 +1,29 @@
-//! Loading the catalog must not hold every parsed document at once.
+//! Loading the catalog must not hold every parsed document at once, and a catalog must not hold
+//! every definition and code system either.
 //!
-//! A parsed StructureDefinition or code system is several times the size of its text, and the
-//! catalog keeps only a fraction of it. Loading used to parse the whole conformance store and
-//! keep all of it until the catalog was built, so a start needed several times the memory the
-//! running server did, and a server given a limit for the second was killed in the first. This is
-//! a binary of its own, with one test, so that the allocator it counts is the only thing running.
+//! A parsed StructureDefinition or code system is several times the size of its text. Loading used
+//! to parse the whole conformance store and keep all of it until the catalog was built, so a start
+//! needed several times the memory the running server did, and a server given a limit for the
+//! second was killed in the first. Loading a page at a time brought the peak down to a small
+//! multiple of what the catalog kept; the catalog now keeps an index of the definitions and
+//! terminology and reads each when it is first used, so what it keeps is a small part of that.
+//! This is a binary of its own, with one test, so that the allocator it counts is the only thing
+//! running.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+mod common;
+
 use std::sync::{Arc, RwLock};
 
+use common::{measure, mib, Counting};
 use refhir_database::Database;
 use refhir_fhir::{install_package_dir, r4_dir, Catalog};
 use refhir_sqlite::SqlitePersistence;
-
-/// Bytes the program has allocated now, and the most it has had at once since the last reset.
-struct Counting;
-static NOW: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let pointer = System.alloc(layout);
-        if !pointer.is_null() {
-            let now = NOW.fetch_add(layout.size(), Relaxed) + layout.size();
-            PEAK.fetch_max(now, Relaxed);
-        }
-        pointer
-    }
-
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        System.dealloc(pointer, layout);
-        NOW.fetch_sub(layout.size(), Relaxed);
-    }
-
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        let moved = System.realloc(pointer, layout, size);
-        if !moved.is_null() {
-            if size >= layout.size() {
-                let now = NOW.fetch_add(size - layout.size(), Relaxed) + (size - layout.size());
-                PEAK.fetch_max(now, Relaxed);
-            } else {
-                NOW.fetch_sub(layout.size() - size, Relaxed);
-            }
-        }
-        moved
-    }
-}
 
 #[global_allocator]
 static COUNTING: Counting = Counting;
 
 #[test]
-fn loading_the_catalog_takes_a_small_multiple_of_what_it_keeps() {
+fn a_catalog_keeps_an_index_and_loading_it_takes_a_fraction_of_holding_everything() {
     let store = SqlitePersistence::open_in_memory().unwrap();
     let db = Database::open(Arc::new(store.clone())).unwrap();
     // The whole R4 definition set, as a server stores it.
@@ -60,19 +31,43 @@ fn loading_the_catalog_takes_a_small_multiple_of_what_it_keeps() {
     install_package_dir(&store, &db, &installed, r4_dir()).unwrap();
     drop(installed);
 
-    let before = NOW.load(Relaxed);
-    PEAK.store(before, Relaxed);
-    let loaded = Catalog::open(&store).unwrap();
-    let kept = NOW.load(Relaxed) - before;
-    let peak = PEAK.load(Relaxed) - before;
-    drop(loaded);
+    // Reading and compiling every definition and code system, and holding all of it.
+    let whole = measure(|| Catalog::open_whole(&store).unwrap());
+    drop(whole.value);
+    // Reading what a request needs when it needs it.
+    let lazy = measure(|| Catalog::open(&store).unwrap());
+    let read_when_used = lazy.value;
 
-    // Loading it as one piece took about seven times what the catalog keeps, and parsing a
-    // table at a time about three. A page at a time takes about one and a third.
+    // Loading everything as one piece took about seven times what the catalog keeps, and
+    // parsing a table at a time about three. A page at a time takes about one and a third.
     assert!(
-        peak < kept * 2,
-        "loading the catalog peaked at {} MiB to keep {} MiB",
-        peak >> 20,
-        kept >> 20
+        whole.peak < whole.kept * 2,
+        "loading the whole catalog peaked at {} MiB to keep {} MiB",
+        mib(whole.peak),
+        mib(whole.kept)
     );
+    eprintln!(
+        "whole: kept {} KiB, peak {} KiB; read when used: kept {} KiB, peak {} KiB",
+        whole.kept >> 10,
+        whole.peak >> 10,
+        lazy.kept >> 10,
+        lazy.peak >> 10
+    );
+    // An index keeps a small part of that: nothing of a definition or code system but where it
+    // is and what is asked of it without reading it. What is left is what is not read when used:
+    // the search parameters, the resource types and the FHIRPath type model.
+    assert!(
+        lazy.kept * 3 < whole.kept,
+        "the catalog that reads when used keeps {} MiB, the whole one {} MiB",
+        mib(lazy.kept),
+        mib(whole.kept)
+    );
+    // And loading it takes less than half of what loading the whole one does.
+    assert!(
+        lazy.peak * 2 < whole.peak,
+        "loading the catalog that reads when used peaked at {} MiB, the whole one at {} MiB",
+        mib(lazy.peak),
+        mib(whole.peak)
+    );
+    drop(read_when_used);
 }

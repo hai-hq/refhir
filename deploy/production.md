@@ -238,7 +238,7 @@ curl -s https://fhir.example.com/oauth/introspect \
 
 Add other implementation guides with `[conformance].packages` (`name@version`, `.tgz`, or directory), or repeat `--package` on the CLI.
 
-**Memory.** Storing the default packages is the most memory the server ever asks for, so it is what sets the limit for a container: a first start needs more than a running server, and a restart on a database that already has its packages needs less than the first start. Start from 512 MiB, and watch your own first start before you tighten it; give it more if you add large implementation guides with `[conformance].packages`. A container with less than a start needs is killed (exit status 137) before the server is ready, and starts again with the same result.
+**Memory.** A running server keeps an index of the packages' definitions and terminology, and reads a definition, code system, value set or concept map from the database the first time a request needs it. What it has read stays in memory until other reads push it out, within a fixed limit for each kind, so an idle server holds the index and costs no CPU. The first request that needs a profile or a value set waits for the read, a few milliseconds; the next does not. Storing the default packages on a first start is the most memory the server ever asks for, so it is what sets the limit for a container: a restart on a database that already has its packages needs less. Start from 512 MiB, and watch your own first start before you tighten it; give it more if you add large implementation guides with `[conformance].packages`. A container with less than a start needs is killed (exit status 137) before the server is ready, and starts again with the same result.
 
 ### Preparing the packages
 
