@@ -5,7 +5,7 @@ use std::path::Path;
 
 use std::process::ExitCode;
 
-use crate::config::{discover_config_path, load_file, ResolvedConfig};
+use crate::config::{database_value, discover_config_path, load_file, ResolvedConfig};
 
 pub const HELP: &str = "\
 refhir migrate --status | --dry-run [--config path] [--sqlite path | --postgres url]
@@ -22,6 +22,9 @@ not reversible: take a backup first.
 
 Exit codes: 0 this build would start; 1 it would refuse to start (for example the database was
 migrated by a newer ReFHIR); 2 the database could not be read, or the arguments were wrong.";
+
+/// The refusal for a database named twice.
+const ONE_DATABASE: &str = "pass only one of --sqlite or --postgres";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -59,6 +62,8 @@ fn inspect(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let mut config_path = None;
     let mut sqlite = None;
     let mut postgres = None;
+    // How many times the command line names a database, whichever flag does.
+    let mut databases = 0;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -76,8 +81,20 @@ fn inspect(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
                     args, &mut index, "--config",
                 )?))
             }
-            "--sqlite" => sqlite = Some(take(args, &mut index, "--sqlite")?),
-            "--postgres" => postgres = Some(take(args, &mut index, "--postgres")?),
+            "--sqlite" => {
+                sqlite = Some(database_value(
+                    "--sqlite",
+                    take(args, &mut index, "--sqlite")?,
+                )?);
+                databases += 1;
+            }
+            "--postgres" => {
+                postgres = Some(database_value(
+                    "--postgres",
+                    take(args, &mut index, "--postgres")?,
+                )?);
+                databases += 1;
+            }
             other => {
                 return Err(format!("unknown argument {other} (see refhir migrate --help)").into())
             }
@@ -87,6 +104,11 @@ fn inspect(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
     let Some(mode) = mode else {
         return Err("pass --status or --dry-run (see refhir migrate --help)".into());
     };
+    // Checked on the flags alone: applied below, each clears the other, so the last would win. One
+    // named twice is as ambiguous as both.
+    if databases > 1 {
+        return Err(ONE_DATABASE.into());
+    }
 
     // The same sources as `refhir`, in the same order: file, then environment, then flags.
     let mut cfg = ResolvedConfig::defaults();
@@ -113,8 +135,10 @@ fn inspect(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         cfg.memory = false;
         cfg.sqlite = None;
     }
+    // A backstop, as in `refhir`: every source clears the other kinds when it sets one, so none
+    // leaves two set today. This catches a new setter that forgets to.
     if cfg.postgres.is_some() && (cfg.sqlite.is_some() || cfg.memory) {
-        return Err("pass only one of --sqlite or --postgres".into());
+        return Err(ONE_DATABASE.into());
     }
     if cfg.memory {
         return Err(

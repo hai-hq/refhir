@@ -2607,32 +2607,6 @@ async fn include_search_invalidates_when_the_included_patient_changes() {
 
 #[tokio::test]
 async fn subscription_rest_hook_runs_after_commit() {
-    let package = std::env::temp_dir().join(format!(
-        "refhir-sub-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(
-        package.join("package.json"),
-        r#"{"name":"example.subs","version":"1.0.0","fhirVersion":"4.0.1"}"#,
-    )
-    .unwrap();
-    std::fs::write(
-        package.join("StructureDefinition-Subscription.json"),
-        r#"{"resourceType":"StructureDefinition","url":"http://example.org/StructureDefinition/Subscription","name":"Subscription","status":"active","kind":"resource","abstract":false,"type":"Subscription","fhirVersion":"4.0.1","derivation":"specialization","snapshot":{"element":[{"path":"Subscription","min":0,"max":"*"},{"path":"Subscription.status","min":0,"max":"1","type":[{"code":"code"}]},{"path":"Subscription.criteria","min":0,"max":"1","type":[{"code":"string"}]},{"path":"Subscription.channel","min":0,"max":"1","type":[{"code":"BackboneElement"}]},{"path":"Subscription.channel.type","min":0,"max":"1","type":[{"code":"code"}]},{"path":"Subscription.channel.endpoint","min":0,"max":"1","type":[{"code":"url"}]}]}}"#,
-    )
-    .unwrap();
-    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
-    let db = Arc::new(Database::open(store.clone()).unwrap());
-    let catalog = Arc::new(RwLock::new(Catalog::empty()));
-    install_package_dir(store.as_ref(), &db, &catalog, minir4_dir()).unwrap();
-    install_package_dir(store.as_ref(), &db, &catalog, &package).unwrap();
-    let _ = std::fs::remove_dir_all(&package);
-    catalog.write().unwrap().set_update_create(true);
-
     let hook = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = hook.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2658,7 +2632,7 @@ async fn subscription_rest_hook_runs_after_commit() {
         }
     });
 
-    let app = app(db, catalog, store);
+    let app = subscription_app();
     let created = send(
         &app,
         "POST",
@@ -2833,32 +2807,7 @@ async fn rest_hook_retries_after_a_failure() {
         }
     });
 
-    let package = std::env::temp_dir().join(format!(
-        "refhir-retry-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&package).unwrap();
-    std::fs::write(
-        package.join("package.json"),
-        r#"{"name":"example.retry","version":"1.0.0","fhirVersion":"4.0.1"}"#,
-    )
-    .unwrap();
-    std::fs::write(
-        package.join("StructureDefinition-Subscription.json"),
-        r#"{"resourceType":"StructureDefinition","url":"http://example.org/StructureDefinition/Subscription","name":"Subscription","status":"active","kind":"resource","abstract":false,"type":"Subscription","fhirVersion":"4.0.1","derivation":"specialization","snapshot":{"element":[{"path":"Subscription","min":0,"max":"*"},{"path":"Subscription.status","min":0,"max":"1","type":[{"code":"code"}]},{"path":"Subscription.criteria","min":0,"max":"1","type":[{"code":"string"}]},{"path":"Subscription.channel","min":0,"max":"1","type":[{"code":"BackboneElement"}]},{"path":"Subscription.channel.type","min":0,"max":"1","type":[{"code":"code"}]},{"path":"Subscription.channel.endpoint","min":0,"max":"1","type":[{"code":"url"}]}]}}"#,
-    )
-    .unwrap();
-    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
-    let db = Arc::new(Database::open(store.clone()).unwrap());
-    let catalog = Arc::new(RwLock::new(Catalog::empty()));
-    install_package_dir(store.as_ref(), &db, &catalog, minir4_dir()).unwrap();
-    install_package_dir(store.as_ref(), &db, &catalog, &package).unwrap();
-    let _ = std::fs::remove_dir_all(&package);
-    catalog.write().unwrap().set_update_create(true);
-    let app = app(db, catalog, store);
+    let app = subscription_app();
     let created = send(
         &app,
         "POST",
@@ -2881,6 +2830,521 @@ async fn rest_hook_retries_after_a_failure() {
         .unwrap()
         .expect("retried hook");
     assert!(body.contains("retry1"), "{body}");
+}
+
+/// An app whose `Subscription` has the elements a delivery reads (`criteria`, the channel and its
+/// headers) and the ones the server writes back (`status` and `error`), as R4's does.
+fn subscription_app() -> axum::Router {
+    // Tests run side by side, and a clock is too coarse to tell them apart.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let package = std::env::temp_dir().join(format!(
+        "refhir-subscription-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"example.subscriptions","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("StructureDefinition-Subscription.json"),
+        r#"{"resourceType":"StructureDefinition","url":"http://example.org/StructureDefinition/Subscription","name":"Subscription","status":"active","kind":"resource","abstract":false,"type":"Subscription","fhirVersion":"4.0.1","derivation":"specialization","snapshot":{"element":[{"path":"Subscription","min":0,"max":"*"},{"path":"Subscription.status","min":0,"max":"1","type":[{"code":"code"}]},{"path":"Subscription.criteria","min":0,"max":"1","type":[{"code":"string"}]},{"path":"Subscription.error","min":0,"max":"1","type":[{"code":"string"}]},{"path":"Subscription.channel","min":0,"max":"1","type":[{"code":"BackboneElement"}]},{"path":"Subscription.channel.type","min":0,"max":"1","type":[{"code":"code"}]},{"path":"Subscription.channel.endpoint","min":0,"max":"1","type":[{"code":"url"}]},{"path":"Subscription.channel.header","min":0,"max":"*","type":[{"code":"string"}]}]}}"#,
+    )
+    .unwrap();
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, minir4_dir()).unwrap();
+    install_package_dir(store.as_ref(), &db, &catalog, &package).unwrap();
+    let _ = std::fs::remove_dir_all(&package);
+    catalog.write().unwrap().set_update_create(true);
+    app(db, catalog, store)
+}
+
+/// A rest-hook receiver on a local port. It answers every request with `status` (for example
+/// `204 No Content`) and sends the text of each request it gets down the channel.
+fn hook_receiver(status: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while let Ok((mut stream, _)) = listener.accept() {
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .ok();
+            let request = read_http_request(&mut stream);
+            let reply =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = std::io::Write::write_all(&mut stream, reply.as_bytes());
+            let _ = std::io::Write::flush(&mut stream);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            if tx.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// Read the Subscription until `ready` is true of it, for as long as `seconds`.
+async fn subscription_where(
+    app: &axum::Router,
+    id: &str,
+    seconds: u64,
+    ready: impl Fn(&Value) -> bool,
+) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..seconds * 20 {
+        let read = send(app, "GET", &format!("/Subscription/{id}"), None, None).await;
+        last = read.body;
+        if ready(&last) {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("Subscription/{id} never became what the test waits for: {last}");
+}
+
+async fn subscription_versions(app: &axum::Router, id: &str) -> usize {
+    let history = send(
+        app,
+        "GET",
+        &format!("/Subscription/{id}/_history"),
+        None,
+        None,
+    )
+    .await;
+    history.body["entry"].as_array().map_or(0, Vec::len)
+}
+
+/// Delivery is one loop that takes commits in order. A Subscription on every patient, answered
+/// at once, therefore says when it has got through everything committed before the patient the
+/// notification is for: including any status it decided to write about another Subscription.
+/// Waiting on it is how a test shows that something did *not* happen, with no fixed sleep.
+struct Barrier {
+    app: axum::Router,
+    requests: std::sync::mpsc::Receiver<String>,
+    reached: usize,
+}
+
+impl Barrier {
+    async fn new(app: &axum::Router) -> Barrier {
+        let (port, requests) = hook_receiver("204 No Content");
+        let created = put(
+            app,
+            json!({
+                "resourceType": "Subscription",
+                "id": "sub-barrier",
+                "status": "active",
+                "criteria": "Patient",
+                "channel": {"type": "rest-hook", "endpoint": format!("http://127.0.0.1:{port}/barrier")}
+            }),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        Barrier {
+            app: app.clone(),
+            requests,
+            reached: 0,
+        }
+    }
+
+    /// Return once delivery has got through everything committed so far. The patient is not
+    /// active, so no Subscription on `Patient?active=true` is woken by it.
+    async fn caught_up(&mut self) {
+        self.reached += 1;
+        let id = format!("barrier-{}", self.reached);
+        let written = put(
+            &self.app,
+            json!({"resourceType": "Patient", "id": id, "active": false}),
+        )
+        .await;
+        assert_eq!(written.status, StatusCode::CREATED, "{}", written.body);
+        let wanted = format!("\"id\":\"{id}\"");
+        for _ in 0..400 {
+            if self.requests.try_iter().any(|text| text.contains(&wanted)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("delivery never got to {id}");
+    }
+}
+
+/// The request bodies of everything a receiver has been sent since it was last asked.
+fn bodies(requests: &std::sync::mpsc::Receiver<String>) -> Vec<String> {
+    requests.try_iter().collect()
+}
+
+#[tokio::test]
+async fn rest_hook_sends_the_channel_headers() {
+    let (port, requests) = hook_receiver("204 No Content");
+    let app = subscription_app();
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-headers",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            "channel": {
+                "type": "rest-hook",
+                "endpoint": format!("http://127.0.0.1:{port}/hook"),
+                "header": ["Authorization: Bearer secret-token", "X-Tenant:  acme "]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let patient = put(&app, patient("h1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    let request =
+        tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(8)))
+            .await
+            .unwrap()
+            .expect("rest-hook");
+    let lines: Vec<String> = request.lines().map(str::to_ascii_lowercase).collect();
+    assert!(
+        lines.contains(&"authorization: bearer secret-token".to_string()),
+        "{request}"
+    );
+    assert!(lines.contains(&"x-tenant: acme".to_string()), "{request}");
+    assert!(
+        lines.contains(&"content-type: application/fhir+json".to_string()),
+        "{request}"
+    );
+    assert!(request.contains("\"id\":\"h1\""), "{request}");
+    // The notification worked, so the Subscription was not touched.
+    assert_eq!(subscription_versions(&app, "sub-headers").await, 1);
+}
+
+#[tokio::test]
+async fn a_channel_header_replaces_the_default_content_type_whatever_its_case() {
+    let (port, requests) = hook_receiver("204 No Content");
+    let app = subscription_app();
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-type",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            "channel": {
+                "type": "rest-hook",
+                "endpoint": format!("http://127.0.0.1:{port}/hook"),
+                "header": ["content-type: application/json"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let patient = put(&app, patient("t1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    let request =
+        tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(8)))
+            .await
+            .unwrap()
+            .expect("rest-hook");
+    let types: Vec<String> = request
+        .lines()
+        .map(str::to_ascii_lowercase)
+        .filter(|line| line.starts_with("content-type:"))
+        .collect();
+    assert_eq!(types, vec!["content-type: application/json"], "{request}");
+}
+
+#[tokio::test]
+async fn rest_hook_that_always_fails_ends_in_error() {
+    let (port, requests) = hook_receiver("500 Internal Server Error");
+    let app = subscription_app();
+    let mut barrier = Barrier::new(&app).await;
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-down",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            "channel": {"type": "rest-hook", "endpoint": format!("http://127.0.0.1:{port}/hook")}
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let patient = put(&app, patient("down1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    // Three attempts at once, then the rest when the queue runs and the notification is due:
+    // eight in all.
+    let failed = subscription_where(&app, "sub-down", 30, |sub| sub["status"] == "error").await;
+    let error = failed["error"].as_str().expect("the failure is recorded");
+    assert!(error.contains("8 attempts"), "{error}");
+    assert!(error.contains("500"), "{error}");
+    assert_eq!(bodies(&requests).len(), 8);
+    // The server's own write is a second version, and did not start another round of delivery.
+    barrier.caught_up().await;
+    assert_eq!(bodies(&requests).len(), 0);
+    assert_eq!(subscription_versions(&app, "sub-down").await, 2);
+}
+
+#[tokio::test]
+async fn subscription_in_error_returns_to_active_after_a_delivery() {
+    let (port, requests) = hook_receiver("204 No Content");
+    let app = subscription_app();
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-back",
+            "status": "error",
+            "error": "an earlier failure",
+            "criteria": "Patient?active=true",
+            "channel": {"type": "rest-hook", "endpoint": format!("http://127.0.0.1:{port}/hook")}
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    // `error` is not `off`: the Subscription is still delivered, and a delivery clears it.
+    let patient = put(&app, patient("back1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    let body = tokio::task::spawn_blocking(move || requests.recv_timeout(Duration::from_secs(8)))
+        .await
+        .unwrap()
+        .expect("rest-hook");
+    assert!(body.contains("back1"), "{body}");
+    let healed = subscription_where(&app, "sub-back", 8, |sub| sub["status"] == "active").await;
+    assert!(healed.get("error").is_none(), "{healed}");
+    assert_eq!(subscription_versions(&app, "sub-back").await, 2);
+}
+
+#[tokio::test]
+async fn invalid_channel_header_ends_in_error_and_is_not_repeated() {
+    let app = subscription_app();
+    let mut barrier = Barrier::new(&app).await;
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-bad-header",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            // Nothing listens here: a header that cannot be sent stops the request being made.
+            "channel": {
+                "type": "rest-hook",
+                "endpoint": "http://127.0.0.1:9/hook",
+                "header": ["Authorization Bearer s3cret"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let first = put(&app, patient("bad1")).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+    let failed =
+        subscription_where(&app, "sub-bad-header", 8, |sub| sub["status"] == "error").await;
+    let error = failed["error"].as_str().expect("the failure is recorded");
+    assert!(error.contains("channel.header entry 1"), "{error}");
+    // Stamped with the time like every other failure, and the value of a header is a credential:
+    // it is not repeated in the Subscription.
+    assert!(error.starts_with("20"), "{error}");
+    assert!(!error.contains("s3cret"), "{error}");
+    assert_eq!(subscription_versions(&app, "sub-bad-header").await, 2);
+    // Another matching resource fails the same way, and finds the status already `error`.
+    let second = put(&app, patient("bad2")).await;
+    assert_eq!(second.status, StatusCode::CREATED, "{}", second.body);
+    barrier.caught_up().await;
+    assert_eq!(subscription_versions(&app, "sub-bad-header").await, 2);
+}
+
+#[tokio::test]
+async fn a_rest_hook_without_an_endpoint_ends_in_error() {
+    let app = subscription_app();
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-nowhere",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            "channel": {"type": "rest-hook"}
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let patient = put(&app, patient("nowhere1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    let failed = subscription_where(&app, "sub-nowhere", 8, |sub| sub["status"] == "error").await;
+    let error = failed["error"].as_str().expect("the failure is recorded");
+    assert!(error.contains("no endpoint"), "{error}");
+}
+
+#[tokio::test]
+async fn a_client_edit_wins_over_the_status_write_and_stops_the_retries() {
+    let (port, requests) = hook_receiver("500 Internal Server Error");
+    let app = subscription_app();
+    let mut barrier = Barrier::new(&app).await;
+    let subscription = json!({
+        "resourceType": "Subscription",
+        "id": "sub-edited",
+        "status": "active",
+        "criteria": "Patient?active=true",
+        "channel": {"type": "rest-hook", "endpoint": format!("http://127.0.0.1:{port}/hook")}
+    });
+    let created = put(&app, subscription.clone()).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let patient = put(&app, patient("edited1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    // The three quick attempts are in; the rest are waiting in the queue. The client turns the
+    // Subscription off.
+    let requests = tokio::task::spawn_blocking(move || {
+        for _ in 0..3 {
+            requests
+                .recv_timeout(Duration::from_secs(8))
+                .expect("a quick attempt");
+        }
+        requests
+    })
+    .await
+    .unwrap();
+    let mut switched_off = subscription.clone();
+    switched_off["status"] = json!("off");
+    let off = put(&app, switched_off).await;
+    assert_eq!(off.status, StatusCode::OK, "{}", off.body);
+    // Long enough for the queue to have run twice, which it would have used to try again.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    barrier.caught_up().await;
+    assert_eq!(bodies(&requests).len(), 0, "retries went on after `off`");
+    let stored = send(&app, "GET", "/Subscription/sub-edited", None, None).await;
+    assert_eq!(stored.body["status"], "off", "{}", stored.body);
+    assert!(stored.body.get("error").is_none(), "{}", stored.body);
+    assert_eq!(subscription_versions(&app, "sub-edited").await, 2);
+}
+
+#[tokio::test]
+async fn commits_do_not_use_up_the_retries() {
+    let (port, requests) = hook_receiver("500 Internal Server Error");
+    let app = subscription_app();
+    let mut barrier = Barrier::new(&app).await;
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-busy",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            "channel": {"type": "rest-hook", "endpoint": format!("http://127.0.0.1:{port}/hook")}
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    let patient = put(&app, patient("busy1")).await;
+    assert_eq!(patient.status, StatusCode::CREATED, "{}", patient.body);
+    // The three quick attempts are made, and the rest are queued for later.
+    let requests = tokio::task::spawn_blocking(move || {
+        for _ in 0..3 {
+            requests
+                .recv_timeout(Duration::from_secs(8))
+                .expect("a quick attempt");
+        }
+        requests
+    })
+    .await
+    .unwrap();
+    // Every commit runs the retry queue. A burst of them, which is a busy server, must not spend
+    // the attempts that are meant to be spread over about ten seconds. (One may be due on a slow
+    // machine; five would be the burst.)
+    for _ in 0..5 {
+        barrier.caught_up().await;
+    }
+    let extra = bodies(&requests).len();
+    assert!(
+        extra <= 1,
+        "{extra} retries were made during a burst of commits"
+    );
+    let stored = send(&app, "GET", "/Subscription/sub-busy", None, None).await;
+    assert_eq!(stored.body["status"], "active", "{}", stored.body);
+}
+
+#[tokio::test]
+async fn a_subscription_on_subscriptions_is_not_woken_by_its_own_status_write() {
+    let app = subscription_app();
+    let mut barrier = Barrier::new(&app).await;
+    // The criteria match every Subscription, so the `error` the server writes is a change this
+    // one is for. Its entry cannot be sent, which fails every notification at once.
+    let created = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-self",
+            "status": "active",
+            "criteria": "Subscription",
+            "channel": {"type": "rest-hook", "endpoint": "http://127.0.0.1:9/hook", "header": ["bad"]}
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    subscription_where(&app, "sub-self", 8, |sub| sub["status"] == "error").await;
+    barrier.caught_up().await;
+    // Create, then the one write that says what went wrong; the write did not start another.
+    assert_eq!(subscription_versions(&app, "sub-self").await, 2);
+}
+
+#[tokio::test]
+async fn a_notification_of_a_subscription_leaves_out_its_header_credentials() {
+    let (port, requests) = hook_receiver("204 No Content");
+    let app = subscription_app();
+    // This one is told about every Subscription that is written.
+    let watcher = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-watcher",
+            "status": "active",
+            "criteria": "Subscription",
+            "channel": {"type": "rest-hook", "endpoint": format!("http://127.0.0.1:{port}/hook")}
+        }),
+    )
+    .await;
+    assert_eq!(watcher.status, StatusCode::CREATED, "{}", watcher.body);
+    let victim = put(
+        &app,
+        json!({
+            "resourceType": "Subscription",
+            "id": "sub-victim",
+            "status": "active",
+            "criteria": "Patient?active=true",
+            "channel": {
+                "type": "rest-hook",
+                "endpoint": "http://127.0.0.1:9/hook",
+                "header": ["Authorization: Bearer s3cret"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(victim.status, StatusCode::CREATED, "{}", victim.body);
+    let told = tokio::task::spawn_blocking(move || {
+        for _ in 0..4 {
+            let request = requests
+                .recv_timeout(Duration::from_secs(8))
+                .expect("the watcher is told");
+            if request.contains("sub-victim") {
+                return request;
+            }
+        }
+        panic!("the watcher was not told about sub-victim");
+    })
+    .await
+    .unwrap();
+    assert!(told.contains("http://127.0.0.1:9/hook"), "{told}");
+    assert!(!told.contains("s3cret"), "{told}");
+    assert!(!told.contains("Authorization"), "{told}");
+    // The stored Subscription is untouched: only what is sent on is left out.
+    let stored = send(&app, "GET", "/Subscription/sub-victim", None, None).await;
+    assert_eq!(
+        stored.body["channel"]["header"][0], "Authorization: Bearer s3cret",
+        "{}",
+        stored.body
+    );
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {

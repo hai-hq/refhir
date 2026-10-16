@@ -1,0 +1,71 @@
+name: Site
+
+permissions:
+  contents: read
+
+# Builds the website and fails on a broken link. It is cheap, so it runs on pull requests, but only
+# when something the site shows or builds from has changed. That includes the Rust sources, because
+# the command-line page is generated from them and a test checks that every REFHIR_ environment
+# variable the code reads is documented. Deployment is not here: Cloudflare
+# Pages builds `main` and every pull request from site/ with its own Git integration (see
+# site/README.md).
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "site/**"
+      - "docs/**"
+      - "deploy/**/*.md"
+      - "clients/**/README.md"
+      - "fixtures/**/README.md"
+      - "*.md"
+      - "Cargo.toml"
+      - "refhir.toml.example"
+      - "crates/**/*.rs"
+      - ".github/workflows/site.yml"
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "docs/**"
+      - "deploy/**/*.md"
+      - "clients/**/README.md"
+      - "fixtures/**/README.md"
+      - "*.md"
+      - "Cargo.toml"
+      - "refhir.toml.example"
+      - "crates/**/*.rs"
+      - ".github/workflows/site.yml"
+
+concurrency:
+  group: site-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and check links
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test the sync step and the docs manifest
+        run: npm test
+
+      # Syncs the docs, type-checks, builds, and validates every internal link and anchor.
+      - name: Build
+        run: npm run build

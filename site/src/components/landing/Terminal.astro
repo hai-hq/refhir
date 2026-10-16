@@ -1,0 +1,71 @@
+---
+// The hero visual: what the tutorial's watcher prints as the data changes (site/src/content/docs/docs/
+// tutorial.mdx): create Ann, create Bee, deactivate Ann, then create Cho and Dee in one transaction.
+// The lines are real output from a run. The reveal is staged for the page, and says so. Without
+// JavaScript, or with reduced motion, every line is shown at once.
+const lines = [
+  { out: '0 active: -', note: 'The watcher starts and asks once.' },
+  { out: '1 active: Ann', note: 'Ann is created.' },
+  { out: '2 active: Ann, Bee', note: 'Bee is created.' },
+  { out: '1 active: Bee', note: 'Ann is deactivated, so she leaves the result.' },
+  { out: '3 active: Bee, Cho, Dee', note: 'Cho and Dee are created in one transaction, and arrive as one step.' },
+];
+---
+
+<figure class="term" data-term aria-label="A live query printing results as the data changes">
+  <div class="term__bar">
+    <span><span class="term__prompt" aria-hidden="true">$</span> node watch.mjs</span>
+    <span class="term__live" aria-hidden="true">live</span>
+  </div>
+  <ol class="term__lines">
+    {
+      lines.map((line) => (
+        <li class="term__line">
+          <code class="term__out">{line.out}</code>
+          <span class="term__note">{line.note}</span>
+        </li>
+      ))
+    }
+  </ol>
+  <figcaption class="term__cap">
+    <span>
+      A live query printing a new line each time the answer changes. Output from the tutorial, with no polling in
+      the code.
+    </span>
+    <button type="button" class="term__replay" data-replay hidden>Replay</button>
+  </figcaption>
+</figure>
+
+<script>
+  const term = document.querySelector<HTMLElement>('[data-term]');
+  if (term && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    const lines = [...term.querySelectorAll<HTMLElement>('.term__line')];
+    const replay = term.querySelector<HTMLButtonElement>('[data-replay]');
+    let timers: number[] = [];
+    // Hide the staged lines only now that the script that reveals them is running.
+    term.classList.add('is-playing');
+
+    const show = (n: number) =>
+      lines.forEach((line, i) => {
+        line.classList.toggle('is-shown', i < n);
+        line.classList.toggle('is-new', i === n - 1);
+      });
+    const run = () => {
+      timers.forEach((id) => window.clearTimeout(id));
+      if (replay) replay.setAttribute('aria-disabled', 'true');
+      show(2);
+      timers = lines.slice(2).map((_, k) => window.setTimeout(() => show(k + 3), 1300 * (k + 1)));
+      timers.push(
+        window.setTimeout(() => {
+          if (replay) replay.removeAttribute('aria-disabled');
+        }, 1300 * lines.length)
+      );
+    };
+
+    replay?.addEventListener('click', () => {
+      if (replay.getAttribute('aria-disabled') !== 'true') run();
+    });
+    if (replay) replay.hidden = false;
+    run();
+  }
+</script>

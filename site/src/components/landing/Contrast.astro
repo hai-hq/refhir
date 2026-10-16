@@ -1,0 +1,34 @@
+---
+// The problem as one picture. The times are an example. The claim is docs/design.md ("The problem"):
+// a plain FHIR query returns one snapshot, and staying current is left to the app.
+---
+
+<section class="section" id="problem" aria-labelledby="problem-title">
+  <div class="wrap">
+    <p class="kicker">The problem</p>
+    <h2 id="problem-title">Data changes. Your screen should too.</h2>
+
+    <div
+      class="tracks"
+      role="img"
+      aria-label="A timeline. A plain query asks at 10:00, the record changes at 10:02, and the screen still shows the 10:00 list. A live query asks at 10:00, the record changes at 10:02, and the screen updates at once."
+    >
+      <div class="track">
+        <p class="track__name">Plain query</p>
+        <div class="bar" aria-hidden="true">
+          <div class="bar__before"><span>10:00 asked</span></div>
+          <div class="bar__dot"><span>10:02 changed</span></div>
+          <div class="bar__after bar__after--stale"><span>Still showing the 10:00 list</span></div>
+        </div>
+      </div>
+      <div class="track track--live">
+        <p class="track__name">Live query</p>
+        <div class="bar" aria-hidden="true">
+          <div class="bar__before"><span>10:00 asked</span></div>
+          <div class="bar__dot"><span>10:02 changed</span></div>
+          <div class="bar__after bar__after--live"><span>New list, at once</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

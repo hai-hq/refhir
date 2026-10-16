@@ -1,0 +1,85 @@
+---
+// "Queries, not events" (docs/design.md, README.md), shown as what each approach receives while the
+// same five things happen. The Subscription column is docs/concepts/vs-subscriptions: a notification
+// for each matching record created or updated, and nothing when a record stops matching. The live
+// column is the tutorial's output. No other product is named.
+type Cell = { text: string; kind?: 'msg' | 'none' | 'gap' | 'lit' };
+const rows: { event: string; plain: Cell[]; sub: Cell[]; live: Cell[] }[] = [
+  {
+    event: 'You ask',
+    plain: [{ text: '0 active', kind: 'msg' }],
+    sub: [{ text: 'subscribed', kind: 'none' }],
+    live: [{ text: '0 active', kind: 'msg' }],
+  },
+  {
+    event: 'Ann is created',
+    plain: [{ text: 'nothing', kind: 'none' }],
+    sub: [{ text: 'Ann', kind: 'msg' }],
+    live: [{ text: '1 active: Ann', kind: 'msg' }],
+  },
+  {
+    event: 'Bee is created',
+    plain: [{ text: 'nothing', kind: 'none' }],
+    sub: [{ text: 'Bee', kind: 'msg' }],
+    live: [{ text: '2 active: Ann, Bee', kind: 'msg' }],
+  },
+  {
+    event: 'Ann leaves the list',
+    plain: [{ text: 'nothing', kind: 'none' }],
+    sub: [{ text: 'nothing sent', kind: 'gap' }],
+    live: [{ text: '1 active: Bee', kind: 'lit' }],
+  },
+  {
+    event: 'Cho and Dee, one transaction',
+    plain: [{ text: 'nothing', kind: 'none' }],
+    sub: [
+      { text: 'Cho', kind: 'msg' },
+      { text: 'Dee', kind: 'msg' },
+    ],
+    live: [{ text: '3 active: Bee, Cho, Dee', kind: 'lit' }],
+  },
+];
+---
+
+<section class="section band ways" id="different" aria-labelledby="ways-title">
+  <div class="wrap">
+    <p class="kicker">Compare</p>
+    <h2 id="ways-title">Queries, <span class="ways__not">not events.</span></h2>
+    <p class="ways__line">An event says that something changed. A live query says what the answer is now, pushed over one WebSocket.</p>
+
+    <div class="table-wrap">
+      <table class="stream">
+        <caption class="sr-only">What a plain query, a Subscription and a live query each receive as the same things happen</caption>
+        <thead>
+          <tr>
+            <th scope="col"><span class="sr-only">What happens</span></th>
+            <th scope="col">Plain query<span>ask again</span></th>
+            <th scope="col">Subscription<span>FHIR’s notifications: one message per record</span></th>
+            <th scope="col" class="is-live">Live query<span>the whole answer</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {
+            rows.map((row) => (
+              <tr>
+                <th scope="row">{row.event}</th>
+                {[
+                  ['Plain query', row.plain],
+                  ['Subscription', row.sub],
+                  ['Live query', row.live],
+                ].map(([label, cells]) => (
+                  <td data-label={label as string} class={label === 'Live query' ? 'is-live' : undefined}>
+                    {(cells as Cell[]).map((cell) => (
+                      <span class={`msg msg--${cell.kind ?? 'msg'}`}>{cell.text}</span>
+                    ))}
+                  </td>
+                ))}
+              </tr>
+            ))
+          }
+        </tbody>
+      </table>
+    </div>
+    <p class="more"><a href="/docs/concepts/vs-subscriptions/">Live queries and Subscriptions in depth</a></p>
+  </div>
+</section>

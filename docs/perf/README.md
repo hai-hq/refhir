@@ -66,7 +66,7 @@ Add each run to `docs/perf/baseline.md`: date, git commit, server flags,
 hardware, the loadgen command line, the stdout table and the key `server_stats`
 deltas.
 
-## 5. Checking the Phase 2 exit criterion
+## 6. Checking the Phase 2 exit criterion
 
 `scripts/perf-criteria.sh` restarts the server for each configuration, confirms from `/healthz`
 that the pool is the size it asked for, and compares a pool of 8 with a pool of 1 over alternating
@@ -89,7 +89,7 @@ PERF_DB_URL=postgres://postgres:refhir@127.0.0.1:5432/emptydb scripts/perf-crite
 
 Pairs on a shared machine are noisy, so judge the median, not one run.
 
-## 6. How a search scales with its matches
+## 7. How a search scales with its matches
 
 `scripts/perf-search.sh [--patients N] BINARY [BINARY...]` seeds a SQLite database (default 20,000
 patients, ten family names), starts each binary on a copy of it and times a set of searches over
