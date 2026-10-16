@@ -67,6 +67,22 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   endpoint may point; retries are in memory and a restart drops them; the WebSocket channel has
   no handshake and keeps one socket per id. `docs/design.md` no longer lists Subscription
   delivery with the durable jobs: only `$export` is durable.
+- A comma in a search value now separates alternatives wherever the value comes from: a query
+  string, `If-None-Exist`, a conditional update or delete, a Bundle entry. A client that sent a
+  value holding a comma without escaping it (`identifier=a,b` for the identifier `a,b`) now matches
+  the resources with `a` or with `b` instead, so a conditional create can be blocked by, and a
+  conditional update or delete can act on, a different resource than before. Write `\,` for a
+  comma that is part of a value.
+- A search parameter given more than once is AND, as FHIR defines it, in a query string, in the
+  URL of a Bundle entry and in Subscription criteria (only the last one counted in the last two).
+  The values were joined with a comma, which now means OR, so
+  `date=ge2026-01-01&date=lt2026-02-01` would have become a match on either bound.
+- `_revinclude=*` is a `400` naming the problem. It used to return no reverse includes and say
+  nothing.
+- `_include` and `_revinclude` no longer add another patient's resources for a patient-scoped
+  token, as a search does not return them. A match that another match refers to is no longer
+  repeated as an include. The CapabilityStatement's `rest.documentation` states how search treats
+  commas, repeated parameters, `:iterate` and the limits above.
 - **A search whose parameter value cannot be read is now a `400`, where it used to return an empty
   result.** `GET /Patient?birthdate=notadate` and `GET /Observation?value-quantity=abc` answered
   `200` with an empty Bundle, which looks the same as a search that matches nothing; they now answer
@@ -79,9 +95,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   create, update or delete that used such a value, which used to match nothing (and so create), a
   live query over `/sync`, which answers `QueryFailed` at once instead of staying empty, and a
   query in a Questionnaire that `$populate` runs, which now fails with the message instead of
-  populating from nothing. A client that relied on the empty result can send
-  `Prefer: handling=lenient`. A date range written as a parameter given twice (`date=ge2020&date=le2021`) was read as one value joined by a comma, and
-  matched nothing; it now gets this error, with a note that value lists are not supported.
+  populating from nothing. Each alternative of a comma list, and each occurrence of a parameter
+  given twice, is read on its own. A client that relied on the empty result can send
+  `Prefer: handling=lenient`.
+
+### Fixed
+
+- **A comma between the values of one search parameter is OR.** `Slot?status=free,busy` and
+  `HealthcareService?_id=a,b` matched nothing, because the whole value was compared as one. This
+  holds for ids and every parameter type, with `\,` for a literal comma, and a value lists at most
+  1000 alternatives. `:not` and `:not-in` with a list leave out every value in it.
+- **`_include:iterate` and `_revinclude:iterate` are accepted** instead of refused as an unknown
+  parameter. They apply a rule to the matches and to the resources already added, until none is
+  added, and a search that would add more than 1000 resources that way is a `400`.
 
 ## [0.0.1] - 2026-10-15
 

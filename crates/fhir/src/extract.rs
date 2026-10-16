@@ -228,6 +228,41 @@ impl Extractor {
         }
     }
 
+    /// `matches_modifier` for each of `expected`, true when any is: the resource is read once,
+    /// not once per value. `not` is true when none of them matches.
+    pub fn matches_modifier_any(
+        &self,
+        resource: &Value,
+        modifier: &str,
+        expected: &[String],
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        match modifier {
+            "exact" => {
+                let values = self.indexed_values(resource, path_model, host);
+                expected
+                    .iter()
+                    .any(|wanted| values.iter().any(|text| text == wanted))
+            }
+            "contains" => {
+                let values: Vec<String> = self
+                    .indexed_values(resource, path_model, host)
+                    .iter()
+                    .map(|text| text.to_lowercase())
+                    .collect();
+                expected.iter().any(|wanted| {
+                    let needle = wanted.to_lowercase();
+                    values.iter().any(|text| text.contains(&needle))
+                })
+            }
+            "not" => !self.matches_any(resource, expected, path_model, host),
+            _ => expected
+                .iter()
+                .any(|wanted| self.matches_modifier(resource, modifier, wanted, path_model, host)),
+        }
+    }
+
     fn exact_match(
         &self,
         resource: &Value,
@@ -320,6 +355,25 @@ impl Extractor {
         self.matches_op(resource, "eq", expected, path_model, host)
     }
 
+    /// `matches` for each of `expected`, true when any is: the resource is read once, not once per
+    /// value.
+    pub fn matches_any(
+        &self,
+        resource: &Value,
+        expected: &[String],
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        match &self.source {
+            Source::Path(expr) => {
+                path_match(self.kind, expr, "eq", resource, expected, path_model, host)
+            }
+            _ => expected
+                .iter()
+                .any(|wanted| self.matches(resource, wanted, path_model, host)),
+        }
+    }
+
     pub fn matches_op(
         &self,
         resource: &Value,
@@ -349,7 +403,7 @@ impl Extractor {
                 composite_match(focus, parts, resource, expected, path_model, host)
             }
             Source::Path(expr) => {
-                path_match(self.kind, expr, op, resource, expected, path_model, host)
+                path_match(self.kind, expr, op, resource, &[expected], path_model, host)
             }
         }
     }
@@ -672,48 +726,65 @@ fn path_strings(
         .collect()
 }
 
-fn path_match(
+/// Whether any of `expected` matches what the expression finds in the resource, which is read
+/// once whatever the number of values.
+fn path_match<S: AsRef<str>>(
     kind: SearchKind,
     expr: &Expr,
     op: &str,
     resource: &Value,
-    expected: &str,
+    expected: &[S],
     path_model: &Model,
     host: &dyn Host,
 ) -> bool {
     let items = eval_items(expr, resource, path_model, host);
+    let encoded = |kind| {
+        items
+            .iter()
+            .flat_map(|item| encode_value(kind, item))
+            .collect::<Vec<_>>()
+    };
     match kind {
-        SearchKind::Token | SearchKind::Reference => token_match(
-            op,
-            &items
+        SearchKind::Token | SearchKind::Reference => {
+            let values = encoded(kind);
+            expected
                 .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>(),
-            expected,
-        ),
+                .any(|wanted| token_match(op, &values, wanted.as_ref()))
+        }
         SearchKind::Uri => {
-            let values = items
+            let values = encoded(kind);
+            expected
                 .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>();
-            uri_match(op, &values, expected)
+                .any(|wanted| uri_match(op, &values, wanted.as_ref()))
         }
         SearchKind::String => {
-            let values = items
-                .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>();
-            values.iter().any(|text| text_match(op, text, expected))
+            let values = encoded(kind);
+            expected.iter().any(|wanted| {
+                values
+                    .iter()
+                    .any(|text| text_match(op, text, wanted.as_ref()))
+            })
         }
         SearchKind::Date => {
-            let values = items
-                .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>();
-            values.iter().any(|text| date_match(op, text, expected))
+            let values = encoded(kind);
+            expected.iter().any(|wanted| {
+                values
+                    .iter()
+                    .any(|text| date_match(op, text, wanted.as_ref()))
+            })
         }
-        SearchKind::Number => number_match(op, &numbers_of(&items), expected),
-        SearchKind::Quantity => quantity_match(op, &quantities_of(&items), expected),
+        SearchKind::Number => {
+            let numbers = numbers_of(&items);
+            expected
+                .iter()
+                .any(|wanted| number_match(op, &numbers, wanted.as_ref()))
+        }
+        SearchKind::Quantity => {
+            let quantities = quantities_of(&items);
+            expected
+                .iter()
+                .any(|wanted| quantity_match(op, &quantities, wanted.as_ref()))
+        }
         SearchKind::Composite | SearchKind::Special => false,
     }
 }
@@ -753,7 +824,15 @@ fn composite_match(
         .into_iter()
         .any(|node| {
             parts.iter().zip(pieces.iter()).all(|(part, piece)| {
-                path_match(part.kind, &part.expr, "eq", &node, piece, path_model, host)
+                path_match(
+                    part.kind,
+                    &part.expr,
+                    "eq",
+                    &node,
+                    &[*piece],
+                    path_model,
+                    host,
+                )
             })
         })
 }
@@ -1276,13 +1355,10 @@ fn parse_ymd(text: &str) -> Option<(i32, u8, u8)> {
 
 const PREFIX_NOTE: &str = ", optionally after a prefix (eq, ne, gt, lt, ge, le, sa, eb or ap)";
 
-/// What a value that fails to read may have meant, when `reads` says that is what it takes: a
-/// search value cannot be an OR list or hold a bare `+`, and both are easy to send by accident,
-/// since a parameter given twice is joined with a comma and a `+` in a URL query is a space.
+/// What a value that fails to read may have meant, when `reads` says that is what it takes: a `+`
+/// in a URL query is a space, which is easy to send by accident in a time zone.
 fn read_hint(value: &str, reads: impl Fn(&str) -> bool) -> &'static str {
-    if value.contains(',') && value.split(',').all(&reads) {
-        ". Lists of values separated by commas, and a parameter given twice, are not supported"
-    } else if value.contains(' ') && reads(&value.replace(' ', "+")) {
+    if value.contains(' ') && reads(&value.replace(' ', "+")) {
         ". A + in a URL query reads as a space: write it %2B"
     } else {
         ""
@@ -2071,32 +2147,15 @@ mod tests {
     #[test]
     fn the_reason_names_the_commonest_slips() {
         let date = parameter("birthdate", "date", "Patient.birthDate");
-        let list = date.check_value(None, "ge1990,le2000").unwrap_err();
-        assert!(list.contains("not supported"), "{list}");
         let plus = date
             .check_value(None, "1990-06-01T10:00:00 01:00")
             .unwrap_err();
         assert!(plus.contains("%2B"), "{plus}");
-        let plain = date.check_value(None, "notadate").unwrap_err();
-        assert!(
-            !plain.contains("%2B") && !plain.contains("not supported"),
-            "{plain}"
-        );
-        // A hint is for a value that would read once the slip is mended, not for any comma or space.
-        for value in ["last week", "1990, 1991", "1990,notadate", "ge1990 01"] {
+        // A hint is for a value that would read once the slip is mended, not for any space.
+        for value in ["notadate", "last week", "ge1990 01", "1990, 1991"] {
             let said = date.check_value(None, value).unwrap_err();
-            assert!(
-                !said.contains("%2B") && !said.contains("not supported"),
-                "{value}: {said}"
-            );
+            assert!(!said.contains("%2B"), "{value}: {said}");
         }
-        let number = parameter(
-            "probability",
-            "number",
-            "RiskAssessment.prediction.probabilityDecimal",
-        );
-        let list = number.check_value(None, "5,6").unwrap_err();
-        assert!(list.contains("not supported"), "{list}");
     }
 
     #[test]

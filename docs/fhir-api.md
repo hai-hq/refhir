@@ -36,6 +36,23 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - Chaining (`Observation?subject:Patient.name=ann`), reverse chaining (`_has`), `_include` and
   `_revinclude`, and compartment search (`GET /Patient/123/Observation`) all work. Name the target
   type in a chain when a reference parameter can point at more than one type.
+- A comma between the values of one parameter is OR, for every kind of parameter:
+  `Slot?status=free,busy`, `HealthcareService?_id=a,b`. Write `\,` for a comma that is part of a
+  value. A value lists at most 1000 alternatives. With `:not` and `:not-in`, a list leaves out
+  every value in it, and `:missing` takes one value.
+- Giving a parameter twice is AND (`date=ge2026-01-01&date=lt2026-02-01`) in a query string, in the
+  URL of a Bundle entry and in Subscription criteria. A GraphQL argument or a live query's
+  arguments have one value per name, so they cannot say it.
+- `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`. The `:iterate` forms
+  (`_include=Slot:schedule&_include:iterate=Schedule:actor`) apply a rule to the matches and to
+  every resource the rules have added, until none is added. A search that would add more than
+  1000 resources that way is a `400`; name the parameters to follow instead of `*`, or search for
+  fewer resources.
+- Under a patient-scoped token, `_include` and `_revinclude` leave out the resources of other
+  patients, as a search does. Resource types that are in no patient's compartment (a Practitioner,
+  an Organization) are still included.
+- `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
+  `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
 - A reference parameter matches the full reference, so write `Observation?patient=Patient/123`. A
   bare id such as `patient=123` matches nothing.
@@ -54,15 +71,16 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
   instead of staying empty. Conditional create, update and delete, which search the same way,
   refuse it too, and so does a query in a Questionnaire that `$populate` runs: it fails with this
   message instead of populating from nothing.
-  Value lists (`ge1990,le2000`) are not supported, and neither is a range written as a parameter
-  given twice (`date=ge2020&date=le2021`), which is read as one value joined by a comma: for a date,
-  number or quantity that is now this error. Write a `+` in a time zone as `%2B` in a URL, or it
-  reads as a space.
+  Each alternative of a comma list is read on its own (`birthdate=1990,notadate` names
+  `notadate`), and so is each occurrence of a parameter given twice. Write a `+` in a time zone as
+  `%2B` in a URL, or it reads as a space.
 - **`Prefer: handling=lenient`** on a search `GET` asks the server to leave such a parameter out
   and run the search on the rest, as FHIR allows. The Bundle then holds an `OperationOutcome` entry
   (`search.mode` is `outcome`, and it is not counted in `total`) with a warning for each parameter
-  set aside, and its `self` link no longer has them. With `_summary=count`, which has no entries,
-  the `self` link is the only sign. A `_filter` with a value it cannot read is set aside whole. The
+  set aside, and its `self` link no longer has them. A value with an alternative it cannot read is
+  set aside whole, and of a parameter given twice only the occurrence that cannot be read goes.
+  With `_summary=count`, which has no entries, the `self` link is the only sign. A `_filter` with
+  a value it cannot read is set aside whole. The
   response carries `Preference-Applied: handling=lenient`, and every search response has `Vary:
   Prefer`, since the answer depends on it. `handling=strict` is the default, and any other value of
   `handling` is read as that. Lenient is for the value of a search parameter only: an unknown
