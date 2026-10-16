@@ -20,11 +20,12 @@ refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
   wakes up after a standby took over is fenced off and exits instead of writing.
 - **Conformance changes.** Installing a package, or writing a SearchParameter, CodeSystem,
   ValueSet or ConceptMap, changes the catalog the processes serve from. A replica notices within a
-  moment and reloads it in the background (a few seconds of one thread, answering from the old
-  catalog until the new one is ready); a standby keeps its own copy current for when it takes
-  over. A replica does not load a search parameter until its backfill has finished, so it hears of
-  a change made while one is running when the backfill completes. Writing many code systems or
-  value sets one by one keeps replicas reloading; a `transaction` Bundle or a package is one
+  moment and reloads it in the background, answering from the old catalog until the new one is
+  ready; a standby keeps its own copy current for when it takes over. A package or a
+  SearchParameter reloads everything (a few seconds of one thread), and a replica does not load a
+  search parameter until its backfill has finished. A CodeSystem, ValueSet or ConceptMap reloads
+  only the terminology, which takes a fraction of that and does not wait for a backfill. Writing
+  many of them one by one keeps replicas reloading; a `transaction` Bundle or a package is one
   change, and so one reload.
 - **Load balancers.** `GET /healthz` is 200 when a process can take traffic and 503 when it
   cannot: a standby, a process still starting, or a replica that has stopped following the

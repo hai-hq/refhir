@@ -48,6 +48,11 @@ pub enum PersistenceGlobalKey {
     /// pending. A standby watches this one: when it takes over it may have to finish a backfill,
     /// so it needs to know about parameters a replica must not see yet.
     CatalogRevision,
+    /// Moves when only the terminology changed (value sets, code systems, concept maps and the
+    /// expansions kept for them) and the process that made the change has already applied it to
+    /// its own catalog in place. A replica or a standby that sees only this one move reloads the
+    /// terminology and nothing else, so it never loads a search parameter on the way.
+    TerminologyVersion,
 }
 
 impl PersistenceGlobalKey {
@@ -58,6 +63,7 @@ impl PersistenceGlobalKey {
             PersistenceGlobalKey::PublishedTimestamp => "published_ts",
             PersistenceGlobalKey::CatalogVersion => "catalog_version",
             PersistenceGlobalKey::CatalogRevision => "catalog_revision",
+            PersistenceGlobalKey::TerminologyVersion => "terminology_version",
         }
     }
 }
@@ -866,6 +872,14 @@ pub trait ConformanceStore: Send + Sync {
 
     /// Adds one to the catalog revision and returns the new value.
     fn bump_catalog_revision(&self) -> Result<u64, PersistError>;
+
+    /// The counter a change to the terminology alone bumps, when the process that made it has
+    /// already applied it to its own catalog. Whoever follows the version or the revision also
+    /// follows this one: if only it moved, only the terminology needs loading again.
+    fn terminology_version(&self) -> Result<u64, PersistError>;
+
+    /// Adds one to the terminology version and returns the new value.
+    fn bump_terminology_version(&self) -> Result<u64, PersistError>;
 
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError>;
 

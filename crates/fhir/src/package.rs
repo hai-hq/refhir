@@ -15,8 +15,8 @@ use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::TerminologyBuilder;
 use serde_json::Value;
 
-use crate::catalog::CatalogClock;
 use crate::catalog::{pending_index_keys, Catalog};
+use crate::catalog::{CatalogClock, CatalogStamp};
 use crate::error::FhirError;
 use crate::extract;
 use crate::run::MAX_OCC_FAILURES;
@@ -533,27 +533,38 @@ pub(crate) fn publish(
     announce(store, stable)
 }
 
-/// Tell the other processes that a change this one has already applied to its own catalog in
-/// place (terminology written through the API) is in the conformance tables, so a replica and a
-/// standby reload instead of answering from what they loaded before it. A change that is applied
-/// by loading the catalog again goes through [`publish`], which does the same.
+/// Tell the other processes that the terminology changed in a way this one has already applied
+/// to its own catalog in place (a value set, code system or concept map written through the API),
+/// so a replica and a standby load the terminology again instead of answering from what they
+/// loaded before. Nothing else changed, so they load nothing else, and a search parameter that is
+/// still waiting for its backfill cannot reach a replica this way: there is no need to wait for
+/// the backfill, as a change to the version has to.
 ///
 /// Call it once the change is fully in the store: a process that reloads on seeing the counter
-/// move must find all of it.
-pub(crate) fn announce_applied(
+/// move must find all of it. A change that is applied by loading the catalog again goes through
+/// [`publish`] instead.
+pub(crate) fn announce_terminology(store: &dyn ConformanceStore) -> Result<(), FhirError> {
+    store.bump_terminology_version()?;
+    Ok(())
+}
+
+/// Tell the other processes that something may have changed that they have not been told of, so
+/// each loads the whole catalog again. For a write that failed part of the way and was repaired:
+/// the failure may have been the announcement itself, and a repair that finds nothing to fix says
+/// nothing.
+pub(crate) fn announce_all(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    // The change leaves search parameters as they were, so this is stable unless an earlier
-    // change left one waiting for its backfill.
     let stable = !catalog.read().expect("catalog").has_pending_parameters();
     announce(store, stable)
 }
 
-/// Every change moves the revision, which a standby follows. The version, which replicas follow,
-/// moves only when no search parameter is waiting for its backfill: while one is, the change
-/// is announced to standbys only, and the publish that follows the backfill's completion bumps
-/// the version. So a replica never loads a parameter whose index is not complete.
+/// Every change that loads the catalog again moves the revision, which a standby follows. The
+/// version, which replicas follow, moves only when no search parameter is waiting for its
+/// backfill: while one is, the change is announced to standbys only, and the publish that follows
+/// the backfill's completion bumps the version. So a replica never loads a parameter whose index
+/// is not complete.
 fn announce(store: &dyn ConformanceStore, stable: bool) -> Result<(), FhirError> {
     store.bump_catalog_revision()?;
     if stable {
@@ -562,21 +573,41 @@ fn announce(store: &dyn ConformanceStore, stable: bool) -> Result<(), FhirError>
     Ok(())
 }
 
-/// Rebuild `catalog` from the store if its version moved since `loaded_version`, keeping the
-/// settings that are not stored (reference policy, archiver mode). Returns the version the
-/// catalog now reflects. A replica calls this when another process changed the catalog, and a
-/// standby calls it once more when it takes over.
+/// Bring `catalog` up to date with the store if what the process follows moved since it was
+/// loaded at `loaded`, keeping the settings that are not stored (reference policy, archiver mode).
+/// Returns what the catalog now reflects. A replica calls this when another process changed the
+/// catalog, and a standby calls it once more when it takes over.
+///
+/// If the clock moved, the whole catalog is loaded again. If only the terminology counter moved,
+/// a change was made to the terminology alone, and only that is loaded again: the structure
+/// definitions and search parameters are neither read nor compiled, so it takes a fraction of the
+/// time, and it cannot bring in a search parameter whose index is incomplete.
 pub fn reload_catalog(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
-    loaded_version: u64,
+    loaded: CatalogStamp,
     clock: CatalogClock,
-) -> Result<u64, FhirError> {
-    // Nothing to do, and nothing worth the seconds a full load takes, if the clock stands.
-    if clock.read(store)? == loaded_version {
-        return Ok(loaded_version);
+) -> Result<CatalogStamp, FhirError> {
+    // Nothing to do, and nothing worth the seconds a full load takes, if both stand.
+    let now = clock.stamp(store)?;
+    if now == loaded {
+        return Ok(loaded);
     }
-    let (fresh, version) = Catalog::open_consistent(store, clock)?;
+    if now.clock == loaded.clock {
+        let (mut terminology, stamp) = Catalog::open_terminology(store, clock)?;
+        // Read what a request would otherwise wait for now, while the catalog being replaced is
+        // still answering. The definitions it holds are the ones these hold terminology for.
+        catalog
+            .read()
+            .expect("catalog")
+            .prepare_terminology(&mut terminology);
+        catalog
+            .write()
+            .expect("catalog")
+            .replace_terminology(terminology);
+        return Ok(stamp);
+    }
+    let (fresh, stamp) = Catalog::open_consistent(store, clock)?;
     let mut fresh = fresh;
     {
         let current = catalog.read().expect("catalog");
@@ -589,44 +620,45 @@ pub fn reload_catalog(
         fresh.warm(&current.warmth());
     }
     *catalog.write().expect("catalog") = fresh;
-    Ok(version)
+    Ok(stamp)
 }
 
 /// The thread that keeps a catalog in step with another process. See [`watch_catalog`].
 pub struct CatalogWatcher {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    loaded: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    loaded: std::sync::Arc<std::sync::Mutex<CatalogStamp>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CatalogWatcher {
-    /// Stops watching and returns the catalog version the catalog was last loaded at. A standby
-    /// that is about to become the primary does this, then reloads once, so from then on only
-    /// its own changes touch the catalog.
-    pub fn stop(mut self) -> u64 {
+    /// Stops watching and returns what the catalog was last loaded at. A standby that is about to
+    /// become the primary does this, then reloads once, so from then on only its own changes
+    /// touch the catalog.
+    pub fn stop(mut self) -> CatalogStamp {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        self.loaded.load(std::sync::atomic::Ordering::SeqCst)
+        *self.loaded.lock().expect("catalog stamp")
     }
 }
 
-/// Keep `catalog` in step with changes another process makes: poll the catalog version and
-/// reload in the background when it moves. The thread stops when the catalog is dropped or the
-/// returned watcher is stopped.
+/// Keep `catalog` in step with changes another process makes: poll the counters and reload in the
+/// background when they move (the whole catalog, or only the terminology if that is all that
+/// changed; see [`reload_catalog`]). The thread stops when the catalog is dropped or the returned
+/// watcher is stopped.
 pub fn watch_catalog(
     store: std::sync::Arc<dyn ConformanceStore>,
     catalog: &std::sync::Arc<RwLock<Catalog>>,
-    loaded_version: u64,
+    loaded: CatalogStamp,
     interval: std::time::Duration,
     clock: CatalogClock,
 ) -> CatalogWatcher {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     let weak = Arc::downgrade(catalog);
     let stop = Arc::new(AtomicBool::new(false));
-    let loaded = Arc::new(AtomicU64::new(loaded_version));
+    let loaded = Arc::new(Mutex::new(loaded));
     let (stopped, tracked) = (stop.clone(), loaded.clone());
     let spawned = std::thread::Builder::new()
         .name("refhir-catalog".into())
@@ -644,16 +676,27 @@ pub fn watch_catalog(
             let Some(catalog) = weak.upgrade() else {
                 return;
             };
-            let known = tracked.load(Ordering::SeqCst);
-            match clock.read(store.as_ref()) {
-                Ok(version) if version != known => {
+            let known = *tracked.lock().expect("catalog stamp");
+            match clock.stamp(store.as_ref()) {
+                Ok(stamp) if stamp != known => {
                     match reload_catalog(store.as_ref(), &catalog, known, clock) {
                         Ok(now) => {
-                            tracing::info!(
-                                target: "refhir",
-                                "catalog reloaded at version {now} (was {known})"
-                            );
-                            tracked.store(now, Ordering::SeqCst);
+                            if now.clock == known.clock {
+                                tracing::info!(
+                                    target: "refhir",
+                                    "terminology reloaded at terminology version {} (was {})",
+                                    now.terminology,
+                                    known.terminology
+                                );
+                            } else {
+                                tracing::info!(
+                                    target: "refhir",
+                                    "catalog reloaded at version {} (was {})",
+                                    now.clock,
+                                    known.clock
+                                );
+                            }
+                            *tracked.lock().expect("catalog stamp") = now;
                         }
                         Err(err) => {
                             tracing::warn!(target: "refhir", "catalog reload failed: {err}")

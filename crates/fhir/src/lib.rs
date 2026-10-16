@@ -28,7 +28,7 @@ mod terms;
 mod tests;
 
 pub use bundle::transaction;
-pub use catalog::{Catalog, CatalogClock, ReferencePolicy};
+pub use catalog::{Catalog, CatalogClock, CatalogStamp, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
 pub use memory::release_unused_memory;

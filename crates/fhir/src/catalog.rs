@@ -145,6 +145,9 @@ impl ResourceModel {
 /// ready. A replica never writes, so it follows `Stable` and never loads a parameter whose index
 /// is incomplete. A standby may have to finish the backfill when it takes over, so it follows
 /// `Latest` and already knows about the pending parameters.
+///
+/// Either also follows the terminology counter, which a change to the terminology alone moves
+/// instead of these. See [`CatalogStamp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CatalogClock {
     Stable,
@@ -158,6 +161,27 @@ impl CatalogClock {
             CatalogClock::Latest => store.catalog_revision(),
         }
     }
+
+    /// Both counters a process that follows this clock compares with what it loaded at.
+    pub fn stamp(self, store: &dyn ConformanceStore) -> Result<CatalogStamp, PersistError> {
+        Ok(CatalogStamp {
+            clock: self.read(store)?,
+            terminology: store.terminology_version()?,
+        })
+    }
+}
+
+/// What a catalog was loaded at, or what the database says now: the value of the clock a process
+/// follows and the terminology counter.
+///
+/// If `clock` moved, the whole catalog is loaded again. If only `terminology` moved, a change was
+/// made to the terminology alone, and loading that again is enough: the structure definitions and
+/// search parameters are as they were, and none is loaded, so a replica cannot pick up a
+/// parameter whose index is incomplete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatalogStamp {
+    pub clock: u64,
+    pub terminology: u64,
 }
 
 /// What a catalog has read from the store lately and still keeps.
@@ -187,6 +211,25 @@ pub struct Catalog {
     /// Whether any stored expansion was made under other rules than the current ones, so that it
     /// may be wrong and the stored expansions need rebuilding.
     stale_expansions: bool,
+}
+
+/// `load`, run until the counters hold still across it (at most five times; see
+/// [`Catalog::open_consistent`]).
+fn consistent<T>(
+    store: &dyn ConformanceStore,
+    clock: CatalogClock,
+    load: impl Fn() -> Result<T, PersistError>,
+) -> Result<(T, CatalogStamp), PersistError> {
+    let mut attempts = 0;
+    loop {
+        let before = clock.stamp(store)?;
+        let loaded = load()?;
+        let after = clock.stamp(store)?;
+        attempts += 1;
+        if before == after || attempts >= 5 {
+            return Ok((loaded, before));
+        }
+    }
 }
 
 impl Catalog {
@@ -251,25 +294,52 @@ impl Catalog {
         }
     }
 
-    /// The catalog and the value of `clock` it reflects. `open` reads five tables one after
-    /// another, so a change made in between could give a catalog that mixes two states; this
-    /// reads the clock before and after and tries again if it moved. If it never holds still the
-    /// catalog is returned with the *older* reading, so a caller that watches the clock sees it
-    /// differ and loads again, rather than trusting a catalog that may mix two states.
+    /// The catalog and the counters it reflects. `open` reads five tables one after another, so a
+    /// change made in between could give a catalog that mixes two states; this reads the counters
+    /// before and after and tries again if they moved. If they never hold still the catalog is
+    /// returned with the *older* reading, so a caller that watches the counters sees them differ
+    /// and loads again, rather than trusting a catalog that may mix two states.
     pub fn open_consistent(
         store: &dyn ConformanceStore,
         clock: CatalogClock,
-    ) -> Result<(Self, u64), PersistError> {
-        let mut attempts = 0;
-        loop {
-            let before = clock.read(store)?;
-            let catalog = Self::open(store)?;
-            let after = clock.read(store)?;
-            attempts += 1;
-            if before == after || attempts >= 5 {
-                return Ok((catalog, before));
-            }
-        }
+    ) -> Result<(Self, CatalogStamp), PersistError> {
+        consistent(store, clock, || Self::open(store))
+    }
+
+    /// What the terminology and expansion tables hold now, with the counters it reflects, for a
+    /// process that was told only the terminology changed. Nothing else is read.
+    pub(crate) fn open_terminology(
+        store: &dyn ConformanceStore,
+        clock: CatalogClock,
+    ) -> Result<(CompiledTerminology, CatalogStamp), PersistError> {
+        consistent(store, clock, || {
+            let fhir_version = store
+                .load_packages()?
+                .first()
+                .map(|package| package.fhir_version.clone());
+            let source = store
+                .shared()
+                .map(|shared| Arc::new(StoreSource::new(shared)) as Arc<dyn TermSource>);
+            CompiledTerminology::open(store, fhir_version.as_deref(), source)
+        })
+    }
+
+    /// Make terminology read by [`Self::open_terminology`] ready to replace this catalog's own: it
+    /// holds what a full load holds of it and has read what this catalog's terminology has been
+    /// asked for lately. This reads from the store, so it is done under a read lock, while the
+    /// catalog being replaced is still answering; [`Self::replace_terminology`] then only swaps.
+    /// What is held depends on the definitions, which a terminology-only reload does not change.
+    pub(crate) fn prepare_terminology(&self, part: &mut CompiledTerminology) {
+        part.terms.hold(&self.schema.checked_value_sets());
+        part.terms.warm(&self.terms.resident());
+        crate::memory::release_unused_memory();
+    }
+
+    /// Put terminology read by [`Self::open_terminology`] in place of this catalog's own.
+    pub(crate) fn replace_terminology(&mut self, part: CompiledTerminology) {
+        self.terms = part.terms;
+        self.compartments = part.compartments;
+        self.stale_expansions = part.stale_expansions;
     }
 
     /// Read the conformance tables and compile them.
@@ -305,13 +375,11 @@ impl Catalog {
         let packages = store.load_packages()?;
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
         drop(packages);
-        let mut terminology = TerminologyCompiler::new(
+        let terminology = CompiledTerminology::open(
+            store,
             fhir_version.as_deref(),
             source.clone().map(|source| source as Arc<dyn TermSource>),
-        );
-        store.visit_terminology(&mut |rows| terminology.add_resources(&rows))?;
-        store.visit_expansions(&mut |rows| terminology.add_expansions(&rows))?;
-        let terminology = terminology.finish();
+        )?;
         let mut definitions =
             DefinitionsCompiler::new(source.map(|source| source as Arc<dyn DefinitionSource>));
         store.visit_structure_definitions(&mut |rows| definitions.add(&rows))?;
@@ -760,10 +828,30 @@ fn add_parameters(
     }
 }
 
-struct CompiledTerminology {
+/// What a catalog derives from the terminology and expansion tables, and from nothing else.
+///
+/// A full load builds it with everything else, and a change to the terminology alone builds just
+/// this and swaps it in, so the two cannot disagree about what these tables mean.
+pub(crate) struct CompiledTerminology {
     terms: MemoryTerminology,
     compartments: BTreeMap<String, Compartment>,
     stale_expansions: bool,
+}
+
+impl CompiledTerminology {
+    /// The tables read a page at a time and compiled, the code systems indexed and dropped as
+    /// they are parsed. With a `source`, what is not needed to answer a question is left in the
+    /// store.
+    fn open(
+        store: &dyn ConformanceStore,
+        fhir_version: Option<&str>,
+        source: Option<Arc<dyn TermSource>>,
+    ) -> Result<Self, PersistError> {
+        let mut compiler = TerminologyCompiler::new(fhir_version, source);
+        store.visit_terminology(&mut |rows| compiler.add_resources(&rows))?;
+        store.visit_expansions(&mut |rows| compiler.add_expansions(&rows))?;
+        Ok(compiler.finish())
+    }
 }
 
 /// Compiles terminology handed over a page at a time. Each resource goes in with the package it

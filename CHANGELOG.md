@@ -202,15 +202,30 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   the write and told no other. A replica went on validating and expanding against the
   terminology it loaded at start, and a standby took over with it, until something else (a package
   install, a SearchParameter write) happened to make them reload; a restart also fixed it. The
-  write now tells them the way an install does, so each reloads its catalog within a moment of
-  the write.
-  - **What a replica does now.** It reloads the whole catalog in the background, which takes a few
-  seconds of one thread, and answers from the old one until the new one is ready. A script that
-  writes many code systems or value sets in a row keeps every replica reloading until it stops;
-  send them in one `transaction` Bundle, or install them as a package, to have each reload once.
-  - **Unchanged.** A replica still does not load a search parameter until its backfill has
-  completed, so while one is running a terminology write reaches standbys at once and replicas
-  when the backfill finishes.
+  write now tells them, and each reloads the terminology within a moment of it.
+  - **What a replica does now.** It reloads only the terminology (the value sets, code systems and
+    concept maps and the expansions kept for them) in the background, and answers from the old
+    one until the new one is ready. It does not read the structure definitions or the search
+    parameters, so it takes a fraction of a full reload: about a third of the time on the R4
+    package alone, and less saved where a lot of terminology is installed. A package install or a
+    SearchParameter write still reloads everything. A script that writes many code systems or
+    value sets one by one keeps every replica reloading until it stops; send them in one
+    `transaction` Bundle, or install them as a package, to have each reload once.
+  - **A running backfill does not hold it back.** A replica still never loads a search parameter
+    whose index is incomplete, and a terminology reload loads none, so the replica hears of a
+    terminology write at once even while a backfill is running.
+  - **Upgrading.** There is no migration: the change is a new counter, `terminology_version`, in
+    the `persistence_globals` table, created by the first write. It takes effect when the
+    primary, the replicas and the standbys all run this version: an older replica or standby does
+    not follow it, and an older primary does not move it, so those behave as before.
+- **A write whose announcement failed is announced again.** When the server has committed a
+  CodeSystem, ValueSet, ConceptMap or SearchParameter and then fails to tell the other processes
+  (the counter write after the tables were in order), the repair that follows used to find
+  nothing to fix and say nothing, so replicas and standbys stayed on the old catalog until the
+  next change, and the request still succeeded. The repair now tells them again, and they reload
+  everything. If that fails too, the request fails with an error that says the write was
+  committed and the other processes could not be told; they catch up at the next change to the
+  catalog, or at their next start.
 
 ## [0.0.1] - 2026-10-15
 

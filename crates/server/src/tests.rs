@@ -6001,9 +6001,10 @@ mod cluster {
         let cluster = pair(|_| {}).await;
         let primary = cluster_primary_app(&cluster);
         let replica_store = cluster.replica_store.as_ref();
-        let replica_follows = || replica_store.catalog_version().unwrap();
+        let replica_follows = || Stable.stamp(replica_store).unwrap();
 
-        // The primary is given the resource types, which is an install: the replica is told.
+        // The primary is given the resource types, which is an install: the replica is told, and
+        // loads everything.
         let mut loaded_at = replica_follows();
         let dir = conformance_types_dir();
         let store = SqlitePersistence::open(&cluster.path).unwrap();
@@ -6012,6 +6013,7 @@ mod cluster {
         loaded_at =
             reload_catalog(replica_store, &cluster.replica_catalog, loaded_at, Stable).unwrap();
         assert_eq!(loaded_at, replica_follows());
+        assert!(loaded_at.clock > 0);
 
         // A client writes a code system and a value set over it.
         let system = call(
@@ -6053,12 +6055,17 @@ mod cluster {
         // The replica has not looked yet, and answers from what it loaded.
         assert_ne!(expand().await.status, StatusCode::OK);
 
-        // What a watcher does when it sees the version move. It used to stand still: a terminology
-        // write never moved it, so the replica went on answering from the old terminology until
-        // something else (a package, a search parameter) did.
+        // What a watcher does when it sees the counters move. They used to stand still: a
+        // terminology write moved none, so the replica went on answering from the old terminology
+        // until something else (a package, a search parameter) did. Only the terminology changed,
+        // so it is all the replica loads.
         let now =
             reload_catalog(replica_store, &cluster.replica_catalog, loaded_at, Stable).unwrap();
-        assert!(now > loaded_at, "the replica was not told of the write");
+        assert!(
+            now.terminology > loaded_at.terminology,
+            "the replica was not told of the write"
+        );
+        assert_eq!(now.clock, loaded_at.clock, "only the terminology changed");
         let answered = expand().await;
         assert_eq!(answered.status, StatusCode::OK, "{}", answered.body);
         assert_eq!(header(&answered, "x-refhir-role"), "replica");

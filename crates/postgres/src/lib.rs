@@ -1126,6 +1126,7 @@ mod tests {
         fenced(old.mark_base_ready(1, "Patient"));
         fenced(old.insert_backfill(1, 1, "Patient", &[]).map(drop));
         fenced(old.bump_catalog_version().map(drop));
+        fenced(old.bump_terminology_version().map(drop));
         let version = new
             .bump_catalog_version()
             .expect("the new holder announces changes");
@@ -1422,23 +1423,26 @@ mod tests {
     }
 
     #[test]
-    fn the_two_catalog_counters_count_separately() {
+    fn the_catalog_counters_count_separately() {
         let Some(admin) = test_url("postgres catalog counters") else {
             return;
         };
         let url = fresh_database(&admin, "counters");
         let p = PostgresPersistence::connect(&url).unwrap();
-        assert_eq!(
-            (p.catalog_version().unwrap(), p.catalog_revision().unwrap()),
-            (0, 0)
-        );
+        let counters = || {
+            (
+                p.catalog_version().unwrap(),
+                p.catalog_revision().unwrap(),
+                p.terminology_version().unwrap(),
+            )
+        };
+        assert_eq!(counters(), (0, 0, 0));
         assert_eq!(p.bump_catalog_revision().unwrap(), 1);
         assert_eq!(p.bump_catalog_revision().unwrap(), 2);
         assert_eq!(p.bump_catalog_version().unwrap(), 1);
-        assert_eq!(
-            (p.catalog_version().unwrap(), p.catalog_revision().unwrap()),
-            (1, 2)
-        );
+        assert_eq!(counters(), (1, 2, 0));
+        assert_eq!(p.bump_terminology_version().unwrap(), 1);
+        assert_eq!(counters(), (1, 2, 1));
     }
 
     // The audit trail is one table, and the tests below empty it and then verify what they put in

@@ -165,6 +165,14 @@ impl ConformanceStore for PostgresPersistence {
         crate::off_runtime(|| self.bump_counter(PersistenceGlobalKey::CatalogRevision))
     }
 
+    fn terminology_version(&self) -> Result<u64, PersistError> {
+        crate::off_runtime(|| self.read_counter(PersistenceGlobalKey::TerminologyVersion))
+    }
+
+    fn bump_terminology_version(&self) -> Result<u64, PersistError> {
+        crate::off_runtime(|| self.bump_counter(PersistenceGlobalKey::TerminologyVersion))
+    }
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;

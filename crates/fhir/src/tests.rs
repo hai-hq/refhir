@@ -3735,6 +3735,12 @@ mod takeover {
         fn bump_catalog_revision(&self) -> Result<u64, rp::PersistError> {
             self.inner.bump_catalog_revision()
         }
+        fn terminology_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.terminology_version()
+        }
+        fn bump_terminology_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.bump_terminology_version()
+        }
         fn claim_backfill(&self, id: i64) -> Result<bool, rp::PersistError> {
             self.inner.claim_backfill(id)
         }
@@ -4020,7 +4026,7 @@ mod takeover {
             crate::CatalogClock::Latest,
         )
         .unwrap();
-        assert!(now > version);
+        assert!(now.clock > version.clock);
         assert_eq!(types(&warm), types(&primary.catalog));
 
         // When nothing changed there is nothing to do: the same version comes back and the
@@ -4051,7 +4057,7 @@ mod takeover {
         // What a replica loaded before the install: it follows the stable version.
         let (replica_catalog, replica_at) = Catalog::open_consistent(&db.store, Stable).unwrap();
         let replica_catalog = std::sync::RwLock::new(replica_catalog);
-        assert_eq!(replica_at, version_before);
+        assert_eq!(replica_at.clock, version_before);
 
         // The package is installed and published, but its backfill has not run.
         let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
@@ -4090,7 +4096,7 @@ mod takeover {
         );
         let now = crate::package::reload_catalog(&db.store, &replica_catalog, replica_at, Stable)
             .unwrap();
-        assert_eq!(now, version());
+        assert_eq!(now.clock, version());
         assert!(!replica_catalog.read().unwrap().has_pending_parameters());
         assert_eq!(
             search_total(
@@ -4119,17 +4125,25 @@ mod takeover {
     const PETS: &str = "http://example.org/pets";
     const ANIMALS: &str = "http://example.org/animals";
 
-    /// A process that follows one of the counters, as a replica (`Stable`) or a standby (`Latest`)
-    /// does: the catalog it serves from, and the value it loaded it at.
+    /// What a follower had to do to catch up.
+    #[derive(Debug, PartialEq)]
+    enum Reload {
+        Nothing,
+        Terminology,
+        Everything,
+    }
+
+    /// A process that follows one of the clocks, as a replica (`Stable`) or a standby (`Latest`)
+    /// does: the catalog it serves from, and what it loaded it at.
     struct Follower {
         clock: crate::CatalogClock,
         catalog: std::sync::RwLock<Catalog>,
-        at: u64,
+        at: crate::CatalogStamp,
     }
 
     impl Follower {
-        fn start(db: &Harness, clock: crate::CatalogClock) -> Self {
-            let (catalog, at) = Catalog::open_consistent(&db.store, clock).unwrap();
+        fn start(store: &dyn rp::ConformanceStore, clock: crate::CatalogClock) -> Self {
+            let (catalog, at) = Catalog::open_consistent(store, clock).unwrap();
             Self {
                 clock,
                 catalog: std::sync::RwLock::new(catalog),
@@ -4137,14 +4151,19 @@ mod takeover {
             }
         }
 
-        /// What the watcher does when it sees the counter differ from the one it loaded at.
-        /// Whether the catalog was reloaded.
-        fn catch_up(&mut self, db: &Harness) -> bool {
-            let now = crate::package::reload_catalog(&db.store, &self.catalog, self.at, self.clock)
-                .unwrap();
-            let moved = now != self.at;
+        /// What the watcher does when it sees the counters differ from the ones it loaded at.
+        fn catch_up(&mut self, store: &dyn rp::ConformanceStore) -> Reload {
+            let now =
+                crate::package::reload_catalog(store, &self.catalog, self.at, self.clock).unwrap();
+            let reload = if now == self.at {
+                Reload::Nothing
+            } else if now.clock == self.at.clock {
+                Reload::Terminology
+            } else {
+                Reload::Everything
+            };
             self.at = now;
-            moved
+            reload
         }
 
         fn pets(&self) -> Option<Vec<String>> {
@@ -4179,13 +4198,32 @@ mod takeover {
         })
     }
 
-    /// Write a code system and a value set over it through the API, as a client would. Returns the
-    /// ids they were given.
-    fn write_pets(db: &Harness, codes: &[&str]) -> (String, String) {
+    /// Write a code system and a value set over it through the API, as a client would, on the
+    /// primary `db` and through `store`. Returns the ids they were given.
+    fn write_pets_through(
+        db: &Harness,
+        store: &dyn rp::ConformanceStore,
+        codes: &[&str],
+    ) -> Result<(String, String), RunError> {
         let id = |value: Value| value["id"].as_str().unwrap().to_string();
-        let system = commit(db, "CodeSystem/create", json!({"resource": animals(codes)}));
-        let set = commit(db, "ValueSet/create", json!({"resource": pets()}));
-        (id(system.unwrap()), id(set.unwrap()))
+        let write = |path: &str, resource: Value| {
+            commit_operation(
+                store,
+                &db.db,
+                &db.catalog,
+                path,
+                &json!({"resource": resource}),
+            )
+            .map(|result| id(result.value))
+        };
+        Ok((
+            write("CodeSystem/create", animals(codes))?,
+            write("ValueSet/create", pets())?,
+        ))
+    }
+
+    fn write_pets(db: &Harness, codes: &[&str]) -> (String, String) {
+        write_pets_through(db, &db.store, codes).unwrap()
     }
 
     fn with_resource_types() -> Harness {
@@ -4194,10 +4232,18 @@ mod takeover {
         db
     }
 
+    fn counters(db: &Harness) -> (u64, u64, u64) {
+        (
+            db.store.catalog_version().unwrap(),
+            db.store.catalog_revision().unwrap(),
+            db.store.terminology_version().unwrap(),
+        )
+    }
+
     #[test]
     fn a_replica_hears_of_terminology_written_through_the_api() {
         let db = with_resource_types();
-        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
         assert_eq!(replica.pets(), None);
 
         write_pets(&db, &["dog", "cat"]);
@@ -4207,25 +4253,21 @@ mod takeover {
         );
 
         // The primary changed its own catalog in place and rewrote the expansions it touched, and
-        // that is all the replica could see of it: it follows a counter, and nothing moved it.
-        assert!(
-            replica.catch_up(&db),
-            "the version a replica follows did not move, so it kept answering from the old terminology"
-        );
+        // that is all the replica could see of it: it follows counters, and nothing moved them.
+        // Only the terminology changed, so it loads only that.
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
         assert_eq!(replica.pets(), codes_of_pets(&db.catalog));
+        assert_eq!(replica.catch_up(&db.store), Reload::Nothing);
     }
 
     #[test]
     fn a_standby_hears_of_terminology_written_through_the_api() {
         let db = with_resource_types();
-        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
         assert_eq!(standby.pets(), None);
 
         write_pets(&db, &["dog", "cat"]);
-        assert!(
-            standby.catch_up(&db),
-            "the revision a standby follows did not move, so it would take over with old terminology"
-        );
+        assert_eq!(standby.catch_up(&db.store), Reload::Terminology);
         assert_eq!(standby.pets(), codes_of_pets(&db.catalog));
     }
 
@@ -4233,8 +4275,8 @@ mod takeover {
     fn an_edit_or_a_deletion_of_terminology_reaches_replicas_and_standbys_too() {
         let db = with_resource_types();
         let (system, set) = write_pets(&db, &["dog"]);
-        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
-        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
         assert_eq!(replica.pets(), Some(vec!["dog".into()]));
 
         // A code added to a code system changes the expansion of the value set over it.
@@ -4247,7 +4289,7 @@ mod takeover {
         )
         .unwrap();
         for follower in [&mut replica, &mut standby] {
-            assert!(follower.catch_up(&db), "{:?} was not told", follower.clock);
+            assert_eq!(follower.catch_up(&db.store), Reload::Terminology);
             assert_eq!(follower.pets(), Some(vec!["cat".into(), "dog".into()]));
         }
 
@@ -4255,21 +4297,15 @@ mod takeover {
         commit(&db, "ValueSet/delete", json!({"id": set})).unwrap();
         assert_eq!(codes_of_pets(&db.catalog), None);
         for follower in [&mut replica, &mut standby] {
-            assert!(follower.catch_up(&db), "{:?} was not told", follower.clock);
+            assert_eq!(follower.catch_up(&db.store), Reload::Terminology);
             assert_eq!(follower.pets(), None);
         }
     }
 
     #[test]
-    fn a_terminology_write_moves_each_counter_once_by_either_path() {
+    fn a_terminology_write_moves_the_terminology_counter_and_a_rebuild_moves_the_catalog_ones() {
         let db = with_resource_types();
         let watched = WatchedStore::new(db.store.clone());
-        let counters = || {
-            (
-                db.store.catalog_version().unwrap(),
-                db.store.catalog_revision().unwrap(),
-            )
-        };
         let write = |resource: Value| {
             watched_commit(
                 &db,
@@ -4281,31 +4317,59 @@ mod takeover {
         };
         let colors = |id: &str| color_value_set(id, &["a"], "http://example.org/s");
 
-        // Only what the change touches is recomputed and the live catalog is changed in place.
-        let (version, revision) = counters();
+        // Only what the change touches is recomputed and the live catalog is changed in place, so
+        // the others are told the terminology changed, and nothing else.
+        let (version, revision, terminology) = counters(&db);
         write(colors("incremental"));
-        assert_eq!(counters(), (version + 1, revision + 1));
+        assert_eq!(counters(&db), (version, revision, terminology + 1));
 
-        // If that fails the store is rebuilt and the catalog loaded again, and that is one
-        // announcement too, not two.
+        // If that fails the store is rebuilt and the catalog loaded again, which is a publish:
+        // everything is told, once.
         watched.fail_apply_expansions.store(1, Ordering::SeqCst);
-        let (version, revision) = counters();
+        let (version, revision, terminology) = counters(&db);
         write(colors("fallback"));
-        assert_eq!(counters(), (version + 1, revision + 1));
+        assert_eq!(counters(&db), (version + 1, revision + 1, terminology));
+    }
+
+    #[test]
+    fn a_terminology_reload_reads_the_terminology_and_nothing_else() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&watched, crate::CatalogClock::Stable);
+        let kept = replica.catalog.read().unwrap().capability_statement();
+
+        write_pets_through(&db, &watched, &["dog"]).unwrap();
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Terminology);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+        assert!(WatchedStore::count(&watched.full_terminology_loads) > 0);
+        assert!(WatchedStore::count(&watched.full_expansion_loads) > 0);
+        assert_eq!(
+            WatchedStore::count(&watched.definition_loads)
+                + WatchedStore::count(&watched.full_search_parameter_loads),
+            0,
+            "no structure definition or search parameter was read"
+        );
+        assert_eq!(replica.catalog.read().unwrap().capability_statement(), kept);
+
+        // A publish moves the clock, and then the whole catalog is read.
+        publish(&watched, &db.catalog).unwrap();
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Everything);
+        assert!(WatchedStore::count(&watched.definition_loads) > 0);
+        assert!(WatchedStore::count(&watched.full_search_parameter_loads) > 0);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
     }
 
     #[test]
     fn a_transaction_of_terminology_tells_replicas_and_standbys_once() {
         let db = with_resource_types();
-        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
-        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
-        let (version, revision) = (
-            db.store.catalog_version().unwrap(),
-            db.store.catalog_revision().unwrap(),
-        );
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        let (version, revision, terminology) = counters(&db);
 
-        // A code system and ten value sets in one request: one commit, so one reload, however
-        // many resources it holds. Writing them one by one is eleven.
+        // A code system and ten value sets in one request: one commit, so one announcement and
+        // one reload, however many resources it holds. Writing them one by one is eleven.
         let mut entries = vec![json!({
             "request": {"method": "POST", "url": "CodeSystem"},
             "resource": animals(&["dog", "cat"])
@@ -4321,10 +4385,9 @@ mod takeover {
         let bundle = json!({"resourceType": "Bundle", "type": "transaction", "entry": entries});
         commit(&db, "Bundle/transaction", json!({"resource": bundle})).unwrap();
 
-        assert_eq!(db.store.catalog_version().unwrap(), version + 1);
-        assert_eq!(db.store.catalog_revision().unwrap(), revision + 1);
+        assert_eq!(counters(&db), (version, revision, terminology + 1));
         for follower in [&mut replica, &mut standby] {
-            assert!(follower.catch_up(&db), "{:?} was not told", follower.clock);
+            assert_eq!(follower.catch_up(&db.store), Reload::Terminology);
             let expanded = follower
                 .catalog
                 .read()
@@ -4340,7 +4403,7 @@ mod takeover {
     }
 
     #[test]
-    fn a_terminology_write_while_a_backfill_is_pending_tells_a_standby_but_not_a_replica() {
+    fn a_terminology_write_while_a_backfill_is_pending_reaches_both_and_loads_no_parameter() {
         let db = with_resource_types();
         for n in 0..3 {
             apply(
@@ -4350,37 +4413,133 @@ mod takeover {
             );
         }
         // What a replica loaded before the install.
-        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
         let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
             .unwrap()
             .expect("the package has pending search parameters");
         publish(&db.store, &db.catalog).unwrap();
         pending.create(&db.store, &db.db).unwrap();
-        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
         assert!(standby.catalog.read().unwrap().has_pending_parameters());
-        let (version, revision) = (
-            db.store.catalog_version().unwrap(),
-            db.store.catalog_revision().unwrap(),
-        );
+        let (version, revision, _) = counters(&db);
 
         write_pets(&db, &["dog"]);
 
-        // A standby follows every change and may have to finish the backfill, so it is told. A
-        // replica would load a parameter whose index is incomplete if it reloaded now, and it
-        // never does: the version stays where it was.
-        assert_eq!(db.store.catalog_version().unwrap(), version);
-        assert!(db.store.catalog_revision().unwrap() > revision);
-        assert!(!replica.catch_up(&db));
-        assert_eq!(replica.pets(), None);
-        assert!(standby.catch_up(&db));
+        // Nothing waits for the backfill, because nothing about a search parameter is loaded:
+        // both are told at once and load the terminology, and the replica still has no parameter
+        // whose index is incomplete.
+        assert_eq!(counters(&db).0, version);
+        assert_eq!(counters(&db).1, revision);
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+        assert!(!replica.catalog.read().unwrap().has_pending_parameters());
+        assert_eq!(standby.catch_up(&db.store), Reload::Terminology);
         assert_eq!(standby.pets(), Some(vec!["dog".into()]));
         assert!(standby.catalog.read().unwrap().has_pending_parameters());
 
-        // Completing the backfill moves the version, and the replica takes everything at once.
+        // Completing the backfill moves the version, and the replica loads the parameter.
         run_backfills(&db.store, &db.db, &db.catalog).unwrap();
-        assert!(replica.catch_up(&db));
-        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+        assert_eq!(replica.catch_up(&db.store), Reload::Everything);
         assert!(!replica.catalog.read().unwrap().has_pending_parameters());
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+    }
+
+    #[test]
+    fn an_announcement_that_failed_is_made_again_when_the_write_is_repaired() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+
+        // The write and its projection go through and the counter write after them fails. The
+        // repair finds the tables in order and used to leave it there: the request succeeded and
+        // nobody was told.
+        watched.fail_bump_terminology.store(1, Ordering::SeqCst);
+        let (system, _) = write_pets_through(&db, &watched, &["dog"]).unwrap();
+        assert!(!system.is_empty());
+        assert_eq!(codes_of_pets(&db.catalog), Some(vec!["dog".into()]));
+        for follower in [&mut replica, &mut standby] {
+            assert_ne!(
+                follower.catch_up(&db.store),
+                Reload::Nothing,
+                "{:?} was never told",
+                follower.clock
+            );
+            assert_eq!(follower.pets(), Some(vec!["dog".into()]));
+        }
+
+        // The same when the write fell back to a rebuild and it was publishing that failed.
+        watched.fail_apply_expansions.store(1, Ordering::SeqCst);
+        watched.fail_bump_catalog.store(1, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": color_value_set("rebuilt", &["a"], "http://example.org/s")}),
+        )
+        .unwrap();
+        for follower in [&mut replica, &mut standby] {
+            assert_ne!(
+                follower.catch_up(&db.store),
+                Reload::Nothing,
+                "{:?} was never told",
+                follower.clock
+            );
+            let rebuilt = follower
+                .catalog
+                .read()
+                .unwrap()
+                .terms()
+                .expand("http://example.org/rebuilt", None);
+            assert!(rebuilt.is_some(), "{:?}", follower.clock);
+        }
+    }
+
+    #[test]
+    fn an_announcement_that_keeps_failing_says_the_write_happened() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+
+        commit(
+            &db,
+            "CodeSystem/create",
+            json!({"resource": animals(&["dog"])}),
+        )
+        .unwrap();
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+
+        // Nothing can be announced, not even by the repair.
+        watched.fail_bump_terminology.store(1, Ordering::SeqCst);
+        watched.fail_bump_catalog.store(100, Ordering::SeqCst);
+        let told = watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": pets()}),
+        )
+        .unwrap_err();
+        let message = format!("{told:?}");
+        assert!(
+            message.contains("was committed") && message.contains("telling the other processes"),
+            "{message}"
+        );
+        // The write is there, on the primary and in the store, whatever the request said.
+        assert_eq!(codes_of_pets(&db.catalog), Some(vec!["dog".into()]));
+        assert_eq!(replica.catch_up(&db.store), Reload::Nothing);
+        assert_eq!(replica.pets(), None);
+
+        // Any later announcement brings the replica to everything written since.
+        watched.fail_bump_catalog.store(0, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": color_value_set("later", &["a"], "http://example.org/s")}),
+        )
+        .unwrap();
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
     }
 }
 
@@ -5767,6 +5926,7 @@ struct WatchedStore {
     full_terminology_loads: AtomicUsize,
     full_expansion_loads: AtomicUsize,
     full_search_parameter_loads: AtomicUsize,
+    definition_loads: AtomicUsize,
     /// Rewrites of a whole package's expansions.
     package_expansion_rewrites: AtomicUsize,
     expansion_changes: AtomicUsize,
@@ -5775,6 +5935,9 @@ struct WatchedStore {
     fail_apply_expansions: AtomicUsize,
     /// How many of the next reads of every terminology row to fail.
     fail_load_terminology: AtomicUsize,
+    /// Counter writes that announce a change to the other processes.
+    fail_bump_catalog: AtomicUsize,
+    fail_bump_terminology: AtomicUsize,
 }
 
 impl WatchedStore {
@@ -5784,11 +5947,14 @@ impl WatchedStore {
             full_terminology_loads: AtomicUsize::new(0),
             full_expansion_loads: AtomicUsize::new(0),
             full_search_parameter_loads: AtomicUsize::new(0),
+            definition_loads: AtomicUsize::new(0),
             package_expansion_rewrites: AtomicUsize::new(0),
             expansion_changes: AtomicUsize::new(0),
             fail_upsert_terminology: AtomicUsize::new(0),
             fail_apply_expansions: AtomicUsize::new(0),
             fail_load_terminology: AtomicUsize::new(0),
+            fail_bump_catalog: AtomicUsize::new(0),
+            fail_bump_terminology: AtomicUsize::new(0),
         }
     }
 
@@ -5797,6 +5963,7 @@ impl WatchedStore {
             &self.full_terminology_loads,
             &self.full_expansion_loads,
             &self.full_search_parameter_loads,
+            &self.definition_loads,
             &self.package_expansion_rewrites,
             &self.expansion_changes,
         ] {
@@ -5822,13 +5989,28 @@ impl ConformanceStore for WatchedStore {
         self.inner.catalog_version()
     }
     fn bump_catalog_version(&self) -> Result<u64, PersistError> {
+        if Self::should_fail(&self.fail_bump_catalog) {
+            return Err(PersistError::Definite("injected: catalog bump".into()));
+        }
         self.inner.bump_catalog_version()
     }
     fn catalog_revision(&self) -> Result<u64, PersistError> {
         self.inner.catalog_revision()
     }
     fn bump_catalog_revision(&self) -> Result<u64, PersistError> {
+        if Self::should_fail(&self.fail_bump_catalog) {
+            return Err(PersistError::Definite("injected: catalog bump".into()));
+        }
         self.inner.bump_catalog_revision()
+    }
+    fn terminology_version(&self) -> Result<u64, PersistError> {
+        self.inner.terminology_version()
+    }
+    fn bump_terminology_version(&self) -> Result<u64, PersistError> {
+        if Self::should_fail(&self.fail_bump_terminology) {
+            return Err(PersistError::Definite("injected: terminology bump".into()));
+        }
+        self.inner.bump_terminology_version()
     }
     fn claim_backfill(&self, id: i64) -> Result<bool, PersistError> {
         self.inner.claim_backfill(id)
@@ -5837,6 +6019,7 @@ impl ConformanceStore for WatchedStore {
         self.inner.load_packages()
     }
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
+        self.definition_loads.fetch_add(1, Ordering::SeqCst);
         self.inner.load_structure_definitions()
     }
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
@@ -6694,7 +6877,7 @@ fn a_catalog_that_replaces_another_has_read_what_the_old_one_had() {
         crate::CatalogClock::Stable,
     )
     .unwrap();
-    assert!(now > replica_at);
+    assert!(now.clock > replica_at.clock);
     assert!(resident(&replica));
     assert_eq!(validate(&replica), answer);
 }
@@ -6828,7 +7011,7 @@ fn a_catalog_read_when_used_follows_terminology_writes_and_reloads() {
     let now =
         crate::package::reload_catalog(store, &replica, replica_at, crate::CatalogClock::Stable)
             .unwrap();
-    assert!(now > replica_at);
+    assert!(now.clock > replica_at.clock);
     assert_eq!(genders(&replica), ["female", "male", "other", "unknown"]);
     let replicated = replica.read().unwrap();
     assert_eq!(

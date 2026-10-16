@@ -48,7 +48,17 @@ pub fn commit_operation(
         Err(err @ FhirError::Storage(_)) => {
             tracing::error!(error = %err, "conformance projection failed after commit; repairing");
             match repair_conformance(store, db, catalog) {
-                Ok(()) => Ok(result),
+                // The failure may have been the announcement to the other processes, after the
+                // projection had gone through. A repair that finds nothing to fix says nothing,
+                // so say it here, and say all of it: what was lost may have been either kind.
+                Ok(()) => match package::announce_all(store, catalog) {
+                    Ok(()) => Ok(result),
+                    Err(announce) => Err(RunError::Fhir(FhirError::Storage(format!(
+                        "the write was committed and the conformance tables are in order, but \
+                         telling the other processes failed ({announce}); a replica or standby \
+                         follows it when the catalog next changes, or at its next start"
+                    )))),
+                },
                 Err(repair) => Err(RunError::Fhir(FhirError::Storage(format!(
                     "the write was committed, but projecting it into the conformance tables \
                      failed ({err}) and so did the repair ({repair}); it is repaired from the \
@@ -266,8 +276,9 @@ fn project_writes(
         };
         if matches!(applied, Some(Ok(()))) {
             // Nothing was loaded again here, so nothing told the other processes: a replica and a
-            // standby follow counters, and only a publish moved them.
-            package::announce_applied(store, catalog)?;
+            // standby follow counters, and only a publish moved them. This changed the
+            // terminology alone, so that is what they are told, and what they load.
+            package::announce_terminology(store)?;
         } else {
             if let Some(Err(err)) = &applied {
                 tracing::warn!(error = %err, "incremental terminology update failed; rebuilding");

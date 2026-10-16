@@ -194,6 +194,14 @@ impl ConformanceStore for SqlitePersistence {
         self.bump_counter(PersistenceGlobalKey::CatalogRevision)
     }
 
+    fn terminology_version(&self) -> Result<u64, PersistError> {
+        self.read_counter(PersistenceGlobalKey::TerminologyVersion)
+    }
+
+    fn bump_terminology_version(&self) -> Result<u64, PersistError> {
+        self.bump_counter(PersistenceGlobalKey::TerminologyVersion)
+    }
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         let guard = self.inner.lock()?;
         let mut stmt = guard
