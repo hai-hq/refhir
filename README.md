@@ -1,7 +1,7 @@
 <h1>
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/brand/refhir-logo-reversed.svg">
-    <img src="docs/brand/refhir-logo.svg" alt="ReFHIR" height="56">
+    <img src="docs/brand/refhir-logo.svg" alt="ReFHIR" height="40">
   </picture>
 </h1>
 
@@ -20,8 +20,8 @@ It is also an ordinary FHIR server. Existing clients use standard REST, search a
 and [SMART on FHIR](docs/smart.md) for authorization.
 
 ```http
-GET /Observation?patient=123&status=final        <- a snapshot, as with any FHIR server
-ws://host/sync   subscribe: Observation?patient=123&status=final
+GET /Observation?patient=Patient/123&status=final        <- a snapshot, as with any FHIR server
+ws://host/sync   subscribe: Observation?patient=Patient/123&status=final
                  <- the matches now, then a new result whenever a commit changes them
 ```
 
@@ -75,9 +75,8 @@ console.log(await watch.next());  // the next committed result
 In React, `useFHIRQuery` from `@haihq/refhir/react` does the same and re-renders on every
 change. A Go client is in [`clients/go`](clients/go/README.md). Both share the
 [`/sync` wire protocol](docs/sync-protocol.md), so a client in another language is small. The Go
-client is published (`go get github.com/hai-hq/refhir/clients/go@v0.0.1`). The npm package
-`@haihq/refhir` is not published yet; until it is, build the TypeScript client from
-[`clients/ts`](clients/ts).
+client is published (`go get github.com/hai-hq/refhir/clients/go@v0.0.1`), and so is the
+TypeScript client (`npm install @haihq/refhir`).
 
 ## What is in it
 
@@ -101,7 +100,7 @@ client is published (`go get github.com/hai-hq/refhir/clients/go@v0.0.1`). The n
 | [Configuration](docs/configuration.md) | The config file and every flag |
 | [FHIR API](docs/fhir-api.md) | What the server supports, resource ids, terminology |
 | [Live sync protocol](docs/sync-protocol.md) | The `/sync` WebSocket, for client authors |
-| [SMART on FHIR](docs/smart.md) | Authorization, sign-in, [conformance status](docs/smart-compliance.md) |
+| [SMART on FHIR](docs/smart.md) | Authorization, sign-in, [SMART support](docs/smart-compliance.md) |
 | [Rate limits, quotas, metering and audit](docs/governance.md) | Governing and recording access |
 | [Operations](docs/operations.md) | Health probes, Postgres and TLS, export jobs |
 | [Several processes](docs/clustering.md) | Failover and read replicas on one database |

@@ -63,7 +63,7 @@ commit message.
 
 - **Schema changes.** Migrations are forward-only and shipped ones are frozen: a database refuses
   to start if a migration's checksum changed. Add a new numbered migration to **both** SQLite and
-  Postgres, and never edit an old one. Read [Schema migrations](docs/migrations.md#adding-a-migration).
+  Postgres, and never edit an old one. Read [Changing the schema](docs/development.md#changing-the-schema).
 - **The `/sync` protocol and HTTP API.** Existing clients depend on them. Add fields rather than
   change or remove them, and note any break in the changelog.
 - **Authorization.** Anything that reads or writes a resource must go through scope and

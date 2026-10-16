@@ -11,14 +11,6 @@ Package: `@haihq/refhir`
 npm install @haihq/refhir
 ```
 
-From this repo:
-
-```bash
-cd clients/ts
-npm install
-npm run build
-```
-
 ## Quick start
 
 ```ts
@@ -75,7 +67,7 @@ function PatientList() {
 }
 ```
 
-## API (parity with Go)
+## API
 
 | Method | Purpose |
 |--------|---------|
@@ -119,13 +111,3 @@ cd clients/ts && npm run seed -- -url http://127.0.0.1:8080
 ```
 
 Or the Go command (`clients/go/cmd/seed`) — same batches and ordering.
-
-## Tests
-
-```bash
-cargo build -p refhir
-cd clients/ts
-npm test
-```
-
-Set `REFHIR_BIN` if the binary is not at `../../target/debug/refhir`.

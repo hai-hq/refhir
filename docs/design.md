@@ -7,7 +7,7 @@ Why ReFHIR exists and how it works. To run it, start with [Getting started](gett
 FHIR servers are usually request-response.
 
 ```http
-GET /Observation?patient=123&status=final
+GET /Observation?patient=Patient/123&status=final
 ```
 
 returns one snapshot. Healthcare state keeps moving: new results, discontinued orders, closed encounters, updated diagnoses, tasks completed elsewhere, authorization or care-team changes while software or an agent is still working.
@@ -116,7 +116,7 @@ Reactive query     →  a client stays synchronized with what is true now
 
 ### Reactive query semantics (target)
 
-For `Observation?patient=123&status=final`:
+For `Observation?patient=Patient/123&status=final`:
 
 | Change | Effect |
 |--------|--------|

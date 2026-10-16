@@ -1,4 +1,4 @@
-# SMART App Launch conformance
+# SMART App Launch support
 
 ReFHIR implements SMART App Launch 2.2 as authorization server + FHIR resource server.
 
@@ -9,7 +9,7 @@ ReFHIR implements SMART App Launch 2.2 as authorization server + FHIR resource s
 - EHR launch with per-launch patient (public clients use configured `smart_patient` only)
 - Dynamic client registration (initial access token)
 - Scope enforcement on REST and `/sync`
-- OAuth state (clients, codes, tokens, login sessions) and the signing key are stored in the `smart_oauth` table of the configured database (SQLite or Postgres), outside the FHIR resource log. Codes, tokens and session ids are stored as SHA-256 hashes; codes and refresh tokens are consumed with a single atomic delete
+- OAuth state (clients, codes, tokens, login sessions) and the signing key are stored in the configured database, outside the FHIR resources. Codes, tokens and session ids are stored as hashes
 
 ## Configuration
 
@@ -27,15 +27,8 @@ SMART will not start without a login: configure `[smart.oidc]`, or set `demo_log
 
 With `--memory`, OAuth state lives in the in-memory database and ends with the process.
 
-## Validation
+## Sign-in notes
 
-- **Automated smoke (CI)**: `.github/workflows/inferno-smoke.yml` — Docker profile in `deploy/inferno/` (discovery + standalone PKCE + interact).
-- **Full Inferno UI**: [SMART App Launch Test Kit](https://github.com/inferno-framework/smart-app-launch-test-kit) — see [deploy/inferno/README.md](../deploy/inferno/README.md).
-
-Document Inferno pass/fail in your release process.
-
-## Not yet production-grade
-
-- Demo login (`demo_login`) is unauthenticated and for testing only; production uses `[smart.oidc]`
-- SAML is not supported; use an OpenID Connect provider (most SAML IdPs can be brokered through Keycloak)
-- No group or role mapping: every user who may sign in (all of them, unless `allowed_claims` or `allowed_email_domains` narrows it) gets the scopes the client requests
+- Demo login (`demo_login`) is unauthenticated and for testing only; production uses `[smart.oidc]`.
+- SAML is not supported. Use an OpenID Connect provider; most SAML identity providers can be brokered through Keycloak.
+- There is no group or role mapping: every user who may sign in gets the scopes the client requests. Narrow who may sign in with `allowed_claims` or `allowed_email_domains`.

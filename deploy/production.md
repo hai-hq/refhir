@@ -228,7 +228,7 @@ curl -s https://fhir.example.com/oauth/introspect \
   -d token=tok-...
 ```
 
-**`demo_login = true` (or `--smart-demo-login`) is for testing only.** It accepts any username and verifies nothing, so anyone who can reach the server can sign in as anyone and read patient data. It cannot be combined with `[smart.oidc]`, and the server refuses to start with it on a non-loopback bind unless `REFHIR_ALLOW_REMOTE_DEMO_LOGIN=1` is set. The Inferno profile sets that; production must not.
+**`demo_login = true` (or `--smart-demo-login`) is for testing only.** It accepts any username and verifies nothing, so anyone who can reach the server can sign in as anyone and read patient data. It cannot be combined with `[smart.oidc]`, and the server refuses to start with it on a non-loopback bind unless `REFHIR_ALLOW_REMOTE_DEMO_LOGIN=1` is set.
 
 ## FHIR version and Implementation Guides
 
@@ -254,7 +254,7 @@ To control exactly which package versions you run, build a bundle once and host 
 scripts/package-bundle.py --s3 s3://my-bucket/fhir-packages
 ```
 
-The script downloads the release defaults (read from `crates/fhir/src/package.rs`) plus everything they depend on, checks each tarball, writes `<name>/<version>` and a `manifest.json` (sizes and sha256), and uploads with the `aws` CLI. `--spec name@version` adds implementation guides, `--out dir` keeps a local copy only, `--endpoint-url` targets MinIO or R2. Then:
+The script downloads the release defaults plus everything they depend on, checks each tarball, writes `<name>/<version>` and a `manifest.json` (sizes and sha256), and uploads with the `aws` CLI. `--spec name@version` adds implementation guides, `--out dir` keeps a local copy only, `--endpoint-url` targets MinIO or R2. Then:
 
 ```toml
 [conformance]
@@ -272,27 +272,18 @@ package_registry = "s3://my-bucket/fhir-packages"
 
 Only static keys are supported: there is no IAM-role, IRSA, SSO or profile lookup. On Kubernetes put the keys in the chart's `secretEnv`. S3 answers 403, not 404, for a missing object when the keys have no list permission, so a wrong prefix can look like an access problem.
 
-Tested against MinIO. Installing the default packages on a fresh database took about 20 s from MinIO on a laptop (release build), most of it parsing and storing.
+**Release is pinned per database:** `[fhir].version` is fixed when the database is first populated (e.g. `r4` → FHIR `4.0.1`). Changing `version` to another release (e.g. `r5`) on an existing SQLite/Postgres data directory **fails at startup**; provision a new database instead. Individual packages also cannot mix `fhirVersion` values.
 
-**Tests only:** set `REFHIR_SKIP_DEFAULT_PACKAGES=1` when spawning `refhir` so integration tests avoid registry installs (Rust unit tests install fixtures directly). Do not use in production.
-
-**Release is pinned per database:** `[fhir].version` is fixed when the database is first populated (e.g. `r4` → FHIR `4.0.1`). Changing `version` to another release (e.g. `r5`) on an existing SQLite/Postgres data directory **fails at startup**; provision a new database instead. Individual packages also cannot mix `fhirVersion` values (`InstallError::FhirVersion` on install).
-
-## Bulk export and object storage
+## Bulk export
 
 `$export` runs asynchronously and writes **NDJSON to `[export].dir`** on the server filesystem (`{job-id}.ndjson`). Clients poll `GET /export/{job}` and download `GET /export/{job}/file`.
 
-**S3, GCS, and Azure Blob are not wired in yet.** For production you can:
-
-- Mount a persistent volume at `/data/export` and pull files out of band, or
-- Front ReFHIR with a job that copies completed files to object storage (future native support).
+To keep the files in object storage, mount a persistent volume at `/data/export` and copy completed files out with a job of your own.
 
 ## Availability and read scaling
 
 One process is a single point of failure. On Postgres you can run a **standby** that takes over
-within a few seconds when the primary is gone (it keeps its catalog loaded while it waits, so
-takeover does not wait for that; in the [Compose failover test](cluster/README.md) clients saw 3 to 7
-seconds between acknowledged writes, most of it noticing the failure and the load balancer), and
+within a few seconds when the primary is gone, and
 **replicas** that serve reads:
 
 - `refhir --postgres $URL` is the primary. It holds a lease on the database and refuses to start
@@ -321,7 +312,7 @@ Things to know before relying on it:
 - **Replicas are slightly behind.** They follow the primary within tens of milliseconds. Clients
   that must read their own writes send `X-Refhir-Min-Ts` (the Go and TypeScript clients do).
   The SMART patient picker reads the replica's own snapshot, so a patient created a moment ago can
-  be missing from it until the replica refreshes (accepted by design). A request that must see it
+  be missing from it until the replica refreshes. A request that must see it
   sends `X-Refhir-Min-Ts` like any other: `/oauth/*` goes through the same gate, so a replica that
   is behind hands the request to the primary. A replica with no `--primary-url` cannot hand it
   over, so it answers `503` with `Retry-After: 1` instead of an older snapshot.
@@ -343,19 +334,3 @@ reversible: back up the database first**, and use one ReFHIR version for every p
 a database (a database from a newer version makes an older server refuse to start). Restore the
 backup into a scratch database and run `refhir migrate --dry-run` against it with the new binary
 before you upgrade. Details: [docs/migrations.md](../docs/migrations.md).
-
-## Install the binary without Docker
-
-The crate is not on crates.io yet (`publish = false` in the workspace). Install from GitHub:
-
-```bash
-cargo install --git https://github.com/hai-hq/refhir.git refhir
-```
-
-Requires Rust 1.88+. Run with a config file:
-
-```bash
-refhir --config /etc/refhir/refhir.toml
-```
-
-When the project publishes to crates.io, the same command will work with `--package refhir` from the registry.

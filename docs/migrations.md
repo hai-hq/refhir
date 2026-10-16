@@ -9,8 +9,7 @@ the way back is to restore the backup.
 
 ## How it works
 
-- The binary carries an ordered list of migrations, compiled in (`crates/sqlite/migrations/`,
-  `crates/postgres/migrations/`). Version numbers are `1, 2, 3, ...`.
+- The binary carries an ordered list of migrations. Version numbers are `1, 2, 3, ...`.
 - The database has a `schema_migrations` table: `version`, `applied_at` (UTC), `checksum`
   (SHA-256 of the migration's SQL). A row means that migration is applied.
 - At startup, the process compares what the database recorded with what it knows:
@@ -20,7 +19,7 @@ the way back is to restore the backup.
   | has everything the binary knows | does nothing. It reads `schema_migrations` and takes no lock and writes nothing |
   | is behind | applies the pending migrations in order, in **one transaction**: either all of them apply or none do |
   | is new | applies every migration |
-  | has no `schema_migrations` (see below) | adopts it as version 1 |
+  | has no `schema_migrations` (a database from a build before 0.0.1) | adopts it as version 1, the baseline |
   | records a version the binary does not know | **refuses to start** (see below) |
   | records a checksum that differs from the binary's | **refuses to start**: the migration was changed after it was applied |
 
@@ -40,27 +39,6 @@ the way back is to restore the backup.
 
 If a migration fails, the transaction rolls back, nothing is recorded, the database is as it was,
 and the process exits with the error. Fix the cause and start again.
-
-## Databases from before versioning
-
-Development builds before 0.0.1 created their tables at startup with no record of a version. A
-database that has no `schema_migrations` table is **adopted** as version 1, the baseline: the
-current schema. Only a database made by such a build needs this; a database created by 0.0.1 or
-later already has the table.
-
-- If it already has every table, index and column of the baseline, version 1 is **recorded and
-  not run**. No DDL touches your tables. (On Postgres even `ALTER TABLE ... ADD COLUMN IF NOT
-  EXISTS` takes a lock that waits for open writes, so a restart cannot stall a live database.)
-- If it was made by an older build and lacks something (a `claimed_epoch` column on
-  `index_backfills`, the lease columns on `jobs`, the `indexes_by_ts` index), exactly what every
-  earlier release did on every start is done once: the missing objects are added, nothing is
-  altered or dropped, and then version 1 is recorded.
-
-On Postgres, adding a missing `indexes_by_ts` builds it inside the migration transaction. Builds
-before 0.0.1 built it `CONCURRENTLY`, outside a transaction, so writes could continue; Postgres
-refuses that inside a transaction, and a migration that is not one transaction is not atomic.
-This only affects a database from before that index existed, and the build blocks writes to
-`indexes` while it runs. Upgrade such a database in a maintenance window.
 
 ## A database that is newer than the binary
 
@@ -119,22 +97,3 @@ To go back, restore the backup taken in step 1.
 
 A replica on a database that a previous release's primary still owns waits for the primary to
 apply version 2, as it would for any later migration: it never runs DDL itself.
-
-## Adding a migration
-
-1. Add `NNNN_short_name.sql` to **both** `crates/sqlite/migrations/` and
-   `crates/postgres/migrations/`, and an entry to `MIGRATIONS` in each backend's `migrate.rs`.
-   The next version number is the last one plus one, with no gaps.
-2. **Never edit a migration that has shipped.** Its checksum is in every database that applied it,
-   and they would refuse to start. `the_baseline_is_frozen` pins version 1's checksum; pin new
-   ones the same way.
-3. A migration runs inside a transaction, together with any other pending ones. Do not use
-   statements Postgres refuses there (`CREATE INDEX CONCURRENTLY`, `VACUUM`). It does not have to
-   be idempotent: it runs once. Take care with statements that lock a busy table, since a
-   standby or replica starting up waits for them.
-4. Keep it additive where you can (new tables, new nullable columns, new indexes). A migration
-   that rewrites data is not undone by anything but a restore.
-5. Add a test that starts from a database at the previous version.
-
-New SQLite and Postgres migrations should leave the two backends with the same logical schema,
-and neither may change what a query returns without a code change that says so.

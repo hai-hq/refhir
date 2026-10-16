@@ -89,8 +89,24 @@ tick *perf* to include the 45-minute performance check as well.
 
 ## Changing the schema
 
-Read [Schema migrations](migrations.md#adding-a-migration) first. The short version: add a new
-numbered migration to both backends and never edit one that has shipped.
+Migrations are forward-only. [Schema migrations](migrations.md) explains how they run. To add one:
+
+1. Add `NNNN_short_name.sql` to **both** `crates/sqlite/migrations/` and
+   `crates/postgres/migrations/`, and an entry to `MIGRATIONS` in each backend's `migrate.rs`.
+   The next version number is the last one plus one, with no gaps.
+2. **Never edit a migration that has shipped.** Its checksum is in every database that applied it,
+   and they would refuse to start. `the_baseline_is_frozen` pins version 1's checksum; pin new
+   ones the same way.
+3. A migration runs inside a transaction, together with any other pending ones. Do not use
+   statements Postgres refuses there (`CREATE INDEX CONCURRENTLY`, `VACUUM`). It does not have to
+   be idempotent: it runs once. Take care with statements that lock a busy table, since a
+   standby or replica starting up waits for them.
+4. Keep it additive where you can (new tables, new nullable columns, new indexes). A migration
+   that rewrites data is not undone by anything but a restore.
+5. Add a test that starts from a database at the previous version.
+
+New SQLite and Postgres migrations should leave the two backends with the same logical schema,
+and neither may change what a query returns without a code change that says so.
 
 ## Regenerating fixtures
 
