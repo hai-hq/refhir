@@ -8,11 +8,13 @@ use refhir_sqlite::SqlitePersistence;
 use refhir_types::{exact_key, token_interval, IndexId, Order, TabletId};
 use serde_json::{json, Value};
 
+use refhir_sdc::Chart;
 use refhir_validate::{TermAnswer, Terminology};
 
 use crate::catalog::{Catalog, ReferencePolicy};
 use crate::conform::{commit_operation, repair_conformance};
 use crate::error::FhirError;
+use crate::extract::ReferenceId;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
     cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
@@ -2194,6 +2196,395 @@ fn search_modifiers_prefixes_paging_include_chain_has_and_compartment() {
     assert_eq!(compartment["entry"][0]["resource"]["id"], "o1");
 }
 
+/// The full R4 definitions, for the types that give a reference parameter several targets.
+fn r4() -> Harness {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    harness
+}
+
+/// The ids of the resources a search matched, in order.
+fn matched_ids(bundle: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = bundle["entry"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["search"]["mode"] == "match")
+        .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn r4_observation(id: &str, status: &str, subject: &str) -> Value {
+    json!({
+        "resourceType": "Observation",
+        "id": id,
+        "status": status,
+        "code": {"text": "vitals"},
+        "subject": {"reference": subject}
+    })
+}
+
+#[test]
+fn a_bare_id_finds_what_type_slash_id_finds() {
+    let harness = r4();
+    for id in ["p1", "p2"] {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": patient(id, true, "Ann")}),
+        );
+    }
+    apply(
+        &harness,
+        "Group/create",
+        json!({"resource": {"resourceType": "Group", "id": "g1", "type": "person", "actual": true}}),
+    );
+    apply(
+        &harness,
+        "Practitioner/create",
+        json!({"resource": {"resourceType": "Practitioner", "id": "x1"}}),
+    );
+    apply(
+        &harness,
+        "Organization/create",
+        json!({"resource": {"resourceType": "Organization", "id": "x1", "name": "Acme"}}),
+    );
+    for (id, status, subject) in [
+        ("o1", "final", "Patient/p1"),
+        ("o2", "final", "Patient/p2"),
+        ("o3", "preliminary", "Patient/p1"),
+        ("o4", "final", "Group/g1"),
+    ] {
+        apply(
+            &harness,
+            "Observation/create",
+            json!({"resource": r4_observation(id, status, subject)}),
+        );
+    }
+    // o5 is performed by a Practitioner and an Organization that share the id x1, o6 by the
+    // Organization alone.
+    let mut both = r4_observation("o5", "final", "Patient/p2");
+    both["performer"] = json!([
+        {"reference": "Practitioner/x1"},
+        {"reference": "Organization/x1"}
+    ]);
+    let mut one = r4_observation("o6", "final", "Patient/p2");
+    one["performer"] = json!([{"reference": "Organization/x1"}]);
+    for resource in [both, one] {
+        apply(
+            &harness,
+            "Observation/create",
+            json!({"resource": resource}),
+        );
+    }
+    // What a bare id stands for is what the type can hold, not everything the parameter is listed
+    // for: `patient` is a Patient for most types, but `DeviceUseStatement.subject` can be a Group.
+    let stands_for = |type_name: &str, parameter: &str| {
+        let catalog = harness.catalog.read().unwrap();
+        let param = catalog.get(type_name).unwrap().ready_param(parameter);
+        param.unwrap().extractor.reference_id("1")
+    };
+    let type_tokens = |tokens: &[&str]| {
+        ReferenceId::Typed(tokens.iter().map(|token| token.to_string()).collect())
+    };
+    assert_eq!(
+        stands_for("Observation", "patient"),
+        type_tokens(&["Patient/1"])
+    );
+    assert_eq!(
+        stands_for("AllergyIntolerance", "patient"),
+        type_tokens(&["Patient/1"])
+    );
+    assert_eq!(
+        stands_for("DeviceUseStatement", "patient"),
+        type_tokens(&["Patient/1", "Group/1"])
+    );
+    assert_eq!(
+        stands_for("Observation", "subject"),
+        type_tokens(&["Group/1", "Device/1", "Patient/1", "Location/1"])
+    );
+    let search_bundle = |query: Value| apply(&harness, "Observation/search", query);
+    let search = |query: Value| matched_ids(&search_bundle(query));
+    let in_order = |bundle: &Value| -> Vec<String> {
+        bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let has_next = |bundle: &Value| {
+        bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|link| link["relation"] == "next")
+    };
+
+    // `patient` can only be a Patient, so the id is that Patient's.
+    assert_eq!(search(json!({"patient": "p1", "status": "final"})), ["o1"]);
+    assert_eq!(
+        search(json!({"patient": "Patient/p1", "status": "final"})),
+        ["o1"]
+    );
+    assert_eq!(search(json!({"patient": "p1"})), ["o1", "o3"]);
+    assert_eq!(search(json!({"patient": "p2"})), ["o2", "o5", "o6"]);
+    assert!(search(json!({"patient": "nobody"})).is_empty());
+
+    // `subject` can be a Patient, a Group, a Device or a Location: the id is looked for as each.
+    assert_eq!(search(json!({"subject": "p1"})), ["o1", "o3"]);
+    assert_eq!(search(json!({"subject": "Patient/p1"})), ["o1", "o3"]);
+    assert_eq!(search(json!({"subject": "g1"})), ["o4"]);
+    assert_eq!(search(json!({"subject": "Group/g1"})), ["o4"]);
+
+    // `patient` holds no Group, however it is asked for.
+    assert!(search(json!({"patient": "g1"})).is_empty());
+    assert!(search(json!({"patient": "Group/g1"})).is_empty());
+
+    // A comma lists alternatives, and each is read as it would be alone: a bare id, a `Type/id`,
+    // or one of each.
+    let either = ["o1", "o2", "o3", "o5", "o6"];
+    assert_eq!(search(json!({"patient": "p1,p2"})), either);
+    assert_eq!(search(json!({"patient": "p1,Patient/p2"})), either);
+    assert_eq!(search(json!({"patient": "Patient/p1,Patient/p2"})), either);
+    assert_eq!(search(json!({"subject": "p1,g1"})), ["o1", "o3", "o4"]);
+    assert_eq!(search(json!({"patient:not": "p1,p2"})), ["o4"]);
+
+    // The modifiers that take an id read a bare one the same way. `:missing` takes true or false,
+    // which are valid ids and are not looked for as one.
+    assert_eq!(
+        search(json!({"patient:not": "p1"})),
+        ["o2", "o4", "o5", "o6"]
+    );
+    assert_eq!(
+        search(json!({"patient:not": "p1"})),
+        search(json!({"patient:not": "Patient/p1"}))
+    );
+    assert_eq!(
+        search(json!({"patient:missing": "false"})),
+        ["o1", "o2", "o3", "o5", "o6"]
+    );
+    assert_eq!(search(json!({"_filter": "patient eq p1"})), ["o1", "o3"]);
+
+    // Totals and pages count what matches, not the ranges read.
+    assert_eq!(
+        search_bundle(json!({"patient": "p1", "_summary": "count"}))["total"],
+        2
+    );
+    let page = search_bundle(json!({"patient": "p1", "_count": "1"}));
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["entry"].as_array().unwrap().len(), 1);
+    assert!(has_next(&page));
+
+    // Without a total the search stops reading once the page is full, which across several ranges
+    // means reading them all and cutting the merged rows.
+    let first = search_bundle(json!({"subject": "p1", "_count": "1", "_total": "none"}));
+    assert!(first.get("total").is_none());
+    assert_eq!(first["entry"].as_array().unwrap().len(), 1);
+    assert!(has_next(&first), "o3 is one more");
+    let last = search_bundle(json!({"subject": "p1", "_count": "2", "_total": "none"}));
+    assert_eq!(last["entry"].as_array().unwrap().len(), 2);
+    assert!(!has_next(&last), "there is nothing past o3");
+
+    // Each of these checks the rows one by one instead of reading the page off the index.
+    let sorted = search_bundle(json!({"subject": "p1", "_sort": "-status"}));
+    assert_eq!(in_order(&sorted), ["o3", "o1"]);
+    assert_eq!(
+        search(json!({"patient": "p1", "_compartment": "Patient/p1"})),
+        ["o1", "o3"]
+    );
+
+    // A document that references the id under two types is still one match.
+    let found = search_bundle(json!({"performer": "x1"}));
+    assert_eq!(found["total"], 2);
+    assert_eq!(found["entry"].as_array().unwrap().len(), 2, "o5 once");
+    assert_eq!(matched_ids(&found), ["o5", "o6"]);
+    assert_eq!(
+        search_bundle(json!({"performer": "x1", "_count": "1"}))["total"],
+        2
+    );
+    assert_eq!(search(json!({"performer": "Practitioner/x1"})), ["o5"]);
+
+    // The bundle is the same whichever way the reference is written.
+    let bare = search_bundle(json!({"subject": "p1"}));
+    let typed = search_bundle(json!({"subject": "Patient/p1"}));
+    assert_eq!(bare["entry"], typed["entry"]);
+    assert_eq!(bare["total"], typed["total"]);
+}
+
+#[test]
+fn a_bare_id_the_parameter_cannot_place_is_refused_and_says_what_to_send() {
+    let refused = |harness: &Harness, path: &str, query: Value| match commit(harness, path, query) {
+        Err(RunError::Fhir(FhirError::Unsupported(message))) => message,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+
+    // `Task.subject` can point at any resource: an id alone does not say which.
+    let harness = r4();
+    let message = refused(&harness, "Task/search", json!({"subject": "p1"}));
+    assert!(message.contains("subject"), "{message}");
+    assert!(message.contains("145 resource types"), "{message}");
+    assert!(message.contains("use Type/p1"), "{message}");
+    refused(&harness, "Task/search", json!({"subject:not": "p1"}));
+    // A `_filter` comparison reads the id the same way, so it is refused too, not left to match
+    // nothing.
+    refused(&harness, "Task/search", json!({"_filter": "subject eq p1"}));
+    // A reference that names its type, and a modifier whose value is not an id, still work.
+    for query in [
+        json!({"subject": "Patient/p1"}),
+        json!({"subject": "http://example.org/fhir/Patient/p1"}),
+        json!({"subject:missing": "false"}),
+        json!({"_filter": "subject eq Patient/p1"}),
+    ] {
+        let found = commit(&harness, "Task/search", query.clone()).unwrap();
+        assert_eq!(found["total"], 0, "{query}");
+    }
+
+    // An id counts once for every type it stands for toward the 1000 index ranges a search may
+    // read: `Observation.subject` points at four types, so 250 ids are 1000 ranges and 251 are too
+    // many.
+    let ids = |count: usize| {
+        (0..count)
+            .map(|n| format!("p{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let found = commit(&harness, "Observation/search", json!({"subject": ids(250)})).unwrap();
+    assert_eq!(found["total"], 0);
+    match commit(&harness, "Observation/search", json!({"subject": ids(251)})) {
+        Err(RunError::Fhir(FhirError::Invalid(message))) => {
+            assert!(message.contains("1004 index ranges"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+
+    // A parameter that lists no target type cannot place an id either.
+    let harness = ready();
+    install_resource_types(&harness);
+    commit(
+        &harness,
+        "SearchParameter/create",
+        json!({"resource": {
+            "resourceType": "SearchParameter",
+            "id": "focus",
+            "url": "http://example.org/SearchParameter/Observation-focus",
+            "name": "focus",
+            "status": "active",
+            "description": "Who the observation is about",
+            "code": "focus",
+            "base": ["Observation"],
+            "type": "reference",
+            "expression": "Observation.subject"
+        }}),
+    )
+    .unwrap();
+    // The server picks the id, so ask for the one it gave.
+    let created = commit(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("ignored", true, "Ann")}),
+    )
+    .unwrap();
+    let id = created["id"].as_str().unwrap();
+    commit(
+        &harness,
+        "Observation/create",
+        json!({"resource": {
+            "resourceType": "Observation",
+            "code": {"coding": [{"code": "8480-6"}]},
+            "subject": {"reference": format!("Patient/{id}")}
+        }}),
+    )
+    .unwrap();
+    let message = refused(&harness, "Observation/search", json!({"focus": id}));
+    assert!(
+        message.contains("does not say which resource types"),
+        "{message}"
+    );
+    assert!(message.contains(&format!("use Type/{id}")), "{message}");
+    let typed = commit(
+        &harness,
+        "Observation/search",
+        json!({"focus": format!("Patient/{id}")}),
+    )
+    .unwrap();
+    assert_eq!(typed["total"], 1);
+
+    // SDC population searches through the same code. An id the parameter cannot place found
+    // nothing before the server read bare ids, so a form's query still finds nothing; it does not
+    // fail the whole operation.
+    let catalog = harness.catalog.read().unwrap();
+    let mut tx = harness.db.begin();
+    let mut chart = crate::sdc::Bridge {
+        tx: &mut tx,
+        catalog: &catalog,
+        scopes: None,
+    };
+    let query = |value: String| [("focus", value)];
+    assert_eq!(
+        Chart::search_type(&mut chart, "Observation", &query(id.to_string())),
+        Ok(Vec::new())
+    );
+    let found = Chart::search_type(&mut chart, "Observation", &query(format!("Patient/{id}")));
+    assert_eq!(found.unwrap().len(), 1);
+}
+
+#[test]
+fn a_search_by_bare_id_conflicts_only_with_a_write_that_references_that_id() {
+    let conflicts = |written_for: &str| {
+        let db = ready();
+        for id in ["p1", "p2"] {
+            apply(
+                &db,
+                "Patient/create",
+                json!({"resource": patient(id, true, "Ann")}),
+            );
+        }
+        let catalog = db.catalog.read().expect("catalog");
+        let mut reader = db.db.begin();
+        crate::dispatch(
+            &mut reader,
+            &catalog,
+            "Observation/search",
+            &json!({"subject": "p1"}),
+        )
+        .unwrap();
+        // A transaction that wrote nothing has nothing to validate: write something unrelated.
+        let mut other = patient("p2", true, "Ann");
+        other["birthDate"] = json!("1980-01-01");
+        crate::dispatch(
+            &mut reader,
+            &catalog,
+            "Patient/update",
+            &json!({"id": "p2", "resource": other}),
+        )
+        .unwrap();
+
+        let mut writer = db.db.begin();
+        let mut resource = observation("o1", written_for, "2020-01-02", "8480-6");
+        resource.as_object_mut().unwrap().remove("id");
+        crate::dispatch(
+            &mut writer,
+            &catalog,
+            "Observation/create",
+            &json!({"resource": resource}),
+        )
+        .unwrap();
+        db.db.commit_with(writer, crate::stamp_stored_json).unwrap();
+        match db.db.commit_with(reader, crate::stamp_stored_json) {
+            Ok(_) => false,
+            Err(err) => {
+                assert!(err.is_occ(), "{err}");
+                true
+            }
+        }
+    };
+    assert!(conflicts("p1"), "a new match changes the result");
+    assert!(!conflicts("p2"), "an Observation of someone else does not");
+}
+
 #[test]
 fn the_servers_patient_limit_is_combined_with_the_callers_compartment_and_never_replaced() {
     let harness = ready();
@@ -3418,12 +3809,6 @@ mod search_paging {
     use super::*;
     use crate::extract::compile_parameter;
     use crate::search::{search_counted, search_reference, Work};
-
-    fn r4() -> Harness {
-        let harness = empty();
-        install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
-        harness
-    }
 
     const FAMILIES: [&str; 8] = [
         "Smith",

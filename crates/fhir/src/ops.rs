@@ -1,11 +1,11 @@
 use refhir_database::{Delete, Put, Stored, Transaction};
-use refhir_types::Timestamp;
+use refhir_types::{valid_id, Timestamp};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use refhir_validate::validate;
 
-use crate::catalog::{index_keys, valid_id, Catalog, ReferencePolicy, ResourceModel};
+use crate::catalog::{index_keys, Catalog, ReferencePolicy, ResourceModel};
 use crate::error::FhirError;
 use crate::resolve::TxHost;
 

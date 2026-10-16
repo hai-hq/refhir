@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 
 use refhir_fhirpath::{Expr, Host, Model};
 use refhir_types::{
-    number_key, number_range, quantity_key, quantity_range, string_key, token_key, IndexId,
-    Interval,
+    number_key, number_range, quantity_key, quantity_range, string_key, token_key, valid_id,
+    IndexId, Interval,
 };
 use serde_json::Value;
 
@@ -43,10 +43,31 @@ impl SearchKind {
     }
 }
 
+/// A bare id stands for at most this many resource types. A reference parameter that can point at
+/// more (`Task?subject` points at any resource) would read an index range for each of them, and an
+/// id alone says little about which was meant, so it has to be given as `Type/id`.
+const MAX_BARE_ID_TARGETS: usize = 16;
+
+/// What a query value for a reference parameter says about the resource it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceId {
+    /// A reference as it is stored (`Patient/123`, a URL), or a parameter that is not a reference:
+    /// compared as written.
+    AsWritten,
+    /// A bare id (`123`): the references it stands for, `Type/123` for each type the parameter can
+    /// point at.
+    Typed(Vec<String>),
+    /// A bare id the parameter cannot place: it declares no target types, or more than
+    /// `MAX_BARE_ID_TARGETS`. Carries how many it declares.
+    Open(usize),
+}
+
 /// How a query value can narrow the index. `Scan` leaves that to `matches`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Probe<'a> {
     Token(&'a str),
+    /// Any of these tokens. Each one is a range of its own.
+    Tokens(Vec<String>),
     Prefix(&'a str),
     /// Inclusive lower bound on a string or date key. Matching still applies the prefix.
     AtLeast(&'a str),
@@ -80,6 +101,8 @@ struct Part {
 pub struct Extractor {
     kind: SearchKind,
     source: Source,
+    /// The resource types a reference parameter can point at, as its `SearchParameter` lists them.
+    targets: Vec<String>,
 }
 
 impl Extractor {
@@ -87,7 +110,98 @@ impl Extractor {
         self.kind
     }
 
+    /// What `query` names, for a reference parameter read from a path.
+    ///
+    /// A reference is stored as `Type/id`, so `patient=Patient/123` compares whole tokens. FHIR also
+    /// lets a search give just the id, and the parameter's target types supply the rest. The types
+    /// are the `SearchParameter`'s own, wider than what an element allows (`patient` lists `Patient`
+    /// and `Group`), which is safe because the parameter's expression decides what is indexed under
+    /// it: `Observation.subject.where(resolve() is Patient)` never holds a `Group/123`.
+    pub fn reference_id(&self, query: &str) -> ReferenceId {
+        if let Some(types) = self.typed_targets(query) {
+            return ReferenceId::Typed(
+                types
+                    .iter()
+                    .map(|type_name| format!("{type_name}/{query}"))
+                    .collect(),
+            );
+        }
+        if self.is_bare_id(query) {
+            return ReferenceId::Open(self.targets.len());
+        }
+        ReferenceId::AsWritten
+    }
+
+    /// Limits the target types of a reference parameter to those it can hold in a resource of type
+    /// `base`.
+    ///
+    /// `SearchParameter.target` is one list for every base the parameter has. The shared `patient`
+    /// parameter lists `Patient` and `Group` for all thirty-odd of them, although most read an
+    /// element that can only hold a Patient, and some add `.where(resolve() is Patient)`. So for
+    /// each branch of the expression that reads from `base`, a reference can only be to a listed
+    /// type that the element allows (`element_targets`, which is given the element's path) and,
+    /// if the branch resolves, to the type it resolves to. A bare id then stands for those types,
+    /// and the usual search (`patient=123`) reads one index range, not one for each listed type.
+    ///
+    /// A branch this cannot read, a cast or a function, may hold any listed type, and an
+    /// expression with no branch that reads from `base` is left as it is.
+    pub fn narrow_targets<'a>(
+        &mut self,
+        base: &str,
+        element_targets: impl Fn(&str) -> Option<&'a [String]>,
+    ) {
+        let Source::Path(expr) = &self.source else {
+            return;
+        };
+        if self.kind != SearchKind::Reference || self.targets.is_empty() {
+            return;
+        }
+        let mut held: Vec<String> = Vec::new();
+        let mut read_from_base = false;
+        for branch in expr.union_operands() {
+            if branch.root_name() != Some(base) {
+                continue;
+            }
+            read_from_base = true;
+            let (path, resolved) = match branch.resolve_filter() {
+                Some((focus, type_name)) => (focus, Some(type_name)),
+                None => (branch, None),
+            };
+            // An element that can point at any resource restricts nothing.
+            let element = path
+                .member_path()
+                .and_then(|(_, members)| element_targets(&members.join(".")))
+                .filter(|types| !types.is_empty() && !types.iter().any(|item| item == "Resource"));
+            for type_name in &self.targets {
+                let allowed = element.is_none_or(|types| types.contains(type_name));
+                let resolves = resolved.is_none_or(|resolved| resolved == type_name);
+                if allowed && resolves && !held.contains(type_name) {
+                    held.push(type_name.clone());
+                }
+            }
+        }
+        if read_from_base && !held.is_empty() {
+            self.targets.retain(|type_name| held.contains(type_name));
+        }
+    }
+
+    /// Whether `query` is an id given to a reference parameter read from a path.
+    fn is_bare_id(&self, query: &str) -> bool {
+        self.kind == SearchKind::Reference
+            && matches!(self.source, Source::Path(_))
+            && valid_id(query)
+    }
+
+    /// The types a bare id `query` stands for, when this parameter can place one.
+    fn typed_targets(&self, query: &str) -> Option<&[String]> {
+        (self.is_bare_id(query) && (1..=MAX_BARE_ID_TARGETS).contains(&self.targets.len()))
+            .then_some(self.targets.as_slice())
+    }
+
     pub fn probe<'a>(&self, query: &'a str) -> Probe<'a> {
+        if let ReferenceId::Typed(tokens) = self.reference_id(query) {
+            return Probe::Tokens(tokens);
+        }
         match &self.source {
             Source::Composite { parts, .. } => {
                 let first = query.split('$').next().unwrap_or(query);
@@ -112,10 +226,12 @@ impl Extractor {
     /// written from `path_strings`, which is the list of values `path_match` compares; a token key
     /// holds the whole token behind its length, and a string key the lowercased value followed by
     /// a NUL; so the range holds exactly the resources with a value equal to the token, or starting
-    /// with the lowercased prefix. Two things break that and are refused. An expression that asks
-    /// the world something when it is read (a referenced resource, the clock, a profile, a value
-    /// set) can disagree with keys saved earlier. And a NUL in a string query would match the NUL
-    /// that ends every string key.
+    /// with the lowercased prefix. (A bare id for a reference parameter selects several token
+    /// ranges, one for each type it can point at. That holds only because `matches_op` reads the id
+    /// as the same set of `Type/id` references: the probe and the matcher must expand it alike.)
+    /// Two things break that and are refused. An expression that asks the world something when it
+    /// is read (a referenced resource, the clock, a profile, a value set) can disagree with keys
+    /// saved earlier. And a NUL in a string query would match the NUL that ends every string key.
     ///
     /// This trusts the keys: they are as the code that reads them would write them. After a release
     /// that changes how a value is turned into keys, rows saved by the old release keep their old
@@ -164,7 +280,7 @@ impl Extractor {
         }
         let values = self.indexed_values(resource, path_model, host);
         match self.probe("") {
-            Probe::Token(_) => token_rows(index, id, &values),
+            Probe::Token(_) | Probe::Tokens(_) => token_rows(index, id, &values),
             Probe::Prefix(_) | Probe::AtLeast(_) | Probe::AtMost(_) => {
                 string_rows(index, id, &values)
             }
@@ -333,12 +449,32 @@ impl Extractor {
         host: &dyn Host,
     ) -> bool {
         match &self.source {
+            Source::Path(expr) if self.kind == SearchKind::Reference => {
+                let values = path_strings(self.kind, expr, resource, path_model, host);
+                expected
+                    .iter()
+                    .any(|wanted| self.names_a_reference(&values, wanted))
+            }
             Source::Path(expr) => {
                 path_match(self.kind, expr, "eq", resource, expected, path_model, host)
             }
             _ => expected
                 .iter()
                 .any(|wanted| self.matches(resource, wanted, path_model, host)),
+        }
+    }
+
+    /// Whether one of `values`, the references a resource holds, is the one `wanted` names: for a
+    /// bare id a `Type/id` of a type this parameter points at, otherwise the same text. This runs
+    /// for every resource a search checks, so it builds no tokens.
+    fn names_a_reference(&self, values: &[String], wanted: &str) -> bool {
+        match self.typed_targets(wanted) {
+            Some(types) => values.iter().any(|value| {
+                value.split_once('/').is_some_and(|(type_name, id)| {
+                    id == wanted && types.iter().any(|item| item == type_name)
+                })
+            }),
+            None => values.iter().any(|value| value == wanted),
         }
     }
 
@@ -371,6 +507,10 @@ impl Extractor {
                 composite_match(focus, parts, resource, expected, path_model, host)
             }
             Source::Path(expr) => {
+                if self.kind == SearchKind::Reference && matches!(op, "eq" | "ne") {
+                    let values = path_strings(self.kind, expr, resource, path_model, host);
+                    return self.names_a_reference(&values, expected) == (op == "eq");
+                }
                 path_match(self.kind, expr, op, resource, &[expected], path_model, host)
             }
         }
@@ -440,6 +580,7 @@ pub fn compile_parameter(
         return Some(Extractor {
             kind,
             source: Source::Near,
+            targets: Vec::new(),
         });
     }
     let expr = refhir_fhirpath::parse(expression?).ok()?;
@@ -449,7 +590,25 @@ pub fn compile_parameter(
     Some(Extractor {
         kind,
         source: Source::Path(expr),
+        targets: target_types(parameter),
     })
+}
+
+/// The resource types a `SearchParameter` says a reference can point at, each once.
+fn target_types(parameter: &Value) -> Vec<String> {
+    let mut targets: Vec<String> = Vec::new();
+    for type_name in parameter
+        .get("target")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_str())
+    {
+        if !targets.iter().any(|seen| seen == type_name) {
+            targets.push(type_name.to_string());
+        }
+    }
+    targets
 }
 
 fn builtin(code: &str, kind: SearchKind) -> Option<Extractor> {
@@ -463,7 +622,11 @@ fn builtin(code: &str, kind: SearchKind) -> Option<Extractor> {
         "near" => Source::Near,
         _ => return None,
     };
-    Some(Extractor { kind, source })
+    Some(Extractor {
+        kind,
+        source,
+        targets: Vec::new(),
+    })
 }
 
 fn compile_composite(
@@ -501,6 +664,7 @@ fn compile_composite(
     Some(Extractor {
         kind: SearchKind::Composite,
         source: Source::Composite { focus, parts },
+        targets: Vec::new(),
     })
 }
 
@@ -1533,9 +1697,9 @@ mod tests {
     use refhir_fhirpath::{EmptyHost, Model};
     use serde_json::{json, Value};
 
-    use refhir_types::IndexId;
+    use refhir_types::{token_interval, IndexId};
 
-    use super::{compile_parameter, date_match, number_match, Probe};
+    use super::{compile_parameter, date_match, number_match, Probe, ReferenceId};
 
     #[test]
     fn every_r4_search_parameter_compiles() {
@@ -1716,5 +1880,226 @@ mod tests {
         assert!(date_match("eq", "1990-06-01", "1990"));
         assert!(!date_match("eq", "1990-01-01T10:00:00", "gt1990-01-01"));
         assert!(date_match("eq", "1990-01-02", "gt1990-01-01"));
+    }
+
+    fn reference_parameter(kind: &str, targets: Value) -> super::Extractor {
+        compile_parameter(
+            &json!({
+                "code": "subject",
+                "type": kind,
+                "expression": "Observation.subject",
+                "target": targets
+            }),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    fn typed(tokens: &[&str]) -> ReferenceId {
+        ReferenceId::Typed(tokens.iter().map(|token| token.to_string()).collect())
+    }
+
+    #[test]
+    fn a_bare_id_stands_for_a_reference_to_each_type_the_parameter_can_point_at() {
+        let one = reference_parameter("reference", json!(["Patient"]));
+        assert_eq!(one.reference_id("123"), typed(&["Patient/123"]));
+        assert_eq!(one.reference_id("a-1.b"), typed(&["Patient/a-1.b"]));
+        // A type listed twice is one type, and the order is the parameter's.
+        let several = reference_parameter("reference", json!(["Patient", "Group", "Patient"]));
+        assert_eq!(several.reference_id("1"), typed(&["Patient/1", "Group/1"]));
+        // Sixteen types is the most a bare id stands for.
+        let sixteen: Vec<String> = (0..16).map(|n| format!("T{n}")).collect();
+        assert!(matches!(
+            reference_parameter("reference", json!(sixteen)).reference_id("1"),
+            ReferenceId::Typed(types) if types.len() == 16
+        ));
+    }
+
+    #[test]
+    fn a_parameter_shared_by_several_types_is_narrowed_to_what_each_can_hold() {
+        let patient_only = ["Patient".to_string()];
+        let patient_or_group = ["Patient".to_string(), "Group".to_string()];
+        let any = ["Resource".to_string()];
+        let elements = |path: &str| match path {
+            "patient" => Some(&patient_only[..]),
+            "subject" => Some(&patient_or_group[..]),
+            "for" => Some(&any[..]),
+            _ => None,
+        };
+        let parameter = |expression: &str, targets: Value| {
+            compile_parameter(
+                &json!({
+                    "code": "patient",
+                    "type": "reference",
+                    "target": targets,
+                    "expression": expression
+                }),
+                &BTreeMap::new(),
+            )
+            .unwrap()
+        };
+        let narrowed = |expression: &str, targets: Value, base: &str| {
+            let mut extractor = parameter(expression, targets);
+            extractor.narrow_targets(base, elements);
+            extractor.reference_id("1")
+        };
+        let shared =
+            "AllergyIntolerance.patient | Observation.subject.where(resolve() is Patient) \
+            | DeviceUseStatement.subject | Task.for";
+        let both = || json!(["Patient", "Group"]);
+        // The element holds a Patient only.
+        assert_eq!(
+            narrowed(shared, both(), "AllergyIntolerance"),
+            typed(&["Patient/1"])
+        );
+        // The element holds a Patient or a Group, and the branch keeps the Patients.
+        assert_eq!(
+            narrowed(shared, both(), "Observation"),
+            typed(&["Patient/1"])
+        );
+        // The element holds either, and nothing is filtered.
+        assert_eq!(
+            narrowed(shared, both(), "DeviceUseStatement"),
+            typed(&["Patient/1", "Group/1"])
+        );
+        // An element that can point at any resource restricts nothing, and nor does a type the
+        // expression does not read from.
+        for base in ["Task", "Condition"] {
+            assert_eq!(
+                narrowed(shared, both(), base),
+                typed(&["Patient/1", "Group/1"]),
+                "{base}"
+            );
+        }
+        // Branches add up: this type can hold what either of them can.
+        assert_eq!(
+            narrowed(
+                "Observation.patient | Observation.subject.where(resolve() is Group)",
+                both(),
+                "Observation"
+            ),
+            typed(&["Patient/1", "Group/1"])
+        );
+        // A resolved type the parameter does not list leaves the list as it was, and a branch this
+        // cannot read (here a `where` on something else) may hold any of them.
+        assert_eq!(
+            narrowed(
+                "Observation.subject.where(resolve() is Device)",
+                both(),
+                "Observation"
+            ),
+            typed(&["Patient/1", "Group/1"])
+        );
+        assert_eq!(
+            narrowed(
+                "Observation.focus.where(status = 'x')",
+                both(),
+                "Observation"
+            ),
+            typed(&["Patient/1", "Group/1"])
+        );
+        // The listed order is kept, and only reference parameters are touched.
+        assert_eq!(
+            narrowed(
+                "Observation.subject.where(resolve() is Group)",
+                json!(["Patient", "Group", "Device"]),
+                "Observation"
+            ),
+            typed(&["Group/1"])
+        );
+        let mut token = compile_parameter(
+            &json!({"code": "x", "type": "token", "target": ["Patient"],
+                    "expression": "Observation.patient"}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        token.narrow_targets("Observation", elements);
+        assert_eq!(token.reference_id("1"), ReferenceId::AsWritten);
+    }
+
+    #[test]
+    fn a_value_that_is_more_than_an_id_is_compared_as_written() {
+        let one = reference_parameter("reference", json!(["Patient"]));
+        for value in [
+            "Patient/123",
+            "http://example.org/fhir/Patient/123",
+            "urn:uuid:11111111-1111-4111-8111-111111111111",
+            "",
+            "a b",
+        ] {
+            assert_eq!(one.reference_id(value), ReferenceId::AsWritten, "{value}");
+            assert!(!matches!(one.probe(value), Probe::Tokens(_)), "{value}");
+        }
+        // Only a reference parameter reads an id as a reference.
+        let token = reference_parameter("token", json!(["Patient"]));
+        assert_eq!(token.reference_id("123"), ReferenceId::AsWritten);
+    }
+
+    #[test]
+    fn a_bare_id_the_parameter_cannot_place_is_open() {
+        assert_eq!(
+            reference_parameter("reference", json!([])).reference_id("1"),
+            ReferenceId::Open(0)
+        );
+        let compiled = compile_parameter(
+            &json!({"code": "x", "type": "reference", "expression": "Observation.subject"}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(compiled.reference_id("1"), ReferenceId::Open(0));
+        let any: Vec<String> = (0..17).map(|n| format!("T{n}")).collect();
+        assert_eq!(
+            reference_parameter("reference", json!(any)).reference_id("1"),
+            ReferenceId::Open(17)
+        );
+        // What is not an id is still read as written.
+        assert_eq!(
+            reference_parameter("reference", json!([])).reference_id("Patient/1"),
+            ReferenceId::AsWritten
+        );
+    }
+
+    #[test]
+    fn a_bare_id_is_matched_and_probed_like_each_of_its_typed_references() {
+        let host = EmptyHost;
+        let model = Model::new();
+        let parameter = reference_parameter("reference", json!(["Patient", "Group"]));
+        let patient = json!({"resourceType": "Observation", "subject": {"reference": "Patient/1"}});
+        let group = json!({"resourceType": "Observation", "subject": {"reference": "Group/1"}});
+        let device = json!({"resourceType": "Observation", "subject": {"reference": "Device/1"}});
+        let other = json!({"resourceType": "Observation", "subject": {"reference": "Patient/10"}});
+
+        for (resource, expected) in [
+            (&patient, true),
+            (&group, true),
+            (&device, false),
+            (&other, false),
+        ] {
+            assert_eq!(parameter.matches(resource, "1", &model, &host), expected);
+            // The negation says the opposite, however the id is given.
+            assert_eq!(
+                parameter.matches_op(resource, "ne", "1", &model, &host),
+                !expected
+            );
+        }
+        assert!(parameter.matches(&patient, "Patient/1", &model, &host));
+        assert!(!parameter.matches(&group, "Patient/1", &model, &host));
+
+        // The index has a key for each reference, and the probe covers the ones the id stands for.
+        let index = IndexId::new("Observation/subject");
+        let Probe::Tokens(tokens) = parameter.probe("1") else {
+            panic!("a bare id should probe one token for each type");
+        };
+        assert_eq!(tokens, ["Patient/1", "Group/1"]);
+        let intervals: Vec<_> = tokens.iter().map(|token| token_interval(token)).collect();
+        let covered = |resource: &Value| {
+            let keys = parameter.keys(resource, "o1", &index, &model, &host);
+            keys.iter()
+                .any(|(_, key)| intervals.iter().any(|interval| interval.contains(key)))
+        };
+        assert!(covered(&patient));
+        assert!(covered(&group));
+        assert!(!covered(&device));
+        assert!(!covered(&other));
     }
 }
