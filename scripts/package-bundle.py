@@ -54,7 +54,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REGISTRY = "https://packages.fhir.org"
 MAX_BYTES = 100 * 1024 * 1024  # the server refuses larger packages
-# Dependencies that cost minutes on a first start and add nothing the server serves.
+# Dependencies that cost minutes on a first start and add nothing the server serves. The server
+# does not install hl7.fhir.r4.examples as a dependency on its own (SKIPPED_DEPENDENCIES in
+# crates/fhir/src/npm.rs); leaving it out here keeps it out of the bundle too.
 DEFAULT_DROPPED = ["hl7.fhir.r4.examples", "hl7.fhir.uv.xver-r5.r4"]
 
 

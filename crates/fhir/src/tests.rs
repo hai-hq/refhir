@@ -18,7 +18,7 @@ use crate::extract::ReferenceId;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
     cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
-    minir4_dir, newer_terminology_dir, publish, r4_dir, run_backfills, sdc_dir,
+    minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir, run_backfills, sdc_dir,
     stage_package_deferred, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
@@ -945,6 +945,197 @@ fn a_package_that_cannot_be_fetched_stops_the_install_before_anything_is_stored(
     );
     assert!(installed_packages(&db).is_empty());
     for dir in [app, a, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+const EXAMPLES: &str = "hl7.fhir.r4.examples";
+
+fn counting(packages: &[(&str, &str, &PathBuf)]) -> CountingFetcher {
+    CountingFetcher {
+        inner: registry(packages),
+        fetched: Default::default(),
+        running: Default::default(),
+        most_at_once: Default::default(),
+    }
+}
+
+#[test]
+fn the_r4_examples_package_is_not_installed_for_a_package_that_depends_on_it() {
+    // app needs lib, and mid, which needs the examples package (as sdc does, through its own
+    // dependencies in a deeper tree). The examples package needs a package of its own.
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.lib", "1.0.0"), ("example.mid", "1.0.0")],
+    );
+    let mid = dep_package("example.mid", "1.0.0", &[(EXAMPLES, "4.0.1")]);
+    let lib = dep_package("example.lib", "1.0.0", &[(EXAMPLES, "4.0.1")]);
+    let examples = dep_package(EXAMPLES, "4.0.1", &[("example.only-for-examples", "1.0.0")]);
+    let behind = dep_package("example.only-for-examples", "1.0.0", &[]);
+    let fetcher = counting(&[
+        ("example.mid", "1.0.0", &mid),
+        ("example.lib", "1.0.0", &lib),
+        (EXAMPLES, "4.0.1", &examples),
+        ("example.only-for-examples", "1.0.0", &behind),
+    ]);
+    let db = empty();
+    let cache = temp_dir("skip-examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.app@1.0.0",
+            "example.lib@1.0.0",
+            "example.mid@1.0.0"
+        ]
+    );
+    // Neither it nor what only it needs was downloaded or unpacked.
+    let fetched: Vec<String> = fetcher
+        .fetched
+        .lock()
+        .unwrap()
+        .keys()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(fetched, ["example.lib", "example.mid"]);
+    assert!(!cache.join(EXAMPLES).exists());
+    for dir in [app, mid, lib, examples, behind, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn the_r4_examples_package_is_installed_when_it_is_asked_for() {
+    let examples = dep_package(EXAMPLES, "4.0.1", &[("example.lib", "1.0.0")]);
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let fetcher = counting(&[
+        (EXAMPLES, "4.0.1", &examples),
+        ("example.lib", "1.0.0", &lib),
+    ]);
+    let db = empty();
+    let cache = temp_dir("ask-examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        &format!("{EXAMPLES}@4.0.1"),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    // As any package: itself, and what it depends on.
+    assert_eq!(
+        installed_packages(&db),
+        ["example.lib@1.0.0".to_string(), format!("{EXAMPLES}@4.0.1")]
+    );
+    for dir in [examples, lib, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_copy_of_the_r4_examples_package_that_is_installed_stays_when_a_dependent_arrives() {
+    // A database an earlier version started, which installed the examples package for sdc.
+    let examples = dep_package(EXAMPLES, "4.0.1", &[]);
+    let app = dep_package("example.app", "1.0.0", &[(EXAMPLES, "4.0.1")]);
+    let db = empty();
+    install_package_dir(&db.store, &db.db, &db.catalog, &examples).unwrap();
+    let cache = temp_dir("kept-examples-cache");
+    // Nothing is fetched: the package is there and the dependency is skipped.
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &NoNetwork,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.app@1.0.0".to_string(), format!("{EXAMPLES}@4.0.1")]
+    );
+    for dir in [examples, app, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// The codes `url` expands to, sorted.
+fn expansion_codes(harness: &Harness, url: &str) -> Vec<String> {
+    let mut codes: Vec<String> = expansion_of(harness, url)
+        .iter()
+        .filter_map(|item| item["code"].as_str().map(str::to_string))
+        .collect();
+    codes.sort();
+    codes
+}
+
+#[test]
+fn leaving_the_r4_examples_package_out_changes_which_package_holds_a_value_set_but_not_its_codes() {
+    // R4 core, and a package that depends on the examples package, which carries core's
+    // `marital-status` value set and its code system again, with generated narrative. The value
+    // set in use is the last one at the release, so with the examples package installed it is
+    // the examples package's copy, and without it core's. Either way it expands to the same codes.
+    let marital = "http://hl7.org/fhir/ValueSet/marital-status";
+    let app = dep_package(
+        "example.sdc",
+        "1.0.0",
+        &[("hl7.fhir.r4.core", "4.0.1"), (EXAMPLES, "4.0.1")],
+    );
+
+    // As the server now installs it: the dependency is skipped.
+    let (without, _) = watched_r4();
+    let fetcher = counting(&[(EXAMPLES, "4.0.1", &r4_examples_dir().to_path_buf())]);
+    let cache = temp_dir("scope-without-cache");
+    install_with(
+        &without.store,
+        &without.db,
+        &without.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert!(fetcher.fetched.lock().unwrap().is_empty());
+    assert!(!installed_packages(&without)
+        .iter()
+        .any(|name| name.starts_with(EXAMPLES)));
+    let core = package_id(&without, "hl7.fhir.r4.core");
+    let rows = stored_rows(&without, marital);
+    assert_eq!(rows.len(), 1, "one expansion is stored for it");
+    assert_eq!(rows[0].package_id, core, "core holds the value set in use");
+
+    // As an earlier version, or someone who asked for the package, has it installed.
+    let (with, _) = watched_r4();
+    install_package_dir(&with.store, &with.db, &with.catalog, r4_examples_dir()).unwrap();
+    let examples = package_id(&with, EXAMPLES);
+    let owners: Vec<i64> = stored_rows(&with, marital)
+        .iter()
+        .map(|row| row.package_id)
+        .collect();
+    assert!(
+        owners.contains(&examples),
+        "the later copy is the one in use: {owners:?}"
+    );
+
+    // The codes are the same, and so is what a start reads from what was stored.
+    let codes = expansion_codes(&without, marital);
+    assert_eq!(codes.len(), 11, "ten statuses and UNK: {codes:?}");
+    assert_eq!(expansion_codes(&with, marital), codes);
+    publish(&without.store, &without.catalog).unwrap();
+    publish(&with.store, &with.catalog).unwrap();
+    assert_eq!(expansion_codes(&without, marital), codes, "after a restart");
+    assert_eq!(expansion_codes(&with, marital), codes, "after a restart");
+    for dir in [app, cache] {
         let _ = std::fs::remove_dir_all(dir);
     }
 }

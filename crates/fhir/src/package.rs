@@ -74,6 +74,13 @@ pub fn extension_copies_dir() -> &'static Path {
     ))
 }
 
+/// A package named `hl7.fhir.r4.examples` that holds two of `r4_dir`'s resources, a value set and
+/// the code system it includes, as the published package carries them: the same, with generated
+/// narrative text that core does not have.
+pub fn r4_examples_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/r4-examples"))
+}
+
 pub fn expression_clash_dir() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),

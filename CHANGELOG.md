@@ -90,8 +90,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 - **A package that is only a dependency and holds examples is not installed.** SDC lists
   `hl7.fhir.r4.examples`, which holds the example resources of R4 and a second copy of every core
   definition, none of which a server uses; it was downloaded, read, stored and loaded for
-  nothing. It is left out when a package only depends on it. Name it in `[conformance].packages`
-  (or give it to `$install`) to install it.
+  nothing. It is left out when a package only depends on it, with a line in the log. Name it in
+  `[conformance].packages` (or give it to `$install`) to install it, and a database that has it keeps
+  it. The one visible difference is which package holds the value sets that core and the examples
+  package both define: core, where it was the examples package, with the same codes in each
+  expansion.
 - **Naming more than one database on the command line is now an error.** `--sqlite`, `--memory`
   and `--postgres` are alternatives, but ReFHIR used to start without complaint and use one of
   them: `refhir --memory --sqlite x.db` ran in memory and never created `x.db`. It now exits with
@@ -171,9 +174,6 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   start after the lease took about 70 s on PostgreSQL and about 25 s now, and on SQLite about
   26 s and about 24 s; peak memory did not rise. A database whose packages are already installed
   starts as before.
-
-### Fixed
-
 - **A first start needed several gigabytes of memory.** Installing the default packages (R4 core,
   SDC and the seven packages SDC depends on) peaked at over 2 GiB, so a container given 512 MiB or
   2 GiB was killed (exit status 137) while it was still installing, and a server that started

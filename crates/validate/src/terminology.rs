@@ -4609,6 +4609,105 @@ mod tests {
         assert!(has(&terms, SET, R4_SYSTEM, "a") && !has(&terms, SET, R5_SYSTEM, "c"));
     }
 
+    /// `package` again under another scope, each resource with generated narrative text, which is
+    /// how `hl7.fhir.r4.examples` carries what `hl7.fhir.r4.core` does.
+    fn with_narrative(scope: super::Scope, package: &Definitions) -> Definitions {
+        package
+            .iter()
+            .map(|(_, resource)| {
+                let mut resource = resource.clone();
+                resource["text"] = json!({"status": "generated", "div": "<div>narrative</div>"});
+                (scope, resource)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_copy_of_the_release_with_other_narrative_moves_who_holds_a_value_set_and_nothing_it_means()
+    {
+        // R4 core (scope 1), an extensions package with an R5-style copy of the value set
+        // (scope 2), and the examples package (scope 3): core's definitions again, with narrative.
+        // sdc depended on it; it is no longer installed for sdc. Whichever order the rest of the
+        // tree is installed in, the value set means what it meant, and only the package that holds
+        // the definition in use differs.
+        let (core, ext) = r4_and_its_r5_style_copy();
+        let examples = with_narrative(3, &core);
+        let release = Some("4.0.1");
+        let expansion = |all: &Definitions| -> serde_json::Value {
+            let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+                .iter()
+                .map(|(scope, resource)| (*scope, resource))
+                .collect();
+            MemoryTerminology::expansion_documents_scoped(&tagged, release)
+                .into_iter()
+                .find(|document| document["url"] == SET)
+                .unwrap()
+        };
+        let owner = |all: &Definitions| -> super::Scope {
+            let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+                .iter()
+                .map(|(scope, resource)| (*scope, resource))
+                .collect();
+            super::winning_scopes(&tagged, release)[SET]
+        };
+
+        let without = together(&[&core, &ext]);
+        for with in [
+            together(&[&core, &examples, &ext]),
+            together(&[&core, &ext, &examples]),
+        ] {
+            // The same answers, and the same expansion document.
+            for all in [&without, &with] {
+                let terms = scoped_for(all, release);
+                assert!(has(&terms, SET, R4_SYSTEM, "a") && has(&terms, SET, R4_SYSTEM, "b"));
+                assert!(
+                    !has(&terms, SET, R5_SYSTEM, "c"),
+                    "the R5-style copy took over"
+                );
+            }
+            assert_eq!(expansion(&without), expansion(&with));
+            // The definition in use is the last one at the release: core's alone, the examples
+            // package's when it is there. This is the one thing that moves.
+            assert_eq!(owner(&without), 1);
+            assert_eq!(owner(&with), 3);
+        }
+
+        // A code system that two packages carry with the same content is one copy that both hold,
+        // and when the examples package is left out it is core's alone.
+        let held = |all: &Definitions| -> Vec<Vec<super::Scope>> {
+            let terms = scoped_for(all, release);
+            terms.systems.by_url[R4_SYSTEM]["4.0.1"]
+                .iter()
+                .map(|variant| variant.holders.keys().copied().collect())
+                .collect()
+        };
+        assert_eq!(held(&without), [vec![1]]);
+        assert_eq!(held(&together(&[&core, &examples, &ext])), [vec![1, 3]]);
+
+        // A start reads the expansion the owner stored, and answers the same either way.
+        for (all, stored_under) in [
+            (together(&[&core, &examples, &ext]), 3),
+            (without.clone(), 1),
+        ] {
+            let resources: Vec<serde_json::Value> = all
+                .iter()
+                .filter(|(scope, _)| *scope == stored_under)
+                .map(|(_, r)| r.clone())
+                .collect();
+            let documents = MemoryTerminology::expansion_documents(&resources);
+            let stored: Vec<(super::Scope, &serde_json::Value)> = documents
+                .iter()
+                .map(|document| (stored_under, document))
+                .collect();
+            let tagged: Vec<(super::Scope, &serde_json::Value)> = all
+                .iter()
+                .map(|(scope, resource)| (*scope, resource))
+                .collect();
+            let started = MemoryTerminology::from_stored_scoped(&tagged, &stored, release);
+            assert!(has(&started, SET, R4_SYSTEM, "a") && !has(&started, SET, R5_SYSTEM, "c"));
+        }
+    }
+
     #[test]
     fn a_definition_is_tried_alone_before_the_rest_of_the_store_is_read() {
         // An older package holds a code system and a value set over all of it. A newer package's
