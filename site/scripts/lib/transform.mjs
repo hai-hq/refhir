@@ -13,6 +13,35 @@ const INLINE_LINK = /(!?\[[^\]]*\]\()([^)\s]+)((?:\s+"[^"]*")?\))/g;
 const REFERENCE_DEFINITION = /^(\s*\[[^\]]+\]:\s*)(\S+)/;
 const HTML_ATTRIBUTE = /(\s(?:src|href)=")([^"]+)(")/g;
 
+/** GitHub's heading anchor: lowercase, punctuation dropped, spaces to hyphens. */
+export function githubSlug(text) {
+  const plain = text
+    .replace(/`/g, '')
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .normalize('NFC')
+    .toLowerCase()
+    .trim();
+  let out = '';
+  for (const ch of plain) {
+    if (/[\p{L}\p{N}_-]/u.test(ch)) out += ch;
+    else if (/\s/.test(ch)) out += '-';
+  }
+  return out;
+}
+
+/** The first H1 outside a code fence: { index, text }, or null when there is none. */
+export function findH1(lines) {
+  let fenced = false;
+  for (let i = 0; i < lines.length; i += 1) {
+    if (FENCE.test(lines[i])) {
+      fenced = !fenced;
+      continue;
+    }
+    if (!fenced && /^# /.test(lines[i])) return { index: i, text: lines[i].slice(2) };
+  }
+  return null;
+}
+
 function splitFragment(dest) {
   const i = dest.indexOf('#');
   return i === -1 ? [dest, ''] : [dest.slice(0, i), dest.slice(i)];
@@ -27,6 +56,8 @@ function splitFragment(dest) {
  * - A target that does not exist throws, so a broken link fails the build.
  */
 export function rewriteDest(dest, ctx) {
+  // The H1 becomes the page title, so its own anchor no longer exists: link to the top instead.
+  if (ctx.ownH1Slug && dest === `#${ctx.ownH1Slug}`) return '#_top';
   if (LEAVE_ALONE.test(dest)) return dest;
   const [rel, fragment] = splitFragment(dest);
   const target = path.posix.normalize(path.posix.join(path.posix.dirname(ctx.source), decodeURI(rel)));
@@ -36,7 +67,10 @@ export function rewriteDest(dest, ctx) {
   const clean = target.replace(/\/+$/, '') || '.';
 
   const page = ctx.manifest.get(clean);
-  if (page) return `/${page.slug}/${fragment}`;
+  if (page) {
+    const toTitle = page.h1Slug && fragment === `#${page.h1Slug}`;
+    return `/${page.slug}/${toTitle ? '' : fragment}`;
+  }
   if (/^docs\/brand\/[^/]+\.(svg|png)$/.test(clean)) return `/brand/${path.posix.basename(clean)}`;
   if (ctx.isDir(clean)) return `${GITHUB}/tree/main/${clean}${fragment}`;
   if (ctx.exists(clean)) return `${GITHUB}/blob/main/${clean}${fragment}`;
@@ -65,31 +99,21 @@ function cleanTitle(text) {
 /**
  * Build the text of a Starlight page from a canonical document.
  *
- * `entry` is the manifest entry: { source, slug, title?, label?, description?, preface? }.
+ * `entry` is the manifest entry: { source, slug, title?, label?, description? }.
  * The first H1 becomes the page title and is removed from the body, because Starlight renders
  * the title itself.
  */
 export function transformDocument({ source, text, entry, manifest, exists, isDir }) {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
 
-  let fenced = false;
-  let h1 = -1;
-  let title = entry.title ?? null;
-  lines.forEach((line, i) => {
-    if (FENCE.test(line)) {
-      fenced = !fenced;
-      return;
-    }
-    if (!fenced && h1 === -1 && /^# /.test(line)) {
-      h1 = i;
-      title ??= cleanTitle(line.slice(2));
-    }
-  });
+  const found = findH1(lines);
+  const h1 = found ? found.index : -1;
+  const title = entry.title ?? (found ? cleanTitle(found.text) : null);
   if (!title) throw new Error(`${source}: no H1 and no title in the manifest`);
 
-  const ctx = { source, manifest, exists, isDir };
+  const ctx = { source, manifest, exists, isDir, ownH1Slug: found ? githubSlug(found.text) : null };
   const body = [];
-  fenced = false;
+  let fenced = false;
   let skipBlank = false;
   lines.forEach((line, i) => {
     if (FENCE.test(line)) {
@@ -126,7 +150,6 @@ export function transformDocument({ source, text, entry, manifest, exists, isDir
 
   const generated = `<!-- Generated from ${source} by site/scripts/sync-content.mjs. Edit that file, not this one. -->`;
   const parts = [front.join('\n'), generated, ''];
-  if (entry.preface) parts.push(entry.preface.trim(), '');
   parts.push(body.join('\n').replace(/^\n+/, ''));
   return parts.join('\n');
 }

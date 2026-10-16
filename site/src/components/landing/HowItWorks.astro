@@ -1,0 +1,104 @@
+---
+// "A write only wakes the queries it can change." The steps follow "How a write becomes a
+// live-query update" in docs/design.md. The figure is an illustration with example queries: which
+// queries a write wakes depends on which parts of the search index each one read.
+const queries = [
+  { key: 'obs', text: 'Observation?patient=Patient/123' },
+  { key: 'med', text: 'MedicationRequest?patient=Patient/123&status=active' },
+  { key: 'enc', text: 'Encounter?patient=Patient/123&status=in-progress' },
+  { key: 'pat', text: 'Patient?name=ann' },
+];
+
+const writes = [
+  { key: 'med', label: 'Stop a medication', request: 'PUT /MedicationRequest/456', wakes: ['med'] },
+  { key: 'lab', label: 'New lab result', request: 'POST /Observation', wakes: ['obs'] },
+  { key: 'name', label: 'Rename the patient', request: 'PUT /Patient/123', wakes: ['pat'] },
+  { key: 'other', label: 'Another patient’s medication', request: 'PUT /MedicationRequest/789', wakes: [] },
+];
+
+const flow = ['A write commits', 'Only queries that read it wake', 'Each gets the whole new answer'];
+---
+
+<section class="section" id="how" aria-labelledby="how-title">
+  <div class="wrap">
+    <p class="kicker">How it works</p>
+    <h2 id="how-title">A write wakes only the queries it can change.</h2>
+
+    <ol class="flow">
+      {flow.map((step) => <li>{step}</li>)}
+    </ol>
+
+    <div class="how" data-how>
+      <div class="how__writes" role="group" aria-label="Pick a write" data-writes hidden>
+        {
+          writes.map((w, i) => (
+            <button type="button" class="chip" aria-pressed={i === 0 ? 'true' : 'false'} data-write={w.key}>
+              {w.label}
+            </button>
+          ))
+        }
+      </div>
+      <p class="write">
+        <span class="write__pill"><code data-request>{writes[0].request}</code></span>
+        <span class="write__commit">commits</span>
+      </p>
+      <div class="tiles" role="group" aria-label="Four live queries">
+        {
+          queries.map((query) => (
+            <div class={`tile${writes[0].wakes.includes(query.key) ? ' tile--lit' : ''}`} data-tile={query.key}>
+              <code set:html={query.text.replace(/&/g, '&amp;').replace(/(\?|&amp;)/g, '$1<wbr>')} />
+              <span class="tile__note" data-note>
+                {writes[0].wakes.includes(query.key) ? 'Re-runs. New answer pushed.' : 'Not touched'}
+              </span>
+            </div>
+          ))
+        }
+      </div>
+      <p class="sr-only" aria-live="polite" data-how-status></p>
+      <noscript><p class="note">This figure needs JavaScript to pick a write. It shows a write to a medication request.</p></noscript>
+      <p class="how__caption" data-how-note></p>
+    </div>
+  </div>
+</section>
+
+<script>
+  const how = document.querySelector<HTMLElement>('[data-how]');
+  if (how) {
+    const wake: Record<string, string[]> = { med: ['med'], lab: ['obs'], name: ['pat'], other: [] };
+    const request: Record<string, string> = {
+      med: 'PUT /MedicationRequest/456',
+      lab: 'POST /Observation',
+      name: 'PUT /Patient/123',
+      other: 'PUT /MedicationRequest/789',
+    };
+    const names: Record<string, string> = {
+      obs: 'the Observation query',
+      med: 'the MedicationRequest query',
+      enc: 'the Encounter query',
+      pat: 'the Patient query',
+    };
+    const buttons = [...how.querySelectorAll<HTMLButtonElement>('[data-write]')];
+    const tiles = [...how.querySelectorAll<HTMLElement>('[data-tile]')];
+    const code = how.querySelector<HTMLElement>('[data-request]')!;
+    const note = how.querySelector<HTMLElement>('[data-how-note]')!;
+    const status = how.querySelector<HTMLElement>('[data-how-status]')!;
+
+    const show = (key: string) => {
+      buttons.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.write === key)));
+      code.textContent = request[key];
+      tiles.forEach((tile) => {
+        const lit = wake[key].includes(tile.dataset.tile ?? '');
+        tile.classList.toggle('tile--lit', lit);
+        tile.querySelector('[data-note]')!.textContent = lit ? 'Re-runs. New answer pushed.' : 'Not touched';
+      });
+      status.textContent =
+        wake[key].length === 0
+          ? `${request[key]} commits. No live query wakes.`
+          : `${request[key]} commits. It wakes ${wake[key].map((k) => names[k]).join(' and ')}.`;
+      note.textContent = key === 'other' ? 'No live query here read that part of the index, so nothing re-runs.' : '';
+    };
+
+    buttons.forEach((b) => b.addEventListener('click', () => show(b.dataset.write ?? 'med')));
+    how.querySelector<HTMLElement>('[data-writes]')!.hidden = false;
+  }
+</script>

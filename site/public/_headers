@@ -12,6 +12,12 @@
 /brand/*
   Cache-Control: public, max-age=3600
 
+# Icons at the site root keep their names too.
+/favicon.ico
+  Cache-Control: public, max-age=86400
+/apple-touch-icon.png
+  Cache-Control: public, max-age=86400
+
 # Preview deployments on *.pages.dev must not be indexed.
 https://:project.pages.dev/*
   X-Robots-Tag: noindex

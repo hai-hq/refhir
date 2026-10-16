@@ -4,7 +4,9 @@ permissions:
   contents: read
 
 # Builds the website and fails on a broken link. It is cheap, so it runs on pull requests, but only
-# when something the site shows or builds from has changed. Deployment is not here: Cloudflare
+# when something the site shows or builds from has changed. That includes the Rust sources, because
+# the command-line page is generated from them and a test checks that every REFHIR_ environment
+# variable the code reads is documented. Deployment is not here: Cloudflare
 # Pages builds `main` and every pull request from site/ with its own Git integration (see
 # site/README.md).
 on:
@@ -17,6 +19,9 @@ on:
       - "clients/**/README.md"
       - "fixtures/**/README.md"
       - "*.md"
+      - "Cargo.toml"
+      - "refhir.toml.example"
+      - "crates/**/*.rs"
       - ".github/workflows/site.yml"
   push:
     branches: [main]
@@ -27,6 +32,9 @@ on:
       - "clients/**/README.md"
       - "fixtures/**/README.md"
       - "*.md"
+      - "Cargo.toml"
+      - "refhir.toml.example"
+      - "crates/**/*.rs"
       - ".github/workflows/site.yml"
 
 concurrency:

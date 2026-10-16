@@ -1,0 +1,63 @@
+---
+// The commands are the README's quick start and the client examples are the READMEs', all read from
+// the files at build time (src/lib/repo.ts). The printed lines are what the tutorial's watcher prints
+// (site/src/content/docs/docs/tutorial.mdx): create Ann, create Bee, deactivate Ann, then create Cho and
+// Dee in one transaction. No time promise: the first start downloads the FHIR core package.
+import { Code } from 'astro:components';
+
+import { fence } from '../../lib/repo';
+
+const clone = fence('README.md', 'Quick start', 'bash', 0);
+const printed = `0 active: -
+1 active: Ann
+2 active: Ann, Bee
+1 active: Bee
+3 active: Bee, Cho, Dee`;
+
+const tabs = [
+  { id: 'ts', label: 'TypeScript', lang: 'ts', code: fence('README.md', 'Live queries from a client', 'ts') },
+  { id: 'react', label: 'React', lang: 'tsx', code: fence('clients/ts/README.md', null, 'tsx') },
+  { id: 'go', label: 'Go', lang: 'go', code: fence('clients/go/README.md', 'Quick start', 'go') },
+  { id: 'sync', label: 'Raw /sync', lang: 'http', code: fence('README.md', null, 'http') },
+];
+---
+
+<section class="section" id="build" aria-labelledby="build-title">
+  <div class="wrap">
+    <p class="kicker">Run it</p>
+    <h2 id="build-title">Run it. Watch it.</h2>
+
+    <div class="build">
+      <div class="build__run">
+        <p class="step"><span>1</span>Start a server</p>
+        <Code code={clone} lang="bash" theme="github-dark" />
+        <p class="step"><span>2</span>Change data. Watch it print.</p>
+        <Code code={printed} lang="text" theme="github-dark" />
+        <p class="note"><a href="/docs/tutorial/">Full tutorial</a></p>
+      </div>
+
+      <div class="build__code">
+        <p class="step"><span>3</span>Use it from your code</p>
+        <div class="tabs" role="radiogroup" aria-label="Code language">
+          {
+            tabs.map((tab, i) => (
+              <>
+                <input class="tabs__radio" type="radio" name="code-tab" id={`tab-${tab.id}`} checked={i === 0} />
+                <label class="tabs__label" for={`tab-${tab.id}`}>
+                  {tab.label}
+                </label>
+              </>
+            ))
+          }
+          {
+            tabs.map((tab) => (
+              <div class={`tabs__panel tabs__panel--${tab.id}`}>
+                <Code code={tab.code} lang={tab.lang as 'ts'} theme="github-dark" />
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </div>
+  </div>
+</section>

@@ -1,14 +1,15 @@
 /* ReFHIR brand tokens (docs/brand/README.md). Shared by the landing page and Starlight.
-   Ember is the lit block: one use at a time, a fill or accent, never small text on Paper. */
+   Pages are white. Red is the only warm color and appears once at a time; links are blue. */
 :root {
-  --rf-ember: #f2481c;
-  --rf-ink: #0f1d2b;
-  --rf-paper: #faf8f3;
-  --rf-clinical: #005a8c;
-  --rf-amber: #ffb81c;
-  --rf-stone: #d7d7d2;
-  /* Clinical is too dark for links on Ink, so dark mode uses a lighter tint of it. */
-  --rf-clinical-on-ink: #6eb4cd;
+  --rf-red: #e4281e;
+  --rf-red-on-dark: #ff4a3d;
+  --rf-charcoal: #23262b;
+  --rf-grey: #5a5f66;
+  --rf-snow: #f5f6f7;
+  --rf-line: #d9dce0;
+  --rf-night: #14161a;
+  --rf-link: #0b62b8;
+  --rf-link-on-dark: #6fb1f2;
 
   --sl-font: 'Inter Variable', ui-sans-serif, system-ui, sans-serif;
   --sl-font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
@@ -17,33 +18,33 @@
 /* Starlight names its greys by role: in dark mode white is the strongest text and black the page
    background; in light mode the scale is inverted. */
 :root[data-theme='dark'] {
-  --sl-color-white: var(--rf-paper);
-  --sl-color-gray-1: #e6e3da;
-  --sl-color-gray-2: #c4c8cc;
-  --sl-color-gray-3: #8f9ba6;
-  --sl-color-gray-4: #5e6d7b;
-  --sl-color-gray-5: #2b3b4c;
-  --sl-color-gray-6: #172637;
-  --sl-color-gray-7: #0b1622;
-  --sl-color-black: var(--rf-ink);
-  --sl-color-accent-low: #0b3552;
-  --sl-color-accent: #3c93c4;
-  --sl-color-accent-high: var(--rf-clinical-on-ink);
+  --sl-color-white: #f5f6f7;
+  --sl-color-gray-1: #e3e5e8;
+  --sl-color-gray-2: #c3c7cc;
+  --sl-color-gray-3: #9aa0a8;
+  --sl-color-gray-4: #6b727b;
+  --sl-color-gray-5: #2c3036;
+  --sl-color-gray-6: #1b1e23;
+  --sl-color-gray-7: #101215;
+  --sl-color-black: var(--rf-night);
+  --sl-color-accent-low: #0e2a45;
+  --sl-color-accent: #2f7fd0;
+  --sl-color-accent-high: var(--rf-link-on-dark);
 }
 
 :root[data-theme='light'] {
-  --sl-color-white: var(--rf-ink);
-  --sl-color-gray-1: #1e2c3b;
-  --sl-color-gray-2: #34424f;
-  --sl-color-gray-3: #55626e;
-  --sl-color-gray-4: #7f8a94;
-  --sl-color-gray-5: var(--rf-stone);
-  --sl-color-gray-6: #ece9e0;
-  --sl-color-gray-7: #f4f1e9;
-  --sl-color-black: var(--rf-paper);
-  --sl-color-accent-low: #d5e7f1;
-  --sl-color-accent: var(--rf-clinical);
-  --sl-color-accent-high: #00415f;
+  --sl-color-white: var(--rf-charcoal);
+  --sl-color-gray-1: #2e3238;
+  --sl-color-gray-2: #43484f;
+  --sl-color-gray-3: var(--rf-grey);
+  --sl-color-gray-4: #6f757c;
+  --sl-color-gray-5: var(--rf-line);
+  --sl-color-gray-6: #eceef0;
+  --sl-color-gray-7: var(--rf-snow);
+  --sl-color-black: #ffffff;
+  --sl-color-accent-low: #e3eefa;
+  --sl-color-accent: var(--rf-link);
+  --sl-color-accent-high: #084a8c;
 }
 
 h1,
@@ -54,4 +55,35 @@ h3 {
 
 .sl-markdown-content :is(h1, h2, h3, h4) {
   font-weight: 700;
+}
+
+/* Docs: the landing page's hard edges, carried into Starlight. Only Starlight's own selectors are
+   used here, so the landing page is unaffected. */
+.header {
+  border-bottom: 2px solid var(--sl-color-white);
+}
+#_top {
+  font-size: clamp(2.2rem, 5vw, 3.2rem);
+  font-weight: 800;
+  letter-spacing: -0.05em;
+  line-height: 1;
+}
+.sidebar-content a[aria-current='page'] {
+  border-radius: 0.5rem;
+  background-color: var(--sl-color-white) !important;
+  color: var(--sl-color-black) !important;
+  font-weight: 700;
+}
+.expressive-code {
+  --ec-brdWd: 2px;
+  --ec-brdRad: 0.9rem;
+  --ec-brdCol: var(--sl-color-white);
+}
+.expressive-code .frame {
+  box-shadow: 5px 5px 0 var(--sl-color-gray-5);
+}
+.starlight-aside {
+  border-width: 2px;
+  border-style: solid;
+  border-radius: 0.9rem;
 }

@@ -1,0 +1,173 @@
+---
+// A scripted, in-browser simulation, and it says so. Two screens ask the same question. The left one
+// is a plain FHIR query: true when it was fetched, and stale after. The right one is a live query:
+// it always shows the current answer. Without JavaScript the controls stay hidden and both lists
+// show the starting state.
+const meds = ['Metformin 500 mg', 'Lisinopril 10 mg', 'Atorvastatin 20 mg'];
+---
+
+<section class="section" id="playground" aria-labelledby="play-title">
+  <div class="wrap">
+    <p class="kicker">Try it</p>
+    <h2 id="play-title">Change the record. Watch both screens.</h2>
+
+    <div class="play" data-play>
+      <div class="play__controls" data-controls hidden>
+        <button type="button" class="btn btn--primary" data-next>Change the record</button>
+        <button type="button" class="btn" data-reset>Start over</button>
+        <span class="play__next" data-next-label></span>
+      </div>
+
+      <div class="play__panes">
+        <section class="pane" aria-labelledby="pane-std">
+          <h3 id="pane-std">A plain FHIR query</h3>
+          <code class="pane__query">GET /MedicationRequest?<wbr />patient=Patient/123&amp;<wbr />status=active</code>
+          <ul class="meds" data-list="std">
+            {meds.map((m) => <li class="med">{m}</li>)}
+          </ul>
+          <p class="pane__status" data-status="std">True when it was fetched.</p>
+          <button type="button" class="btn btn--small" data-refresh hidden>Ask again</button>
+        </section>
+
+        <section class="pane pane--live" aria-labelledby="pane-live">
+          <h3 id="pane-live">A ReFHIR live query</h3>
+          <code class="pane__query">the same query, kept open</code>
+          <ul class="meds" data-list="live">
+            {meds.map((m) => <li class="med">{m}</li>)}
+          </ul>
+          <p class="pane__status" data-status="live">Kept current by the server.</p>
+        </section>
+      </div>
+
+      <p class="play__log" data-log aria-live="polite">Both screens start with the same list.</p>
+      <noscript><p class="note">This demo needs JavaScript. Without it, both screens show the starting list.</p></noscript>
+    </div>
+  </div>
+</section>
+
+<script>
+  const root = document.querySelector<HTMLElement>('[data-play]');
+  if (root) {
+    const start = ['Metformin 500 mg', 'Lisinopril 10 mg', 'Atorvastatin 20 mg'];
+    const steps = [
+      {
+        label: 'Stop Lisinopril',
+        say: 'A clinician stops Lisinopril.',
+        apply: (l: string[]) => l.filter((m) => m !== 'Lisinopril 10 mg'),
+      },
+      {
+        label: 'Start Amlodipine',
+        say: 'A clinician starts Amlodipine.',
+        apply: (l: string[]) => [...l, 'Amlodipine 5 mg'],
+      },
+      {
+        label: 'Swap Atorvastatin for Rosuvastatin in one transaction',
+        say: 'One transaction swaps Atorvastatin for Rosuvastatin. The live query shows it as a single step, never half done.',
+        apply: (l: string[]) => l.filter((m) => m !== 'Atorvastatin 20 mg').concat('Rosuvastatin 10 mg'),
+      },
+      {
+        label: 'Discharge the patient',
+        say: 'The patient is discharged and every order is stopped.',
+        apply: () => [] as string[],
+      },
+    ];
+
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const controls = q<HTMLElement>('[data-controls]');
+    const next = q<HTMLButtonElement>('[data-next]');
+    const nextLabel = q<HTMLElement>('[data-next-label]');
+    const refresh = q<HTMLButtonElement>('[data-refresh]');
+    const log = q<HTMLElement>('[data-log]');
+    const reset = q<HTMLButtonElement>('[data-reset]');
+    const stdList = q<HTMLElement>('[data-list="std"]');
+    const liveList = q<HTMLElement>('[data-list="live"]');
+    const stdStatus = q<HTMLElement>('[data-status="std"]');
+    const liveStatus = q<HTMLElement>('[data-status="live"]');
+
+    let server = [...start];
+    let snapshot = [...start];
+    let at = 0;
+    let missed = 0;
+    let pushes = 0;
+    let timer = 0;
+
+    const paint = (el: HTMLElement, items: string[], fresh: string[] = [], gone: string[] = []) => {
+      el.replaceChildren(
+        ...[...items, ...gone].map((text) => {
+          const li = document.createElement('li');
+          li.className = 'med';
+          if (fresh.includes(text)) li.classList.add('med--new');
+          if (gone.includes(text)) li.classList.add('med--gone');
+          li.textContent = text;
+          return li;
+        })
+      );
+      if (items.length === 0 && gone.length === 0) {
+        const li = document.createElement('li');
+        li.className = 'med med--empty';
+        li.textContent = 'No active medications';
+        el.append(li);
+      }
+    };
+
+    // Hiding the control that has focus would drop focus onto the page; hand it to another control first.
+    const hide = (el: HTMLElement, shouldHide: boolean, fallback: HTMLElement) => {
+      if (shouldHide && document.activeElement === el) fallback.focus();
+      el.hidden = shouldHide;
+    };
+
+    const status = () => {
+      stdStatus.textContent =
+        missed === 0
+          ? 'True when it was fetched.'
+          : `Out of date. It has missed ${missed} change${missed === 1 ? '' : 's'}.`;
+      stdStatus.classList.toggle('is-stale', missed > 0);
+      hide(refresh, missed === 0, reset);
+      liveStatus.textContent = pushes === 0 ? 'Kept current by the server.' : `Up to date. ${pushes} update${pushes === 1 ? '' : 's'} received.`;
+      const step = steps[at];
+      hide(next, !step, reset);
+      nextLabel.textContent = step ? `Next: ${step.label}` : 'That is every change. Start over to run it again.';
+    };
+
+    const apply = () => {
+      const step = steps[at];
+      if (!step) return;
+      const before = server;
+      server = step.apply(server);
+      at += 1;
+      missed += 1;
+      pushes += 1;
+      const fresh = server.filter((m) => !before.includes(m));
+      const gone = before.filter((m) => !server.includes(m));
+      paint(liveList, server, fresh, gone);
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => paint(liveList, server), 1100);
+      log.textContent = step.say;
+      status();
+    };
+
+    next.addEventListener('click', apply);
+    refresh.addEventListener('click', () => {
+      snapshot = [...server];
+      missed = 0;
+      paint(stdList, snapshot);
+      log.textContent = 'The plain query asked again, and now shows the current list. Someone, or some code, had to ask.';
+      status();
+    });
+    reset.addEventListener('click', () => {
+      server = [...start];
+      snapshot = [...start];
+      at = 0;
+      missed = 0;
+      pushes = 0;
+      paint(stdList, snapshot);
+      paint(liveList, server);
+      log.textContent = 'Press "Change the record" to begin.';
+      status();
+    });
+
+    controls.hidden = false;
+    log.textContent = 'Press "Change the record" to begin.';
+    status();
+  }
+</script>

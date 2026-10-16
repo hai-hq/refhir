@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 
-import { sidebar, synced } from '../docs-manifest.mjs';
+import { generated, sidebar, synced } from '../docs-manifest.mjs';
 import { listRepoFiles, siteRoot } from './lib/repo.mjs';
 
 const { files } = listRepoFiles();
@@ -29,11 +29,29 @@ test('every synced page is in the sidebar, so none is an orphan', () => {
   for (const { slug } of synced) assert.ok(sidebarSlugs.includes(slug), `${slug} is not in the sidebar`);
 });
 
-test('every sidebar slug is a synced page or a page written in site/', () => {
-  const syncedSlugs = new Set(synced.map((e) => e.slug));
+test('every sidebar slug is a synced page, a generated page or a page written in site/', () => {
+  const known = new Set([...synced, ...generated].map((e) => e.slug));
   for (const slug of sidebarSlugs) {
-    assert.ok(syncedSlugs.has(slug) || authored(slug), `${slug} has no page`);
+    assert.ok(known.has(slug) || authored(slug), `${slug} has no page`);
   }
+});
+
+test('every generated page is in the sidebar', () => {
+  for (const { slug } of generated) assert.ok(sidebarSlugs.includes(slug), `${slug} is not in the sidebar`);
+});
+
+test('every page written in site/ is in the sidebar, so none is an orphan', () => {
+  const root = path.join(siteRoot, 'src/content/docs/docs');
+  const pages = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (/\.mdx?$/.test(entry.name)) pages.push(path.relative(path.join(siteRoot, 'src/content/docs'), full).replace(/\.mdx?$/, ''));
+    }
+  };
+  walk(root);
+  for (const slug of pages) assert.ok(sidebarSlugs.includes(slug), `${slug} is written in site/ but not in the sidebar`);
 });
 
 test('no slug appears in the sidebar twice', () => {

@@ -11,6 +11,8 @@ const SITE = 'https://refhir.haihq.org';
 export default defineConfig({
   site: SITE,
   trailingSlash: 'always',
+  // Astro 7's default ('jsx') drops the space between text and an inline element on the next line.
+  compressHTML: true,
   // The docs have no index page of their own; send /docs/ to the first page.
   redirects: { '/docs': '/docs/introduction/' },
   integrations: [
@@ -34,13 +36,32 @@ export default defineConfig({
         './src/styles/brand.css',
       ],
       sidebar,
+      // The docs use ```env fences; Shiki calls that language dotenv.
+      expressiveCode: { shiki: { langAlias: { env: 'dotenv' } } },
       head: [
-        { tag: 'meta', attrs: { property: 'og:image', content: `${SITE}/brand/social-preview.png` } },
-        { tag: 'meta', attrs: { property: 'og:image:width', content: '1280' } },
-        { tag: 'meta', attrs: { property: 'og:image:height', content: '640' } },
+        { tag: 'meta', attrs: { property: 'og:image', content: `${SITE}/brand/og-image.png` } },
+        { tag: 'meta', attrs: { property: 'og:image:type', content: 'image/png' } },
+        { tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+        { tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+        {
+          tag: 'meta',
+          attrs: {
+            property: 'og:image:alt',
+            content: 'ReFHIR: FHIR data that updates itself. An open-source FHIR server with live queries.',
+          },
+        },
+        { tag: 'meta', attrs: { property: 'og:locale', content: 'en_US' } },
         { tag: 'meta', attrs: { name: 'twitter:card', content: 'summary_large_image' } },
-        { tag: 'meta', attrs: { name: 'twitter:image', content: `${SITE}/brand/social-preview.png` } },
-        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/brand/refhir-icon-512.png' } },
+        { tag: 'meta', attrs: { name: 'twitter:image', content: `${SITE}/brand/og-image.png` } },
+        {
+          tag: 'meta',
+          attrs: {
+            name: 'twitter:image:alt',
+            content: 'ReFHIR: FHIR data that updates itself. An open-source FHIR server with live queries.',
+          },
+        },
+        { tag: 'link', attrs: { rel: 'icon', href: '/favicon.ico', sizes: '48x48' } },
+        { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
       ],
       // Docs show commands against http://127.0.0.1:8080, so local links are expected. Relative
       // links and bad anchors still fail the build.

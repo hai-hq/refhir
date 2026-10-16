@@ -1,0 +1,180 @@
+---
+title: Register a SMART app
+description: Register a client, get an access token with the authorization code and PKCE flow, and use it on REST and on /sync.
+---
+
+import { Aside, Steps } from '@astrojs/starlight/components';
+
+This walkthrough takes a local server from "SMART is on" to a working access token using only
+`curl`. It uses the demo login, which accepts any username, so it is for trying SMART out. For real users, configure an OpenID Connect provider; see
+[Production deployment](/docs/operate/production/#smart-sign-in-openid-connect).
+
+For what the server implements, see [SMART on FHIR](/docs/guides/smart/) and
+[SMART support](/docs/reference/smart-support/).
+
+## Start a server with SMART on
+
+```bash
+refhir --memory --smart --smart-demo-login --smart-dcr-token dev-dcr
+```
+
+- `--smart` turns on SMART App Launch 2.2. The server will not start with it unless a login is
+  configured, which is what `--smart-demo-login` is.
+- `--smart-dcr-token` is the _initial access token_ that lets you register clients. If you leave it
+  out, the server generates one and prints it once to the terminal. Under Docker or `nohup`
+  there is no terminal, so set it yourself or in `REFHIR_SMART_DCR_TOKEN`.
+- Without `--public-url`, the server's address is its loopback address. On any other bind, `--smart`
+  needs `--public-url`, and the demo login is refused unless
+  `REFHIR_ALLOW_REMOTE_DEMO_LOGIN=1` is set.
+
+Discovery tells a client where everything is:
+
+```bash
+curl -s http://127.0.0.1:8080/.well-known/smart-configuration
+```
+
+<Steps>
+
+1. **Register a client.**
+
+   ```bash
+   curl -s -X POST http://127.0.0.1:8080/oauth/register \
+     -H 'Authorization: Bearer dev-dcr' \
+     -H 'Content-Type: application/json' \
+     -d '{
+       "token_endpoint_auth_method": "none",
+       "redirect_uris": ["http://127.0.0.1:3000/cb"],
+       "scope": "openid fhirUser offline_access user/*.cruds"
+     }'
+   ```
+
+   The answer is `201` with a `client_id` such as `client-c8da2907-…`. Redirect URIs must be
+   `https`, or `http` on a loopback address. A wrong or missing initial access token is a `401`.
+   There are also two built-in clients, `public` and `confidential`, with loopback redirects.
+
+2. **Make a PKCE verifier and challenge.**
+
+   ```bash
+   VERIFIER=$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=\n' | cut -c1-64)
+   CHALLENGE=$(printf %s "$VERIFIER" | openssl dgst -binary -sha256 | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+   ```
+
+   The method is `S256`, and the verifier is 43 to 128 unreserved characters.
+
+3. **Start the authorization.**
+
+   ```bash
+   BASE=http://127.0.0.1:8080
+   curl -si -G $BASE/oauth/authorize \
+     --data-urlencode "response_type=code" \
+     --data-urlencode "client_id=$CLIENT_ID" \
+     --data-urlencode "redirect_uri=http://127.0.0.1:3000/cb" \
+     --data-urlencode "scope=openid fhirUser offline_access user/*.cruds" \
+     --data-urlencode "state=xyz" \
+     --data-urlencode "aud=$BASE" \
+     --data-urlencode "code_challenge=$CHALLENGE" \
+     --data-urlencode "code_challenge_method=S256"
+   ```
+
+   The answer is a `302` whose `Location` is `/oauth/interact?session=sess-…`. Keep the session id.
+
+   <Aside type="caution" title="aud is required, and it must be this server">
+     Leave out `aud`, or send a different address, and the server redirects to your redirect URI
+     with `error=invalid_request&error_description=aud must be this FHIR server`. Use the server's
+     base URL exactly as discovery reports it in `issuer`.
+   </Aside>
+
+4. **Sign in and approve.**
+
+   In a browser, `Location` opens a page with a banner saying that the demo login accepts any
+   username and verifies nothing. From a script, send what that page's form sends:
+
+   ```bash
+   curl -si -X POST $BASE/oauth/interact \
+     --data-urlencode "session=$SESSION" \
+     --data-urlencode "username=dev" \
+     --data-urlencode "action=approve"
+   ```
+
+   The answer is a `302` to your redirect URI with `code=code-…&state=xyz`. Nothing needs to be
+   listening there, because you only read the code from the header. The code lasts five minutes.
+   A username may contain letters, digits, `-` and `.`; others show the form again. If the scopes
+   need a patient, the form also asks for one, and a script sends it as `patient_id`.
+
+5. **Exchange the code for a token.**
+
+   ```bash
+   curl -s -X POST $BASE/oauth/token \
+     -d grant_type=authorization_code \
+     -d "code=$CODE" \
+     --data-urlencode "redirect_uri=http://127.0.0.1:3000/cb" \
+     -d "client_id=$CLIENT_ID" \
+     -d "code_verifier=$VERIFIER"
+   ```
+
+   The answer holds `access_token`, `token_type: "Bearer"`, `expires_in` (3600 seconds), `scope`,
+   and, depending on the scopes, `id_token`, `fhirUser` and a `refresh_token`. A refresh token is
+   only issued when `offline_access` or `online_access` was granted.
+
+</Steps>
+
+## Use the token
+
+On REST, send it as a bearer token:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/Patient
+```
+
+`?access_token=$TOKEN` also works, which is what a browser WebSocket uses because it cannot set
+headers. Without a token, or with one the server does not know, the answer is a `401`:
+
+```text
+HTTP/1.1 401 Unauthorized
+www-authenticate: Bearer realm="refhir", error="invalid_token"
+
+{"issue":[{"code":"login","diagnostics":"a bearer token is required","severity":"error"}],"resourceType":"OperationOutcome"}
+```
+
+On `/sync`, give the client the token. The Go and Node TypeScript clients send it as an
+`Authorization` header on the upgrade, and the browser build sends `access_token` in the query:
+
+```js
+import { dial } from "@haihq/refhir";
+
+const client = await dial("http://127.0.0.1:8080", { token });
+```
+
+With SMART on, a socket opened without a token is refused with `401`, and the shipped clients treat
+that refusal as final.
+
+### Tokens expire
+
+An access token lasts one hour, and the clients take a token fixed at dial time. When it expires, the
+server closes the socket after sending `{"type":"FatalError","message":"the token expired or was
+revoked"}`. Dialing again with the same token is refused. Get a new token, with the refresh token
+or a new sign-in, and dial again. A refresh rotates the refresh token and cannot widen the scopes.
+
+## Scopes
+
+ReFHIR accepts SMART v1 and v2 scopes of the shape `patient/…`, `user/…` or `system/…` followed by
+`<Type or *>.<permission>`, where the permission is `read`, `write`, `*` or the letters `c`, `r`,
+`u`, `d`, `s` in that order. Scopes such as `openid`, `fhirUser`, `launch/patient` and
+`offline_access` give context or identity and no data access.
+
+A request the scope does not allow is a `403`:
+
+```json
+{"issue":[{"code":"forbidden","diagnostics":"scope does not allow this request","severity":"error"}],"resourceType":"OperationOutcome"}
+```
+
+A client registered with only `user/Patient.rs` can read patients but gets this for an
+`Observation`, and for any write. Unsupported scopes are silently dropped at authorization, so
+check the `scope` in the token response. On `/sync`, scopes are checked per message, not when the
+socket opens.
+
+## Backend services
+
+A backend client with no user registers with `token_endpoint_auth_method: "private_key_jwt"`, a
+`jwks` of its public keys, and only `system/` scopes. It authenticates at the token endpoint with a
+signed JWT assertion and the `client_credentials` grant, and its tokens last five minutes.
