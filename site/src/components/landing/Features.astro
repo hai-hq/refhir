@@ -1,0 +1,41 @@
+---
+// A grid of what is in the box. Every tile is in the "What is in it" table in README.md, in
+// docs/fhir-api.md, docs/clustering.md or docs/governance.md. The strict defaults are linked, not
+// hidden: someone evaluating a FHIR server should hear them.
+const tiles = [
+  { big: 'FHIR R4', wide: true },
+  { big: 'Search' },
+  { big: 'Transactions' },
+  { big: 'Bulk' },
+  { big: 'GraphQL' },
+  { big: 'Subscriptions' },
+  { big: 'SMART sign-in' },
+  { big: 'Every version kept' },
+  { big: 'Validation' },
+  { big: 'SQLite or Postgres', wide: true },
+  { big: 'Docker, Helm, binary' },
+  { big: 'Standby and replicas' },
+  { big: 'Audit trail', wide: true },
+];
+---
+
+<section class="section" id="features" aria-labelledby="features-title">
+  <div class="wrap">
+    <p class="kicker">What is inside</p>
+    <h2 id="features-title">A real FHIR server underneath.</h2>
+    <ul class="bento">
+      {
+        tiles.map((tile) => (
+          <li class={tile.wide ? 'bento__wide' : undefined}>
+            <strong>{tile.big}</strong>
+          </li>
+        ))
+      }
+    </ul>
+    <p class="more">
+      <a href="/docs/guides/fhir-api/">The FHIR API</a>
+      <a href="/docs/operate/production/">Deployment guide</a>
+      <a href="/docs/guides/fhir-api/#resource-ids">Strict defaults to know about</a>
+    </p>
+  </div>
+</section>

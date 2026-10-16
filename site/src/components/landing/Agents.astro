@@ -1,0 +1,40 @@
+---
+// The claims are docs/concepts/agents', run against a live server, with its limits stated. The four
+// steps are its pattern. The printed lines are that page's output. Commit-time revalidation is not built.
+import { Code } from 'astro:components';
+
+const printed = `agent reads 1 active medication(s) and starts reasoning
+context changed: now 0 active medication(s), so the agent re-plans
+write refused: If-Match 12 does not match version 13`;
+
+const steps = [
+  { name: 'Read', note: 'a live query keeps it current' },
+  { name: 'Reason', note: 'seconds or minutes pass' },
+  { name: 'Check', note: 'did the result change?' },
+  { name: 'Write', note: 'refused if the record moved' },
+];
+---
+
+<section class="section band" id="agents" aria-labelledby="agents-title">
+  <div class="wrap">
+    <p class="kicker">For agents</p>
+    <h2 id="agents-title">Live context for AI agents.</h2>
+
+    <ol class="loop" aria-label="An agent's loop">
+      {
+        steps.map((step, i) => (
+          <li class={i === 3 ? 'loop__write' : undefined}>
+            <span class="loop__num">{i + 1}</span>
+            <strong>{step.name}</strong>
+            <span>{step.note}</span>
+          </li>
+        ))
+      }
+    </ol>
+    <p class="loop__back" aria-hidden="true">changed? re-plan, and go round again</p>
+
+    <div class="agents__out">
+      <Code code={printed} lang="text" theme="github-dark" />
+    </div>
+  </div>
+</section>

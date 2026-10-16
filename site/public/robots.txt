@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://refhir.haihq.org/sitemap-index.xml

@@ -1,0 +1,119 @@
+---
+import '@fontsource-variable/inter/index.css';
+import '@fontsource/ibm-plex-mono/500.css';
+import '../styles/brand.css';
+import '../styles/landing.css';
+// The Inter file the first paint needs. Preloading it avoids a flash of the fallback font.
+import interLatin from '@fontsource-variable/inter/files/inter-latin-wght-normal.woff2?url';
+
+import Footer from '../components/landing/Footer.astro';
+import Header from '../components/landing/Header.astro';
+import { workspaceVersion } from '../lib/repo';
+
+interface Props {
+  title: string;
+  description: string;
+}
+
+const { title, description } = Astro.props;
+const site = Astro.site ?? new URL('https://refhir.haihq.org');
+const origin = site.origin;
+const canonical = new URL('/', site).href;
+// The share image is 1200 by 630, the size link previews expect. The 1280 by 640 card is GitHub's.
+const image = new URL('/brand/og-image.png', site).href;
+const imageAlt = 'ReFHIR: FHIR data that updates itself. An open-source FHIR server with live queries.';
+
+// Structured data. Every value is a fact the repository states: the license is LICENSE, the
+// version is Cargo.toml (read at build time), HAIHQ describes itself in these words on haihq.org.
+const structuredData = {
+  '@context': 'https://schema.org',
+  '@graph': [
+    {
+      '@type': 'WebSite',
+      '@id': `${origin}/#website`,
+      url: canonical,
+      name: 'ReFHIR',
+      description,
+      inLanguage: 'en',
+      publisher: { '@id': 'https://haihq.org/#organization' },
+    },
+    {
+      '@type': 'Organization',
+      '@id': 'https://haihq.org/#organization',
+      name: 'HAIHQ',
+      url: 'https://haihq.org/',
+      description:
+        'A nonprofit, open-source research organization building models, datasets, benchmarks and tooling for Health AI.',
+    },
+    {
+      '@type': 'SoftwareApplication',
+      '@id': `${origin}/#software`,
+      name: 'ReFHIR',
+      description,
+      url: canonical,
+      image,
+      applicationCategory: 'DeveloperApplication',
+      applicationSubCategory: 'FHIR server',
+      operatingSystem: 'Linux (container image), or build from source',
+      softwareVersion: workspaceVersion(),
+      license: 'https://www.apache.org/licenses/LICENSE-2.0',
+      isAccessibleForFree: true,
+      offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+      publisher: { '@id': 'https://haihq.org/#organization' },
+      sameAs: ['https://github.com/hai-hq/refhir'],
+      softwareHelp: { '@type': 'CreativeWork', url: `${origin}/docs/introduction/` },
+    },
+  ],
+};
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="canonical" href={canonical} />
+    <link rel="sitemap" type="application/xml" href="/sitemap-index.xml" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#14161a" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="/favicon.ico" sizes="48x48" />
+    <link rel="icon" href="/brand/refhir-icon.svg" type="image/svg+xml" sizes="any" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="preload" as="font" type="font/woff2" href={interLatin} crossorigin />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="ReFHIR" />
+    <meta property="og:locale" content="en_US" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={image} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={imageAlt} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={image} />
+    <meta name="twitter:image:alt" content={imageAlt} />
+    <script type="application/ld+json" set:html={JSON.stringify(structuredData)} />
+    <!-- Follow the theme the reader chose in the docs, before first paint. -->
+    <script is:inline>
+      try {
+        const theme = localStorage.getItem('starlight-theme');
+        if (theme === 'dark' || theme === 'light') document.documentElement.dataset.theme = theme;
+      } catch (_) {}
+    </script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <Header />
+    <main id="main">
+      <slot />
+    </main>
+    <Footer />
+  </body>
+</html>
