@@ -45,23 +45,27 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
-- **A running server keeps an index of its definitions and terminology, and reads each one the
-  first time a request needs it.** It used to hold every StructureDefinition, code system, value
-  set expansion and concept map of the installed packages in memory: about 100 MB for R4 core,
-  SDC and what they depend on, nearly all of what the process used. It now holds an index of them,
-  about 15 MB, and reads a definition, code system, expansion or concept map from the database when
-  a request first uses it. What it read stays, up to about 8 MB of each kind, until other reads
-  push it out: a server that has validated a mix of requests holds a few megabytes more, and one
-  that has been asked about every value set the packages define holds about 40 MB. On macOS the
-  running server's private memory went from about 90 MB to about 17 MB. What a request is
+- **A running server holds what every request needs and an index of the rest, and reads the rest
+  the first time a request uses it.** It used to hold every StructureDefinition, code system,
+  value set expansion and concept map of the installed packages in memory: about 100 MB for R4
+  core, SDC and what they depend on, nearly all of what the process used. It now holds the base
+  types (every resource, data type and primitive), the value sets their bindings check a code
+  against and the code systems behind those, which is what a request of any common kind is
+  validated with, and an index of everything else, about 27 MB in all. A profile, an extension, a
+  concept map or a table nothing binds is read from the database the first time a request uses it,
+  and kept, up to about 8 MB of each kind, until other reads push it out; a server that has been
+  asked about every value set the packages define holds about 48 MB. On macOS the running
+  server's private memory went from about 90 MB to about 27 MB. A request of a common kind reads
+  nothing from the database, the first time or after (a test checks it); the first request that
+  names a profile waits for a read of a few milliseconds, and the next does not. What a request is
   answered does not change, and a catalog loaded this way is checked against one that holds
-  everything, for every definition and expansion of R4 core. What changes is that the first
-  request to use a profile, value set or code system waits for a read (a first `Patient`
-  validation takes about 16 ms, about 8 ms more than before, and the next takes about 2 ms), and
-  that validating a resource is about a third faster once its definitions are read, because they
-  are shared and no longer copied for each request. A replica or standby that reloads its catalog
-  when the primary changes it starts with nothing read; between the change and the reload it can
-  read a row the primary has just written that its index does not describe yet.
+  everything, for every definition and expansion of R4 core. Validating a resource is about a
+  third faster, because a definition is shared and no longer copied for each request. A restart
+  reads what is held, which can take up to half a second longer. When the catalog is rebuilt (a
+  package, a change to a search parameter) or a replica or standby reloads it after the primary
+  changed it, the new catalog reads what the old one had in use before it takes its place, while
+  the old one is still answering, so requests are not sent back to waiting. A replica that lags the
+  primary can read a row the primary has just written that its index does not describe yet.
 - **A first start stores each package as it reads it.** The prepared file (see below) holds a
   package as values of about 4 MB of rows, and the database takes them one at a time inside one
   transaction, so a package is stored whole or not at all, as before. The largest default package

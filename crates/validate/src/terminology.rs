@@ -206,11 +206,16 @@ struct Systems {
     loader: Option<Loading>,
 }
 
+/// Where in `variants` the variant `scope` holds is, or the one loaded last when it holds none.
+fn variant_position(variants: &[Variant], scope: Option<Scope>) -> Option<usize> {
+    scope
+        .and_then(|scope| variants.iter().rposition(|v| v.held_by(scope)))
+        .or(variants.len().checked_sub(1))
+}
+
 /// The variant `scope` holds, or the one loaded last when it holds none.
 fn variant_for(variants: &[Variant], scope: Option<Scope>) -> Option<&Variant> {
-    scope
-        .and_then(|scope| variants.iter().rev().find(|v| v.held_by(scope)))
-        .or_else(|| variants.last())
+    variants.get(variant_position(variants, scope)?)
 }
 
 fn held_by(variants: &[Variant], scope: Scope) -> bool {
@@ -357,6 +362,27 @@ impl Systems {
             .get(url)
             .map(|versions| versions.keys().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Read the content that [`Self::resolve_in`] gives for this reference and keep it, so a
+    /// lookup of it never waits for a read again. What is already held is left as it is.
+    fn hold(&mut self, scope: Option<Scope>, url: &str, version: Option<&str>) {
+        let Some((found, variant)) = self.pick_in(scope, false, url, version) else {
+            return;
+        };
+        if variant.index.is_some() {
+            return;
+        }
+        let found = found.to_string();
+        let Some(content) = self.content(variant) else {
+            return;
+        };
+        let Some(variants) = self.by_url.get_mut(url).and_then(|v| v.get_mut(&found)) else {
+            return;
+        };
+        if let Some(position) = variant_position(variants, scope) {
+            variants[position].index = Some(content);
+        }
     }
 }
 
@@ -506,6 +532,43 @@ impl Loader {
             .clear();
     }
 
+    /// The rows read lately and still kept, least recently read first.
+    fn resident(&self) -> Resident {
+        Resident {
+            systems: self.systems.keys(),
+            expansions: self.expansions.keys(),
+            definitions: self.definitions.keys(),
+            maps: self.maps.keys(),
+        }
+    }
+
+    /// Read every row `resident` lists that is still there.
+    fn warm(&self, resident: &Resident) {
+        for (package, key) in &resident.systems {
+            let _ = self.system(*package, key);
+        }
+        for (package, key, inline) in &resident.expansions {
+            let origin = if *inline {
+                Origin::Definition {
+                    package: *package,
+                    key: Some(key.clone()),
+                }
+            } else {
+                Origin::Expansion {
+                    package: *package,
+                    key: Some(key.clone()),
+                }
+            };
+            let _ = self.expansion(key, &origin);
+        }
+        for (package, key) in &resident.definitions {
+            let _ = self.definition(*package, key);
+        }
+        for (package, key) in &resident.maps {
+            let _ = self.map(*package, key);
+        }
+    }
+
     fn system(&self, package: Scope, key: &str) -> Option<Arc<SystemIndex>> {
         self.systems.get_or_load(
             &(package, key.to_string()),
@@ -572,6 +635,17 @@ impl Loader {
             },
         )
     }
+}
+
+/// The rows a terminology that reads when used has read lately and still keeps, as the package and
+/// key each is stored under: what a terminology that replaces it reads at once, so that a reload
+/// does not send the requests that were being answered back to waiting for reads.
+#[derive(Clone, Debug, Default)]
+pub struct Resident {
+    systems: Vec<(Scope, String)>,
+    expansions: Vec<(Scope, String, bool)>,
+    definitions: Vec<(Scope, String)>,
+    maps: Vec<(Scope, String)>,
 }
 
 /// A handle to the [`Loader`] of a terminology. A copy of a terminology reads from the same
@@ -1229,6 +1303,72 @@ impl MemoryTerminology {
             builder.add_expansion(*scope, document);
         }
         builder.finish()
+    }
+
+    /// Read the expansions of these value sets, and the code systems they were made from, and
+    /// keep them, so a request that checks a code against one of them never waits for a read.
+    /// Terminology that holds everything already does, and nothing is done.
+    ///
+    /// This is for the value sets the base types bind (see `Schema::checked_value_sets`): a few
+    /// hundred expansions of a few kilobytes and the code systems behind them, megabytes in all.
+    /// What a request uses beyond them is read when it is used, and kept while it is among the
+    /// most recently used.
+    pub fn hold(&mut self, value_sets: &BTreeSet<String>) {
+        let Some(loader) = self.loader.as_ref().map(|loading| loading.0.clone()) else {
+            return;
+        };
+        let mut drawn: BTreeSet<(Option<Scope>, String, String)> = BTreeSet::new();
+        let mut read = Vec::new();
+        for url in value_sets {
+            let url = canonical(url);
+            let Some(Answer::Stored {
+                origin,
+                scope,
+                systems,
+            }) = self.expansions.get(url).cloned()
+            else {
+                continue;
+            };
+            let Some(expansion) = loader.expansion(url, &origin) else {
+                continue;
+            };
+            for (system, version) in systems.iter() {
+                drawn.insert((scope, system.clone(), version.clone()));
+            }
+            read.push((url.to_string(), expansion));
+        }
+        for (url, expansion) in read {
+            self.expansions.insert(url, Answer::Held(expansion));
+        }
+        // The version of a system an expansion was made from is what describes its codes, and the
+        // latest installed is what describes a code that no version names.
+        for (scope, system, version) in drawn {
+            if !version.is_empty() {
+                self.systems.hold(scope, &system, Some(&version));
+            }
+            self.systems.hold(None, &system, None);
+        }
+        // What was read to be kept is kept where it is, not a second time in the caches.
+        loader.clear();
+    }
+
+    /// What has been read from the store lately and is still kept: what a terminology that
+    /// replaces this one can be told to read at once (see [`Self::warm`]). Terminology that holds
+    /// everything has nothing of the kind.
+    pub fn resident(&self) -> Resident {
+        match &self.loader {
+            Some(loading) => loading.0.resident(),
+            None => Resident::default(),
+        }
+    }
+
+    /// Read what `resident` lists, so that the requests that used it before this terminology
+    /// replaced the one they were read for do not wait for it again. A row that is no longer
+    /// there is passed over.
+    pub fn warm(&self, resident: &Resident) {
+        if let Some(loading) = &self.loader {
+            loading.0.warm(resident);
+        }
     }
 
     /// Why `url` has no expansion, or `None` when it has one. A value set that cannot be
@@ -5751,5 +5891,101 @@ mod tests {
         assert_eq!(copy.contains(SET, None, "a"), TermAnswer::Yes);
         assert_eq!(shelf.reads.load(Relaxed), 2);
         assert_eq!(copy.documents(), lazy.documents());
+    }
+
+    #[test]
+    fn terminology_that_holds_what_a_request_needs_answers_as_before() {
+        for (resources, release) in lazy_scenarios() {
+            let stored = stored_expansions(&resources, release);
+            let held = held(&resources, &stored, release);
+            let (mut lazy, shelf) = lazily(&resources, &stored, release);
+            let every: Names<String> = resources
+                .iter()
+                .filter(|(_, item)| item["resourceType"] == "ValueSet")
+                .map(|(_, item)| url_of(item))
+                .collect();
+            lazy.hold(&every);
+            assert_alike(&held, &lazy);
+            // The same, with everything read again each time except what is held.
+            lazy.squeeze();
+            assert_alike(&held, &lazy);
+            assert!(shelf.reads.load(Relaxed) > 0);
+        }
+    }
+
+    #[test]
+    fn what_is_held_is_read_once_and_a_request_for_it_reads_nothing() {
+        let (r4, _) = r4_and_its_r5_style_copy();
+        let extra = package(
+            1,
+            vec![
+                versioned_system("http://example.org/other", "1", &["q"]),
+                value_set(
+                    "http://example.org/other-set",
+                    json!({"include": [{"system": "http://example.org/other"}]}),
+                ),
+            ],
+        );
+        let resources = together(&[&r4, &extra]);
+        let stored = stored_expansions(&resources, Some("4.0.1"));
+        let (mut lazy, shelf) = lazily(&resources, &stored, Some("4.0.1"));
+        let reads = || shelf.reads.load(Relaxed);
+        lazy.hold(&Names::from([
+            SET.to_string(),
+            "http://example.org/not-a-value-set".to_string(),
+        ]));
+        // The expansion, and the one version of its code system, were each read once.
+        assert_eq!(reads(), 2);
+        let after_hold = reads();
+        // Checking a code, describing it from the version the set was made from, and describing
+        // it as the latest of its system: nothing is read.
+        assert_eq!(lazy.contains(SET, None, "a"), TermAnswer::Yes);
+        assert_eq!(lazy.contains(SET, Some(R4_SYSTEM), "b"), TermAnswer::Yes);
+        assert!(lazy.describe_bound(SET, Some(R4_SYSTEM), "a").is_some());
+        assert!(lazy.describe(R4_SYSTEM, "a").is_some());
+        assert_eq!(reads(), after_hold);
+        // What was not held is read when used, as before.
+        assert_eq!(
+            lazy.contains("http://example.org/other-set", None, "q"),
+            TermAnswer::Yes
+        );
+        assert_eq!(reads(), after_hold + 1);
+        // Terminology that holds everything has nothing to hold, and a hold does nothing to it.
+        let mut everything = held(&resources, &stored, Some("4.0.1"));
+        let before = everything.documents();
+        everything.hold(&Names::from([SET.to_string()]));
+        assert_eq!(everything.documents(), before);
+        // A copy that is made reads what it is asked, and keeps what was held.
+        let copy = lazy.clone();
+        assert_eq!(copy.contains(SET, None, "a"), TermAnswer::Yes);
+        assert_eq!(reads(), after_hold + 1);
+    }
+
+    #[test]
+    fn what_a_terminology_read_lately_a_replacing_one_reads_at_once() {
+        let (r4, _) = r4_and_its_r5_style_copy();
+        let stored = stored_expansions(&r4, None);
+        let (old, shelf) = lazily(&r4, &stored, None);
+        assert_eq!(old.contains(SET, None, "a"), TermAnswer::Yes);
+        assert!(old.describe_bound(SET, Some(R4_SYSTEM), "a").is_some());
+        let reads = shelf.reads.load(Relaxed);
+        assert!(reads >= 2);
+        // The one that replaces it is built from the same store, and knows nothing of what was read.
+        let (new, new_shelf) = lazily(&r4, &stored, None);
+        assert_eq!(new_shelf.reads.load(Relaxed), 0);
+        new.warm(&old.resident());
+        assert_eq!(new_shelf.reads.load(Relaxed), reads);
+        // What was read is there: the same questions read nothing more.
+        assert_eq!(new.contains(SET, None, "a"), TermAnswer::Yes);
+        assert!(new.describe_bound(SET, Some(R4_SYSTEM), "a").is_some());
+        assert_eq!(new_shelf.reads.load(Relaxed), reads);
+        // A row that is no longer in the store is passed over.
+        let (empty, empty_shelf) = lazily(&[], &[], None);
+        empty.warm(&old.resident());
+        assert_eq!(empty_shelf.reads.load(Relaxed), reads);
+        // Terminology that holds everything has nothing to warm from or to.
+        let everything = held(&r4, &stored, None);
+        new.warm(&everything.resident());
+        assert_eq!(new_shelf.reads.load(Relaxed), reads);
     }
 }

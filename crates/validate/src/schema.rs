@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -80,6 +80,14 @@ pub struct TypeRef {
 pub struct Binding {
     pub strength: String,
     pub value_set: String,
+}
+
+impl Binding {
+    /// Whether a code is checked against the value set: a `preferred` or `example` binding is
+    /// guidance, and nothing is asked of the terminology for it.
+    pub fn is_checked(&self) -> bool {
+        self.strength != "preferred" && self.strength != "example"
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -402,16 +410,26 @@ impl SchemaBuilder {
     }
 
     /// Add a definition that package `package` stores. On a builder made by [`Self::lazy`] only an
-    /// index of it is kept; on any other the structure is compiled and kept, as [`Self::add`] does.
+    /// index of it is kept, except for a base type (a resource, a data type or a primitive: what
+    /// `derivation` calls a specialization), which is compiled and kept. Every request is
+    /// validated against base types, so the first request of each kind must not wait for one to
+    /// be read; they are about a quarter of the definitions of the R4 packages and a few
+    /// megabytes. A profile, an extension or anything else is read when it is used. On a builder
+    /// that is not lazy every structure is compiled and kept, as [`Self::add`] does.
     pub fn add_stored(&mut self, package: i64, definition: &Json) {
         if self.source.is_none() {
             self.add(definition);
             return;
         }
-        self.model.add(definition);
         let Some(head) = head_of(definition) else {
+            self.model.add(definition);
             return;
         };
+        if head.derivation == "specialization" {
+            self.add(definition);
+            return;
+        }
+        self.model.add(definition);
         let elements = head.elements;
         self.index(definition, &head, Entry::Stored { package, elements });
     }
@@ -514,6 +532,40 @@ impl Schema {
 
     pub fn primitive_regex(&self, code: &str) -> Option<&str> {
         self.primitive_regex.get(code).map(String::as_str)
+    }
+
+    /// The value sets that a code is checked against, as the structures held here bind them
+    /// (see [`Binding::is_checked`]). A terminology that reads when used is told to keep what
+    /// these draw on, so a request does not wait for it.
+    pub fn checked_value_sets(&self) -> BTreeSet<String> {
+        self.by_url
+            .values()
+            .filter_map(|entry| match entry {
+                Entry::Held(structure) => Some(structure),
+                Entry::Stored { .. } => None,
+            })
+            .flat_map(|structure| structure.elements.iter())
+            .filter_map(|element| element.binding.as_ref())
+            .filter(|binding| binding.is_checked())
+            .map(|binding| binding.value_set.clone())
+            .collect()
+    }
+
+    /// The URLs of the structures read from the source lately and still kept, which a schema
+    /// that replaces this one can be told to read at once (see [`Self::warm`]).
+    pub fn resident(&self) -> Vec<String> {
+        self.lazy
+            .as_ref()
+            .map(|loading| loading.cache.keys())
+            .unwrap_or_default()
+    }
+
+    /// Read the structures at `urls` now, so that the requests that used them before do not wait
+    /// for them again. A URL this schema has no structure for is passed over.
+    pub fn warm(&self, urls: &[String]) {
+        for url in urls {
+            let _ = self.structure(url);
+        }
     }
 }
 
@@ -826,6 +878,8 @@ fn walk_regex(value: &Json, found: &mut Option<String>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet as Names;
+
     use serde_json::json;
 
     use super::*;
@@ -995,9 +1049,14 @@ mod tests {
             builder.add_stored(*package, definition);
         }
         let schema = builder.finish();
+        // A profile is read when used, and the source has no such row. A base type is held, so
+        // it never asks.
+        assert!(schema
+            .structure("http://example.org/StructureDefinition/my-patient")
+            .is_none());
         assert!(schema
             .structure("http://hl7.org/fhir/StructureDefinition/Patient")
-            .is_none());
+            .is_some());
     }
 
     #[test]
@@ -1008,5 +1067,115 @@ mod tests {
             builder.add_stored(*package, definition);
         }
         assert_same(&eager(&packages), &builder.finish());
+    }
+
+    /// A source that counts what it is asked for.
+    struct Counted {
+        inner: Packages,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DefinitionSource for Counted {
+        fn definition(&self, package: i64, url: &str) -> Option<Json> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.definition(package, url)
+        }
+    }
+
+    #[test]
+    fn base_types_are_held_and_the_rest_is_read_when_used() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let packages = packages();
+        let source = Arc::new(Counted {
+            inner: Packages(packages.clone()),
+            reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut builder = SchemaBuilder::lazy(source.clone());
+        for (package, definition) in &packages {
+            builder.add_stored(*package, definition);
+        }
+        let schema = builder.finish();
+        assert_eq!(source.reads.load(SeqCst), 0, "nothing is read to build it");
+        // A resource, a data type, a primitive: held, so asking for them reads nothing.
+        for url in [
+            "http://hl7.org/fhir/StructureDefinition/Patient",
+            "http://hl7.org/fhir/StructureDefinition/id",
+            "http://hl7.org/fhir/StructureDefinition/Extension",
+        ] {
+            assert!(schema.structure(url).is_some(), "{url}");
+        }
+        assert!(schema.base_type("Patient").is_some());
+        assert_eq!(source.reads.load(SeqCst), 0, "base types are held");
+        // A profile is read, once.
+        let profile = "http://example.org/StructureDefinition/my-patient";
+        assert!(schema.structure(profile).is_some());
+        assert!(schema.structure(profile).is_some());
+        assert_eq!(source.reads.load(SeqCst), 1);
+        // It is what a schema that holds everything holds.
+        assert_same(&eager(&packages), &schema);
+    }
+
+    #[test]
+    fn what_is_read_can_be_read_again_by_a_schema_that_replaces_this_one() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let packages = packages();
+        let build = || {
+            let source = Arc::new(Counted {
+                inner: Packages(packages.clone()),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let mut builder = SchemaBuilder::lazy(source.clone());
+            for (package, definition) in &packages {
+                builder.add_stored(*package, definition);
+            }
+            (builder.finish(), source)
+        };
+        let (old, _) = build();
+        let profile = "http://example.org/StructureDefinition/my-patient";
+        assert!(old.structure(profile).is_some());
+        assert_eq!(old.resident(), [profile.to_string()]);
+        let (new, source) = build();
+        assert!(new.resident().is_empty());
+        new.warm(&old.resident());
+        assert_eq!(source.reads.load(SeqCst), 1);
+        assert_eq!(new.resident(), [profile.to_string()]);
+        // Asking for it now reads nothing, and a URL that is gone is passed over.
+        assert!(new.structure(profile).is_some());
+        new.warm(&["http://example.org/gone".to_string()]);
+        assert_eq!(source.reads.load(SeqCst), 1);
+    }
+
+    #[test]
+    fn the_value_sets_a_held_structure_is_checked_against_are_listed() {
+        let mut patient = definition(
+            "http://hl7.org/fhir/StructureDefinition/Patient",
+            "Patient",
+            "resource",
+            &[("Patient", "Patient"), ("Patient.gender", "code")],
+        );
+        patient["snapshot"]["element"][1]["binding"] =
+            json!({"strength": "required", "valueSet": "http://example.org/vs/gender|4.0.1"});
+        let mut preferred = patient.clone();
+        preferred["snapshot"]["element"][1]["binding"] =
+            json!({"strength": "preferred", "valueSet": "http://example.org/vs/language"});
+        preferred["url"] = json!("http://hl7.org/fhir/StructureDefinition/Other");
+        preferred["name"] = json!("Other");
+        preferred["type"] = json!("Other");
+        let mut profile = patient.clone();
+        profile["url"] = json!("http://example.org/StructureDefinition/p");
+        profile["derivation"] = json!("constraint");
+        profile["snapshot"]["element"][1]["binding"] =
+            json!({"strength": "extensible", "valueSet": "http://example.org/vs/profiled"});
+        let packages = vec![(1, patient), (1, preferred), (1, profile)];
+        let mut builder = SchemaBuilder::lazy(Arc::new(Packages(packages.clone())));
+        for (package, definition) in &packages {
+            builder.add_stored(*package, definition);
+        }
+        // What a held base type binds and a code is checked against; not a `preferred` binding,
+        // and not a profile, which is not held.
+        assert_eq!(
+            builder.finish().checked_value_sets(),
+            Names::from(["http://example.org/vs/gender".to_string()])
+        );
     }
 }

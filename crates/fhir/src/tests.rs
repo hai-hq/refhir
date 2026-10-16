@@ -5997,6 +5997,125 @@ fn a_run_of_terminology_writes_leaves_the_store_as_a_full_rebuild_would() {
     }
 }
 
+/// What a request of a common kind needs is in memory when the catalog is built: it reads nothing
+/// from the store, the first time or after. What is not common (a profile) is read once.
+#[test]
+fn a_request_of_a_common_kind_reads_nothing_from_the_store() {
+    use refhir_fhirpath::Host;
+    struct NoHost;
+    impl Host for NoHost {}
+
+    let harness = r4();
+    let source = Arc::new(crate::lazy::StoreSource::new(Arc::new(
+        harness.store.clone(),
+    )));
+    let catalog = Catalog::open_from(&harness.store, Some(source.clone())).unwrap();
+    let after_open = source.reads();
+    assert!(after_open > 0, "what a base type binds is read to be kept");
+    let validate = |resource: &Value| {
+        refhir_validate::validate_resource(resource, catalog.schema(), catalog.terms(), &NoHost)
+            .operation_outcome()
+    };
+    let common = [
+        json!({"resourceType": "Patient", "gender": "female", "birthDate": "1980-05-01",
+               "name": [{"family": "Okafor", "given": ["Ada"]}],
+               "maritalStatus": {"coding": [{
+                   "system": "http://terminology.hl7.org/CodeSystem/v3-MaritalStatus",
+                   "code": "M"}]},
+               "communication": [{"language": {"coding": [{
+                   "system": "urn:ietf:bcp:47", "code": "en"}]}}]}),
+        json!({"resourceType": "Observation", "status": "final",
+               "category": [{"coding": [{
+                   "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                   "code": "vital-signs"}]}],
+               "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+               "valueQuantity": {"value": 120, "unit": "mmHg",
+                                 "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}}),
+        json!({"resourceType": "Encounter", "status": "finished",
+               "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                         "code": "AMB", "display": "ambulatory"}}),
+        json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+               "medicationCodeableConcept": {"text": "aspirin"}}),
+        json!({"resourceType": "Encounter", "status": "wrong"}),
+    ];
+    let answers: Vec<Value> = common.iter().map(&validate).collect();
+    for resource in &common {
+        validate(resource);
+    }
+    assert_eq!(source.reads(), after_open, "a common request reads nothing");
+
+    // A profile is not held: it is read the first time a request names it, and not again.
+    let profiled = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"profile": ["http://hl7.org/fhir/StructureDefinition/vitalsigns"]},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]}});
+    let first = validate(&profiled);
+    let read = source.reads();
+    assert!(read > after_open);
+    assert_eq!(validate(&profiled), first);
+    assert_eq!(source.reads(), read);
+
+    // Reading nothing is not answering differently.
+    let whole = Catalog::open_whole(&harness.store).unwrap();
+    for (resource, answer) in common.iter().zip(&answers) {
+        let held =
+            refhir_validate::validate_resource(resource, whole.schema(), whole.terms(), &NoHost)
+                .operation_outcome();
+        assert_eq!(&held, answer);
+    }
+}
+
+/// A catalog that takes the place of another has already read what the requests that were being
+/// answered used, so the swap does not send them back to waiting for the store.
+#[test]
+fn a_catalog_that_replaces_another_has_read_what_the_old_one_had() {
+    use refhir_fhirpath::Host;
+    struct NoHost;
+    impl Host for NoHost {}
+
+    let harness = r4();
+    let profile = "http://hl7.org/fhir/StructureDefinition/vitalsigns";
+    let observation = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"profile": [profile]},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]}});
+    let validate = |catalog: &std::sync::RwLock<Catalog>| {
+        let catalog = catalog.read().unwrap();
+        refhir_validate::validate_resource(&observation, catalog.schema(), catalog.terms(), &NoHost)
+            .operation_outcome()
+    };
+    let resident = |catalog: &std::sync::RwLock<Catalog>| {
+        catalog
+            .read()
+            .unwrap()
+            .schema()
+            .resident()
+            .contains(&profile.to_string())
+    };
+    let (replica, replica_at) =
+        Catalog::open_consistent(&harness.store, crate::CatalogClock::Stable).unwrap();
+    let replica = std::sync::RwLock::new(replica);
+    assert!(!resident(&harness.catalog) && !resident(&replica));
+    let answer = validate(&harness.catalog);
+    validate(&replica);
+    assert!(resident(&harness.catalog) && resident(&replica));
+
+    // A publish builds a new catalog, which has read the profile before it is put in place.
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(resident(&harness.catalog));
+    assert_eq!(validate(&harness.catalog), answer);
+
+    // So does a replica's reload when the version it follows has moved.
+    let now = crate::package::reload_catalog(
+        &harness.store,
+        &replica,
+        replica_at,
+        crate::CatalogClock::Stable,
+    )
+    .unwrap();
+    assert!(now > replica_at);
+    assert!(resident(&replica));
+    assert_eq!(validate(&replica), answer);
+}
+
 /// A catalog that reads definitions and terminology when they are first used, kept current by
 /// writes as it is by a rebuild, and by a reload on a replica.
 #[test]

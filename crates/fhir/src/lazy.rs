@@ -5,6 +5,7 @@
 //! catalog was built from. A server whose catalog moves reloads it, and a catalog that was
 //! replaced takes what it read with it.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use refhir_persistence::{ConformanceStore, PersistError};
@@ -14,11 +15,22 @@ use serde_json::Value;
 /// The conformance tables of a store, read a row at a time.
 pub(crate) struct StoreSource {
     store: Arc<dyn ConformanceStore>,
+    /// How many rows have been asked for.
+    reads: AtomicUsize,
 }
 
 impl StoreSource {
     pub(crate) fn new(store: Arc<dyn ConformanceStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            reads: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many rows have been asked for since this source was made.
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
     }
 
     /// The row as JSON. A row that cannot be read is logged and answers as if it were not there:
@@ -54,6 +66,7 @@ impl StoreSource {
 
 impl DefinitionSource for StoreSource {
     fn definition(&self, package: i64, url: &str) -> Option<Value> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         Self::parse(
             "structure definition",
             package,
@@ -65,6 +78,7 @@ impl DefinitionSource for StoreSource {
 
 impl TermSource for StoreSource {
     fn resource(&self, package: Scope, key: &str) -> Option<Value> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         Self::parse(
             "terminology resource",
             package,
@@ -74,6 +88,7 @@ impl TermSource for StoreSource {
     }
 
     fn expansion(&self, package: Scope, key: &str) -> Option<Value> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         Self::parse(
             "value set expansion",
             package,

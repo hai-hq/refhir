@@ -118,6 +118,18 @@ impl<K: Hash + Eq + Clone, V> Cache<K, V> {
         value
     }
 
+    /// The keys of the values held, oldest read first.
+    pub(crate) fn keys(&self) -> Vec<K> {
+        let slots = self.slots.read().unwrap_or_else(PoisonError::into_inner);
+        let mut by_age: Vec<(u64, K)> = slots
+            .by_key
+            .iter()
+            .map(|(key, slot)| (slot.used.load(Relaxed), key.clone()))
+            .collect();
+        by_age.sort_unstable_by_key(|(used, _)| *used);
+        by_age.into_iter().map(|(_, key)| key).collect()
+    }
+
     /// Forget every value whose key `stale` picks, because what it was read from changed.
     pub(crate) fn forget(&self, stale: impl Fn(&K) -> bool) {
         let mut slots = self.slots.write().unwrap_or_else(PoisonError::into_inner);

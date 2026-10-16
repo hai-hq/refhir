@@ -53,21 +53,32 @@ fn a_catalog_keeps_an_index_and_loading_it_takes_a_fraction_of_holding_everythin
         lazy.kept >> 10,
         lazy.peak >> 10
     );
-    // An index keeps a small part of that: nothing of a definition or code system but where it
-    // is and what is asked of it without reading it. What is left is what is not read when used:
-    // the search parameters, the resource types and the FHIRPath type model.
+    // What it keeps is an index and what every request needs: the base types, the value sets
+    // their bindings check a code against, and the code systems behind those. For R4 core alone,
+    // which is mostly that, it is well under what holding everything keeps; for the default
+    // packages, which are mostly profiles and extensions, it is about a quarter.
     assert!(
-        lazy.kept * 3 < whole.kept,
+        lazy.kept * 10 < whole.kept * 7,
         "the catalog that reads when used keeps {} MiB, the whole one {} MiB",
         mib(lazy.kept),
         mib(whole.kept)
     );
-    // And loading it takes less than half of what loading the whole one does.
     assert!(
-        lazy.peak * 2 < whole.peak,
+        lazy.kept < 24 << 20,
+        "the catalog that reads when used keeps {} MiB",
+        mib(lazy.kept)
+    );
+    // And loading it takes well under what loading the whole one does.
+    assert!(
+        lazy.peak * 10 < whole.peak * 7,
         "loading the catalog that reads when used peaked at {} MiB, the whole one at {} MiB",
         mib(lazy.peak),
         mib(whole.peak)
+    );
+    assert!(
+        lazy.peak < 28 << 20,
+        "loading the catalog that reads when used peaked at {} MiB",
+        mib(lazy.peak)
     );
     drop(read_when_used);
 }

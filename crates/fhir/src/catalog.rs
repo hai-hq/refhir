@@ -160,6 +160,13 @@ impl CatalogClock {
     }
 }
 
+/// What a catalog has read from the store lately and still keeps.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Warmth {
+    structures: Vec<String>,
+    terminology: refhir_validate::Resident,
+}
+
 #[derive(Clone, Debug)]
 pub struct Catalog {
     fhir_version: Option<String>,
@@ -252,10 +259,11 @@ impl Catalog {
         Self::open_from(store, None)
     }
 
-    fn open_from(
+    pub(crate) fn open_from(
         store: &dyn ConformanceStore,
         source: Option<Arc<StoreSource>>,
     ) -> Result<Self, PersistError> {
+        let lazy = source.is_some();
         let packages = store.load_packages()?;
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
         drop(packages);
@@ -271,7 +279,15 @@ impl Catalog {
         store.visit_structure_definitions(&mut |rows| definitions.add(&rows))?;
         let mut definitions = definitions.finish();
         add_parameters(&mut definitions.types, &store.load_search_parameters()?);
-        let catalog = Self::assemble(fhir_version, definitions, terminology);
+        let mut catalog = Self::assemble(fhir_version, definitions, terminology);
+        if lazy {
+            // The base types are held, and so is what they bind: the value sets a code is checked
+            // against and the code systems behind them. A request of any common kind finds all of
+            // it in memory. What it uses beyond that (a profile, an extension, a table nothing
+            // binds) is read when it is first used.
+            let checked = catalog.schema.checked_value_sets();
+            catalog.terms.hold(&checked);
+        }
         // The load parsed several times what the catalog keeps; do not let the process stay at
         // that peak.
         crate::memory::release_unused_memory();
@@ -296,6 +312,23 @@ impl Catalog {
             rebuild_in_place: false,
             stale_expansions: terminology.stale_expansions,
         }
+    }
+
+    /// What this catalog has read from the store lately and still keeps, which a catalog that
+    /// replaces it can be told to read at once (see [`Self::warm`]).
+    pub(crate) fn warmth(&self) -> Warmth {
+        Warmth {
+            structures: self.schema.resident(),
+            terminology: self.terms.resident(),
+        }
+    }
+
+    /// Read what `warmth` lists, so that a reload does not send the requests that were being
+    /// answered back to waiting for reads. It is done before the catalog is put in place, while
+    /// the one it replaces is still answering.
+    pub(crate) fn warm(&self, warmth: &Warmth) {
+        self.schema.warm(&warmth.structures);
+        self.terms.warm(&warmth.terminology);
     }
 
     /// Whether any stored expansion was made under other rules than the current ones. A database

@@ -10,8 +10,8 @@ pub use outcome::{Issue, Outcome, Severity};
 pub use schema::{DefinitionSource, Schema, SchemaBuilder, Structure};
 pub use terminology::{
     code_system_key, code_system_row_key, expansion_is_current, winning_scopes, ExpansionFailure,
-    ExpansionUpdate, IncludeAt, MemoryTerminology, Scope, TermAnswer, TermSource, Terminology,
-    TerminologyBuilder, TerminologyChange,
+    ExpansionUpdate, IncludeAt, MemoryTerminology, Resident, Scope, TermAnswer, TermSource,
+    Terminology, TerminologyBuilder, TerminologyChange,
 };
 pub use walk::validate;
 

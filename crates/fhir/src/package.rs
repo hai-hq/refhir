@@ -451,13 +451,15 @@ pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let (policy, archiver, update_create, in_place) = {
+    let (policy, archiver, update_create, in_place, warmth) = {
         let current = catalog.read().expect("catalog");
         (
             current.reference_policy(),
             current.sdc_archiver(),
             current.update_create(),
             current.rebuild_in_place(),
+            // Nothing is being answered while a server starts, so there is nothing to keep warm.
+            (!current.rebuild_in_place()).then(|| current.warmth()),
         )
     };
     if in_place {
@@ -471,6 +473,11 @@ pub(crate) fn publish(
     loaded.set_sdc_archiver(archiver);
     let stable = !loaded.has_pending_parameters();
     loaded.set_update_create(update_create);
+    // The requests that are being answered used definitions and terminology beyond what every
+    // catalog holds. The new catalog reads them before it takes the old one's place.
+    if let Some(warmth) = &warmth {
+        loaded.warm(warmth);
+    }
     *catalog.write().expect("catalog") = loaded;
     // Tell the other processes the conformance tables changed. Every change moves the revision,
     // which a standby follows. The version, which replicas follow, moves only when no search
@@ -506,6 +513,9 @@ pub fn reload_catalog(
         fresh.set_sdc_archiver(current.sdc_archiver());
         fresh.set_update_create(current.update_create());
         fresh.set_rebuild_in_place(current.rebuild_in_place());
+        // What the requests being answered use beyond what every catalog holds is read now, while
+        // the old catalog is still answering them, and not by the first request after the swap.
+        fresh.warm(&current.warmth());
     }
     *catalog.write().expect("catalog") = fresh;
     Ok(version)

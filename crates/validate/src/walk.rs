@@ -650,7 +650,7 @@ impl State<'_> {
         let Some(binding) = &element.binding else {
             return;
         };
-        if binding.strength == "preferred" || binding.strength == "example" {
+        if !binding.is_checked() {
             return;
         }
         for bound in bound_codes(value, type_code.unwrap_or("")) {
