@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use refhir_fhirpath::{Expr, Host, Model};
+use refhir_fhirpath::{days_in_month, Expr, Host, Model};
 use refhir_types::{
     number_key, number_range, quantity_key, quantity_range, string_key, token_key, valid_id,
     IndexId, Interval,
@@ -215,6 +215,38 @@ impl Extractor {
             | Source::Query => Probe::Scan,
             Source::MultipleBirth => Probe::Token(query),
             Source::Path(_) => probe_kind(Some(self.kind), query),
+        }
+    }
+
+    /// Whether `value` can be read as a query value for this parameter, and if not, why.
+    ///
+    /// `matches` answers `false` for a value it cannot read, so a search for a date that is not one
+    /// looks the same as a search that matches nothing. This tells them apart from the value alone:
+    /// it never looks at what is stored, so a search of an empty table, and a live query before
+    /// anything is written, refuse a value exactly as a full table does. A string, token, uri or
+    /// reference is free text and always reads; what can be wrong with one is its modifier's
+    /// operand (`:missing`, `:of-type`).
+    pub fn check_value(&self, modifier: Option<&str>, value: &str) -> Result<(), String> {
+        match modifier {
+            Some("missing") => return check_missing(value),
+            Some("of-type") => return check_of_type(value),
+            // The operand of these is text, a prefix or a value set URL: any value reads.
+            Some(
+                "exact" | "contains" | "text" | "identifier" | "above" | "below" | "in" | "not-in",
+            ) => return Ok(()),
+            // No modifier, or `:not`, which reads the value as the parameter's own type.
+            _ => {}
+        }
+        match &self.source {
+            Source::Composite { parts, .. } => check_composite(parts, value),
+            Source::Age => check_number(value),
+            Source::Near => check_near(value),
+            Source::Path(_) => check_kind(self.kind, value),
+            Source::Narrative
+            | Source::Content
+            | Source::MultipleBirth
+            | Source::Filter
+            | Source::Query => Ok(()),
         }
     }
 
@@ -1397,6 +1429,11 @@ fn prefixed<'a>(op: &'a str, expected: &'a str) -> (&'a str, &'a str) {
 
 fn date_period(text: &str) -> Option<(i64, i64)> {
     let text = text.trim().trim_start_matches('@');
+    // One grammar for the search and for the check of its value: a date the check refuses is not
+    // one this reads, so a value cannot pass the check and then match nothing.
+    if !is_date(text) {
+        return None;
+    }
     let (date, time) = text.split_once('T').unwrap_or((text, ""));
     let mut parts = date.split('-');
     let year: i32 = parts.next()?.parse().ok()?;
@@ -1478,6 +1515,218 @@ fn parse_ymd(text: &str) -> Option<(i32, u8, u8)> {
     let month = parts.next().and_then(|text| text.parse().ok()).unwrap_or(1);
     let day = parts.next().and_then(|text| text.parse().ok()).unwrap_or(1);
     Some((year, month, day))
+}
+
+const PREFIX_NOTE: &str = ", optionally after a prefix (eq, ne, gt, lt, ge, le, sa, eb or ap)";
+
+/// What a value that fails to read may have meant, when `reads` says that is what it takes: a `+`
+/// in a URL query is a space, which is easy to send by accident in a time zone.
+fn read_hint(value: &str, reads: impl Fn(&str) -> bool) -> &'static str {
+    if value.contains(' ') && reads(&value.replace(' ', "+")) {
+        ". A + in a URL query reads as a space: write it %2B"
+    } else {
+        ""
+    }
+}
+
+fn check_kind(kind: SearchKind, value: &str) -> Result<(), String> {
+    match kind {
+        SearchKind::Date => check_date(value),
+        SearchKind::Number => check_number(value),
+        SearchKind::Quantity => check_quantity(value),
+        SearchKind::Token
+        | SearchKind::String
+        | SearchKind::Reference
+        | SearchKind::Uri
+        | SearchKind::Composite
+        | SearchKind::Special => Ok(()),
+    }
+}
+
+fn check_missing(value: &str) -> Result<(), String> {
+    match value {
+        "true" | "false" => Ok(()),
+        _ => Err("expected true or false after :missing".into()),
+    }
+}
+
+fn check_of_type(value: &str) -> Result<(), String> {
+    // The matcher reads three parts and no more, so a fourth would be dropped without a word.
+    if value.split('|').count() == 3 {
+        Ok(())
+    } else {
+        Err("expected system|code|value after :of-type".into())
+    }
+}
+
+fn check_composite(parts: &[Part], value: &str) -> Result<(), String> {
+    let pieces: Vec<&str> = value.split('$').collect();
+    if pieces.len() != parts.len() {
+        return Err(format!(
+            "expected {} values separated by $, one for each component",
+            parts.len()
+        ));
+    }
+    pieces
+        .into_iter()
+        .zip(parts)
+        .try_for_each(|(piece, part)| check_kind(part.kind, piece))
+}
+
+fn is_date_value(value: &str) -> bool {
+    is_date(split_prefix(value).1)
+}
+
+fn is_number_value(value: &str) -> bool {
+    is_decimal(split_prefix(value).1)
+}
+
+/// `number`, `number|code` or `number|system|code`, after an optional prefix.
+fn is_quantity_value(value: &str) -> bool {
+    let mut parts = split_prefix(value).1.split('|');
+    is_decimal(parts.next().unwrap_or("")) && parts.count() <= 2
+}
+
+fn check_date(value: &str) -> Result<(), String> {
+    if is_date_value(value) {
+        return Ok(());
+    }
+    Err(format!(
+        "expected a date such as 2020, 2020-01, 2020-01-31 or 2020-01-31T10:30:00Z{PREFIX_NOTE}{}",
+        read_hint(value, is_date_value)
+    ))
+}
+
+fn check_number(value: &str) -> Result<(), String> {
+    if is_number_value(value) {
+        return Ok(());
+    }
+    Err(format!(
+        "expected a number{PREFIX_NOTE}{}",
+        read_hint(value, is_number_value)
+    ))
+}
+
+fn check_quantity(value: &str) -> Result<(), String> {
+    if is_quantity_value(value) {
+        return Ok(());
+    }
+    Err(format!(
+        "expected number, number|code or number|system|code{PREFIX_NOTE}{}",
+        read_hint(value, is_quantity_value)
+    ))
+}
+
+fn check_near(value: &str) -> Result<(), String> {
+    let mut parts = value.split('|');
+    let place = parts.next().is_some_and(is_decimal) && parts.next().is_some_and(is_decimal);
+    // The distance is optional, and an empty one means the default.
+    let distance = parts
+        .next()
+        .is_none_or(|text| text.is_empty() || is_decimal(text));
+    if place && distance {
+        return Ok(());
+    }
+    Err("expected latitude|longitude, optionally followed by |distance and |units".into())
+}
+
+/// A number as FHIR writes one, with an optional exponent. Rust reads more than that (`inf`,
+/// `NaN`), and a number that overflows is no number to compare with, so those are refused.
+fn is_decimal(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E'))
+        && text.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+/// `YYYY`, `YYYY-MM`, `YYYY-MM-DD`, or a day with a time after a `T`: see `is_time`. The month and
+/// the day must exist, in that year.
+fn is_date(text: &str) -> bool {
+    let (date, time) = match text.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
+    let mut parts = date.split('-');
+    let Some(year) = parts.next().and_then(|part| digits(part, 4)) else {
+        return false;
+    };
+    let month = match parts.next() {
+        None => None,
+        Some(part) => match digits(part, 2) {
+            Some(month @ 1..=12) => Some(month),
+            _ => return false,
+        },
+    };
+    let day = match (month, parts.next()) {
+        (_, None) => None,
+        (Some(month), Some(part)) => match digits(part, 2) {
+            Some(day)
+                if (1..=u32::from(days_in_month(year as i32, month as u8))).contains(&day) =>
+            {
+                Some(day)
+            }
+            _ => return false,
+        },
+        (None, Some(_)) => return false,
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    match time {
+        None => true,
+        Some(time) => day.is_some() && is_time(time),
+    }
+}
+
+/// `hh`, `hh:mm`, `hh:mm:ss` or `hh:mm:ss.fff`, then optionally `Z`, `+hh`, `+hh:mm`, `-hh` or
+/// `-hh:mm`.
+fn is_time(text: &str) -> bool {
+    let (clock, zone) = match text.find(['Z', '+', '-']) {
+        Some(at) => text.split_at(at),
+        None => (text, ""),
+    };
+    let mut parts = clock.split(':');
+    // The first part is there even when the clock is empty, and then it is not two digits.
+    if !digits_up_to(parts.next().unwrap_or(""), 2, 23) {
+        return false;
+    }
+    if let Some(minute) = parts.next() {
+        if !digits_up_to(minute, 2, 59) {
+            return false;
+        }
+    }
+    if let Some(second) = parts.next() {
+        let (whole, fraction) = second.split_once('.').unwrap_or((second, "0"));
+        let fraction_ok =
+            !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit());
+        // 60 is a leap second.
+        if !digits_up_to(whole, 2, 60) || !fraction_ok {
+            return false;
+        }
+    }
+    if parts.next().is_some() {
+        return false;
+    }
+    match zone.strip_prefix(['+', '-']) {
+        Some(offset) => {
+            let (hours, minutes) = offset.split_once(':').unwrap_or((offset, "00"));
+            digits_up_to(hours, 2, 23) && digits_up_to(minutes, 2, 59)
+        }
+        None => zone.is_empty() || zone == "Z",
+    }
+}
+
+/// Whether `text` is exactly `width` ASCII digits that make a number no greater than `max`.
+fn digits_up_to(text: &str, width: usize, max: u32) -> bool {
+    digits(text, width).is_some_and(|number| number <= max)
+}
+
+/// `text` as a number, when it is exactly `width` ASCII digits.
+fn digits(text: &str, width: usize) -> Option<u32> {
+    if text.len() == width && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        text.parse().ok()
+    } else {
+        None
+    }
 }
 
 fn as_f64(item: &refhir_fhirpath::Value) -> Option<f64> {
@@ -1872,6 +2121,233 @@ mod tests {
         let resource = json!({"resourceType": "ValueSet", "url": "http://example.org/vs"});
         assert!(extractor.matches(&resource, "http://example.org/vs", &model, &host));
         assert!(!extractor.matches(&resource, "http://example.org", &model, &host));
+    }
+
+    fn parameter(code: &str, kind: &str, expression: &str) -> super::Extractor {
+        compile_parameter(
+            &json!({"code": code, "type": kind, "expression": expression}),
+            &BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_value_that_cannot_be_read_is_told_from_one_that_matches_nothing() {
+        let date = parameter("birthdate", "date", "Patient.birthDate");
+        for good in [
+            "1990",
+            "1990-06",
+            "1990-06-01",
+            "2024-02-29",
+            "ge1990-06-01",
+            "ne1990",
+            "sa2020-01-01T10:30",
+            "2020-01-01T10:30:00Z",
+            "2020-01-01T10:30:00.123+01:00",
+            "lt2020-01-01T23:59:60-05",
+        ] {
+            assert_eq!(date.check_value(None, good), Ok(()), "{good}");
+        }
+        for bad in [
+            "",
+            "notadate",
+            "gt",
+            "19900601",
+            "90-06-01",
+            "1990-13",
+            "1990-00-10",
+            "1990-02-30",
+            "2023-02-29",
+            "1990-06-01-02",
+            "1990T10:00",
+            "1990-06-01T",
+            "1990-06-01T24:00",
+            "1990-06-01T10:60",
+            "1990-06-01T10:00:00+25:00",
+            "1990-06-01T10:00:00 01:00",
+            "ge1990,le2000",
+            "@1990",
+        ] {
+            assert!(date.check_value(None, bad).is_err(), "{bad:?}");
+        }
+
+        let number = parameter(
+            "probability",
+            "number",
+            "RiskAssessment.prediction.probabilityDecimal",
+        );
+        for good in ["5", "-5", "5.40", "1e3", "gt0.5", "le-2", "ap100"] {
+            assert_eq!(number.check_value(None, good), Ok(()), "{good}");
+        }
+        for bad in ["", "abc", "nan", "inf", "1e999", "5x", "gt", "1,2", "0x10"] {
+            assert!(number.check_value(None, bad).is_err(), "{bad:?}");
+        }
+
+        let quantity = parameter("value-quantity", "quantity", "Observation.valueQuantity");
+        for good in [
+            "5.4",
+            "gt5.4",
+            "5.4|mg",
+            "5.4||mg",
+            "5.4|http://unitsofmeasure.org|mg",
+        ] {
+            assert_eq!(quantity.check_value(None, good), Ok(()), "{good}");
+        }
+        for bad in ["", "abc", "|mg", "mg|5.4", "5.4|a|b|c", "ge"] {
+            assert!(quantity.check_value(None, bad).is_err(), "{bad:?}");
+        }
+
+        // Text is text: whatever it says, it is a value to look for.
+        let token = parameter("gender", "token", "Patient.gender");
+        for text in ["", "female", "a|b|c", "ge1", "notadate", "1,2"] {
+            assert_eq!(token.check_value(None, text), Ok(()), "{text}");
+            assert_eq!(token.check_value(Some("not"), text), Ok(()), "{text}");
+        }
+        let reference = parameter("subject", "reference", "Observation.subject");
+        let string = parameter("name", "string", "Patient.name");
+        for text in ["", "Patient/1", "http://example.org/Patient/1", "ann,bob"] {
+            assert_eq!(reference.check_value(None, text), Ok(()), "{text}");
+            assert_eq!(string.check_value(Some("exact"), text), Ok(()), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_modifier_checks_its_own_operand() {
+        let token = parameter("gender", "token", "Patient.gender");
+        assert_eq!(token.check_value(Some("missing"), "true"), Ok(()));
+        assert_eq!(token.check_value(Some("missing"), "false"), Ok(()));
+        for bad in ["", "maybe", "TRUE", "1"] {
+            assert!(token.check_value(Some("missing"), bad).is_err(), "{bad:?}");
+        }
+        // `:missing` takes true or false whatever the type, and a date given to it is not a date.
+        let date = parameter("birthdate", "date", "Patient.birthDate");
+        assert_eq!(date.check_value(Some("missing"), "true"), Ok(()));
+        assert!(date.check_value(Some("missing"), "1990").is_err());
+        // `:not` reads the value as the parameter's own type.
+        assert_eq!(date.check_value(Some("not"), "1990"), Ok(()));
+        assert!(date.check_value(Some("not"), "notadate").is_err());
+
+        let identifier = parameter("identifier", "token", "Patient.identifier");
+        assert_eq!(identifier.check_value(Some("of-type"), "s|c|v"), Ok(()));
+        assert_eq!(identifier.check_value(Some("of-type"), "s|c|"), Ok(()));
+        assert!(identifier.check_value(Some("of-type"), "s|c").is_err());
+        assert!(identifier.check_value(Some("of-type"), "v").is_err());
+        // The matcher reads three parts, so a fourth would be dropped silently.
+        assert!(identifier.check_value(Some("of-type"), "s|c|v|x").is_err());
+        // These read the value as text, whatever the type.
+        for modifier in [
+            "exact",
+            "contains",
+            "text",
+            "identifier",
+            "above",
+            "below",
+            "in",
+            "not-in",
+        ] {
+            assert_eq!(identifier.check_value(Some(modifier), "anything"), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_composite_reads_each_component_by_its_own_type() {
+        let mut kinds = BTreeMap::new();
+        kinds.insert("http://example.org/code".to_string(), "token".to_string());
+        kinds.insert(
+            "http://example.org/value".to_string(),
+            "quantity".to_string(),
+        );
+        let extractor = compile_parameter(
+            &json!({
+                "code": "code-value-quantity",
+                "type": "composite",
+                "expression": "Observation.component",
+                "component": [
+                    {"definition": "http://example.org/code", "expression": "code"},
+                    {"definition": "http://example.org/value", "expression": "value"}
+                ]
+            }),
+            &kinds,
+        )
+        .unwrap();
+        assert_eq!(
+            extractor.check_value(None, "http://loinc.org|8480-6$gt100|mm[Hg]"),
+            Ok(())
+        );
+        assert_eq!(extractor.check_value(None, "8480-6$100"), Ok(()));
+        let one_piece = extractor.check_value(None, "8480-6").unwrap_err();
+        assert!(
+            one_piece.contains("expected 2 values separated by $"),
+            "{one_piece}"
+        );
+        assert!(extractor.check_value(None, "a$b$c").is_err());
+        let not_a_number = extractor.check_value(None, "8480-6$high").unwrap_err();
+        assert!(not_a_number.contains("expected number"), "{not_a_number}");
+    }
+
+    #[test]
+    fn near_and_age_are_read_like_the_numbers_they_hold() {
+        let near = compile_parameter(
+            &json!({"code": "near", "type": "special", "expression": "Location.position"}),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        for good in [
+            "51.5|-0.12",
+            "51.5|-0.12|10",
+            "51.5|-0.12|10|km",
+            "51.5|-0.12||mi",
+        ] {
+            assert_eq!(near.check_value(None, good), Ok(()), "{good}");
+        }
+        for bad in ["", "51.5", "51.5|", "north|south", "51.5|-0.12|far"] {
+            assert!(near.check_value(None, bad).is_err(), "{bad:?}");
+        }
+        let age = super::builtin("age", super::SearchKind::Number).unwrap();
+        assert_eq!(age.check_value(None, "ge18"), Ok(()));
+        assert!(age.check_value(None, "adult").is_err());
+    }
+
+    #[test]
+    fn the_reason_names_the_commonest_slips() {
+        let date = parameter("birthdate", "date", "Patient.birthDate");
+        let plus = date
+            .check_value(None, "1990-06-01T10:00:00 01:00")
+            .unwrap_err();
+        assert!(plus.contains("%2B"), "{plus}");
+        // A hint is for a value that would read once the slip is mended, not for any space.
+        for value in ["notadate", "last week", "ge1990 01", "1990, 1991"] {
+            let said = date.check_value(None, value).unwrap_err();
+            assert!(!said.contains("%2B"), "{value}: {said}");
+        }
+    }
+
+    #[test]
+    fn the_matcher_reads_only_what_the_check_accepts() {
+        // One grammar: a value the check lets through is one `date_period` reads, and the reverse.
+        let date = parameter("birthdate", "date", "Patient.birthDate");
+        for text in [
+            "1990",
+            "1990-06",
+            "1990-06-01",
+            "1990-06-01T10:30",
+            "1990-06-01T10:30:00.5+01:00",
+            "",
+            "notadate",
+            "90-06-01",
+            "1990-6-1",
+            "1990-13",
+            "1990-02-30",
+            "1990-06-01T25:00",
+        ] {
+            assert_eq!(
+                date.check_value(None, text).is_ok(),
+                super::date_period(text).is_some(),
+                "{text:?}"
+            );
+        }
+        assert!(!date_match("eq", "1990-01-01", "1990-02-30"));
+        assert!(!date_match("eq", "1990-02-30", "1990"));
     }
 
     #[test]

@@ -24,6 +24,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `error` to the time and the reason. The next notification that gets through sets `status` back
   to `active` and clears `error`. Delivery continues while the status is `error`; only `off`
   stops it, and the server never changes an `off` Subscription.
+- **`Prefer: handling=lenient` on a search `GET`.** A search whose parameter value cannot be read
+  (see Changed) can ask for the parameter to be left out instead: the search runs on the rest, the
+  Bundle carries an `OperationOutcome` entry (`search.mode` `outcome`) with a warning for each
+  parameter set aside, and its `self` link no longer has them. The response says
+  `Preference-Applied: handling=lenient`, and search responses now carry `Vary: Prefer`.
+  `handling=strict` is the default. Conditional create, update and delete, `batch` and
+  `transaction` entries, GraphQL and live queries are never lenient. See
+  [FHIR API](docs/fhir-api.md#search).
 
 ### Changed
 
@@ -77,6 +85,21 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   commas, repeated parameters, `:iterate` and the limits above.
 - A bare id given to a reference parameter that can point at any resource (`Task?subject=123`) or
   that lists no `target` is now a `400` that asks for `Type/id`; it used to find nothing.
+- **A search whose parameter value cannot be read is now a `400`, where it used to return an empty
+  result.** `GET /Patient?birthdate=notadate` and `GET /Observation?value-quantity=abc` answered
+  `200` with an empty Bundle, which looks the same as a search that matches nothing; they now answer
+  `400` with an `OperationOutcome` that names the parameter, the value and what was expected. It
+  covers a date, number or quantity that does not parse, a composite with the wrong number of
+  parts, a `near` that is not `latitude|longitude`, `:missing` without `true` or `false`, and
+  `:of-type` without exactly `system|code|value`, also behind a chain or `_has` and inside a
+  `_filter` (where a parameter that does not exist is now refused too). Strings, tokens, uris and
+  references are free text and are not affected. The same check now refuses a conditional
+  create, update or delete that used such a value, which used to match nothing (and so create), a
+  live query over `/sync`, which answers `QueryFailed` at once instead of staying empty, and a
+  query in a Questionnaire that `$populate` runs, which now fails with the message instead of
+  populating from nothing. Each alternative of a comma list, and each occurrence of a parameter
+  given twice, is read on its own. A client that relied on the empty result can send
+  `Prefer: handling=lenient`.
 
 ### Fixed
 

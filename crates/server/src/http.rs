@@ -418,7 +418,7 @@ fn apply_cors(headers: &mut HeaderMap, path: &str, origin: Option<&str>, origin_
         if let Ok(value) = allow.parse() {
             headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, value);
             if allow != "*" {
-                headers.insert(header::VARY, "Origin".parse().unwrap());
+                headers.append(header::VARY, "Origin".parse().unwrap());
             }
         }
     }
@@ -437,7 +437,7 @@ fn apply_cors(headers: &mut HeaderMap, path: &str, origin: Option<&str>, origin_
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
         "Location, Content-Location, ETag, WWW-Authenticate, X-Refhir-Commit-Ts, Retry-After, \
-         X-Request-Id, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset"
+         X-Request-Id, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, Preference-Applied"
             .parse()
             .unwrap(),
     );
@@ -1183,6 +1183,7 @@ async fn search(
     let mut args = search_object(params);
     args.remove("access_token");
     limit_to_patient(&app, &headers, uri.query(), &mut args);
+    let lenient = handle_unreadable_values(&headers, &mut args);
     let args = Value::Object(args);
     match execute(
         &app.db,
@@ -1193,8 +1194,8 @@ async fn search(
     )
     .await
     {
-        Ok(result) => render(StatusCode::OK, result.value, xml),
-        Err(err) => error_response(err),
+        Ok(result) => note_handling(render(StatusCode::OK, result.value, xml), lenient),
+        Err(err) => note_handling(error_response(err), lenient),
     }
 }
 
@@ -1437,12 +1438,14 @@ async fn compartment_search(
         Value::String(format!("{compartment}/{id}")),
     );
     limit_to_patient(&app, &headers, uri.query(), &mut args);
-    run_read(
+    let lenient = handle_unreadable_values(&headers, &mut args);
+    let response = run_read(
         &app,
         &format!("{resource_type}/search"),
         Value::Object(args),
     )
-    .await
+    .await;
+    note_handling(response, lenient)
 }
 
 async fn meta_get(
@@ -1718,6 +1721,59 @@ fn limit_to_patient(
             Value::String(compartment),
         );
     }
+}
+
+/// Say how a search is to treat a parameter value it cannot read, in the one place the engine
+/// reads it. A search is strict (a `400` naming the parameter) unless the request has `Prefer:
+/// handling=lenient`, which leaves such a parameter out and says so in the bundle. What the query
+/// string had under `_handling` is dropped: the header is the only way to ask. Returns whether
+/// the request asked for lenient.
+fn handle_unreadable_values(
+    headers: &HeaderMap,
+    args: &mut serde_json::Map<String, Value>,
+) -> bool {
+    args.remove(refhir_fhir::HANDLING);
+    let lenient = prefers_lenient(headers);
+    if lenient {
+        args.insert(refhir_fhir::HANDLING.into(), json!("lenient"));
+    }
+    lenient
+}
+
+/// What a search's answer says about `Prefer`, which it depends on: `Vary` for caches, so the
+/// lenient answer to a URL is not served to a client that did not ask for it, and, when the
+/// preference was honored, `Preference-Applied` (RFC 7240), so a client can tell a server that
+/// understood it from one that ignored it.
+fn note_handling(mut response: Response, lenient: bool) -> Response {
+    response
+        .headers_mut()
+        .append(header::VARY, header::HeaderValue::from_static("Prefer"));
+    if lenient && response.status() == StatusCode::OK {
+        response.headers_mut().insert(
+            "preference-applied",
+            header::HeaderValue::from_static("handling=lenient"),
+        );
+    }
+    response
+}
+
+/// Whether the request has `handling=lenient` among its `Prefer` preferences (RFC 7240: a comma
+/// separated list of `token[=value][; parameter]`, the value possibly quoted). Anything else, an
+/// unknown value included, leaves the search strict.
+fn prefers_lenient(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("prefer")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .filter_map(|preference| preference.split(';').next()?.split_once('='))
+        .any(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("handling")
+                && value
+                    .trim()
+                    .trim_matches('"')
+                    .eq_ignore_ascii_case("lenient")
+        })
 }
 
 pub(crate) fn stamp_sdc(app: &AppState, headers: &HeaderMap, args: &mut Value) {

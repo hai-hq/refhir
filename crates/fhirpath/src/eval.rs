@@ -2112,7 +2112,8 @@ fn add_years(temporal: &mut Temporal, years: i64) -> bool {
     true
 }
 
-fn days_in_month(year: i32, month: u8) -> u8 {
+/// Days in `month` (1 to 12) of `year`.
+pub fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,

@@ -66,8 +66,40 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
   `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
-- A date that is not well formed matches nothing: `birthdate=notadate` answers `200` with an empty
-  Bundle.
+- **A value that cannot be read as its parameter's type is a `400`, not an empty result.**
+  `GET /Patient?birthdate=notadate` answers `invalid value "notadate" for search parameter
+  birthdate on Patient: expected a date such as 2020, 2020-01, 2020-01-31 or
+  2020-01-31T10:30:00Z`, with the prefixes it takes (`eq`, `ne`, `gt`, `lt`, `ge`, `le`, `sa`,
+  `eb`, `ap`), in an `OperationOutcome`. It applies to a date, number or quantity that does not
+  parse (a day that does not exist, such as `1990-02-30`, included), a composite with the wrong
+  number of `$` parts, a `near` that is not `latitude|longitude`, `:missing` with anything but
+  `true` or `false`, and `:of-type` without exactly `system|code|value`, and to the same
+  parameters behind a chain or `_has`, and in the comparisons of a `_filter` (which also refuses a
+  parameter that does not exist). A string, token, uri or reference is free text, so any value
+  reads for it. The check looks at the value alone, so it gives the same answer on an empty
+  database, and a [live query](sync-protocol.md) with such a value fails with `QueryFailed` at once
+  instead of staying empty. Conditional create, update and delete, which search the same way,
+  refuse it too, and so does a query in a Questionnaire that `$populate` runs: it fails with this
+  message instead of populating from nothing.
+  Each alternative of a comma list is read on its own (`birthdate=1990,notadate` names
+  `notadate`), and so is each occurrence of a parameter given twice. Write a `+` in a time zone as
+  `%2B` in a URL, or it reads as a space.
+- **`Prefer: handling=lenient`** on a search `GET` asks the server to leave such a parameter out
+  and run the search on the rest, as FHIR allows. The Bundle then holds an `OperationOutcome` entry
+  (`search.mode` is `outcome`, and it is not counted in `total`) with a warning for each parameter
+  set aside, and its `self` link no longer has them. A value with an alternative it cannot read is
+  set aside whole, and of a parameter given twice only the occurrence that cannot be read goes.
+  With `_summary=count`, which has no entries, the `self` link is the only sign. A `_filter` with
+  a value it cannot read is set aside whole. The
+  response carries `Preference-Applied: handling=lenient`, and every search response has `Vary:
+  Prefer`, since the answer depends on it. `handling=strict` is the default, and any other value of
+  `handling` is read as that. Lenient is for the value of a search parameter only: an unknown
+  parameter name, a bare id that a reference parameter cannot place, a `_filter` that does not
+  parse, `_count`, `_offset` and `_cursor` are a `400` either way.
+  It is not available to a conditional create, update or delete (a clause set aside widens what
+  they match, and a conditional delete must not delete a different resource than the one the
+  client described), nor to a `batch` or `transaction` entry, GraphQL or a live query. A
+  `_handling` in the query string does nothing.
 
 ## Operations
 

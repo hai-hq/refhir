@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use refhir_database::{ScannedEntry, ScannedRow, ScannedText, Transaction};
@@ -46,6 +47,11 @@ const WIDE: &[&str] = &[
 /// caller's to choose, so a limit carried there could be replaced by the caller. The two are
 /// combined, so this can only narrow what a search returns.
 pub const PATIENT_COMPARTMENT: &str = "_patientCompartment";
+
+/// The argument the server sets on a search to say it is lenient (`"lenient"`), from the `Prefer:
+/// handling=lenient` header. It is not a search parameter, and not the client's to set: see
+/// `CONTROL_ARGS`.
+pub const HANDLING: &str = "_handling";
 
 /// The compartment parameters are not part of a search's identity: a paging link or a cursor does
 /// not carry them, because each request gets its limit from the server again.
@@ -257,13 +263,50 @@ pub(crate) struct Work {
     pub checked: usize,
 }
 
+/// What a search does with a parameter whose value it cannot read (a date that is not one, a
+/// number that is not a number). FHIR lets a server refuse such a search or ignore the parameter,
+/// and lets the client say which with `Prefer: handling=strict | lenient`.
+///
+/// Every search is strict unless the one that serves a client's `GET` asks otherwise, so a chain,
+/// a conditional update or delete, a transaction entry and a live query are never lenient: setting
+/// a parameter aside widens a result, and a conditional delete must not widen into a different
+/// resource than the one the client described.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Handling {
+    /// The search fails with `400`, naming the parameter and what was wrong with its value.
+    Strict,
+    /// The parameter is left out of the search, which runs on the rest. The bundle says so.
+    Lenient,
+}
+
+/// A parameter a lenient search set aside, and why.
+struct Ignored {
+    /// The name as the client wrote it, modifier and chain included.
+    key: String,
+    /// The occurrence that was set aside: a parameter given more than once is a clause each, and
+    /// only the one that cannot be read goes.
+    occurrence: String,
+    message: String,
+}
+
 pub fn search(
     tx: &mut Transaction,
     catalog: &Catalog,
     model: &ResourceModel,
     params: &BTreeMap<String, String>,
 ) -> Result<Value, FhirError> {
-    search_counted(tx, catalog, model, params).map(|(bundle, _)| bundle)
+    search_handling(tx, catalog, model, params, Handling::Strict)
+}
+
+/// `search`, for the request a client made, with the handling it asked for.
+pub(crate) fn search_handling(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+    handling: Handling,
+) -> Result<Value, FhirError> {
+    search_counted(tx, catalog, model, params, handling).map(|(bundle, _)| bundle)
 }
 
 pub(crate) fn search_counted(
@@ -271,13 +314,17 @@ pub(crate) fn search_counted(
     catalog: &Catalog,
     model: &ResourceModel,
     params: &BTreeMap<String, String>,
+    handling: Handling,
 ) -> Result<(Value, Work), FhirError> {
     catalog.deny_response_read(&model.name)?;
     if let Some(query) = params.get("_query") {
         return Err(FhirError::Invalid(format!("unknown query {query}")));
     }
-    let controls = controls_from(params)?;
-    let clauses = clauses_from(model, params)?;
+    let (clauses, ignored) = clauses_from(catalog, model, params, handling)?;
+    // The links, and the cursor in them, describe the search that ran, so a parameter that was set
+    // aside is in neither, and a `_cursor` is checked against the same parameters it was made from.
+    let ran = without_ignored(params, &ignored);
+    let controls = controls_from(&ran)?;
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
@@ -308,8 +355,67 @@ pub(crate) fn search_counted(
             &controls,
         )?
     };
-    let bundle = assemble(tx, catalog, model, params, &controls, page, total)?;
+    let mut bundle = assemble(tx, catalog, model, &ran, &controls, page, total)?;
+    // `_summary=count` has no entries to put the outcome in; its `self` link shows what ran.
+    if controls.summary.as_deref() != Some("count") {
+        report_ignored(&mut bundle, &ignored);
+    }
     Ok((bundle, work))
+}
+
+fn without_ignored<'a>(
+    params: &'a BTreeMap<String, String>,
+    ignored: &[Ignored],
+) -> Cow<'a, BTreeMap<String, String>> {
+    if ignored.is_empty() {
+        return Cow::Borrowed(params);
+    }
+    let mut ran = params.clone();
+    for item in ignored {
+        let Some(value) = ran.get(&item.key) else {
+            continue;
+        };
+        // Only that occurrence goes: the others of the same parameter are clauses that were read.
+        let mut kept: Vec<&str> = value.split(AND).collect();
+        if let Some(at) = kept.iter().position(|text| *text == item.occurrence) {
+            kept.remove(at);
+        }
+        if kept.is_empty() {
+            ran.remove(&item.key);
+        } else {
+            let joined = kept.join(&AND.to_string());
+            ran.insert(item.key.clone(), joined);
+        }
+    }
+    Cow::Owned(ran)
+}
+
+/// Add to a search bundle the `OperationOutcome` that says which parameters were set aside. FHIR
+/// gives an entry with mode `outcome` for this, and it is not a match, so it is never counted.
+fn report_ignored(bundle: &mut Value, ignored: &[Ignored]) {
+    if ignored.is_empty() {
+        return;
+    }
+    let issues: Vec<Value> = ignored
+        .iter()
+        .map(|item| {
+            json!({
+                "severity": "warning",
+                "code": "processing",
+                "diagnostics": format!(
+                    "{}. The parameter was ignored because the request asked for handling=lenient",
+                    item.message
+                ),
+                "expression": [item.key]
+            })
+        })
+        .collect();
+    if let Some(entries) = bundle.get_mut("entry").and_then(Value::as_array_mut) {
+        entries.push(json!({
+            "resource": {"resourceType": "OperationOutcome", "issue": issues},
+            "search": {"mode": "outcome"}
+        }));
+    }
 }
 
 /// The page of matches and how many there are, when the index range already decides every clause:
@@ -466,8 +572,8 @@ pub(crate) fn search_reference(
     if let Some(query) = params.get("_query") {
         return Err(FhirError::Invalid(format!("unknown query {query}")));
     }
+    let (clauses, _) = clauses_from(catalog, model, params, Handling::Strict)?;
     let controls = controls_from(params)?;
-    let clauses = clauses_from(model, params)?;
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
@@ -670,21 +776,173 @@ fn parse_include(text: &str, iterate: bool) -> Option<IncludeSpec> {
     })
 }
 
+/// Most characters of a value an error message repeats.
+const ECHO_LIMIT: usize = 64;
+
+/// The clauses of a search, and the parameters a lenient search set aside.
+///
+/// A value is read here, before any row is, so whether it is well formed never depends on what
+/// is stored: a search of an empty table, and a live query before anything is written, refuse a
+/// value exactly as a full table does.
 fn clauses_from(
+    catalog: &Catalog,
     model: &ResourceModel,
     params: &BTreeMap<String, String>,
-) -> Result<Vec<Clause>, FhirError> {
+    handling: Handling,
+) -> Result<(Vec<Clause>, Vec<Ignored>), FhirError> {
     let mut clauses = Vec::new();
+    let mut ignored = Vec::new();
+    // Whether the clause stays. A value that cannot be read ends a strict search; a lenient one
+    // runs without the clause and says so.
+    let mut keeps = |verdict: Result<(), (String, String)>, key: &str, occurrence: &str| {
+        let Err((value, reason)) = verdict else {
+            return Ok(true);
+        };
+        // A long value is not echoed whole: the message goes into the response, a live query's
+        // error and the logs.
+        let mut shown: String = value.chars().take(ECHO_LIMIT).collect();
+        if shown.len() < value.len() {
+            shown.push('…');
+        }
+        let message = format!(
+            "invalid value {shown:?} for search parameter {key} on {}: {reason}",
+            model.name
+        );
+        match handling {
+            Handling::Strict => Err(FhirError::Invalid(message)),
+            Handling::Lenient => {
+                ignored.push(Ignored {
+                    key: key.to_string(),
+                    occurrence: occurrence.to_string(),
+                    message,
+                });
+                Ok(false)
+            }
+        }
+    };
     for (name, value) in params {
         if is_control(name) || name == "_query" {
             continue;
         }
         // A parameter given more than once is AND: each occurrence is a clause of its own.
-        for value in value.split(AND) {
-            clauses.push(clause_from(model, name, value)?);
+        for occurrence in value.split(AND) {
+            let clause = clause_from(model, name, occurrence)?;
+            if keeps(check_clause(catalog, model, &clause), name, occurrence)? {
+                clauses.push(clause);
+            }
         }
     }
-    Ok(clauses)
+    Ok((clauses, ignored))
+}
+
+/// The first value of the clause that its parameter cannot read, and why. A comma between values
+/// is OR, so each alternative is read on its own.
+fn check_clause(
+    catalog: &Catalog,
+    model: &ResourceModel,
+    clause: &Clause,
+) -> Result<(), (String, String)> {
+    match clause {
+        Clause::Id(_) => Ok(()),
+        // The syntax of a `_filter` was refused, and the parameters it names checked, with the clause.
+        Clause::Filter(value) => {
+            let Ok(filter) = parse_filter(value) else {
+                return Ok(());
+            };
+            let mut comparisons = Vec::new();
+            filter_comparisons(&filter, &mut comparisons);
+            for (param, op, text) in comparisons {
+                let Some(found) = model.ready_param(param) else {
+                    continue;
+                };
+                let modifier = (op == "pr").then_some("missing");
+                found
+                    .extractor
+                    .check_value(modifier, text)
+                    .map_err(|reason| (text.to_string(), format!("in {param}: {reason}")))?;
+            }
+            Ok(())
+        }
+        Clause::Param {
+            name,
+            modifier,
+            values,
+        } => {
+            let Some(param) = model.ready_param(name) else {
+                return Ok(());
+            };
+            for value in values {
+                param
+                    .extractor
+                    .check_value(modifier.as_deref(), value)
+                    .map_err(|reason| (value.clone(), reason))?;
+            }
+            Ok(())
+        }
+        Clause::Chain {
+            param,
+            target_type,
+            target_param,
+            modifier,
+            value,
+        } => {
+            let types = target_types(catalog, model, param, target_type.as_deref());
+            reads_on(
+                catalog,
+                types.iter().map(String::as_str),
+                target_param,
+                modifier.as_deref(),
+                value,
+            )
+        }
+        Clause::Has {
+            type_name,
+            search_param,
+            modifier,
+            value,
+            ..
+        } => reads_on(
+            catalog,
+            [type_name.as_str()],
+            search_param,
+            modifier.as_deref(),
+            value,
+        ),
+    }
+}
+
+/// Whether the parameter `code` of every one of `types` can read each alternative of `value`. A
+/// type with no such parameter says nothing: the search over it refuses the name, as it does for
+/// any parameter.
+fn reads_on<'a>(
+    catalog: &Catalog,
+    types: impl IntoIterator<Item = &'a str>,
+    code: &str,
+    modifier: Option<&str>,
+    value: &str,
+) -> Result<(), (String, String)> {
+    // The search over the type splits the value the same way, and refuses a list that is too long.
+    let alternatives = if modifier == Some("missing") {
+        vec![value.to_string()]
+    } else {
+        or_values(value).unwrap_or_else(|_| vec![value.to_string()])
+    };
+    for type_name in types {
+        let Some(param) = catalog
+            .get(type_name)
+            .ok()
+            .and_then(|model| model.ready_param(code))
+        else {
+            continue;
+        };
+        for alternative in &alternatives {
+            param
+                .extractor
+                .check_value(modifier, alternative)
+                .map_err(|reason| (alternative.clone(), reason))?;
+        }
+    }
+    Ok(())
 }
 
 fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause, FhirError> {
@@ -693,6 +951,17 @@ fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause,
     }
     if name == "_filter" {
         let filter = parse_filter(value).map_err(FhirError::Invalid)?;
+        let mut comparisons = Vec::new();
+        filter_comparisons(&filter, &mut comparisons);
+        // A comparison with a parameter that does not exist used to match nothing.
+        for (param, _, _) in comparisons {
+            if model.ready_param(param).is_none() {
+                return Err(FhirError::Invalid(format!(
+                    "unsupported search parameter {param} on {}",
+                    model.name
+                )));
+            }
+        }
         check_filter_ids(model, &filter)?;
         return Ok(Clause::Filter(value.to_string()));
     }
@@ -1563,6 +1832,9 @@ pub(crate) fn capability_notes() -> String {
          occurrence or comma-separated; `_include:iterate` and `_revinclude:iterate` apply a rule \
          to the matches and to every resource the rules have added, until none is added, and a \
          search that would add more than {MAX_ITERATED} resources that way is refused with a 400. \
+         A value that cannot be read as its parameter's type (a date that is not one) is a 400, and \
+         `Prefer: handling=lenient` on a search GET leaves that parameter out instead and says so \
+         in the Bundle. \
          Not supported: `_revinclude=*` and `_revinclude=Type:*` (a 400), and the escapes `\\$` \
          and `\\|` in a search value (they are not interpreted)."
     )
@@ -2074,6 +2346,18 @@ impl FilterParser {
             self.pos += 1;
         }
         token
+    }
+}
+
+/// Every comparison in a `_filter` expression, as (parameter, operator, value).
+fn filter_comparisons<'a>(filter: &'a Filter, found: &mut Vec<(&'a str, &'a str, &'a str)>) {
+    match filter {
+        Filter::And(parts) | Filter::Or(parts) => {
+            for part in parts {
+                filter_comparisons(part, found);
+            }
+        }
+        Filter::Cmp { name, op, value } => found.push((name, op, value)),
     }
 }
 

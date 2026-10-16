@@ -21,10 +21,16 @@ use crate::search;
 /// Arguments the server puts beside a caller's own to say what it knows about the caller: the
 /// scopes of the token (`_readScopes`, read by the SDC operations and by stores that must not
 /// read what the token may not), whether it is an archiver, and the compartment a patient-scoped
-/// token is limited to (`_patientCompartment`, read by every search). They are not the client's, so
-/// a search does not take them for search parameters, and the code that adds them (and the code
-/// that makes sure a client did not) uses this same list.
-pub const CONTROL_ARGS: [&str; 3] = ["_readScopes", "_sdcArchiver", search::PATIENT_COMPARTMENT];
+/// token is limited to (`_patientCompartment`, read by every search), and how a search is to treat a
+/// value it cannot read (`_handling`, from the `Prefer` header of a `GET`). They are not the
+/// client's, so a search does not take them for search parameters, and the code that adds them (and
+/// the code that makes sure a client did not) uses this same list.
+pub const CONTROL_ARGS: [&str; 4] = [
+    "_readScopes",
+    "_sdcArchiver",
+    search::PATIENT_COMPARTMENT,
+    search::HANDLING,
+];
 
 /// Retries after an OCC conflict. The first attempt is not counted.
 pub const MAX_OCC_FAILURES: usize = 4;
@@ -335,7 +341,7 @@ pub fn dispatch(
         }
         "search" => {
             let params = search_args(args)?;
-            search::search(tx, catalog, model, &params)
+            search::search_handling(tx, catalog, model, &params, handling_arg(args))
         }
         "$populate" | "$assemble" | "$next-question" | "$behavior" | "$extract" => {
             crate::sdc::operation(tx, catalog, type_name, op, args)
@@ -404,6 +410,15 @@ fn search_args(args: &Value) -> Result<BTreeMap<String, String>, FhirError> {
     }
     limit_to_caller(&mut params, args)?;
     Ok(params)
+}
+
+/// How the request asked a search to treat a value it cannot read. Only the server puts
+/// `_handling` in the arguments of a search, so this is not a client's say beyond the header.
+fn handling_arg(args: &Value) -> search::Handling {
+    match args.get(search::HANDLING).and_then(Value::as_str) {
+        Some("lenient") => search::Handling::Lenient,
+        _ => search::Handling::Strict,
+    }
 }
 
 /// Put the server's limit on the caller, if it set one, on the parameters of a search that was
