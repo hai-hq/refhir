@@ -264,10 +264,15 @@ fn project_writes(
                 store, catalog, local_id, &written, &removed,
             ))
         };
-        if !matches!(applied, Some(Ok(()))) {
+        if matches!(applied, Some(Ok(()))) {
+            // Nothing was loaded again here, so nothing told the other processes: a replica and a
+            // standby follow counters, and only a publish moved them.
+            package::announce_applied(store, catalog)?;
+        } else {
             if let Some(Err(err)) = &applied {
                 tracing::warn!(error = %err, "incremental terminology update failed; rebuilding");
             }
+            // Publishing announces the change as well, so this is told once either way.
             sync_expansions(store)?;
             package::publish(store, catalog)?;
         }

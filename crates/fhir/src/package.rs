@@ -530,11 +530,31 @@ pub(crate) fn publish(
         loaded.warm(warmth);
     }
     *catalog.write().expect("catalog") = loaded;
-    // Tell the other processes the conformance tables changed. Every change moves the revision,
-    // which a standby follows. The version, which replicas follow, moves only when no search
-    // parameter is waiting for its backfill: while one is, this publish is skipped, and the one
-    // that follows the backfill's completion bumps it. So a replica never loads a parameter whose
-    // index is not complete.
+    announce(store, stable)
+}
+
+/// Tell the other processes that a change this one has already applied to its own catalog in
+/// place (terminology written through the API) is in the conformance tables, so a replica and a
+/// standby reload instead of answering from what they loaded before it. A change that is applied
+/// by loading the catalog again goes through [`publish`], which does the same.
+///
+/// Call it once the change is fully in the store: a process that reloads on seeing the counter
+/// move must find all of it.
+pub(crate) fn announce_applied(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+) -> Result<(), FhirError> {
+    // The change leaves search parameters as they were, so this is stable unless an earlier
+    // change left one waiting for its backfill.
+    let stable = !catalog.read().expect("catalog").has_pending_parameters();
+    announce(store, stable)
+}
+
+/// Every change moves the revision, which a standby follows. The version, which replicas follow,
+/// moves only when no search parameter is waiting for its backfill: while one is, the change
+/// is announced to standbys only, and the publish that follows the backfill's completion bumps
+/// the version. So a replica never loads a parameter whose index is not complete.
+fn announce(store: &dyn ConformanceStore, stable: bool) -> Result<(), FhirError> {
     store.bump_catalog_revision()?;
     if stable {
         store.bump_catalog_version()?;

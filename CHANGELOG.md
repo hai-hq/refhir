@@ -197,6 +197,20 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   type the search parameter can point at, so `subject=123` finds a `Patient/123` or a `Group/123`.
   Live queries over `/sync` read ids the same way, and are woken only by writes that reference
   that id.
+- **A replica and a standby now follow terminology written through the API.** Creating, updating
+  or deleting a CodeSystem, ValueSet or ConceptMap changed the catalog of the process that took
+  the write and told no other. A replica went on validating and expanding against the
+  terminology it loaded at start, and a standby took over with it, until something else (a package
+  install, a SearchParameter write) happened to make them reload; a restart also fixed it. The
+  write now tells them the way an install does, so each reloads its catalog within a moment of
+  the write.
+  - **What a replica does now.** It reloads the whole catalog in the background, which takes a few
+  seconds of one thread, and answers from the old one until the new one is ready. A script that
+  writes many code systems or value sets in a row keeps every replica reloading until it stops;
+  send them in one `transaction` Bundle, or install them as a package, to have each reload once.
+  - **Unchanged.** A replica still does not load a search parameter until its backfill has
+  completed, so while one is running a terminology write reaches standbys at once and replicas
+  when the backfill finishes.
 
 ## [0.0.1] - 2026-10-15
 

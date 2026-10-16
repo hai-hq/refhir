@@ -4115,6 +4115,273 @@ mod takeover {
         assert!(db.store.catalog_version().unwrap() > before);
         assert!(db.store.catalog_revision().unwrap() > revision);
     }
+
+    const PETS: &str = "http://example.org/pets";
+    const ANIMALS: &str = "http://example.org/animals";
+
+    /// A process that follows one of the counters, as a replica (`Stable`) or a standby (`Latest`)
+    /// does: the catalog it serves from, and the value it loaded it at.
+    struct Follower {
+        clock: crate::CatalogClock,
+        catalog: std::sync::RwLock<Catalog>,
+        at: u64,
+    }
+
+    impl Follower {
+        fn start(db: &Harness, clock: crate::CatalogClock) -> Self {
+            let (catalog, at) = Catalog::open_consistent(&db.store, clock).unwrap();
+            Self {
+                clock,
+                catalog: std::sync::RwLock::new(catalog),
+                at,
+            }
+        }
+
+        /// What the watcher does when it sees the counter differ from the one it loaded at.
+        /// Whether the catalog was reloaded.
+        fn catch_up(&mut self, db: &Harness) -> bool {
+            let now = crate::package::reload_catalog(&db.store, &self.catalog, self.at, self.clock)
+                .unwrap();
+            let moved = now != self.at;
+            self.at = now;
+            moved
+        }
+
+        fn pets(&self) -> Option<Vec<String>> {
+            codes_of_pets(&self.catalog)
+        }
+    }
+
+    /// The codes `catalog` expands the pets value set to, or `None` when it has no such value set.
+    fn codes_of_pets(catalog: &std::sync::RwLock<Catalog>) -> Option<Vec<String>> {
+        let expanded = catalog.read().unwrap().terms().expand(PETS, None)?;
+        let mut codes: Vec<String> = expanded["expansion"]["contains"]
+            .as_array()?
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect();
+        codes.sort();
+        Some(codes)
+    }
+
+    fn animals(codes: &[&str]) -> Value {
+        json!({
+            "resourceType": "CodeSystem", "url": ANIMALS, "status": "active",
+            "content": "complete",
+            "concept": codes.iter().map(|code| json!({"code": code})).collect::<Vec<_>>()
+        })
+    }
+
+    fn pets() -> Value {
+        json!({
+            "resourceType": "ValueSet", "url": PETS, "status": "active",
+            "compose": {"include": [{"system": ANIMALS}]}
+        })
+    }
+
+    /// Write a code system and a value set over it through the API, as a client would. Returns the
+    /// ids they were given.
+    fn write_pets(db: &Harness, codes: &[&str]) -> (String, String) {
+        let id = |value: Value| value["id"].as_str().unwrap().to_string();
+        let system = commit(db, "CodeSystem/create", json!({"resource": animals(codes)}));
+        let set = commit(db, "ValueSet/create", json!({"resource": pets()}));
+        (id(system.unwrap()), id(set.unwrap()))
+    }
+
+    fn with_resource_types() -> Harness {
+        let db = ready();
+        install_resource_types(&db);
+        db
+    }
+
+    #[test]
+    fn a_replica_hears_of_terminology_written_through_the_api() {
+        let db = with_resource_types();
+        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
+        assert_eq!(replica.pets(), None);
+
+        write_pets(&db, &["dog", "cat"]);
+        assert_eq!(
+            codes_of_pets(&db.catalog),
+            Some(vec!["cat".into(), "dog".into()])
+        );
+
+        // The primary changed its own catalog in place and rewrote the expansions it touched, and
+        // that is all the replica could see of it: it follows a counter, and nothing moved it.
+        assert!(
+            replica.catch_up(&db),
+            "the version a replica follows did not move, so it kept answering from the old terminology"
+        );
+        assert_eq!(replica.pets(), codes_of_pets(&db.catalog));
+    }
+
+    #[test]
+    fn a_standby_hears_of_terminology_written_through_the_api() {
+        let db = with_resource_types();
+        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        assert_eq!(standby.pets(), None);
+
+        write_pets(&db, &["dog", "cat"]);
+        assert!(
+            standby.catch_up(&db),
+            "the revision a standby follows did not move, so it would take over with old terminology"
+        );
+        assert_eq!(standby.pets(), codes_of_pets(&db.catalog));
+    }
+
+    #[test]
+    fn an_edit_or_a_deletion_of_terminology_reaches_replicas_and_standbys_too() {
+        let db = with_resource_types();
+        let (system, set) = write_pets(&db, &["dog"]);
+        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+
+        // A code added to a code system changes the expansion of the value set over it.
+        let mut edited = animals(&["dog", "cat"]);
+        edited["id"] = json!(system);
+        commit(
+            &db,
+            "CodeSystem/update",
+            json!({"id": system, "resource": edited}),
+        )
+        .unwrap();
+        for follower in [&mut replica, &mut standby] {
+            assert!(follower.catch_up(&db), "{:?} was not told", follower.clock);
+            assert_eq!(follower.pets(), Some(vec!["cat".into(), "dog".into()]));
+        }
+
+        // A value set that is deleted is gone from them too.
+        commit(&db, "ValueSet/delete", json!({"id": set})).unwrap();
+        assert_eq!(codes_of_pets(&db.catalog), None);
+        for follower in [&mut replica, &mut standby] {
+            assert!(follower.catch_up(&db), "{:?} was not told", follower.clock);
+            assert_eq!(follower.pets(), None);
+        }
+    }
+
+    #[test]
+    fn a_terminology_write_moves_each_counter_once_by_either_path() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let counters = || {
+            (
+                db.store.catalog_version().unwrap(),
+                db.store.catalog_revision().unwrap(),
+            )
+        };
+        let write = |resource: Value| {
+            watched_commit(
+                &db,
+                &watched,
+                "ValueSet/create",
+                json!({"resource": resource}),
+            )
+            .unwrap()
+        };
+        let colors = |id: &str| color_value_set(id, &["a"], "http://example.org/s");
+
+        // Only what the change touches is recomputed and the live catalog is changed in place.
+        let (version, revision) = counters();
+        write(colors("incremental"));
+        assert_eq!(counters(), (version + 1, revision + 1));
+
+        // If that fails the store is rebuilt and the catalog loaded again, and that is one
+        // announcement too, not two.
+        watched.fail_apply_expansions.store(1, Ordering::SeqCst);
+        let (version, revision) = counters();
+        write(colors("fallback"));
+        assert_eq!(counters(), (version + 1, revision + 1));
+    }
+
+    #[test]
+    fn a_transaction_of_terminology_tells_replicas_and_standbys_once() {
+        let db = with_resource_types();
+        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        let (version, revision) = (
+            db.store.catalog_version().unwrap(),
+            db.store.catalog_revision().unwrap(),
+        );
+
+        // A code system and ten value sets in one request: one commit, so one reload, however
+        // many resources it holds. Writing them one by one is eleven.
+        let mut entries = vec![json!({
+            "request": {"method": "POST", "url": "CodeSystem"},
+            "resource": animals(&["dog", "cat"])
+        })];
+        let mut set = pets();
+        for n in 0..10 {
+            set["url"] = json!(format!("{PETS}-{n}"));
+            entries.push(json!({
+                "request": {"method": "POST", "url": "ValueSet"},
+                "resource": set.clone()
+            }));
+        }
+        let bundle = json!({"resourceType": "Bundle", "type": "transaction", "entry": entries});
+        commit(&db, "Bundle/transaction", json!({"resource": bundle})).unwrap();
+
+        assert_eq!(db.store.catalog_version().unwrap(), version + 1);
+        assert_eq!(db.store.catalog_revision().unwrap(), revision + 1);
+        for follower in [&mut replica, &mut standby] {
+            assert!(follower.catch_up(&db), "{:?} was not told", follower.clock);
+            let expanded = follower
+                .catalog
+                .read()
+                .unwrap()
+                .terms()
+                .expand(&format!("{PETS}-9"), None);
+            assert!(
+                expanded.is_some(),
+                "{:?} has the last value set",
+                follower.clock
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminology_write_while_a_backfill_is_pending_tells_a_standby_but_not_a_replica() {
+        let db = with_resource_types();
+        for n in 0..3 {
+            apply(
+                &db,
+                "Patient/create",
+                json!({"resource": with_birth_date(&format!("p{n}"))}),
+            );
+        }
+        // What a replica loaded before the install.
+        let mut replica = Follower::start(&db, crate::CatalogClock::Stable);
+        let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
+            .unwrap()
+            .expect("the package has pending search parameters");
+        publish(&db.store, &db.catalog).unwrap();
+        pending.create(&db.store, &db.db).unwrap();
+        let mut standby = Follower::start(&db, crate::CatalogClock::Latest);
+        assert!(standby.catalog.read().unwrap().has_pending_parameters());
+        let (version, revision) = (
+            db.store.catalog_version().unwrap(),
+            db.store.catalog_revision().unwrap(),
+        );
+
+        write_pets(&db, &["dog"]);
+
+        // A standby follows every change and may have to finish the backfill, so it is told. A
+        // replica would load a parameter whose index is incomplete if it reloaded now, and it
+        // never does: the version stays where it was.
+        assert_eq!(db.store.catalog_version().unwrap(), version);
+        assert!(db.store.catalog_revision().unwrap() > revision);
+        assert!(!replica.catch_up(&db));
+        assert_eq!(replica.pets(), None);
+        assert!(standby.catch_up(&db));
+        assert_eq!(standby.pets(), Some(vec!["dog".into()]));
+        assert!(standby.catalog.read().unwrap().has_pending_parameters());
+
+        // Completing the backfill moves the version, and the replica takes everything at once.
+        run_backfills(&db.store, &db.db, &db.catalog).unwrap();
+        assert!(replica.catch_up(&db));
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+        assert!(!replica.catalog.read().unwrap().has_pending_parameters());
+    }
 }
 
 /// Search builds its page lazily: only the ids of the index range, only the page's documents, no

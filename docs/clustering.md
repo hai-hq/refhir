@@ -18,6 +18,14 @@ refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
 - **Writer lease.** The primary holds a lease on the database (a Postgres advisory lock, or a file
   lock `<db>.lock` for SQLite). If it loses the lease the process exits, and a paused primary that
   wakes up after a standby took over is fenced off and exits instead of writing.
+- **Conformance changes.** Installing a package, or writing a SearchParameter, CodeSystem,
+  ValueSet or ConceptMap, changes the catalog the processes serve from. A replica notices within a
+  moment and reloads it in the background (a few seconds of one thread, answering from the old
+  catalog until the new one is ready); a standby keeps its own copy current for when it takes
+  over. A replica does not load a search parameter until its backfill has finished, so it hears of
+  a change made while one is running when the backfill completes. Writing many code systems or
+  value sets one by one keeps replicas reloading; a `transaction` Bundle or a package is one
+  change, and so one reload.
 - **Load balancers.** `GET /healthz` is 200 when a process can take traffic and 503 when it
   cannot: a standby, a process still starting, or a replica that has stopped following the
   primary. `?verbose=1` adds connection pool and commit timing counters.
