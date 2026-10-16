@@ -15,15 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 mod common;
-use common::{admin_url, fresh_database};
-
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+use common::{admin_url, free_port, fresh_database};
 
 /// A directory with the resource types a user needs to author conformance resources.
 fn types_package() -> PathBuf {

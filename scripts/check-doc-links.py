@@ -74,7 +74,11 @@ def tracked_markdown() -> list:
         ["git", "ls-files", "--others", "--exclude-standard", "*.md"],
         cwd=ROOT, capture_output=True, text=True, check=True,
     ).stdout.split("\n")
-    return sorted({ROOT / p for p in out if p and (ROOT / p).exists()})
+    # site/ holds the website's own pages, which link with site URLs (/docs/...) that are not
+    # files. The site build validates those links itself.
+    return sorted(
+        {ROOT / p for p in out if p and not p.startswith("site/") and (ROOT / p).exists()}
+    )
 
 
 def select(args: list) -> list:

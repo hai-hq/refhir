@@ -66,7 +66,9 @@ changelog says so. The clients are released at the same version:
 6. **Check the result.** The release page lists three archives and `SHA256SUMS`;
    `docker run --rm ghcr.io/hai-hq/refhir:X.Y.Z --version` prints `refhir X.Y.Z`;
    `go list -m github.com/hai-hq/refhir/clients/go@vX.Y.Z` finds the Go client; and once the npm
-   version is approved, `npm view @haihq/refhir@X.Y.Z version` finds the TypeScript one.
+   version is approved, `npm view @haihq/refhir@X.Y.Z version` finds the TypeScript one. The
+   website rebuilds by itself when `main` changes, so its version badge and its changelog page follow
+   the release; look at [refhir.haihq.org](https://refhir.haihq.org) once that build has finished.
 
 The clients are handled after the GitHub release, and only if it succeeded, in two jobs of their
 own: **Tag the Go client** and **Stage the TypeScript client on npm**. Both are safe to re-run: a

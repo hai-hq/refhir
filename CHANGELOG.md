@@ -12,6 +12,18 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **Subscriptions send `channel.header`.** Each entry (R4 says `Name: value`, for example
+  `Authorization: Bearer …`) is added to the `rest-hook` request, so a receiver that needs a
+  token can be served. A name can be given once. An entry that is not a valid header, that
+  repeats a name, or that sets a header the server controls (`Host`, `Content-Length`,
+  `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`,
+  `Cookie`, `Proxy-*`) fails the notification and puts the Subscription in `error` with the
+  reason. A `Content-Type` entry replaces the default, whatever its case.
+- **A Subscription's `status` follows its deliveries.** When a `rest-hook` notification still
+  fails after its eight attempts (about ten seconds), the server sets `status` to `error` and
+  `error` to the time and the reason. The next notification that gets through sets `status` back
+  to `active` and clears `error`. Delivery continues while the status is `error`; only `off`
+  stops it, and the server never changes an `off` Subscription.
 - **`Prefer: handling=lenient` on a search `GET`.** A search whose parameter value cannot be read
   (see Changed) can ask for the parameter to be left out instead: the search runs on the rest, the
   Bundle carries an `OperationOutcome` entry (`search.mode` `outcome`) with a warning for each
@@ -23,6 +35,38 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **Naming more than one database on the command line is now an error.** `--sqlite`, `--memory`
+  and `--postgres` are alternatives, but ReFHIR used to start without complaint and use one of
+  them: `refhir --memory --sqlite x.db` ran in memory and never created `x.db`. It now exits with
+  `pass only one of --sqlite, --memory, or --postgres`, as the
+  [CLI reference](docs/configuration.md#cli-reference) has always said, and that includes the same
+  flag twice. `--sqlite` or `--postgres` followed directly by another flag is refused too, where
+  it used to take the flag as its value (`--sqlite --memory` opened a file called `--memory`).
+  `refhir migrate` does the same for `--sqlite` and `--postgres` (exit status 2). A single flag
+  still overrides the database the config file or the environment names. If a script passes two,
+  remove the one you did not mean.
+- **A `rest-hook` endpoint that redirects has not received the notification.** Redirects are no
+  longer followed, and a `3xx` is a failed delivery. A `301`, `302` or `303` used to turn the
+  `POST` into a `GET`, and the notification counted as delivered.
+- **Retries are spaced.** A failed notification waits at least a second and a half between
+  attempts. The retry queue also runs after every commit, so on a busy server all eight attempts
+  could be used up in a moment. Before each retry the Subscription is read again: if it has been
+  deleted, is `off` or sends somewhere else the notification is dropped, and a changed header is
+  the one sent.
+- **A `rest-hook` channel with no endpoint ends in `error`.** It was skipped without a word.
+- **A notification for a Subscription leaves out its `channel.header`.** A Subscription whose
+  `criteria` are `Subscription` is told about every one written, and would otherwise have been
+  sent their credentials.
+- **The server now writes to Subscriptions.** The `status` and `error` change above is an
+  ordinary update, so a Subscription can gain a version you did not write (visible in its
+  `_history`, not in the audit trail: there is no caller to name). An `If-Match` that names an
+  older version fails with `409`, as for any concurrent edit.
+- **Subscription behavior is documented in full** ([Subscriptions](docs/fhir-api.md#subscriptions)):
+  only creates and updates are notified, as R4 defines it (a delete, or a resource that stops
+  matching, sends nothing); `channel.payload` and `end` are ignored; nothing limits where an
+  endpoint may point; retries are in memory and a restart drops them; the WebSocket channel has
+  no handshake and keeps one socket per id. `docs/design.md` no longer lists Subscription
+  delivery with the durable jobs: only `$export` is durable.
 - **A search whose parameter value cannot be read is now a `400`, where it used to return an empty
   result.** `GET /Patient?birthdate=notadate` and `GET /Observation?value-quantity=abc` answered
   `200` with an empty Bundle, which looks the same as a search that matches nothing; they now answer
@@ -35,9 +79,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   create, update or delete that used such a value, which used to match nothing (and so create), a
   live query over `/sync`, which answers `QueryFailed` at once instead of staying empty, and a
   query in a Questionnaire that `$populate` runs, which now fails with the message instead of
-  populating from nothing. A client
-  that relied on the empty result can send `Prefer: handling=lenient`. A date range written as a
-  parameter given twice (`date=ge2020&date=le2021`) was read as one value joined by a comma, and
+  populating from nothing. A client that relied on the empty result can send
+  `Prefer: handling=lenient`. A date range written as a parameter given twice (`date=ge2020&date=le2021`) was read as one value joined by a comma, and
   matched nothing; it now gets this error, with a note that value lists are not supported.
 
 ## [0.0.1] - 2026-10-15

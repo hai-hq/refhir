@@ -1,6 +1,10 @@
-//! Flags that print something and exit, through the real binary.
+//! Command-line flags, through the real binary: the ones that print something and exit, and the
+//! rules about which flags may be combined.
 
 use std::process::Command;
+
+mod common;
+use common::{exits, serves, Scratch, UNUSABLE_POSTGRES};
 
 fn refhir(flag: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_refhir"))
@@ -28,4 +32,188 @@ fn help_mentions_the_version_flag() {
     let out = refhir("--help");
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("--version"));
+}
+
+const ONE_DATABASE: &str = "pass only one of --sqlite, --memory, or --postgres";
+
+fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+    if items.len() <= 1 {
+        return vec![items.to_vec()];
+    }
+    let mut all = Vec::new();
+    for at in 0..items.len() {
+        let mut rest = items.to_vec();
+        let head = rest.remove(at);
+        for mut tail in permutations(&rest) {
+            tail.insert(0, head.clone());
+            all.push(tail);
+        }
+    }
+    all
+}
+
+/// The flags used to be applied in a fixed order (`--sqlite`, then `--memory`, then `--postgres`),
+/// each clearing the others, so one of them won whatever order the command line gave: `--memory`
+/// beat `--sqlite`, and `--postgres` beat both. A SQLite file that was asked for was left alone.
+#[test]
+fn naming_more_than_one_database_is_refused_in_every_order() {
+    let dir = Scratch::new("cli-conflict");
+    let file = dir.join("named.sqlite");
+    let file_arg = file.to_str().unwrap();
+    let flags: [Vec<&str>; 3] = [
+        vec!["--sqlite", file_arg],
+        vec!["--memory"],
+        vec!["--postgres", UNUSABLE_POSTGRES],
+    ];
+
+    // Every ordered pair, and every ordering of all three.
+    let mut orders = permutations(&[0, 1, 2]);
+    for first in 0..3 {
+        for second in 0..3 {
+            if first != second {
+                orders.push(vec![first, second]);
+            }
+        }
+    }
+    assert_eq!(orders.len(), 12);
+    let mut lines: Vec<Vec<&str>> = orders
+        .iter()
+        .map(|order| order.iter().flat_map(|at| flags[*at].clone()).collect())
+        .collect();
+    // The same one twice, and other flags in between.
+    lines.push(vec!["--sqlite", file_arg, "--sqlite", file_arg]);
+    lines.push(vec![
+        "--postgres",
+        UNUSABLE_POSTGRES,
+        "--postgres",
+        UNUSABLE_POSTGRES,
+    ]);
+    lines.push(vec![
+        "--memory",
+        "--bind",
+        "127.0.0.1:0",
+        "--sqlite",
+        file_arg,
+    ]);
+    for mut args in lines {
+        args.extend(["--bind", "127.0.0.1:0"]);
+        let output = exits(&dir, &args);
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {said}");
+        assert_eq!(said, format!("refhir: {ONE_DATABASE}\n"), "{args:?}");
+        assert!(!file.exists(), "{args:?} opened the SQLite file");
+    }
+
+    // It is the command line that is refused, before the settings are read.
+    let broken = dir.join("broken.toml");
+    std::fs::write(&broken, "[database\nkind = = =\n").unwrap();
+    let output = exits(
+        &dir,
+        &[
+            "--config",
+            broken.to_str().unwrap(),
+            "--memory",
+            "--sqlite",
+            file_arg,
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("refhir: {ONE_DATABASE}\n")
+    );
+}
+
+/// A database flag followed by another flag has no value, and was read as the value instead: it
+/// opened a SQLite file named `--memory`.
+#[test]
+fn a_database_flag_does_not_take_the_next_flag_as_its_value() {
+    let dir = Scratch::new("cli-novalue");
+    for (args, said) in [
+        (
+            ["--sqlite", "--memory"],
+            "refhir: --sqlite needs a value, not the flag --memory\n",
+        ),
+        (
+            ["--postgres", "--sqlite"],
+            "refhir: --postgres needs a value, not the flag --sqlite\n",
+        ),
+    ] {
+        let output = exits(&dir, &args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), said, "{args:?}");
+    }
+    assert!(!dir.join("--memory").exists(), "a file named after a flag");
+}
+
+/// "CLI flags override the file", and the environment: one flag on the command line replaces
+/// whatever database the settings name, and is not a conflict with it.
+#[test]
+fn one_database_flag_still_overrides_the_settings() {
+    let dir = Scratch::new("cli-override");
+    let from_file = dir.join("from-file.sqlite");
+    let from_flag = dir.join("from-flag.sqlite");
+    let from_env = dir.join("from-env.sqlite");
+    let write_config = |body: String| {
+        let path = dir.join("settings.toml");
+        std::fs::write(&path, format!("[database]\n{body}")).unwrap();
+        path
+    };
+
+    // The file names a SQLite database; --memory replaces it.
+    let config = write_config(format!(
+        "kind = \"sqlite\"\nsqlite_path = '{}'\n",
+        from_file.display()
+    ));
+    let config = config.to_str().unwrap();
+    serves(&dir, &["--config", config, "--memory"], &[]);
+    assert!(
+        !from_file.exists(),
+        "--memory did not replace the file's database"
+    );
+
+    // ...and so does Postgres, which here is refused at once, and not opened.
+    let output = exits(
+        &dir,
+        &[
+            "--config",
+            config,
+            "--postgres",
+            UNUSABLE_POSTGRES,
+            "--bind",
+            "127.0.0.1:0",
+        ],
+    );
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(!said.contains("pass only one"), "{said}");
+    assert!(
+        !from_file.exists(),
+        "--postgres did not replace the file's database"
+    );
+
+    // The file names a database in memory; --sqlite replaces it.
+    let config = write_config("kind = \"memory\"\n".to_string());
+    serves(
+        &dir,
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--sqlite",
+            from_flag.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        from_flag.exists(),
+        "--sqlite did not replace the file's database"
+    );
+
+    // The environment names a Postgres that cannot be used; --sqlite and --memory replace it.
+    let postgres = [("REFHIR_POSTGRES_URL", UNUSABLE_POSTGRES)];
+    serves(&dir, &["--sqlite", from_env.to_str().unwrap()], &postgres);
+    assert!(
+        from_env.exists(),
+        "--sqlite did not replace the environment's database"
+    );
+    serves(&dir, &["--memory"], &postgres);
 }

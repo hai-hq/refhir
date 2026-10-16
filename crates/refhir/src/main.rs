@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 
 use config::{
-    apply_env, check_release_matches_database, discover_config_path, load_file, release_from_plan,
-    FhirRelease, PackagePlan, ResolvedConfig, Role,
+    apply_env, check_release_matches_database, database_value, discover_config_path, load_file,
+    release_from_plan, FhirRelease, PackagePlan, ResolvedConfig, Role,
 };
 use refhir_database::Database;
 use refhir_fhir::{Catalog, CatalogClock};
@@ -24,6 +24,8 @@ use tokio::net::TcpListener;
 
 /// Database connections to open when `--db-pool` is not given.
 const DEFAULT_DB_POOL: usize = 8;
+/// The refusal for a database named twice.
+const ONE_DATABASE: &str = "pass only one of --sqlite, --memory, or --postgres";
 /// How often a standby asks for the writer lease.
 const STANDBY_POLL: Duration = Duration::from_secs(1);
 /// How often a replica moves its snapshot up to the writer's watermark.
@@ -71,6 +73,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_sqlite: Option<Option<String>> = None;
     let mut cli_memory = false;
     let mut cli_postgres: Option<Option<String>> = None;
+    // How many times the command line names a database, whichever flag does.
+    let mut cli_databases = 0;
     let mut cli_bind: Option<String> = None;
     let mut cli_references: Option<String> = None;
     let mut cli_auth = false;
@@ -111,12 +115,23 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             }
             "--sqlite" => {
                 index += 1;
-                cli_sqlite = Some(Some(required(&args, index, "--sqlite")?));
+                cli_sqlite = Some(Some(database_value(
+                    "--sqlite",
+                    required(&args, index, "--sqlite")?,
+                )?));
+                cli_databases += 1;
             }
-            "--memory" => cli_memory = true,
+            "--memory" => {
+                cli_memory = true;
+                cli_databases += 1;
+            }
             "--postgres" => {
                 index += 1;
-                cli_postgres = Some(Some(required(&args, index, "--postgres")?));
+                cli_postgres = Some(Some(database_value(
+                    "--postgres",
+                    required(&args, index, "--postgres")?,
+                )?));
+                cli_databases += 1;
             }
             "--package" => {
                 index += 1;
@@ -201,6 +216,13 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             other => return Err(format!("unknown argument {other}").into()),
         }
         index += 1;
+    }
+
+    // Checked here, on the flags alone: once they are applied below each one clears the other two,
+    // so the last would win and the check after them could never see two. One named twice is as
+    // ambiguous as two kinds.
+    if cli_databases > 1 {
+        return Err(ONE_DATABASE.into());
     }
 
     let file_path = discover_config_path(config_path.as_deref());
@@ -303,11 +325,14 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     // A limit that cannot work is refused now, and not discovered by the first caller to hit it.
     cfg.governance.validate(cfg.auth)?;
+    // A backstop. Every source clears the other two kinds when it sets one, so none leaves two set
+    // today: a settings file that names two quietly resolves to one (Postgres over SQLite, and
+    // `kind = "memory"` over a path). This catches a new setter that forgets to clear them.
     if cfg.postgres.is_some() && (cfg.sqlite.is_some() || cfg.memory) {
-        return Err("pass only one of --sqlite, --memory, or --postgres".into());
+        return Err(ONE_DATABASE.into());
     }
     if cfg.sqlite.is_some() && cfg.memory {
-        return Err("pass only one of --sqlite, --memory, or --postgres".into());
+        return Err(ONE_DATABASE.into());
     }
 
     let default_filter = if cfg.trace_engine {
@@ -825,7 +850,7 @@ fn install_packages(
 
 fn print_help() {
     println!(
-        "refhir [--config path] [--sqlite path] [--memory] [--postgres url] [--bind 127.0.0.1:8080]\n\
+        "refhir [--config path] [--sqlite path | --memory | --postgres url] [--bind 127.0.0.1:8080]\n\
          [--package dir|name@version] [--references strict|fhir] [--smart]\n\
          [--public-url url] [--smart-patient id] [--smart-encounter id]\n\
          [--smart-fhir-user Resource/id] [--smart-dcr-token token] [--update-as-create]\n\

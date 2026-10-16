@@ -7,7 +7,7 @@ Why ReFHIR exists and how it works. To run it, start with [Getting started](gett
 FHIR servers are usually request-response.
 
 ```http
-GET /Observation?patient=123&status=final
+GET /Observation?patient=Patient/123&status=final
 ```
 
 returns one snapshot. Healthcare state keeps moving: new results, discontinued orders, closed encounters, updated diagnoses, tasks completed elsewhere, authorization or care-team changes while software or an agent is still working.
@@ -24,10 +24,9 @@ Subscribe to the **result of a query**, not only to per-resource change events.
 
 ```ts
 const observations = useFHIRQuery({
+  baseURL: "http://127.0.0.1:8080",
   resourceType: "Observation",
-  patient: patientId,
-  status: "final",
-  _sort: "-date",
+  params: { patient: patientId, status: "final", _sort: "-date" },
 });
 ```
 
@@ -108,7 +107,7 @@ Web apps, backends, AI runtimes (/sync)
 | **Reactive engine** | Recompute only queries whose results may have changed |
 | **Sync** | Initial result, ordered transitions, versions, reconnect (target: full recovery semantics) |
 
-**FHIR Subscriptions.** ReFHIR delivers these too (`rest-hook` and `websocket` channels), for system-to-system events and async workflows.
+**FHIR Subscriptions.** ReFHIR delivers these too (`rest-hook` and `websocket` channels), for system-to-system events and async workflows. They notify creates and updates only, as R4 does; see [Subscriptions](fhir-api.md#subscriptions).
 
 ```text
 FHIR Subscription  →  another system learns something happened
@@ -117,7 +116,7 @@ Reactive query     →  a client stays synchronized with what is true now
 
 ### Reactive query semantics (target)
 
-For `Observation?patient=123&status=final`:
+For `Observation?patient=Patient/123&status=final`:
 
 | Change | Effect |
 |--------|--------|
@@ -174,8 +173,12 @@ tombstone row, and each search parameter value is a row in the index log. A read
 *t* takes the newest row at or before *t*, which is what makes snapshots cheap and `vread` and
 `_history` free.
 
-Work that should follow a commit but is not part of it (Subscription delivery, bulk export, remote
-terminology) runs as jobs after `publish_commit`; see [Operations](operations.md#export-jobs).
+Work that should follow a commit but is not part of it runs after `publish_commit`: Subscription
+delivery, bulk export and remote terminology. Only `$export` is a durable job, a row in the `jobs`
+table that survives a restart (see [Operations](operations.md#export-jobs)). Subscription delivery
+is a loop in the primary process, and a notification that has failed waits in memory for its
+retries, so a restart drops it; what delivery learned about a Subscription (`status` and `error`)
+is written to the Subscription, which is stored. See [Subscriptions](fhir-api.md#subscriptions).
 
 ## Client SDKs
 

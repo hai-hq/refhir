@@ -864,6 +864,15 @@ fn env_value(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// The value after `--sqlite` or `--postgres`. A word that starts with `--` is the next flag,
+/// which the first was left without a value to take, and not a database named `--memory`.
+pub fn database_value(flag: &str, value: String) -> Result<String, String> {
+    if value.starts_with("--") {
+        return Err(format!("{flag} needs a value, not the flag {value}"));
+    }
+    Ok(value)
+}
+
 pub fn discover_config_path(cli_path: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = cli_path {
         return Some(p.to_path_buf());
