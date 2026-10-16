@@ -5,6 +5,10 @@
 //! Bulk export is a durable job. Its row lives in the database (the `jobs` table behind
 //! [`JobStore`]), not in this process, so a client can ask for the outcome after a restart, and
 //! a job the restart cut off is run again.
+//!
+//! Subscription delivery is not durable. A rest-hook notification that failed waits in memory for
+//! its retries, and a restart drops it. What delivery learns about a Subscription is written to
+//! it as `status` and `error`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -12,13 +16,13 @@ use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use refhir_database::Database;
-use refhir_fhir::{Catalog, ConformanceStore};
+use refhir_fhir::{Catalog, ConformanceStore, FhirError, RunError};
 use refhir_persistence::{
     JobLease, JobStatus, JobStore, MemoryJobStore, PersistError, StoredJob, TimestampRange,
 };
@@ -391,30 +395,32 @@ pub fn attach(
     if tokio::runtime::Handle::try_current().is_err() {
         return;
     }
-    let pending = Arc::new(Mutex::new(Vec::<PendingHook>::new()));
+    let relay = Arc::new(Relay {
+        db,
+        catalog,
+        store,
+        pending: Mutex::new(Vec::new()),
+    });
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
                 Some(ts) = rx.recv() => {
-                    let db = db.clone();
-                    let catalog = catalog.clone();
-                    let store = store.clone();
+                    let relay = relay.clone();
                     let urls = urls.clone();
-                    let pending = pending.clone();
                     tokio::task::spawn_blocking(move || {
-                        drain_hooks(&pending);
-                        deliver_subscriptions(&db, &catalog, ts, &pending);
+                        drain_hooks(&relay);
+                        deliver_subscriptions(&relay, ts);
                         if !urls.is_empty() {
-                            fetch_terminology(store.as_ref(), &db, &catalog, &urls);
+                            fetch_terminology(relay.store.as_ref(), &relay.db, &relay.catalog, &urls);
                         }
                     })
                     .await
                     .ok();
                 }
                 _ = ticker.tick() => {
-                    let pending = pending.clone();
-                    tokio::task::spawn_blocking(move || drain_hooks(&pending)).await.ok();
+                    let relay = relay.clone();
+                    tokio::task::spawn_blocking(move || drain_hooks(&relay)).await.ok();
                 }
             }
         }
@@ -785,13 +791,9 @@ fn field_references(value: Option<&Value>, patient: &str) -> bool {
     }
 }
 
-fn deliver_subscriptions(
-    db: &Database,
-    catalog: &std::sync::RwLock<Catalog>,
-    ts: Timestamp,
-    pending: &Mutex<Vec<PendingHook>>,
-) {
-    let catalog = catalog.read().expect("catalog");
+fn deliver_subscriptions(relay: &Relay, ts: Timestamp) {
+    let db = &*relay.db;
+    let catalog = relay.catalog.read().expect("catalog");
     let Ok(_model) = catalog.get("Subscription") else {
         return;
     };
@@ -816,6 +818,10 @@ fn deliver_subscriptions(
     ) else {
         return;
     };
+    // The rest-hook notifications to send. They go out once the catalog lock is let go: a dead
+    // endpoint takes seconds to time out, and a writer waiting for the lock would hold every
+    // reader up behind it.
+    let mut deliveries = Vec::<(Arc<Target>, String)>::new();
     for entry in entries {
         let Some(subscription) = entry.get("resource") else {
             continue;
@@ -838,6 +844,8 @@ fn deliver_subscriptions(
         let Some((type_name, query)) = criteria.split_once('?').or(Some((criteria, ""))) else {
             continue;
         };
+        // Made at the first match, so a commit that matches nothing costs nothing here.
+        let mut hook: Option<Arc<Target>> = None;
         for row in &rows {
             if row.id.tablet.as_str() != type_name {
                 continue;
@@ -845,7 +853,7 @@ fn deliver_subscriptions(
             let Some(text) = row.value.as_deref() else {
                 continue;
             };
-            let Ok(_resource) = serde_json::from_str::<Value>(text) else {
+            let Ok(resource) = serde_json::from_str::<Value>(text) else {
                 continue;
             };
             if !criteria_matches(
@@ -857,18 +865,49 @@ fn deliver_subscriptions(
             ) {
                 continue;
             }
-            if channel == "rest-hook" && !endpoint.is_empty() {
-                post_hook(pending, endpoint, text);
-            }
-            if channel == "websocket" {
+            let body = notification_body(type_name, resource, text);
+            if channel == "rest-hook" {
+                let target = hook
+                    .get_or_insert_with(|| Arc::new(Target::of(subscription, endpoint)))
+                    .clone();
+                deliveries.push((target, body));
+            } else if channel == "websocket" {
                 let id = subscription
                     .get("id")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                notify_socket(id, text);
+                notify_socket(id, &body);
             }
         }
     }
+    drop(catalog);
+    // How each Subscription's delivery ended, where that is already known: recorded once all
+    // are sent, and once for each.
+    let mut outcomes = BTreeMap::<String, (Arc<Target>, Outcome)>::new();
+    for (target, body) in deliveries {
+        if let Some(outcome) = post_hook(relay, &target, &body) {
+            outcomes
+                .entry(target.id.clone())
+                .or_insert((target, outcome));
+        }
+    }
+    for (target, outcome) in outcomes.into_values() {
+        relay.record(&target, outcome);
+    }
+}
+
+/// The text a notification carries for `resource`, which is the stored text unless the resource
+/// is a Subscription. Its `channel.header` entries are credentials for its own receiver, so they
+/// are left out of what another Subscription's receiver is sent (a Subscription whose criteria
+/// are `Subscription` is notified of every other one).
+fn notification_body(type_name: &str, mut resource: Value, text: &str) -> String {
+    if type_name != "Subscription" {
+        return text.to_string();
+    }
+    if let Some(channel) = resource.get_mut("channel").and_then(Value::as_object_mut) {
+        channel.remove("header");
+    }
+    resource.to_string()
 }
 
 fn criteria_matches(
@@ -976,53 +1015,369 @@ fn fetch_terminology(
     }
 }
 
-struct PendingHook {
-    endpoint: String,
-    body: String,
-    attempts: u8,
+/// Sends before a rest-hook notification is given up on: this many in all, the first
+/// [`HOOK_QUICK_ATTEMPTS`] at once and each of the rest when the retry queue next runs after the
+/// notification is due.
+const HOOK_ATTEMPTS: u8 = 8;
+
+/// Attempts made straight away, a moment apart, before a failed notification is left to the queue.
+const HOOK_QUICK_ATTEMPTS: u8 = 3;
+
+/// The least time between two of the later attempts. The retry queue runs after every commit as
+/// well as every two seconds, and without this a busy server would spend all of them in a moment
+/// on an endpoint that has been down for a second.
+const HOOK_RETRY_GAP: Duration = Duration::from_millis(1500);
+
+/// The longest `Subscription.error` the server writes.
+const ERROR_CHARS: usize = 500;
+
+/// Headers a `channel.header` entry cannot set. The request's framing and connection handling are
+/// the server's, and `Cookie` and `Proxy-*` carry an identity that is not the Subscription's to
+/// assert.
+const CONTROLLED_HEADERS: [&str; 10] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "keep-alive",
+    "upgrade",
+    "te",
+    "trailer",
+    "expect",
+    "cookie",
+];
+
+fn controlled_header(name: &str) -> bool {
+    CONTROLLED_HEADERS
+        .iter()
+        .any(|controlled| name.eq_ignore_ascii_case(controlled))
+        || name.to_ascii_lowercase().starts_with("proxy-")
 }
 
-fn post_hook(pending: &Mutex<Vec<PendingHook>>, endpoint: &str, body: &str) {
-    for attempt in 1u8..=3 {
-        if http_post(endpoint, body).is_ok() {
+/// What the delivery loop needs to send notifications and to record how they went.
+struct Relay {
+    db: Arc<Database>,
+    catalog: Arc<std::sync::RwLock<Catalog>>,
+    store: Arc<dyn ConformanceStore>,
+    /// Notifications that failed and wait for another attempt. They are held in memory only: a
+    /// restart loses them.
+    pending: Mutex<Vec<PendingHook>>,
+}
+
+/// The Subscription a rest-hook notification is for, as it was when the notification was sent.
+struct Target {
+    id: String,
+    status: Option<String>,
+    endpoint: String,
+    /// `channel.header` as (name, value), or why an entry cannot be sent. These are credentials:
+    /// they are never logged, and never put in an error message.
+    headers: Result<Vec<(String, String)>, String>,
+}
+
+impl Target {
+    fn of(subscription: &Value, endpoint: &str) -> Target {
+        Target {
+            id: subscription
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            status: subscription
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            endpoint: endpoint.to_string(),
+            headers: channel_headers(subscription),
+        }
+    }
+}
+
+/// How a notification ended.
+enum Outcome {
+    Delivered,
+    Failed(String),
+}
+
+/// A failure that is recorded as it is: stamped with the time.
+fn failure(message: &str) -> Outcome {
+    Outcome::Failed(format!("{}: {message}", rfc3339(now_ms())))
+}
+
+struct PendingHook {
+    target: Arc<Target>,
+    body: String,
+    attempts: u8,
+    /// Not sent again before this.
+    due: Instant,
+}
+
+/// R4 `channel.header`: each entry is `Name: value`, and a name appears once.
+fn channel_headers(subscription: &Value) -> Result<Vec<(String, String)>, String> {
+    let Some(entries) = subscription
+        .pointer("/channel/header")
+        .and_then(Value::as_array)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut headers = Vec::<(String, String)>::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let number = index + 1;
+        let invalid =
+            || format!("channel.header entry {number} is not a valid \"Name: value\" HTTP header");
+        let (name, value) = entry
+            .as_str()
+            .and_then(|line| line.split_once(':'))
+            .ok_or_else(invalid)?;
+        let (name, value) = (name.trim(), value.trim());
+        if header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            || header::HeaderValue::from_str(value).is_err()
+        {
+            return Err(invalid());
+        }
+        if controlled_header(name) {
+            return Err(format!(
+                "channel.header entry {number} sets a header the server controls"
+            ));
+        }
+        // The HTTP client treats names as case-sensitive, so a repeat would be sent twice or
+        // would replace the first, depending on how it is spelt.
+        if headers
+            .iter()
+            .any(|(seen, _)| seen.eq_ignore_ascii_case(name))
+        {
+            return Err(format!(
+                "channel.header entry {number} repeats the name of an earlier entry"
+            ));
+        }
+        headers.push((name.to_string(), value.to_string()));
+    }
+    Ok(headers)
+}
+
+impl Relay {
+    /// The Subscription as it is stored now, or `None` if there is none.
+    fn subscription(&self, id: &str) -> Option<Value> {
+        refhir_fhir::commit_operation(
+            self.store.as_ref(),
+            &self.db,
+            &self.catalog,
+            "Subscription/read",
+            &json!({"id": id}),
+        )
+        .ok()
+        .map(|run| run.value)
+    }
+
+    /// `target` as its Subscription says it is now, for a notification that is being retried. It
+    /// is `None` when the notification should not go out any more: the Subscription is gone, is
+    /// `off`, or sends somewhere else than it did. A header that was rotated since is the one
+    /// sent.
+    fn refreshed(&self, target: &Target) -> Option<Arc<Target>> {
+        let subscription = self.subscription(&target.id)?;
+        let endpoint = subscription
+            .pointer("/channel/endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let live = subscription.get("status").and_then(Value::as_str) != Some("off")
+            && subscription
+                .pointer("/channel/type")
+                .and_then(Value::as_str)
+                == Some("rest-hook")
+            && endpoint == target.endpoint;
+        live.then(|| Arc::new(Target::of(&subscription, endpoint)))
+    }
+
+    /// Write how deliveries are going into the Subscription, as R4 intends: `status` becomes
+    /// `error` and `error` says why when a notification fails for good, and `status` returns to
+    /// `active` when one gets through after that.
+    ///
+    /// What is stored now decides, not what it was when the notification was made. `off` is the
+    /// client's to set and is never changed, and neither is a Subscription whose endpoint has
+    /// moved. A write follows only a result that disagrees with the stored status, so an endpoint
+    /// that stays down costs one write, not one for each notification, and a Subscription whose
+    /// criteria match Subscriptions cannot keep waking itself. The patch tests the status and
+    /// endpoint it was decided on, so an edit made in the moment between reading and writing wins
+    /// and nothing is written.
+    fn record(&self, target: &Target, outcome: Outcome) {
+        // Nothing to undo for a delivery to a Subscription that was not in error when it was sent.
+        if matches!(outcome, Outcome::Delivered) && target.status.as_deref() != Some("error") {
             return;
         }
-        if attempt < 3 {
+        let Some(subscription) = self.subscription(&target.id) else {
+            return;
+        };
+        let status = subscription.get("status").and_then(Value::as_str);
+        let endpoint = subscription
+            .pointer("/channel/endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if status == Some("off") || endpoint != target.endpoint {
+            return;
+        }
+        let in_error = status == Some("error");
+        let (new_status, change) = match outcome {
+            Outcome::Failed(message) if !in_error => {
+                let message: String = message.chars().take(ERROR_CHARS).collect();
+                (
+                    "error",
+                    vec![
+                        json!({"op": "add", "path": "/status", "value": "error"}),
+                        json!({"op": "add", "path": "/error", "value": message}),
+                    ],
+                )
+            }
+            Outcome::Delivered if in_error => (
+                "active",
+                vec![
+                    json!({"op": "add", "path": "/status", "value": "active"}),
+                    json!({"op": "remove", "path": "/error"}),
+                ],
+            ),
+            _ => return,
+        };
+        let mut patch = Vec::new();
+        if let Some(status) = status {
+            patch.push(json!({"op": "test", "path": "/status", "value": status}));
+        }
+        if !endpoint.is_empty() {
+            patch.push(json!({"op": "test", "path": "/channel/endpoint", "value": endpoint}));
+        }
+        patch.extend(change);
+        let args = json!({"id": target.id, "patch": patch});
+        match refhir_fhir::commit_operation(
+            self.store.as_ref(),
+            &self.db,
+            &self.catalog,
+            "Subscription/patch",
+            &args,
+        ) {
+            Ok(_) => {
+                tracing::info!(subscription = %target.id, status = new_status, "subscription status changed")
+            }
+            // Edited, or gone, in the moment since it was read.
+            Err(RunError::Fhir(FhirError::Conflict(_) | FhirError::NotFound(_))) => {
+                tracing::debug!(subscription = %target.id, "subscription changed; status left as it is")
+            }
+            Err(err) => {
+                tracing::warn!(subscription = %target.id, error = %err, "could not update subscription status")
+            }
+        }
+    }
+}
+
+/// Send a notification, trying a few times a moment apart. If every try fails it is queued for
+/// the retry queue and nothing is known yet; otherwise this says how it ended.
+fn post_hook(relay: &Relay, target: &Arc<Target>, body: &str) -> Option<Outcome> {
+    if target.endpoint.is_empty() {
+        return Some(failure("the rest-hook channel has no endpoint"));
+    }
+    let headers = match &target.headers {
+        Ok(headers) => headers,
+        // The same entries would fail again.
+        Err(message) => return Some(failure(message)),
+    };
+    for attempt in 1..=HOOK_QUICK_ATTEMPTS {
+        if http_post(&target.endpoint, headers, body).is_ok() {
+            return Some(Outcome::Delivered);
+        }
+        if attempt < HOOK_QUICK_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(40 * u64::from(attempt)));
         }
     }
-    pending.lock().expect("hooks").push(PendingHook {
-        endpoint: endpoint.to_string(),
+    relay.pending.lock().expect("hooks").push(PendingHook {
+        target: target.clone(),
         body: body.to_string(),
-        attempts: 3,
+        attempts: HOOK_QUICK_ATTEMPTS,
+        due: Instant::now() + HOOK_RETRY_GAP,
     });
+    None
 }
 
-fn drain_hooks(pending: &Mutex<Vec<PendingHook>>) {
-    let batch = std::mem::take(&mut *pending.lock().expect("hooks"));
+fn drain_hooks(relay: &Relay) {
+    let now = Instant::now();
+    let batch = std::mem::take(&mut *relay.pending.lock().expect("hooks"));
     for mut hook in batch {
+        if hook.due > now {
+            relay.pending.lock().expect("hooks").push(hook);
+            continue;
+        }
+        // The Subscription may have changed since this was queued; if it has gone, is `off` or
+        // sends elsewhere, the notification ends here.
+        let Some(target) = relay.refreshed(&hook.target) else {
+            continue;
+        };
+        hook.target = target;
+        let headers = match &hook.target.headers {
+            Ok(headers) => headers,
+            Err(message) => {
+                relay.record(&hook.target, failure(message));
+                continue;
+            }
+        };
         hook.attempts = hook.attempts.saturating_add(1);
-        if http_post(&hook.endpoint, &hook.body).is_err() && hook.attempts < 8 {
-            pending.lock().expect("hooks").push(hook);
+        match http_post(&hook.target.endpoint, headers, &hook.body) {
+            Ok(()) => relay.record(&hook.target, Outcome::Delivered),
+            Err(error) if hook.attempts >= HOOK_ATTEMPTS => {
+                tracing::warn!(subscription = %hook.target.id, attempts = hook.attempts, "rest-hook notification given up on");
+                relay.record(
+                    &hook.target,
+                    failure(&format!(
+                        "notification not delivered after {} attempts: {error}",
+                        hook.attempts
+                    )),
+                );
+            }
+            Err(_) => {
+                hook.due = Instant::now() + HOOK_RETRY_GAP;
+                relay.pending.lock().expect("hooks").push(hook);
+            }
         }
     }
+}
+
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn agent(redirects: u32) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(HTTP_TIMEOUT)
+        .redirects(redirects)
+        .build()
 }
 
 fn http_agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
-    AGENT.get_or_init(|| {
-        ureq::AgentBuilder::new()
-            .timeout(Duration::from_secs(5))
-            .build()
-    })
+    AGENT.get_or_init(|| agent(5))
 }
 
-fn http_post(url: &str, body: &str) -> Result<(), String> {
-    let response = http_agent()
-        .post(url)
-        .set("Content-Type", "application/fhir+json")
-        .send_string(body)
-        .map_err(|err| err.to_string())?;
+/// The agent for notifications. It does not follow redirects: a notification that is redirected
+/// has not been delivered, a 301, 302 or 303 would turn the POST into a GET the receiver never
+/// sees as one, and the headers (which can hold a credential) must not follow it to another host.
+fn hook_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| agent(0))
+}
+
+fn http_post(url: &str, headers: &[(String, String)], body: &str) -> Result<(), String> {
+    let mut request = hook_agent().post(url);
+    // The client compares header names case-sensitively, so a `content-type` entry would not
+    // replace this one and both would be sent.
+    if !headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+    {
+        request = request.set("Content-Type", "application/fhir+json");
+    }
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    let response = request.send_string(body).map_err(|err| {
+        // The text of this one repeats the header line, and the line is a credential.
+        if err.kind() == ureq::ErrorKind::BadHeader {
+            "a channel.header entry is not a valid HTTP header".to_string()
+        } else {
+            err.to_string()
+        }
+    })?;
     if (200..300).contains(&response.status()) {
         Ok(())
     } else {
@@ -1047,8 +1402,87 @@ mod tests {
 
     #[test]
     fn https_endpoints_are_attempted() {
-        let err = http_post("https://127.0.0.1:1/hook", "{}").unwrap_err();
+        let err = http_post("https://127.0.0.1:1/hook", &[], "{}").unwrap_err();
         assert!(!err.contains("only http"), "{err}");
+    }
+
+    fn headers_of(entries: Value) -> Result<Vec<(String, String)>, String> {
+        channel_headers(&json!({"channel": {"type": "rest-hook", "header": entries}}))
+    }
+
+    #[test]
+    fn channel_headers_are_name_colon_value() {
+        assert_eq!(channel_headers(&json!({"channel": {}})), Ok(Vec::new()));
+        assert_eq!(
+            headers_of(json!(["Authorization: Bearer a:b", "X-Tenant:acme"])),
+            Ok(vec![
+                ("Authorization".to_string(), "Bearer a:b".to_string()),
+                ("X-Tenant".to_string(), "acme".to_string()),
+            ])
+        );
+        for bad in [
+            "no colon",
+            ": value",
+            "Bad Name: value",
+            "X-A: line\r\nX-B: smuggled",
+        ] {
+            let err = headers_of(json!(["X-Ok: 1", bad])).unwrap_err();
+            assert!(err.contains("entry 2"), "{bad}: {err}");
+            // The entry is a credential, so what is wrong with it is said without repeating it.
+            assert!(!err.contains("smuggled"), "{bad}: {err}");
+        }
+        // The request's framing, its connection handling and a cookie or proxy identity are not
+        // the Subscription's to set.
+        for controlled in [
+            "Host: elsewhere",
+            "content-length: 0",
+            "Transfer-Encoding: chunked",
+            "Keep-Alive: timeout=5",
+            "Upgrade: websocket",
+            "TE: trailers",
+            "Trailer: Expires",
+            "Expect: 100-continue",
+            "Cookie: session=1",
+            "Proxy-Authorization: Basic abc",
+        ] {
+            assert!(
+                headers_of(json!([controlled]))
+                    .unwrap_err()
+                    .contains("controls"),
+                "{controlled}"
+            );
+        }
+        // A name is given once, whatever its case: the client would send both or keep one
+        // depending on how it is spelt.
+        for repeated in ["x-tenant: other", "X-TENANT: other", "X-Tenant: acme"] {
+            let err = headers_of(json!(["X-Tenant: acme", repeated])).unwrap_err();
+            assert!(err.contains("entry 2") && err.contains("repeats"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_redirected_notification_is_not_delivered() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            // Answers every connection, so a client that followed the redirect would find one.
+            while let Ok((mut stream, _)) = listener.accept() {
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(200)))
+                    .ok();
+                // The headers and the body can arrive apart. Reading until the client has nothing
+                // more to say keeps the close from resetting the connection under its answer.
+                let mut buffer = [0_u8; 2048];
+                while matches!(std::io::Read::read(&mut stream, &mut buffer), Ok(n) if n > 0) {}
+                let _ = stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.flush();
+            }
+        });
+        let headers = [("X-Api-Key".to_string(), "secret".to_string())];
+        let err = http_post(&url, &headers, "{}").unwrap_err();
+        assert!(err.contains("302"), "{err}");
     }
 
     #[test]

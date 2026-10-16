@@ -56,11 +56,96 @@ Beyond REST:
 
 - **GraphQL** at `POST /graphql`.
 - **Subscriptions.** `Subscription` resources with a `rest-hook` or `websocket` channel are
-  delivered by the primary; the WebSocket channel is `GET /[type]/[id]/$websocket`.
+  delivered by the primary; the WebSocket channel is `GET /[type]/[id]/$websocket`. See
+  [Subscriptions](#subscriptions) for what is and is not notified.
 - **Live queries** over [`/sync`](sync-protocol.md).
 - **Governance endpoints** `/_usage`, `/_requests`, `/_audit` and `/_audit/verify`; see
   [governance](governance.md).
 - **Health probes** `/livez`, `/readyz` and `/healthz`; see [Operations](operations.md#health-probes).
+
+## Subscriptions
+
+`Subscription` is the R4 resource: a `criteria` string such as `Patient?active=true`, and a
+`channel` of type `rest-hook` or `websocket` (`email` and `sms` are not delivered). Only the
+primary delivers, so a replica neither sends notifications nor serves `$websocket`
+([clustering](clustering.md)).
+
+**What is notified.** A *create or update* of a resource of the criteria's type that matches its
+query. The query is run against the new version, so, as R4 defines it:
+
+- A **delete** sends nothing.
+- A resource that **stops matching** (`Patient?active=true` after `active` becomes `false`) sends
+  nothing, so a receiver cannot learn from a Subscription that a resource left. A
+  [`/sync` live query](sync-protocol.md) reports a result gaining and losing members, and is the
+  tool for that.
+- A Subscription whose `status` is `off` is skipped. Any other status delivers, `requested` and
+  `error` included. The server does not move `requested` to `active` when it accepts one.
+- A transaction Bundle notifies once for each matching resource it wrote.
+
+**`rest-hook`.** Each notification is a `POST` to `channel.endpoint` with
+`Content-Type: application/fhir+json` (unless a `channel.header` entry sets another, in any
+case) and the full resource as the body. Any `2xx` is delivery. Redirects are not followed: a
+`3xx` is a failed delivery. A `rest-hook` channel with no endpoint fails the same way.
+
+When the resource is itself a Subscription (a Subscription whose `criteria` are `Subscription` is
+told about every one that is written), its `channel.header` entries are left out of the body: they
+are credentials for its own receiver. Its `endpoint` is not, so do not put a secret in the URL.
+
+`channel.header` is honored. Each entry is `Name: value` (for example
+`Authorization: Bearer 7f3c…`) and is added to the request. A name can be given once. An entry
+that is not a valid header, that repeats a name, or that sets `Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Cookie` or
+a `Proxy-` header, makes the notification fail at once, with no request and no retry, and the
+Subscription goes to `error` as described below. Header values are stored in the Subscription
+like any other element, so anyone who can read the Subscription (or its history) can read them:
+use a credential that is good only for that receiver. Whoever may write a Subscription also
+chooses the URL the server posts to and the headers it sends, and nothing limits where an
+endpoint may point (loopback and private addresses included), so grant that write as carefully as
+you would `$install`.
+
+`channel.payload` and `end` are **ignored**. The body is always the full resource as JSON, an
+absent `payload` does not make it empty as R4 says it should, and a Subscription does not expire.
+
+**Failures, retries and `status`.** A failed notification is tried three times a moment apart,
+then again each time the retry queue runs once the notification is due, which is at least a second
+and a half after its last attempt. The queue runs on every tick of a two second timer and after
+each commit, so a burst of commits does not use the attempts up. That is eight attempts in all,
+about ten seconds on a quiet server and never much less than seven. Before each retry the
+Subscription is read again: if it has been deleted, is `off` or sends somewhere else, the
+notification is dropped, and a header that was changed is the one sent. After the eighth attempt
+the notification is dropped, and the Subscription is updated as R4 describes:
+
+- `status` becomes `error` and `error` holds the time and what went wrong, at most 500
+  characters: after eight failed attempts, the attempts and the last failure; for a header that
+  cannot be sent, or a missing endpoint, which one.
+- This is written when the status changes, not for each failed notification. An endpoint that
+  stays down leaves `error` as it was first written, and costs one new version.
+- Delivery goes on while the status is `error`. The next notification, or retry, that gets through
+  sets `status` back to `active` and removes `error`. Set `status` to `off` to stop delivery. The
+  server never changes an `off` Subscription.
+- The change is an ordinary update: a new version in `_history`, and a wake-up for `/sync`
+  queries over `Subscription`. It is made by the server with no request behind it, so it is not an
+  `AuditEvent` (see [governance](governance.md#rate-limits-quotas-metering-and-audit)). It is
+  decided on what is stored when the notification ends, not on what was stored when it was made,
+  and is made only if `status` and `channel.endpoint` are still what it was decided on, so an
+  edit by a client in the meantime is not overwritten.
+- A Subscription whose criteria match `Subscription` is notified of this write like any other
+  change. That cannot start a chain, because a write follows only a delivery result that
+  disagrees with the stored `status`.
+
+Pending retries are held **in memory** on the primary, so a restart drops them. The stored
+`status` and `error` are in the database and survive it. (Only [`$export`](operations.md#export-jobs)
+jobs are durable.)
+
+**`websocket`.** `GET /{type}/{id}/$websocket` upgrades to a WebSocket, where `{id}` is the id of
+a Subscription with a `websocket` channel. For each matching create or update the server sends the
+resource as a raw JSON text frame. There is no handshake (R4's `bind` and `bound` messages are not
+implemented) and frames from the client are ignored. The route does not check that `{id}` names a
+Subscription or that `{type}` is right, and keeps one socket per id: a second connection for the
+same id replaces the first, which is closed. A notification made while no socket is connected is
+lost. `status` never changes for this channel, since there is no delivery to fail.
+
+R5 topic-based Subscriptions (`SubscriptionTopic`) are not supported.
 
 ## Reference checking
 
