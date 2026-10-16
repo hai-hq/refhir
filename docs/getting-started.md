@@ -1,12 +1,12 @@
 # Getting started
 
-Pick one path. **Docker** is for running a server (your machine, VM, or cluster) without installing Rust. **Local development** is for hacking on ReFHIR or using repo fixtures and tests.
+Pick one path. **Docker** is for running a server (your machine, VM, or cluster) without installing Rust. **From source** is for running ReFHIR from a clone of the repository.
 
-| | Docker | Local development |
+| | Docker | From source |
 |---|--------|-------------------|
 | **You need** | Docker (and optionally Docker Compose) | Rust 1.88 ([rust-toolchain.toml](../rust-toolchain.toml)), Git |
 | **You get** | A `refhir` process in a container | `cargo run -p refhir` from a clone |
-| **Config** | `refhir.toml` on the host (recommended) | `refhir.toml` in the repo root and/or CLI flags |
+| **Config** | `refhir.toml` on the host (recommended) | `refhir.toml` in the clone and/or command-line flags |
 | **Data** | Docker volume (e.g. `/data`) | `refhir.sqlite` in the clone, or `--memory` |
 
 Configuration is a `refhir.toml` file plus command-line flags; see [Configuration](configuration.md) for the file search order, the packages installed on first start, and every flag. For a production deployment start from [deploy/production.md](../deploy/production.md).
@@ -17,7 +17,7 @@ Use this when you only want to **run** ReFHIR, not build it from source.
 
 **1. Get an image**
 
-- **Release image** (after a `v*` tag on GitHub): `ghcr.io/hai-hq/refhir:latest`
+- **Release image**: `ghcr.io/hai-hq/refhir:latest`, or pin a version such as `ghcr.io/hai-hq/refhir:0.0.1`
 - **Build from the repo** (no registry needed):
 
   ```bash
@@ -56,9 +56,9 @@ Use `refhir:local` instead of `ghcr.io/hai-hq/refhir:latest` if you built locall
 
 **Kubernetes:** [deploy/helm/refhir](../deploy/helm/refhir/README.md).
 
-## Local development
+## From source
 
-Use this when you work **in the repository** (server code, `cargo test`, seed scripts, clients).
+Use this when you want to run ReFHIR from a clone of the repository.
 
 **1. Clone and toolchain**
 
@@ -78,23 +78,29 @@ For a quick try you can skip the file and pass flags only (next step).
 
 **3. Run the server**
 
-Persistent SQLite file in the repo:
+A SQLite file in the clone:
 
 ```bash
 cargo run -p refhir -- --sqlite refhir.sqlite
 ```
 
-Ephemeral (no file, good for tests):
+In memory (no file, good for trying things):
 
 ```bash
 cargo run -p refhir -- --memory
 ```
 
-Equivalent with [just](https://github.com/casey/just): `just run` or `just memory`.
-
 **4. Load demo data (optional)**
 
-With the server up on port 8080 and Go 1.23+ installed:
+The demo files name their own ids, so they are loaded with `PUT [type]/[id]`. A server accepts that only
+when it is started with `--update-as-create` (or `update_as_create = true` under `[conformance]`), so
+start it that way:
+
+```bash
+cargo run -p refhir -- --memory --update-as-create
+```
+
+Then, with Go 1.23+ installed:
 
 ```bash
 cd clients/go && go run ./cmd/seed -url http://127.0.0.1:8080
@@ -103,8 +109,6 @@ cd clients/go && go run ./cmd/seed -url http://127.0.0.1:8080
 See [fixtures/mock-fhir/README.md](../fixtures/mock-fhir/README.md) and [clients/go/README.md](../clients/go/README.md#demo-data-seed-script).
 
 **Packages at runtime:** `[conformance].packages` or repeat `--package` to add IGs after the `[fhir].version` defaults. After startup, `POST /ImplementationGuide/$install` can install `name@version` from the registry when SMART is enabled (`system/*.write`). Override the package source with `REFHIR_PACKAGE_REGISTRY`: a registry or mirror URL, or `s3://bucket/prefix` for a bundle you host yourself, built with `scripts/package-bundle.py` (see [deploy/production.md](../deploy/production.md#package-source)). ReFHIR ships no packages, so a first start needs that source to be reachable.
-
-Regenerate the R4 fixtures used by the test suites (the server itself ships no packages): `python3 crates/fhir/generate-r4.py`.
 
 ## Verify the server
 

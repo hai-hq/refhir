@@ -54,6 +54,9 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
   `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
+- A reference parameter matches the full reference, so write `Observation?patient=Patient/123`. A
+  bare id such as `patient=123` matches nothing, and neither does a date that is not well formed:
+  `birthdate=notadate` answers `200` with an empty Bundle.
 
 ## Operations
 
@@ -73,11 +76,96 @@ Beyond REST:
 
 - **GraphQL** at `POST /graphql`.
 - **Subscriptions.** `Subscription` resources with a `rest-hook` or `websocket` channel are
-  delivered by the primary; the WebSocket channel is `GET /[type]/[id]/$websocket`.
+  delivered by the primary; the WebSocket channel is `GET /[type]/[id]/$websocket`. See
+  [Subscriptions](#subscriptions) for what is and is not notified.
 - **Live queries** over [`/sync`](sync-protocol.md).
 - **Governance endpoints** `/_usage`, `/_requests`, `/_audit` and `/_audit/verify`; see
   [governance](governance.md).
 - **Health probes** `/livez`, `/readyz` and `/healthz`; see [Operations](operations.md#health-probes).
+
+## Subscriptions
+
+`Subscription` is the R4 resource: a `criteria` string such as `Patient?active=true`, and a
+`channel` of type `rest-hook` or `websocket` (`email` and `sms` are not delivered). Only the
+primary delivers, so a replica neither sends notifications nor serves `$websocket`
+([clustering](clustering.md)).
+
+**What is notified.** A *create or update* of a resource of the criteria's type that matches its
+query. The query is run against the new version, so, as R4 defines it:
+
+- A **delete** sends nothing.
+- A resource that **stops matching** (`Patient?active=true` after `active` becomes `false`) sends
+  nothing, so a receiver cannot learn from a Subscription that a resource left. A
+  [`/sync` live query](sync-protocol.md) reports a result gaining and losing members, and is the
+  tool for that.
+- A Subscription whose `status` is `off` is skipped. Any other status delivers, `requested` and
+  `error` included. The server does not move `requested` to `active` when it accepts one.
+- A transaction Bundle notifies once for each matching resource it wrote.
+
+**`rest-hook`.** Each notification is a `POST` to `channel.endpoint` with
+`Content-Type: application/fhir+json` (unless a `channel.header` entry sets another, in any
+case) and the full resource as the body. Any `2xx` is delivery. Redirects are not followed: a
+`3xx` is a failed delivery. A `rest-hook` channel with no endpoint fails the same way.
+
+When the resource is itself a Subscription (a Subscription whose `criteria` are `Subscription` is
+told about every one that is written), its `channel.header` entries are left out of the body: they
+are credentials for its own receiver. Its `endpoint` is not, so do not put a secret in the URL.
+
+`channel.header` is honored. Each entry is `Name: value` (for example
+`Authorization: Bearer 7f3c…`) and is added to the request. A name can be given once. An entry
+that is not a valid header, that repeats a name, or that sets `Host`, `Content-Length`,
+`Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`, `Cookie` or
+a `Proxy-` header, makes the notification fail at once, with no request and no retry, and the
+Subscription goes to `error` as described below. Header values are stored in the Subscription
+like any other element, so anyone who can read the Subscription (or its history) can read them:
+use a credential that is good only for that receiver. Whoever may write a Subscription also
+chooses the URL the server posts to and the headers it sends, and nothing limits where an
+endpoint may point (loopback and private addresses included), so grant that write as carefully as
+you would `$install`.
+
+`channel.payload` and `end` are **ignored**. The body is always the full resource as JSON, an
+absent `payload` does not make it empty as R4 says it should, and a Subscription does not expire.
+
+**Failures, retries and `status`.** A failed notification is tried three times a moment apart,
+then again each time the retry queue runs once the notification is due, which is at least a second
+and a half after its last attempt. The queue runs on every tick of a two second timer and after
+each commit, so a burst of commits does not use the attempts up. That is eight attempts in all,
+about ten seconds on a quiet server and never much less than seven. Before each retry the
+Subscription is read again: if it has been deleted, is `off` or sends somewhere else, the
+notification is dropped, and a header that was changed is the one sent. After the eighth attempt
+the notification is dropped, and the Subscription is updated as R4 describes:
+
+- `status` becomes `error` and `error` holds the time and what went wrong, at most 500
+  characters: after eight failed attempts, the attempts and the last failure; for a header that
+  cannot be sent, or a missing endpoint, which one.
+- This is written when the status changes, not for each failed notification. An endpoint that
+  stays down leaves `error` as it was first written, and costs one new version.
+- Delivery goes on while the status is `error`. The next notification, or retry, that gets through
+  sets `status` back to `active` and removes `error`. Set `status` to `off` to stop delivery. The
+  server never changes an `off` Subscription.
+- The change is an ordinary update: a new version in `_history`, and a wake-up for `/sync`
+  queries over `Subscription`. It is made by the server with no request behind it, so it is not an
+  `AuditEvent` (see [governance](governance.md#rate-limits-quotas-metering-and-audit)). It is
+  decided on what is stored when the notification ends, not on what was stored when it was made,
+  and is made only if `status` and `channel.endpoint` are still what it was decided on, so an
+  edit by a client in the meantime is not overwritten.
+- A Subscription whose criteria match `Subscription` is notified of this write like any other
+  change. That cannot start a chain, because a write follows only a delivery result that
+  disagrees with the stored `status`.
+
+Pending retries are held **in memory** on the primary, so a restart drops them. The stored
+`status` and `error` are in the database and survive it. (Only [`$export`](operations.md#export-jobs)
+jobs are durable.)
+
+**`websocket`.** `GET /{type}/{id}/$websocket` upgrades to a WebSocket, where `{id}` is the id of
+a Subscription with a `websocket` channel. For each matching create or update the server sends the
+resource as a raw JSON text frame. There is no handshake (R4's `bind` and `bound` messages are not
+implemented) and frames from the client are ignored. The route does not check that `{id}` names a
+Subscription or that `{type}` is right, and keeps one socket per id: a second connection for the
+same id replaces the first, which is closed. A notification made while no socket is connected is
+lost. `status` never changes for this channel, since there is no delivery to fail.
+
+R5 topic-based Subscriptions (`SubscriptionTopic`) are not supported.
 
 ## Reference checking
 
@@ -95,13 +183,12 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 
 - **`PUT [type]/[id]`** updates a resource that exists. For an id that does not, it answers `405` with an `OperationOutcome`, because update-as-create is off. `GET /metadata` says so (`updateCreate: false` on every resource), and also reports the conditional interactions that are implemented (`conditionalCreate`, `conditionalUpdate`, `conditionalDelete: single`).
 - **Transactions** give entries that create resources their ids up front. Entries that refer to one another name each other by `fullUrl`, as FHIR defines: give the creating entry `"fullUrl": "urn:uuid:..."` and use that string in the references. A `Patient/p1` written in the bundle by hand does not name the resource the server creates.
-- **Update-as-create** is a deployment choice in FHIR. Start with `--update-as-create` (or `update_as_create = true` under `[conformance]`) to let `PUT [type]/[id]` create the resource under that id (`201`); `/metadata` then reports `updateCreate: true`. Data that has ids of its own, such as the demo data under `fixtures/mock-fhir` and the Inferno profile, is loaded this way. The environment variable `REFHIR_UPDATE_AS_CREATE=true` turns it on too. With SMART enabled, a `PUT` then needs the `create` permission as well as `update`, since it may create. An SDC `$extract` whose templates name a `resourceId` (or an `id`) returns those entries as `PUT [type]/[id]`, so the bundle it returns needs this setting to be accepted by a server that has not got it, which answers each such entry with `405`.
-- Rust code that embeds the server and needs a known id can call `refhir_fhir::import_resource`. It is a function, not an operation: nothing a client sends reaches it.
+- **Update-as-create** is a deployment choice in FHIR. Start with `--update-as-create` (or `update_as_create = true` under `[conformance]`) to let `PUT [type]/[id]` create the resource under that id (`201`); `/metadata` then reports `updateCreate: true`. Data that has ids of its own, such as the demo data, is loaded this way. The environment variable `REFHIR_UPDATE_AS_CREATE=true` turns it on too. With SMART enabled, a `PUT` then needs the `create` permission as well as `update`, since it may create. An SDC `$extract` whose templates name a `resourceId` (or an `id`) returns those entries as `PUT [type]/[id]`, so the bundle it returns needs this setting to be accepted by a server that has not got it, which answers each such entry with `405`.
 
 ## Terminology
 
 `ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
 
-A code system can be installed in several versions, and each is kept. HL7's v2 tables carry theirs in the URL (`.../v2-0006|2.1`), other packages in `CodeSystem.version`; a code system written through the API with a `version` is stored the same way. A value set that names a version (`system|version`, or `include.version`) gets exactly that one; with none named, a value set from a package reads the versions of that system **its own package** holds (installing the package expanded it with those, and a rebuild gives the same answer), and a value set written through the API, or one whose package does not hold the system, reads the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed and the latest installed version otherwise. The expansion records the version it read. A value set that includes another by URL reads that one's definition from its own package too, when the package has one. When several packages define the same value set URL, the definition at the server's release version is the one in use (the extensions package carries `5.3.0-ballot-tc1` copies of R4's value sets over R5's code system URLs, and an R4 server means R4's `4.0.1`); with none at the release, the one installed last, because version strings in different styles (`2018-08-12`, `2.9`, `3.0.0`) do not order against each other. If the one in use cannot be expanded, the next that can answers, so a newer terminology package that needs a code system nothing carries does not take away the older expansion. A start, a rebuild and an incremental change choose the same definition: each is tried first as installing its own package tried it, against what that package holds alone, and only when none can be expanded that way is the rest of the store read, which is how a value set that waits on another package's code system gets an expansion (a start reads what installing each package stored, so it has none for such a value set until the next rebuild). A rebuild stores the expansion under the package whose definition is in use. Stored expansions carry the rules they were made under, and a database written by an older version has them rebuilt once, at its next start. Cross-version and newer packages are why: `hl7.fhir.uv.xver-r5.r4`, a dependency of SDC, has `5.0.0` of `http://hl7.org/fhir/encounter-status`, and `hl7.terminology.r4` carries newer copies of systems the R4 core package also carries; an R4 value set that includes them still means R4's codes (`arrived`, `finished`). A version that is not installed is refused, naming the versions that are, rather than answered from another one. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
+A code system can be installed in several versions, and each is kept. Name a version with `system|version` (or `include.version`) and the expansion uses exactly that one. A version that is not installed is refused, and the error lists the versions that are. With no version named, a value set from a package uses the versions its own package holds, and a value set you write through the API, or one whose package does not hold the system, uses the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed, and the latest installed version otherwise. The expansion records the version it read. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
 
 `POST /ValueSet/$expandability` reports, for the value sets named in `url` (a string, an array, or `url` parameters of a Parameters resource), whether each can be expanded and why not; with none named it lists every loaded value set that cannot. Use it as a deployment check for the value sets a UI depends on. `POST /ImplementationGuide/$install` adds a warning to its response for any value set the package made unexpandable, and the server logs how many there are at start-up.

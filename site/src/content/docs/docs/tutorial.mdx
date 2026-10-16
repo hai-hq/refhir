@@ -1,0 +1,140 @@
+---
+title: "Tutorial: a live patient list"
+description: Build a small program whose output stays current as patients are created, changed and deactivated, with no polling.
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+You will build a program that prints the active patients, and prints a new list every time
+something changes. It contains no polling, no refetching and no change handling. It asks one
+question, and the server keeps the answer current.
+
+You need Node 20 or newer, and Rust or Docker to run a server.
+
+<Steps>
+
+1. **Start a server.**
+
+   In one terminal:
+
+   ```bash
+   git clone https://github.com/hai-hq/refhir.git
+   cd refhir
+   cargo run -p refhir -- --memory
+   ```
+
+   The first start installs the FHIR core package, so give it a moment. It is ready when
+   `curl -s http://127.0.0.1:8080/readyz` prints `{"status":"ok"}`. Other ways to run it are on the
+   [Install](/docs/install/) page. Leave the server running.
+
+2. **Create a project.**
+
+   In a second terminal:
+
+   ```bash
+   mkdir live-patients
+   cd live-patients
+   npm init -y
+   npm pkg set type=module
+   npm install @haihq/refhir
+   ```
+
+3. **Write the watcher.**
+
+   Save this as `watch.mjs`:
+
+   ```js
+   import { dial } from "@haihq/refhir";
+
+   const client = await dial("http://127.0.0.1:8080");
+   const watch = await client.search("Patient", { active: "true", _sort: "family" });
+
+   function show(bundle) {
+     const names = (bundle.entry ?? []).map((e) => e.resource.name?.[0]?.family ?? "(no name)");
+     console.log(`${bundle.total} active: ${names.join(", ") || "-"}`);
+   }
+
+   show(watch.latest());
+   for (;;) show(await watch.next());
+   ```
+
+   `client.search` subscribes to the query and returns once it has the first result. `latest()`
+   is that result, and each `next()` waits for the next committed one.
+
+4. **Run it.**
+
+   ```bash
+   node watch.mjs
+   ```
+
+   It prints the first result and then waits:
+
+   ```text
+   0 active: -
+   ```
+
+5. **Change the data.**
+
+   In a third terminal, create a patient:
+
+   ```bash
+   curl -s -X POST http://127.0.0.1:8080/Patient \
+     -H 'Content-Type: application/fhir+json' \
+     -d '{"resourceType":"Patient","active":true,"name":[{"family":"Ann"}]}'
+   ```
+
+   The watcher prints a new line without being asked. Add a second patient the same way, with the
+   family name `Bee`. Now deactivate Ann, who should leave the result:
+
+   ```bash
+   curl -s -X PUT 'http://127.0.0.1:8080/Patient?family=Ann' \
+     -H 'Content-Type: application/fhir+json' \
+     -d '{"resourceType":"Patient","active":false,"name":[{"family":"Ann"}]}'
+   ```
+
+   Finally, create two patients in one transaction:
+
+   ```bash
+   curl -s -X POST http://127.0.0.1:8080/ \
+     -H 'Content-Type: application/fhir+json' \
+     -d '{"resourceType":"Bundle","type":"transaction","entry":[
+       {"resource":{"resourceType":"Patient","active":true,"name":[{"family":"Cho"}]},"request":{"method":"POST","url":"Patient"}},
+       {"resource":{"resourceType":"Patient","active":true,"name":[{"family":"Dee"}]},"request":{"method":"POST","url":"Patient"}}]}'
+   ```
+
+</Steps>
+
+The watcher has printed this by now:
+
+```text
+0 active: -
+1 active: Ann
+2 active: Ann, Bee
+1 active: Bee
+3 active: Bee, Cho, Dee
+```
+
+## What you just saw
+
+- **A new match appears.** Creating Ann and Bee changed what the query returns, so the server re-ran
+  it and sent the new result.
+- **A match can leave.** Setting `active` to `false` did not delete Ann, but she stopped matching
+  the question, so the next result is without her. An event stream would have sent "Ann changed",
+  and your code would have had to work out that she no longer belongs in the list.
+- **A transaction is one step.** Cho and Dee were created together and arrived together, as
+  `1 active` becoming `3 active`. There was no moment in which the list held only one of them.
+- **The order is part of the answer.** `_sort: "family"` is part of the query, so the list stays in
+  that order as it changes.
+
+If two commits land close together, `next()` can return the newest result and skip the one before it,
+because every push is a full result and the newest one is the one that is true.
+
+## Where to go next
+
+- [How live queries work](/docs/concepts/how-it-works/) explains what the server does between your
+  write and your next line of output.
+- [React hooks](/docs/sdks/react/) give you the same live result in a component.
+- [Live queries for AI agents](/docs/concepts/agents/) uses the same idea to notice that an agent's
+  context has changed.
+- [The TypeScript client](/docs/sdks/typescript/) covers sign-in tokens, reconnects and
+  read-your-writes.

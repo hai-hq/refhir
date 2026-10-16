@@ -55,42 +55,6 @@ The other writer finds the lease free within a second, loads nothing it does not
 timestamps carry on from where the old primary stopped, and every write that returned 201 is still
 there. A request that was in flight on the old primary can fail; that is the most a client sees.
 
-`failover-test.sh` does this for you and checks the result: it writes through HAProxy, kills
-the live primary twice (once in each direction), and then reads back every acknowledged write
-asking for at least the commit timestamp it was acknowledged with.
-
-```bash
-deploy/cluster/failover-test.sh          # builds the image if there is none; --keep leaves the stack up
-```
-
-`failover-test.sh` and `deploy/helm/refhir/kind-test.sh` share the write-and-check code in
-`failover_load.py`. Last run, on the final code, with the full FHIR R4 core installed:
-
-| | round 1 (writer2 killed) | round 2 (writer1 killed) |
-|---|---|---|
-| Writes acknowledged | 187 | 182 |
-| Requests that failed | 0 | 1 (a 502 in flight on the killed primary) |
-| Longest gap between two acknowledgements | 4.2 s | 3.3 s |
-| Acknowledged writes missing afterwards | 0 | 0 |
-| Commit timestamps strictly increasing | yes | yes |
-| Writer epoch afterwards | 2 | 3 |
-
-An earlier run, on a machine that was also running other heavy programs, had gaps of 7.2 s and
-3.8 s, so expect a few seconds and more when the machine is busy.
-
-Where the gap goes, from one more run that logged the standby's clock against the moment of the
-kill (same loaded machine):
-
-| Time after the kill | What happened |
-|---|---|
-| +2.74 s | the standby took the writer lease (it checks once a second; the rest is how long Postgres took to release the dead process's lock, which was not measured separately) |
-| +2.79 s | it was serving: its own start after winning took 55 ms, because it keeps its catalog loaded while it waits (an earlier run on a quieter machine: 58 ms and 71 ms, against about 17 s before the catalog was kept warm) |
-| +4.72 s | HAProxy had put it in rotation (two good checks one second apart) |
-
-So a client sees a gap of about 4 to 7 seconds on this machine, a little under two thirds of it the
-standby noticing and the rest the load balancer. Lower `inter` and `rise` in `haproxy.cfg` to
-shorten the HAProxy part, at the price of more health-check traffic.
-
 `docker compose kill` is a hard stop, which Docker treats as a manual stop, so start the writer
 again yourself and it comes back as the standby:
 
@@ -105,12 +69,7 @@ Replicas follow the primary within tens of milliseconds, not instantly. A write 
 that snapshot or asks the primary, so you never read a stale answer. A replica started without
 `--primary-url` cannot ask, so it answers `503` with `Retry-After: 1` (a transient error) rather than
 return an older snapshot; retry, or give it the primary's address. The Go and TypeScript clients
-echo the header themselves. The load generator shows the effect:
-
-```bash
-go run ./clients/go/cmd/loadgen --base http://localhost:8080 --duration 20s \
-  --read-your-writes --verify-ryw
-```
+echo the header themselves.
 
 ## SMART
 
