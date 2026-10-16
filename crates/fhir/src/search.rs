@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use refhir_database::Transaction;
+use refhir_database::{ScannedEntry, ScannedRow, ScannedText, Transaction};
 use refhir_types::{
     exact_key, string_at_least, string_at_most, string_interval, token_interval, IndexId, Interval,
+    Timestamp,
 };
 use refhir_validate::{TermAnswer, Terminology};
 use serde_json::{json, Value};
@@ -52,6 +53,101 @@ fn is_compartment_param(key: &str) -> bool {
     key == "_compartment" || key == PATIENT_COMPARTMENT
 }
 
+/// Joins two occurrences of a search parameter into one value, for the places that gather a query
+/// into a map with a single value per name.
+///
+/// FHIR reads a repeated parameter as AND (`date=ge2020&date=lt2021`), and a comma inside one value
+/// as OR, so a comma cannot join the occurrences. They are joined with `AND`, which `clauses_from`
+/// splits again into one clause each. The parameters that take a list rather than a condition
+/// (`_include`, `_revinclude` and their `:iterate` forms, `_sort`, `_elements`) are still joined
+/// with a comma, which is how they are written.
+pub fn join_repeated(name: &str, existing: &str, value: &str) -> String {
+    let separator = if is_list_control(name) { ',' } else { AND };
+    format!("{existing}{separator}{value}")
+}
+
+/// Puts `value` into `params` under `name`; a second occurrence of `name` is joined to the first
+/// as `join_repeated` says. Everything that gathers a search query into a map goes through this, so
+/// a repeated parameter means the same wherever the query came from.
+pub fn add_param(params: &mut BTreeMap<String, String>, name: String, value: String) {
+    let value = match params.get(&name) {
+        Some(existing) => join_repeated(&name, existing, &value),
+        None => value,
+    };
+    params.insert(name, value);
+}
+
+/// Between the occurrences of a repeated search parameter in a value built by `join_repeated`.
+/// Control characters do not appear in a search value, so no value is cut in two by it.
+pub const AND: char = '\u{1f}';
+
+fn is_list_control(name: &str) -> bool {
+    matches!(
+        name,
+        "_include"
+            | "_include:iterate"
+            | "_revinclude"
+            | "_revinclude:iterate"
+            | "_sort"
+            | "_elements"
+    )
+}
+
+/// Most alternatives one search value may list. Each is an index range to read, and every row
+/// found is checked against all of them, so a list as long as a query string allows is refused.
+const MAX_ALTERNATIVES: usize = 1000;
+
+/// The alternatives of one search value: a comma between values of the same parameter is OR.
+///
+/// `\,` is a literal comma. A backslash pair is kept as written, but never hides the comma after
+/// it, and every other escape (`\$`, `\|`) is left for the code that splits on that character.
+/// Empty alternatives (a doubled or trailing comma) and repeats are dropped, and more than
+/// `MAX_ALTERNATIVES` is an error. A value with no comma is its own only alternative, empty or not.
+fn or_values(text: &str) -> Result<Vec<String>, FhirError> {
+    if !text.contains(',') {
+        return Ok(vec![text.to_string()]);
+    }
+    fn keep(
+        values: &mut Vec<String>,
+        seen: &mut BTreeSet<String>,
+        value: String,
+    ) -> Result<(), FhirError> {
+        if value.is_empty() || !seen.insert(value.clone()) {
+            return Ok(());
+        }
+        if values.len() == MAX_ALTERNATIVES {
+            return Err(FhirError::Invalid(format!(
+                "a search value lists more than {MAX_ALTERNATIVES} alternatives"
+            )));
+        }
+        values.push(value);
+        Ok(())
+    }
+    let mut values = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut current = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => match chars.next() {
+                Some(',') => current.push(','),
+                Some(next) => {
+                    current.push('\\');
+                    current.push(next);
+                }
+                None => current.push('\\'),
+            },
+            ',' => keep(&mut values, &mut seen, std::mem::take(&mut current))?,
+            _ => current.push(ch),
+        }
+    }
+    keep(&mut values, &mut seen, current)?;
+    if values.is_empty() {
+        values.push(String::new());
+    }
+    Ok(values)
+}
+
 struct Controls {
     count: Option<usize>,
     offset: usize,
@@ -63,7 +159,16 @@ struct Controls {
     revinclude: Vec<IncludeSpec>,
     /// Every one of these must contain a match: the caller's own `_compartment`, and the limit the
     /// server set on the caller (`_patientCompartment`).
-    compartments: Vec<(String, String)>,
+    compartments: Vec<Within>,
+}
+
+/// A compartment a search is limited to.
+struct Within {
+    type_name: String,
+    id: String,
+    /// Set by the server (`_patientCompartment`), not asked for by the caller. A resource that
+    /// `_include` or `_revinclude` adds has to respect it as well as a match.
+    limit: bool,
 }
 
 /// Most documents a page may have for the index-only path to read them one query each.
@@ -83,12 +188,10 @@ impl Controls {
         !self.needs_documents() || self.count.is_some_and(|count| count <= MAX_POINT_READS)
     }
 
-    /// Whether the resources of the page are used at all: `_summary=count` shows none, unless
-    /// `_include` or `_revinclude` follow references out of them.
+    /// Whether the resources of the page are used at all: `_summary=count` shows none, and
+    /// follows no `_include` or `_revinclude` out of them.
     fn needs_documents(&self) -> bool {
         self.summary.as_deref() != Some("count")
-            || !self.include.is_empty()
-            || !self.revinclude.is_empty()
     }
 }
 
@@ -97,15 +200,21 @@ struct IncludeSpec {
     source: Option<String>,
     param: String,
     target: Option<String>,
+    /// `:iterate`: the rule also applies to the resources the rules have added, over and over until
+    /// it adds none. A plain rule applies to the matches only.
+    iterate: bool,
 }
 
 enum Clause {
-    Id(String),
+    /// The ids a resource may have: a comma between them is OR.
+    Id(Vec<String>),
     Filter(String),
     Param {
         name: String,
         modifier: Option<String>,
-        value: String,
+        /// The alternatives of the value: a resource matches when any of them does (when none of
+        /// them does, for the `:not` and `:not-in` modifiers).
+        values: Vec<String>,
     },
     Chain {
         param: String,
@@ -216,16 +325,12 @@ fn page_from_index(
     // there instead of listing the whole range.
     let (rows, total) = match controls.count {
         Some(count) if !controls.needs_total() => {
-            let (rows, more) = tx.index_range_first(
-                &scan.index,
-                scan.interval.clone(),
-                offset.saturating_add(count),
-            )?;
+            let (rows, more) = scan.first(tx, offset.saturating_add(count))?;
             let total = rows.len() + usize::from(more);
             (rows, total)
         }
         _ => {
-            let rows = tx.index_range_entries(&scan.index, scan.interval.clone())?;
+            let rows = scan.entries(tx)?;
             let total = rows.len();
             (rows, total)
         }
@@ -268,7 +373,7 @@ fn page_by_checking(
     checks: &Checks<'_>,
     controls: &Controls,
 ) -> Result<Page, FhirError> {
-    let rows = tx.index_range_text(&scan.index, scan.interval.clone())?;
+    let rows = scan.text(tx)?;
     let mut work = Work {
         rows: rows.len(),
         ..Work::default()
@@ -325,8 +430,10 @@ fn assemble(
         }));
         let _ = id;
     }
-    let included = include_entries(tx, catalog, model, &page, controls)?;
-    entries.extend(included);
+    // `_summary=count` shows no entry, so it follows no `_include` or `_revinclude` either.
+    if controls.summary.as_deref() != Some("count") {
+        entries.extend(include_entries(tx, catalog, model, &page, controls)?);
+    }
     let mut bundle = json!({
         "resourceType": "Bundle",
         "type": "searchset",
@@ -364,7 +471,15 @@ pub(crate) fn search_reference(
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
-    let rows = tx.index_range(&scan.index, scan.interval.clone())?;
+    let mut rows = Vec::new();
+    for interval in &scan.intervals {
+        rows.extend(tx.index_range(&scan.index, interval.clone())?);
+    }
+    if scan.intervals.len() > 1 {
+        rows.sort_by(|left, right| left.key.cmp(&right.key));
+        let mut seen = BTreeSet::new();
+        rows.retain(|row| seen.insert(row.id.id_str().unwrap_or("").to_string()));
+    }
     let host = TxHost::new(tx, catalog);
     let mut matched = Vec::new();
     for row in rows {
@@ -441,7 +556,11 @@ fn controls_from(params: &BTreeMap<String, String>) -> Result<Controls, FhirErro
         .get("_compartment")
         .and_then(|text| text.split_once('/'))
     {
-        compartments.push((type_name.to_string(), id.to_string()));
+        compartments.push(Within {
+            type_name: type_name.to_string(),
+            id: id.to_string(),
+            limit: false,
+        });
     }
     // The server's limit has to hold or the search must not run: ignoring a malformed one would
     // search without it.
@@ -449,7 +568,11 @@ fn controls_from(params: &BTreeMap<String, String>) -> Result<Controls, FhirErro
         let (type_name, id) = text
             .split_once('/')
             .ok_or_else(|| FhirError::Invalid(format!("{PATIENT_COMPARTMENT} must be Type/id")))?;
-        compartments.push((type_name.to_string(), id.to_string()));
+        compartments.push(Within {
+            type_name: type_name.to_string(),
+            id: id.to_string(),
+            limit: true,
+        });
     }
     Ok(Controls {
         count,
@@ -461,8 +584,8 @@ fn controls_from(params: &BTreeMap<String, String>) -> Result<Controls, FhirErro
             .get("_total")
             .cloned()
             .unwrap_or_else(|| "accurate".into()),
-        include: split_includes(params.get("_include")),
-        revinclude: split_includes(params.get("_revinclude")),
+        include: include_specs(params, "_include")?,
+        revinclude: include_specs(params, "_revinclude")?,
         compartments,
     })
 }
@@ -472,24 +595,51 @@ fn parse_usize(text: &str, name: &str) -> Result<usize, FhirError> {
         .map_err(|_| FhirError::Invalid(format!("{name} must be an integer")))
 }
 
-fn split_includes(value: Option<&String>) -> Vec<IncludeSpec> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    value
-        .split(',')
-        .filter(|part| !part.is_empty())
-        .filter_map(parse_include)
-        .collect()
+/// The rules of `_include` or `_revinclude` (`name`): those given under the plain name, and those
+/// under `name:iterate`.
+///
+/// A reverse include cannot take `*`: finding what points at a resource through any parameter
+/// means reading the index of every reference parameter of every resource type, for each match.
+fn include_specs(
+    params: &BTreeMap<String, String>,
+    name: &str,
+) -> Result<Vec<IncludeSpec>, FhirError> {
+    let mut specs = Vec::new();
+    for (key, iterate) in [(name.to_string(), false), (format!("{name}:iterate"), true)] {
+        let Some(value) = params.get(&key) else {
+            continue;
+        };
+        for part in value.split(',').filter(|part| !part.is_empty()) {
+            let Some(spec) = parse_include(part, iterate) else {
+                continue;
+            };
+            if name == "_revinclude" && spec.param == "*" {
+                return Err(FhirError::Invalid(format!(
+                    "{key}={part} is not supported: name the parameter that points at the match, \
+                     for example Observation:subject"
+                )));
+            }
+            specs.push(spec);
+        }
+    }
+    Ok(specs)
 }
 
-fn parse_include(text: &str) -> Option<IncludeSpec> {
-    let text = text.trim().trim_end_matches(":iterate");
+fn parse_include(text: &str, iterate: bool) -> Option<IncludeSpec> {
+    let text = text.trim();
+    // A rule written `Type:param:iterate` has always been accepted, though it used to be treated
+    // as a plain one. It means what the `:iterate` form of the parameter means.
+    let (text, marked) = match text.strip_suffix(":iterate") {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    let iterate = iterate || marked;
     if text == "*" {
         return Some(IncludeSpec {
             source: None,
             param: "*".into(),
             target: None,
+            iterate,
         });
     }
     let mut parts = text.split(':');
@@ -502,6 +652,7 @@ fn parse_include(text: &str) -> Option<IncludeSpec> {
             source: None,
             param: first,
             target: None,
+            iterate,
         });
     };
     if param.is_empty() {
@@ -515,6 +666,7 @@ fn parse_include(text: &str) -> Option<IncludeSpec> {
         source: Some(first),
         param: param.to_string(),
         target,
+        iterate,
     })
 }
 
@@ -524,51 +676,57 @@ fn clauses_from(
 ) -> Result<Vec<Clause>, FhirError> {
     let mut clauses = Vec::new();
     for (name, value) in params {
-        if is_control(name) {
+        if is_control(name) || name == "_query" {
             continue;
         }
-        if name == "_id" {
-            clauses.push(Clause::Id(value.clone()));
-            continue;
+        // A parameter given more than once is AND: each occurrence is a clause of its own.
+        for value in value.split(AND) {
+            clauses.push(clause_from(model, name, value)?);
         }
-        if name == "_query" {
-            continue;
-        }
-        if name == "_filter" {
-            parse_filter(value).map_err(FhirError::Invalid)?;
-            clauses.push(Clause::Filter(value.clone()));
-            continue;
-        }
-        if let Some(clause) = parse_has(name, value) {
-            clauses.push(clause);
-            continue;
-        }
-        if let Some(clause) = parse_chain(name, value) {
-            if let Clause::Chain { param, .. } = &clause {
-                if model.ready_param(param).is_none() {
-                    return Err(FhirError::Invalid(format!(
-                        "unsupported search parameter {param} on {}",
-                        model.name
-                    )));
-                }
-            }
-            clauses.push(clause);
-            continue;
-        }
-        let (base, modifier) = split_modifier(name);
-        if model.ready_param(&base).is_none() {
-            return Err(FhirError::Invalid(format!(
-                "unsupported search parameter {name} on {}",
-                model.name
-            )));
-        }
-        clauses.push(Clause::Param {
-            name: base,
-            modifier,
-            value: value.clone(),
-        });
     }
     Ok(clauses)
+}
+
+fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause, FhirError> {
+    if name == "_id" {
+        return Ok(Clause::Id(or_values(value)?));
+    }
+    if name == "_filter" {
+        parse_filter(value).map_err(FhirError::Invalid)?;
+        return Ok(Clause::Filter(value.to_string()));
+    }
+    if let Some(clause) = parse_has(name, value) {
+        return Ok(clause);
+    }
+    if let Some(clause) = parse_chain(name, value) {
+        if let Clause::Chain { param, .. } = &clause {
+            if model.ready_param(param).is_none() {
+                return Err(FhirError::Invalid(format!(
+                    "unsupported search parameter {param} on {}",
+                    model.name
+                )));
+            }
+        }
+        return Ok(clause);
+    }
+    let (base, modifier) = split_modifier(name);
+    if model.ready_param(&base).is_none() {
+        return Err(FhirError::Invalid(format!(
+            "unsupported search parameter {name} on {}",
+            model.name
+        )));
+    }
+    // `:missing` takes `true` or `false`, which a comma cannot list.
+    let values = if modifier.as_deref() == Some("missing") {
+        vec![value.to_string()]
+    } else {
+        or_values(value)?
+    };
+    Ok(Clause::Param {
+        name: base,
+        modifier,
+        values,
+    })
 }
 
 fn is_control(name: &str) -> bool {
@@ -584,7 +742,9 @@ fn is_control(name: &str) -> bool {
             | "_offset"
             | "_cursor"
             | "_include"
+            | "_include:iterate"
             | "_revinclude"
+            | "_revinclude:iterate"
             | "_compartment"
             | PATIENT_COMPARTMENT
     )
@@ -641,34 +801,113 @@ fn split_modifier(name: &str) -> (String, Option<String>) {
 /// Where `search` reads, and what that read already settles.
 struct Scan {
     index: IndexId,
-    interval: Interval,
-    /// The clause whose match every row of `interval` already proves, if there is one.
+    /// The ranges of `index` that hold every match: one for a single value, one per alternative
+    /// when a comma lists several (they may overlap, and one document may be in several).
+    intervals: Vec<Interval>,
+    /// The clause whose match every row of `intervals` already proves, if there is one.
     proven: Option<usize>,
 }
 
 impl Scan {
-    /// Whether the range decides every clause, so no row needs checking.
+    /// Whether the ranges decide every clause, so no row needs checking.
     fn decides_all(&self, clauses: &[Clause]) -> bool {
         (0..clauses.len()).all(|position| self.proven == Some(position))
     }
+
+    /// The rows of the ranges, without their documents, in key order and each document once.
+    fn entries(&self, tx: &mut Transaction) -> Result<Vec<ScannedEntry>, FhirError> {
+        let mut lists = Vec::with_capacity(self.intervals.len());
+        for interval in &self.intervals {
+            lists.push(tx.index_range_entries(&self.index, interval.clone())?);
+        }
+        Ok(in_key_order(lists))
+    }
+
+    /// The first `wanted` rows `entries` lists, and whether the ranges hold more. Each range is read
+    /// no further than `wanted` rows, which is enough: a row among the first `wanted` of the merged
+    /// list is among the first `wanted` of its own range, and one more row anywhere shows there is
+    /// more.
+    fn first(
+        &self,
+        tx: &mut Transaction,
+        wanted: usize,
+    ) -> Result<(Vec<ScannedEntry>, bool), FhirError> {
+        let mut lists = Vec::with_capacity(self.intervals.len());
+        let mut more = false;
+        for interval in &self.intervals {
+            let (rows, extra) = tx.index_range_first(&self.index, interval.clone(), wanted)?;
+            more |= extra;
+            lists.push(rows);
+        }
+        let mut rows = in_key_order(lists);
+        more |= rows.len() > wanted;
+        rows.truncate(wanted);
+        Ok((rows, more))
+    }
+
+    /// The rows of the ranges, each with its document as JSON text, in key order and each
+    /// document once.
+    fn text(&self, tx: &mut Transaction) -> Result<Vec<ScannedText>, FhirError> {
+        let mut lists = Vec::with_capacity(self.intervals.len());
+        for interval in &self.intervals {
+            lists.push(tx.index_range_text(&self.index, interval.clone())?);
+        }
+        Ok(in_key_order(lists))
+    }
+}
+
+/// The rows of several ranges of one index as one list. Each range is in key order and holds a
+/// document once, so one range is returned as it is; several are merged in key order, and a
+/// document found by more than one value is kept where its first key puts it.
+fn in_key_order<P>(mut lists: Vec<Vec<ScannedRow<P>>>) -> Vec<ScannedRow<P>> {
+    if lists.len() == 1 {
+        return lists.pop().expect("one list");
+    }
+    let mut rows: Vec<ScannedRow<P>> = lists.into_iter().flatten().collect();
+    rows.sort_by(|left, right| left.key.cmp(&right.key));
+    let mut seen = BTreeSet::new();
+    rows.retain(|row| seen.insert(row.id.id_str().unwrap_or("").to_string()));
+    rows
+}
+
+/// The index range a probe narrows to, and how wide it is likely to be (lower is narrower).
+fn probe_range(probe: Probe<'_>) -> Option<(u8, Interval)> {
+    Some(match probe {
+        Probe::Token(text) => (0, token_interval(text)),
+        Probe::Prefix(text) => (1, string_interval(text)),
+        Probe::AtLeast(text) => (2, string_at_least(text)),
+        Probe::AtMost(text) => (2, string_at_most(text)),
+        Probe::Range(interval) => (2, interval),
+        Probe::Scan => return None,
+    })
 }
 
 fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
     for clause in clauses {
-        if let Clause::Id(id) = clause {
+        if let Clause::Id(ids) = clause {
             return Scan {
                 index: model.by_id(),
-                interval: Interval::point(exact_key(id)),
+                intervals: ids
+                    .iter()
+                    .map(|id| Interval::point(exact_key(id)))
+                    .collect(),
                 proven: None,
             };
         }
     }
-    let mut chosen: Option<(u8, String, Interval, usize, bool)> = None;
+    struct Candidate {
+        rank: u8,
+        name: String,
+        intervals: Vec<Interval>,
+        position: usize,
+        proven: bool,
+    }
+    let mut chosen: Option<Candidate> = None;
     for (position, clause) in clauses.iter().enumerate() {
         let Clause::Param {
             name,
             modifier,
-            value,
+            values,
         } = clause
         else {
             continue;
@@ -679,35 +918,53 @@ fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
         let Some(param) = model.ready_param(name) else {
             continue;
         };
-        let probe = param.extractor.probe(value);
-        let (rank, interval) = match probe {
-            Probe::Token(text) => (0, token_interval(text)),
-            Probe::Prefix(text) => (1, string_interval(text)),
-            Probe::AtLeast(text) => (2, string_at_least(text)),
-            Probe::AtMost(text) => (2, string_at_most(text)),
-            Probe::Range(interval) => (2, interval),
-            Probe::Scan => continue,
+        // Every alternative needs a range, or the clause cannot narrow the read at all.
+        let Some(ranges) = values
+            .iter()
+            .map(|value| probe_range(param.extractor.probe(value)))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
         };
+        let rank = ranges.iter().map(|(rank, _)| *rank).max().unwrap_or(0);
+        let intervals: Vec<Interval> = ranges.into_iter().map(|(_, interval)| interval).collect();
+        // Ties go to the clause with fewer ranges to read.
         let replace = chosen
             .as_ref()
-            .map(|(prev, _, _, _, _)| rank < *prev)
+            .map(|prev| (rank, intervals.len()) < (prev.rank, prev.intervals.len()))
             .unwrap_or(true);
         if replace {
             // A modifier changes what a match is, so only a plain parameter can be proven.
-            let proven = modifier.is_none() && param.extractor.index_proves(value);
-            chosen = Some((rank, name.clone(), interval, position, proven));
+            let proven = modifier.is_none()
+                && values
+                    .iter()
+                    .all(|value| param.extractor.index_proves(value));
+            chosen = Some(Candidate {
+                rank,
+                name: name.clone(),
+                intervals,
+                position,
+                proven,
+            });
         }
     }
-    if let Some((_, name, interval, position, proven)) = chosen {
+    if let Some(Candidate {
+        name,
+        intervals,
+        position,
+        proven,
+        ..
+    }) = chosen
+    {
         return Scan {
             index: model.search_index(&name),
-            interval,
+            intervals,
             proven: proven.then_some(position),
         };
     }
     Scan {
         index: model.by_id(),
-        interval: Interval::all(),
+        intervals: vec![Interval::all()],
         proven: None,
     }
 }
@@ -859,27 +1116,37 @@ fn row_matches(
         chain_ids,
         has_ids,
     } = *checks;
-    for (type_name, id) in &controls.compartments {
-        if !in_compartment(catalog, model, resource, type_name, id, host) {
+    for within in &controls.compartments {
+        if !in_compartment(
+            catalog,
+            model,
+            resource,
+            &within.type_name,
+            &within.id,
+            host,
+        ) {
             return false;
         }
     }
     clauses.iter().enumerate().all(|(index, clause)| {
         proven == Some(index)
             || match clause {
-                Clause::Id(id) => resource.get("id").and_then(|item| item.as_str()) == Some(id),
+                Clause::Id(ids) => resource
+                    .get("id")
+                    .and_then(|item| item.as_str())
+                    .is_some_and(|id| ids.iter().any(|wanted| wanted == id)),
                 Clause::Filter(value) => eval_filter(value, catalog, model, resource, host),
                 Clause::Param {
                     name,
                     modifier,
-                    value,
+                    values,
                 } => param_matches(
                     catalog,
                     model,
                     resource,
                     name,
                     modifier.as_deref(),
-                    value,
+                    values,
                     host,
                 ),
                 Clause::Chain { param, .. } => {
@@ -906,13 +1173,17 @@ fn row_matches(
     })
 }
 
+/// Whether `resource` matches the parameter: any of the alternatives of `values` (a comma is OR)
+/// has to match. With `:not` and `:not-in` it is the other way round, so a comma excludes every
+/// value it lists: `gender:not=male,female` finds what is neither. The resource is read once, not
+/// once per alternative.
 fn param_matches(
     catalog: &Catalog,
     model: &ResourceModel,
     resource: &Value,
     name: &str,
     modifier: Option<&str>,
-    value: &str,
+    values: &[String],
     host: &TxHost<'_>,
 ) -> bool {
     let Some(param) = model.ready_param(name) else {
@@ -921,20 +1192,28 @@ fn param_matches(
     match modifier {
         None => param
             .extractor
-            .matches(resource, value, catalog.path_model(), host),
-        Some("above" | "below" | "in" | "not-in") => hierarchy_match(
-            catalog,
-            &param
+            .matches_any(resource, values, catalog.path_model(), host),
+        Some(modifier @ ("above" | "below" | "in" | "not-in")) => {
+            let tokens = param
                 .extractor
-                .indexed(resource, catalog.path_model(), host),
-            modifier.unwrap_or(""),
-            value,
-        ),
-        Some(modifier) => {
-            param
-                .extractor
-                .matches_modifier(resource, modifier, value, catalog.path_model(), host)
+                .indexed(resource, catalog.path_model(), host);
+            if modifier == "not-in" {
+                values
+                    .iter()
+                    .all(|value| hierarchy_match(catalog, &tokens, modifier, value))
+            } else {
+                values
+                    .iter()
+                    .any(|value| hierarchy_match(catalog, &tokens, modifier, value))
+            }
         }
+        Some(modifier) => param.extractor.matches_modifier_any(
+            resource,
+            modifier,
+            values,
+            catalog.path_model(),
+            host,
+        ),
     }
 }
 
@@ -1038,7 +1317,7 @@ fn in_compartment(
                 .extractor
                 .indexed(resource, catalog.path_model(), host)
                 .iter()
-                .any(|reference| reference == &token || reference.ends_with(&format!("/{id}")))
+                .any(|reference| reference == &token || reference.ends_with(&format!("/{token}")))
         })
     })
 }
@@ -1134,6 +1413,108 @@ fn project_resource(resource: &Value, controls: &Controls) -> Value {
     }
 }
 
+/// Most resources the `:iterate` rules may add to one search. A round of an iterating rule can add
+/// more than the round before, so a rule that follows every reference (`*`), or finds everything
+/// that points at a resource, can reach much of a database. A search that would pass this is
+/// refused, not answered with part of what it asked for.
+const MAX_ITERATED: usize = 1000;
+
+#[cfg(test)]
+thread_local! {
+    static ITERATED_CAP: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_ITERATED) };
+}
+
+/// Lowers the cap for the rest of the test (or until it is dropped), so a test reaches it without
+/// creating a thousand resources.
+#[cfg(test)]
+pub(crate) struct LoweredCap;
+
+#[cfg(test)]
+impl LoweredCap {
+    pub(crate) fn to(cap: usize) -> Self {
+        ITERATED_CAP.with(|current| current.set(cap));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for LoweredCap {
+    fn drop(&mut self) {
+        ITERATED_CAP.with(|current| current.set(MAX_ITERATED));
+    }
+}
+
+fn max_iterated() -> usize {
+    #[cfg(test)]
+    {
+        ITERATED_CAP.with(|cap| cap.get())
+    }
+    #[cfg(not(test))]
+    {
+        MAX_ITERATED
+    }
+}
+
+fn too_many_iterated() -> FhirError {
+    FhirError::Invalid(format!(
+        "the :iterate rules would reach more than {} resources: name the parameters to follow \
+         instead of *, or search for fewer resources",
+        max_iterated()
+    ))
+}
+
+/// The resources the rules of one pass add. `room` is how many it may hold, and a pass that would
+/// hold more is refused where it reads them, not after it has read them all. Only the `:iterate`
+/// rules have one: they follow references out of resources the search did not match.
+struct Added {
+    found: Vec<Value>,
+    room: Option<usize>,
+}
+
+impl Added {
+    fn new(room: Option<usize>) -> Self {
+        Self {
+            found: Vec::new(),
+            room,
+        }
+    }
+
+    fn push(&mut self, resource: Value) -> Result<(), FhirError> {
+        self.found.push(resource);
+        match self.room {
+            Some(room) if self.found.len() > room => Err(too_many_iterated()),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// What this server's search does that a client may not expect, and what it does not do: the
+/// `documentation` of the CapabilityStatement's `rest`. R4 has no element that advertises
+/// `:iterate`, or the limits of a comma or an escape, so a client reads it here.
+pub(crate) fn capability_notes() -> String {
+    format!(
+        "Search: a comma between the values of one parameter is OR (`status=free,busy`), \
+         and `\\,` is a literal comma; a value lists at most {MAX_ALTERNATIVES} alternatives. \
+         `:not` and `:not-in` with several values leave out every one of them, and `:missing` \
+         takes one value. A parameter given more than once is AND \
+         (`date=ge2026-01-01&date=lt2026-02-01`) in a query string, a Bundle entry and \
+         Subscription criteria; GraphQL and live-query arguments have one value per name. \
+         `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`, once per \
+         occurrence or comma-separated; `_include:iterate` and `_revinclude:iterate` apply a rule \
+         to the matches and to every resource the rules have added, until none is added, and a \
+         search that would add more than {MAX_ITERATED} resources that way is refused with a 400. \
+         Not supported: `_revinclude=*` and `_revinclude=Type:*` (a 400), and the escapes `\\$` \
+         and `\\|` in a search value (they are not interpreted)."
+    )
+}
+
+/// The resources `_include` and `_revinclude` add to a page, as bundle entries.
+///
+/// The plain rules are applied to the matches. The `:iterate` rules are applied to the matches and
+/// to everything the plain rules added, then to what those added, until a round adds nothing. A
+/// resource is added once, and never when it is a match already, so references that lead back to
+/// where they started end the search.
 fn include_entries(
     tx: &mut Transaction,
     catalog: &Catalog,
@@ -1141,39 +1522,134 @@ fn include_entries(
     page: &[(String, Value)],
     controls: &Controls,
 ) -> Result<Vec<Value>, FhirError> {
-    let mut entries = Vec::new();
-    let mut seen = BTreeSet::new();
-    for (_, resource) in page {
-        for spec in &controls.include {
-            push_forward(tx, catalog, model, resource, spec, &mut entries, &mut seen)?;
+    let mut seen: BTreeSet<String> = page
+        .iter()
+        .map(|(id, _)| format!("{}/{}", model.name, id))
+        .collect();
+    let matches: Vec<&Value> = page.iter().map(|(_, resource)| resource).collect();
+    let mut plain = Added::new(None);
+    apply_rules(
+        tx, catalog, controls, &mut seen, &matches, false, &mut plain,
+    )?;
+    let mut added = plain.found;
+    if controls
+        .include
+        .iter()
+        .chain(&controls.revinclude)
+        .any(|spec| spec.iterate)
+    {
+        let mut fresh = Added::new(Some(max_iterated()));
+        let sources: Vec<&Value> = matches.iter().copied().chain(added.iter()).collect();
+        apply_rules(tx, catalog, controls, &mut seen, &sources, true, &mut fresh)?;
+        let mut iterated = 0;
+        while !fresh.found.is_empty() {
+            iterated += fresh.found.len();
+            let from = added.len();
+            added.append(&mut fresh.found);
+            fresh.room = Some(max_iterated() - iterated);
+            let sources: Vec<&Value> = added[from..].iter().collect();
+            apply_rules(tx, catalog, controls, &mut seen, &sources, true, &mut fresh)?;
         }
     }
-    for (id, _) in page {
-        for spec in &controls.revinclude {
-            push_reverse(tx, catalog, model, id, spec, &mut entries, &mut seen)?;
-        }
-    }
-    Ok(entries)
+    Ok(added
+        .into_iter()
+        .map(|resource| json!({"resource": resource, "search": {"mode": "include"}}))
+        .collect())
 }
 
+/// Applies the plain rules (`iterating` false) or the `:iterate` rules to each of `sources`, and
+/// puts the resources they add into `into`: what the `_include` rules add first, then what the
+/// `_revinclude` rules add.
+fn apply_rules(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    controls: &Controls,
+    seen: &mut BTreeSet<String>,
+    sources: &[&Value],
+    iterating: bool,
+    into: &mut Added,
+) -> Result<(), FhirError> {
+    for resource in sources {
+        for spec in controls
+            .include
+            .iter()
+            .filter(|spec| spec.iterate == iterating)
+        {
+            push_forward(tx, catalog, controls, resource, spec, into, seen)?;
+        }
+    }
+    for resource in sources {
+        for spec in controls
+            .revinclude
+            .iter()
+            .filter(|spec| spec.iterate == iterating)
+        {
+            push_reverse(tx, catalog, controls, resource, spec, into, seen)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether a resource a rule would add is outside the compartment the server limited the caller
+/// to. The limit holds for the types that belong to that compartment; a type that does not belong
+/// to it (a Practitioner, for a patient's compartment) has never been kept out of an include.
+fn outside_limit(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    controls: &Controls,
+    model: &ResourceModel,
+    resource: &Value,
+) -> bool {
+    let Some(Within { type_name, id, .. }) =
+        controls.compartments.iter().find(|within| within.limit)
+    else {
+        return false;
+    };
+    let belongs = model.name == *type_name
+        || catalog
+            .compartment(type_name)
+            .is_some_and(|compartment| compartment.params_for(&model.name).is_some());
+    if !belongs {
+        return false;
+    }
+    let host = TxHost::new(tx, catalog);
+    !in_compartment(catalog, model, resource, type_name, id, &host)
+}
+
+/// `Type/id` of a resource, as the references that point at it are written.
+fn identity(resource: &Value) -> Option<(&str, &str)> {
+    Some((
+        resource.get("resourceType")?.as_str()?,
+        resource.get("id")?.as_str()?,
+    ))
+}
+
+/// Follows the reference parameter of `spec` out of `resource` (`_include`), adding what it points
+/// at.
 fn push_forward(
     tx: &mut Transaction,
     catalog: &Catalog,
-    model: &ResourceModel,
+    controls: &Controls,
     resource: &Value,
     spec: &IncludeSpec,
-    entries: &mut Vec<Value>,
+    into: &mut Added,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), FhirError> {
+    let Some((source_type, _)) = identity(resource) else {
+        return Ok(());
+    };
     if spec
         .source
         .as_deref()
-        .is_some_and(|source| source != "*" && source != model.name)
+        .is_some_and(|source| source != "*" && source != source_type)
     {
         return Ok(());
     }
+    let Ok(source) = catalog.get(source_type) else {
+        return Ok(());
+    };
     let params: Vec<&crate::catalog::SearchParam> = if spec.param == "*" {
-        model
+        source
             .params
             .iter()
             .filter(|param| {
@@ -1182,7 +1658,7 @@ fn push_forward(
             })
             .collect()
     } else {
-        model.ready_param(&spec.param).into_iter().collect()
+        source.ready_param(&spec.param).into_iter().collect()
     };
     let mut references = Vec::new();
     {
@@ -1217,25 +1693,67 @@ fn push_forward(
             continue;
         };
         if let Some(stored) = tx.get(&target.tablet(), id, &target.by_id())? {
-            entries.push(json!({
-                "resource": decorate(stored.json, id, stored.ts),
-                "search": {"mode": "include"}
-            }));
+            let included = decorate(stored.json, id, stored.ts);
+            if !outside_limit(tx, catalog, controls, target, &included) {
+                into.push(included)?;
+            }
         }
     }
     Ok(())
 }
 
+/// The documents that have a key for `token` in `index`, as their id, JSON and revision timestamp.
+/// With a `room`, the range is read no further than one row past it and a range that holds more is
+/// refused, so a resource that millions point at costs a few reads, not all of them.
+fn referencing(
+    tx: &mut Transaction,
+    index: &IndexId,
+    token: &str,
+    room: Option<usize>,
+) -> Result<Vec<(String, Value, Option<Timestamp>)>, FhirError> {
+    let interval = token_interval(token);
+    let Some(room) = room else {
+        return Ok(tx
+            .index_range(index, interval)?
+            .into_iter()
+            .map(|row| (row.id.id_str().unwrap_or("").to_string(), row.json, row.ts))
+            .collect());
+    };
+    let (rows, _) = tx.index_range_first(index, interval, room.saturating_add(1))?;
+    if rows.len() > room {
+        return Err(too_many_iterated());
+    }
+    let mut documents = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let (json, ts) = tx.entry_json(row)?;
+        documents.push((row.id.id_str().unwrap_or("").to_string(), json, ts));
+    }
+    Ok(documents)
+}
+
+/// Finds what points at `resource` through the reference parameter of `spec` (`_revinclude`), and
+/// adds it. A target type in the rule (`Provenance:target:Observation`) restricts it to references
+/// to resources of that type.
 fn push_reverse(
     tx: &mut Transaction,
     catalog: &Catalog,
-    model: &ResourceModel,
-    id: &str,
+    controls: &Controls,
+    resource: &Value,
     spec: &IncludeSpec,
-    entries: &mut Vec<Value>,
+    into: &mut Added,
     seen: &mut BTreeSet<String>,
 ) -> Result<(), FhirError> {
-    let token = format!("{}/{}", model.name, id);
+    let Some((type_name, id)) = identity(resource) else {
+        return Ok(());
+    };
+    if spec
+        .target
+        .as_deref()
+        .is_some_and(|target| target != type_name)
+    {
+        return Ok(());
+    }
+    let token = format!("{type_name}/{id}");
     for other in catalog.resource_models() {
         if spec
             .source
@@ -1250,24 +1768,23 @@ fn push_reverse(
         let Some(param) = other.ready_param(&spec.param) else {
             continue;
         };
-        let rows = tx.index_range(&other.search_index(&spec.param), token_interval(&token))?;
-        for row in rows {
+        let documents = referencing(tx, &other.search_index(&spec.param), &token, into.room)?;
+        for (other_id, json, ts) in documents {
             if !param
                 .extractor
-                .indexed(&row.json, catalog.path_model(), &TxHost::new(tx, catalog))
+                .indexed(&json, catalog.path_model(), &TxHost::new(tx, catalog))
                 .iter()
                 .any(|reference| reference == &token)
             {
                 continue;
             }
-            let other_id = row.id.id_str().unwrap_or("").to_string();
             if !seen.insert(format!("{}/{}", other.name, other_id)) {
                 continue;
             }
-            entries.push(json!({
-                "resource": decorate(row.json, &other_id, row.ts),
-                "search": {"mode": "include"}
-            }));
+            let included = decorate(json, &other_id, ts);
+            if !outside_limit(tx, catalog, controls, other, &included) {
+                into.push(included)?;
+            }
         }
     }
     Ok(())
@@ -1400,7 +1917,10 @@ fn query_url(type_name: &str, params: &BTreeMap<String, String>, offset: usize) 
         if key == "_offset" || key == "_cursor" || is_compartment_param(key) {
             continue;
         }
-        parts.push(format!("{key}={value}"));
+        // A parameter given more than once is written as it was sent.
+        for occurrence in value.split(AND) {
+            parts.push(format!("{key}={occurrence}"));
+        }
     }
     if offset > 0 {
         parts.push(format!("_cursor={}", encode_cursor(offset, params)));
@@ -1579,5 +2099,138 @@ fn eval_filter_expr(
                     .matches_op(resource, op, value, catalog.path_model(), host)
             })
             .unwrap_or(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn or(text: &str) -> Vec<String> {
+        or_values(text).unwrap()
+    }
+
+    #[test]
+    fn a_value_with_no_comma_is_its_own_alternative() {
+        assert_eq!(or("free"), ["free"]);
+        assert_eq!(or(""), [""]);
+        assert_eq!(or(r"a\|b"), [r"a\|b"]);
+        assert_eq!(or("a|b"), ["a|b"]);
+        assert_eq!(or(r"trailing\"), [r"trailing\"]);
+    }
+
+    #[test]
+    fn a_comma_separates_alternatives() {
+        assert_eq!(or("free,busy"), ["free", "busy"]);
+        assert_eq!(or("a,b,c"), ["a", "b", "c"]);
+        // Values are not trimmed, repeats are dropped and so are empty alternatives.
+        assert_eq!(or("a, b"), ["a", " b"]);
+        assert_eq!(or("a,a,b,a"), ["a", "b"]);
+        assert_eq!(or("a,,b,"), ["a", "b"]);
+        assert_eq!(or(",a"), ["a"]);
+        // Nothing left is still one (empty) value, as an empty value always was.
+        assert_eq!(or(","), [""]);
+        assert_eq!(or(",,"), [""]);
+    }
+
+    #[test]
+    fn an_escaped_comma_is_a_comma_in_the_value() {
+        assert_eq!(or(r"a\,b"), ["a,b"]);
+        assert_eq!(or(r"a\,b,c"), ["a,b", "c"]);
+        assert_eq!(or(r"a\,\,b"), ["a,,b"]);
+        assert_eq!(or(r"\,"), [","]);
+    }
+
+    #[test]
+    fn a_backslash_pair_never_hides_the_comma_after_it() {
+        assert_eq!(or(r"a\\,b"), [r"a\\", "b"]);
+        assert_eq!(or(r"a\\\,b"), [r"a\\,b"]);
+        // Escapes for other characters are left for whoever splits on them.
+        assert_eq!(or(r"a\$b,c\|d"), [r"a\$b", r"c\|d"]);
+        assert_eq!(or(r"a,\"), ["a", r"\"]);
+    }
+
+    #[test]
+    fn a_list_of_alternatives_has_a_limit_and_repeats_do_not_count_toward_it() {
+        let many: Vec<String> = (0..=MAX_ALTERNATIVES).map(|n| format!("v{n}")).collect();
+        assert!(or_values(&many.join(",")).is_err());
+        let at_the_limit = or_values(&many[..MAX_ALTERNATIVES].join(",")).unwrap();
+        assert_eq!(at_the_limit.len(), MAX_ALTERNATIVES);
+        let repeated = vec!["a"; MAX_ALTERNATIVES * 3].join(",");
+        assert_eq!(or(&repeated), ["a"]);
+    }
+
+    #[test]
+    fn add_param_joins_a_second_occurrence_as_join_repeated_does() {
+        let mut params = BTreeMap::new();
+        for (name, value) in [
+            ("date", "ge1"),
+            ("date", "lt2"),
+            ("_include", "a"),
+            ("_include", "b"),
+            ("status", "free"),
+        ] {
+            add_param(&mut params, name.to_string(), value.to_string());
+        }
+        assert_eq!(params["date"], "ge1\u{1f}lt2");
+        assert_eq!(params["_include"], "a,b");
+        assert_eq!(params["status"], "free");
+    }
+
+    #[test]
+    fn repeated_occurrences_are_joined_as_and_but_lists_stay_lists() {
+        assert_eq!(join_repeated("date", "ge1", "lt2"), "ge1\u{1f}lt2");
+        assert_eq!(join_repeated("status", "a,b", "c"), "a,b\u{1f}c");
+        for list in [
+            "_include",
+            "_include:iterate",
+            "_revinclude",
+            "_revinclude:iterate",
+            "_sort",
+            "_elements",
+        ] {
+            assert_eq!(join_repeated(list, "a", "b"), "a,b", "{list}");
+        }
+        // The pieces come back apart as clauses: one per occurrence, each its own OR list.
+        let joined = join_repeated("status", "a,b", "c");
+        let pieces: Vec<&str> = joined.split(AND).collect();
+        assert_eq!(pieces, ["a,b", "c"]);
+    }
+
+    #[test]
+    fn include_rules_know_whether_they_iterate() {
+        let spec = |text: &str, iterate: bool| parse_include(text, iterate).expect(text);
+        let plain = spec("Slot:schedule", false);
+        assert!(!plain.iterate);
+        assert_eq!(plain.source.as_deref(), Some("Slot"));
+        assert_eq!(plain.param, "schedule");
+        assert_eq!(plain.target, None);
+        assert!(spec("Slot:schedule", true).iterate);
+        let marked = spec("Slot:schedule:iterate", false);
+        assert!(marked.iterate);
+        assert_eq!(marked.target, None);
+        let targeted = spec("Schedule:actor:Location", true);
+        assert_eq!(targeted.target.as_deref(), Some("Location"));
+        assert!(spec("*", true).iterate);
+    }
+
+    #[test]
+    fn the_iterate_forms_are_rules_of_their_own() {
+        let params: BTreeMap<String, String> = [
+            ("_include", "Slot:schedule"),
+            ("_include:iterate", "Schedule:actor,Schedule:actor:Location"),
+            ("_revinclude:iterate", "Slot:schedule"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let include = include_specs(&params, "_include").unwrap();
+        let iterating: Vec<bool> = include.iter().map(|spec| spec.iterate).collect();
+        assert_eq!(iterating, [false, true, true]);
+        let revinclude = include_specs(&params, "_revinclude").unwrap();
+        assert_eq!(revinclude.len(), 1);
+        assert!(revinclude[0].iterate);
+        // Neither is a search parameter.
+        assert!(is_control("_include:iterate") && is_control("_revinclude:iterate"));
     }
 }

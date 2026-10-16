@@ -196,6 +196,41 @@ impl Extractor {
         }
     }
 
+    /// `matches_modifier` for each of `expected`, true when any is: the resource is read once,
+    /// not once per value. `not` is true when none of them matches.
+    pub fn matches_modifier_any(
+        &self,
+        resource: &Value,
+        modifier: &str,
+        expected: &[String],
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        match modifier {
+            "exact" => {
+                let values = self.indexed_values(resource, path_model, host);
+                expected
+                    .iter()
+                    .any(|wanted| values.iter().any(|text| text == wanted))
+            }
+            "contains" => {
+                let values: Vec<String> = self
+                    .indexed_values(resource, path_model, host)
+                    .iter()
+                    .map(|text| text.to_lowercase())
+                    .collect();
+                expected.iter().any(|wanted| {
+                    let needle = wanted.to_lowercase();
+                    values.iter().any(|text| text.contains(&needle))
+                })
+            }
+            "not" => !self.matches_any(resource, expected, path_model, host),
+            _ => expected
+                .iter()
+                .any(|wanted| self.matches_modifier(resource, modifier, wanted, path_model, host)),
+        }
+    }
+
     fn exact_match(
         &self,
         resource: &Value,
@@ -288,6 +323,25 @@ impl Extractor {
         self.matches_op(resource, "eq", expected, path_model, host)
     }
 
+    /// `matches` for each of `expected`, true when any is: the resource is read once, not once per
+    /// value.
+    pub fn matches_any(
+        &self,
+        resource: &Value,
+        expected: &[String],
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> bool {
+        match &self.source {
+            Source::Path(expr) => {
+                path_match(self.kind, expr, "eq", resource, expected, path_model, host)
+            }
+            _ => expected
+                .iter()
+                .any(|wanted| self.matches(resource, wanted, path_model, host)),
+        }
+    }
+
     pub fn matches_op(
         &self,
         resource: &Value,
@@ -317,7 +371,7 @@ impl Extractor {
                 composite_match(focus, parts, resource, expected, path_model, host)
             }
             Source::Path(expr) => {
-                path_match(self.kind, expr, op, resource, expected, path_model, host)
+                path_match(self.kind, expr, op, resource, &[expected], path_model, host)
             }
         }
     }
@@ -640,48 +694,65 @@ fn path_strings(
         .collect()
 }
 
-fn path_match(
+/// Whether any of `expected` matches what the expression finds in the resource, which is read
+/// once whatever the number of values.
+fn path_match<S: AsRef<str>>(
     kind: SearchKind,
     expr: &Expr,
     op: &str,
     resource: &Value,
-    expected: &str,
+    expected: &[S],
     path_model: &Model,
     host: &dyn Host,
 ) -> bool {
     let items = eval_items(expr, resource, path_model, host);
+    let encoded = |kind| {
+        items
+            .iter()
+            .flat_map(|item| encode_value(kind, item))
+            .collect::<Vec<_>>()
+    };
     match kind {
-        SearchKind::Token | SearchKind::Reference => token_match(
-            op,
-            &items
+        SearchKind::Token | SearchKind::Reference => {
+            let values = encoded(kind);
+            expected
                 .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>(),
-            expected,
-        ),
+                .any(|wanted| token_match(op, &values, wanted.as_ref()))
+        }
         SearchKind::Uri => {
-            let values = items
+            let values = encoded(kind);
+            expected
                 .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>();
-            uri_match(op, &values, expected)
+                .any(|wanted| uri_match(op, &values, wanted.as_ref()))
         }
         SearchKind::String => {
-            let values = items
-                .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>();
-            values.iter().any(|text| text_match(op, text, expected))
+            let values = encoded(kind);
+            expected.iter().any(|wanted| {
+                values
+                    .iter()
+                    .any(|text| text_match(op, text, wanted.as_ref()))
+            })
         }
         SearchKind::Date => {
-            let values = items
-                .iter()
-                .flat_map(|item| encode_value(kind, item))
-                .collect::<Vec<_>>();
-            values.iter().any(|text| date_match(op, text, expected))
+            let values = encoded(kind);
+            expected.iter().any(|wanted| {
+                values
+                    .iter()
+                    .any(|text| date_match(op, text, wanted.as_ref()))
+            })
         }
-        SearchKind::Number => number_match(op, &numbers_of(&items), expected),
-        SearchKind::Quantity => quantity_match(op, &quantities_of(&items), expected),
+        SearchKind::Number => {
+            let numbers = numbers_of(&items);
+            expected
+                .iter()
+                .any(|wanted| number_match(op, &numbers, wanted.as_ref()))
+        }
+        SearchKind::Quantity => {
+            let quantities = quantities_of(&items);
+            expected
+                .iter()
+                .any(|wanted| quantity_match(op, &quantities, wanted.as_ref()))
+        }
         SearchKind::Composite | SearchKind::Special => false,
     }
 }
@@ -721,7 +792,15 @@ fn composite_match(
         .into_iter()
         .any(|node| {
             parts.iter().zip(pieces.iter()).all(|(part, piece)| {
-                path_match(part.kind, &part.expr, "eq", &node, piece, path_model, host)
+                path_match(
+                    part.kind,
+                    &part.expr,
+                    "eq",
+                    &node,
+                    &[*piece],
+                    path_model,
+                    host,
+                )
             })
         })
 }

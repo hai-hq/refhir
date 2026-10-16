@@ -331,11 +331,12 @@ pub(crate) fn bound_patient(iss: &str, reference: &str) -> Option<String> {
 
 /// The search value for `lookup`, or `None` when `key` cannot be put in a search safely.
 ///
-/// `,` `$` `\` are search syntax (OR, composite, escape) and `|` splits system from code; the
-/// engine does not unescape, so a key holding them is refused rather than escaped, which keeps
-/// a person from matching more than their own resource. `|` is fine after a system.
+/// `,` `$` `\` are search syntax (OR, composite, escape), the separator of a repeated parameter
+/// is too, and `|` splits system from code; the engine unescapes `\,` and nothing else, so a key
+/// holding them is refused rather than escaped, which keeps a person from matching more than
+/// their own resource. `|` is fine after a system.
 pub(crate) fn lookup_query(lookup: &FhirUserLookup, key: &str) -> Option<String> {
-    let reserved = |c: char| matches!(c, ',' | '$' | '\\');
+    let reserved = |c: char| matches!(c, ',' | '$' | '\\') || c == refhir_fhir::AND;
     if key.is_empty() || key.contains(reserved) {
         return None;
     }
@@ -841,7 +842,7 @@ mod tests {
             lookup_query(&lookup, "auth0|u1").as_deref(),
             Some("urn:idp|auth0|u1")
         );
-        for bad in ["", "a,b", "a$b", "a\\b"] {
+        for bad in ["", "a,b", "a$b", "a\\b", "a\u{1f}b"] {
             assert_eq!(lookup_query(&lookup, bad), None, "{bad}");
         }
     }

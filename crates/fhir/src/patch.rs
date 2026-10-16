@@ -338,7 +338,8 @@ pub fn parse_query(query: &str) -> BTreeMap<String, String> {
             continue;
         }
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        params.insert(decode(key), decode(value));
+        // A parameter given twice is AND (`date=ge2020&date=lt2021`), not the last one given.
+        crate::search::add_param(&mut params, decode(key), decode(value));
     }
     params
 }
