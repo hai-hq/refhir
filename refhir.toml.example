@@ -82,7 +82,7 @@ enabled = false
 # demo_login = true
 
 [export]
-# Local NDJSON output for $export jobs (no S3 yet — see deploy/production.md).
+# Local NDJSON output for $export jobs.
 dir = "/data/export"
 
 [terminology]

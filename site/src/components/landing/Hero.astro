@@ -1,0 +1,20 @@
+---
+import Terminal from './Terminal.astro';
+---
+
+<section class="hero">
+  <div class="wrap hero__grid">
+    <div class="hero__copy">
+      <h1>FHIR data that <span class="echo">updates itself.</span></h1>
+      <p class="lede">
+        FHIR is the standard way healthcare software shares patient data. ReFHIR is an open-source FHIR server that
+        keeps your query results live: ask once, and the new answer arrives whenever the data changes.
+      </p>
+      <p class="actions">
+        <a class="btn btn--primary" href="/docs/getting-started/">Get started</a>
+        <a class="btn" href="#playground">See it work</a>
+      </p>
+    </div>
+    <Terminal />
+  </div>
+</section>

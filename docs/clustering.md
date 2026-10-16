@@ -15,11 +15,9 @@ refhir --postgres $URL --standby                                        # takes 
 refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
 ```
 
-- **Writer lease.** A session-level Postgres advisory lock on a dedicated connection (a file lock
-  `<db>.lock` for SQLite), kept alive every two seconds. If the connection is lost the process
-  exits. Each takeover bumps a `writer_epoch`, and every write checks it inside its own
-  transaction, so a paused primary that wakes up after its successor took over is fenced and
-  exits instead of writing.
+- **Writer lease.** The primary holds a lease on the database (a Postgres advisory lock, or a file
+  lock `<db>.lock` for SQLite). If it loses the lease the process exits, and a paused primary that
+  wakes up after a standby took over is fenced off and exits instead of writing.
 - **Load balancers.** `GET /healthz` is 200 when a process can take traffic and 503 when it
   cannot: a standby, a process still starting, or a replica that has stopped following the
   primary. `?verbose=1` adds connection pool and commit timing counters.
@@ -34,17 +32,6 @@ refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
 - **SMART.** Tokens, clients and the signing key are in the database, so any process accepts a
   token another issued. Every process must be given the same `--smart-dcr-token` and
   `--smart-confidential-secret`; standbys and replicas refuse to start without them.
-- **Catalog.** Search parameters and profiles are loaded into memory, so two counters in the
-  database tell other processes to reload. A replica follows the *version*, which moves only when
-  no search parameter is waiting for its backfill: it is bumped when a backfill completes (or at
-  once for a change with nothing to backfill), so a replica never loads a parameter whose index is
-  incomplete. A standby follows the *revision*, which moves on every change, because after a
-  takeover it may have to finish the backfill itself.
-- **Backfills.** Each backfill job records the writer epoch that claims it. A standby that takes
-  over resumes a job its predecessor left half done from the stored cursor and takes the claim;
-  an older writer is refused a job a newer one holds. Backfill progress, the claim, installs and
-  the catalog counters are written inside a transaction that first checks the writer epoch, like
-  document commits, so a replaced primary cannot alter them.
 
-Running it: [deploy/cluster](../deploy/cluster/README.md) (Docker Compose with HAProxy), the Helm
-chart's `cluster.enabled`, and measurements in [docs/perf](perf/baseline.md).
+Running it: [deploy/cluster](../deploy/cluster/README.md) (Docker Compose with HAProxy) and the Helm
+chart's `cluster.enabled`.
