@@ -36,6 +36,18 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - Chaining (`Observation?subject:Patient.name=ann`), reverse chaining (`_has`), `_include` and
   `_revinclude`, and compartment search (`GET /Patient/123/Observation`) all work. Name the target
   type in a chain when a reference parameter can point at more than one type.
+- A reference parameter takes `Type/id` or just the id: `Observation?patient=Patient/123` and
+  `Observation?patient=123` return the same resources. A bare id is looked up as a reference to
+  each type the parameter can point at in that resource: the types its `SearchParameter` lists as
+  `target`, limited to those the element it reads allows. So `patient=123` finds `Patient/123`,
+  and `subject=123`, which can point at a Patient, a Group, a Device or a Location, finds a
+  reference to any of them with that id. Write `Type/id` to name the type. An absolute URL is
+  compared as written, so a bare id never matches a reference that is stored as a URL. A parameter
+  that can point at more than 16 types in the resource (`Task?subject` points at any resource) or
+  lists no `target` cannot place a bare id: that search, and a `_filter` comparison, is a `400`
+  that asks for `Type/id`. In a comma list each id is read this way, and an id counts once for
+  every type it stands for toward the 1000 index ranges a search may read. A
+  [live query](sync-protocol.md) re-runs the same search, so it reads ids the same way.
 - A comma between the values of one parameter is OR, for every kind of parameter:
   `Slot?status=free,busy`, `HealthcareService?_id=a,b`. Write `\,` for a comma that is part of a
   value. A value lists at most 1000 alternatives. With `:not` and `:not-in`, a list leaves out
@@ -54,8 +66,6 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
   `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
-- A reference parameter matches the full reference, so write `Observation?patient=Patient/123`. A
-  bare id such as `patient=123` matches nothing.
 - **A value that cannot be read as its parameter's type is a `400`, not an empty result.**
   `GET /Patient?birthdate=notadate` answers `invalid value "notadate" for search parameter
   birthdate on Patient: expected a date such as 2020, 2020-01, 2020-01-31 or
@@ -84,8 +94,8 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
   response carries `Preference-Applied: handling=lenient`, and every search response has `Vary:
   Prefer`, since the answer depends on it. `handling=strict` is the default, and any other value of
   `handling` is read as that. Lenient is for the value of a search parameter only: an unknown
-  parameter name, a `_filter` that does not parse, `_count`, `_offset` and `_cursor` are a `400`
-  either way.
+  parameter name, a bare id that a reference parameter cannot place, a `_filter` that does not
+  parse, `_count`, `_offset` and `_cursor` are a `400` either way.
   It is not available to a conditional create, update or delete (a clause set aside widens what
   they match, and a conditional delete must not delete a different resource than the one the
   client described), nor to a `batch` or `transaction` entry, GraphQL or a live query. A

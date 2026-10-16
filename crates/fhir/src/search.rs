@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
 use crate::error::FhirError;
-use crate::extract::Probe;
+use crate::extract::{Probe, ReferenceId};
 use crate::ops::decorate;
 use crate::resolve::TxHost;
 
@@ -962,6 +962,7 @@ fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause,
                 )));
             }
         }
+        check_filter_ids(model, &filter)?;
         return Ok(Clause::Filter(value.to_string()));
     }
     if let Some(clause) = parse_has(name, value) {
@@ -979,23 +980,76 @@ fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause,
         return Ok(clause);
     }
     let (base, modifier) = split_modifier(name);
-    if model.ready_param(&base).is_none() {
+    let Some(param) = model.ready_param(&base) else {
         return Err(FhirError::Invalid(format!(
             "unsupported search parameter {name} on {}",
             model.name
         )));
-    }
+    };
     // `:missing` takes `true` or `false`, which a comma cannot list.
     let values = if modifier.as_deref() == Some("missing") {
         vec![value.to_string()]
     } else {
         or_values(value)?
     };
+    // Only a plain value or `:not` is an id to look for. A bare id is one range for each type it
+    // can stand for, so the ranges a plain value reads are counted, not only its alternatives.
+    if matches!(modifier.as_deref(), None | Some("not")) {
+        let mut ranges = 0;
+        for value in &values {
+            match param.extractor.reference_id(value) {
+                ReferenceId::Open(types) => return Err(open_reference(&base, value, types)),
+                ReferenceId::Typed(tokens) => ranges += tokens.len(),
+                ReferenceId::AsWritten => ranges += 1,
+            }
+        }
+        if modifier.is_none() && ranges > MAX_ALTERNATIVES {
+            return Err(FhirError::Invalid(format!(
+                "reference parameter {base} would read {ranges} index ranges: an id counts once \
+                 for every type the parameter can point at, and a search reads at most \
+                 {MAX_ALTERNATIVES}"
+            )));
+        }
+    }
     Ok(Clause::Param {
         name: base,
         modifier,
         values,
     })
+}
+
+/// Why a bare id cannot be searched for through a reference parameter, and what to send instead.
+/// It is `Unsupported` (still a 400) so that a caller that runs searches on someone else's behalf,
+/// as SDC population does, can tell it from a malformed query.
+fn open_reference(name: &str, id: &str, types: usize) -> FhirError {
+    let why = if types == 0 {
+        "does not say which resource types it can point at".to_string()
+    } else {
+        format!("can point at any of {types} resource types")
+    };
+    FhirError::Unsupported(format!(
+        "reference parameter {name} {why}, so the id {id} alone is not enough: use Type/{id}"
+    ))
+}
+
+/// A `_filter` comparison reads an id as a plain parameter does, so it is refused the same way.
+fn check_filter_ids(model: &ResourceModel, filter: &Filter) -> Result<(), FhirError> {
+    match filter {
+        Filter::And(parts) | Filter::Or(parts) => parts
+            .iter()
+            .try_for_each(|part| check_filter_ids(model, part)),
+        Filter::Cmp { name, op, value } => {
+            if let Some(param) = model
+                .ready_param(name)
+                .filter(|_| matches!(op.as_str(), "eq" | "ne"))
+            {
+                if let ReferenceId::Open(types) = param.extractor.reference_id(value) {
+                    return Err(open_reference(name, value, types));
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 fn is_control(name: &str) -> bool {
@@ -1139,14 +1193,16 @@ fn in_key_order<P>(mut lists: Vec<Vec<ScannedRow<P>>>) -> Vec<ScannedRow<P>> {
     rows
 }
 
-/// The index range a probe narrows to, and how wide it is likely to be (lower is narrower).
-fn probe_range(probe: Probe<'_>) -> Option<(u8, Interval)> {
+/// The index ranges a probe narrows to (one, except for a bare id, which is one for each type it
+/// can stand for), and how wide they are likely to be (lower is narrower).
+fn probe_ranges(probe: Probe<'_>) -> Option<(u8, Vec<Interval>)> {
     Some(match probe {
-        Probe::Token(text) => (0, token_interval(text)),
-        Probe::Prefix(text) => (1, string_interval(text)),
-        Probe::AtLeast(text) => (2, string_at_least(text)),
-        Probe::AtMost(text) => (2, string_at_most(text)),
-        Probe::Range(interval) => (2, interval),
+        Probe::Token(text) => (0, vec![token_interval(text)]),
+        Probe::Tokens(tokens) => (0, tokens.iter().map(|text| token_interval(text)).collect()),
+        Probe::Prefix(text) => (1, vec![string_interval(text)]),
+        Probe::AtLeast(text) => (2, vec![string_at_least(text)]),
+        Probe::AtMost(text) => (2, vec![string_at_most(text)]),
+        Probe::Range(interval) => (2, vec![interval]),
         Probe::Scan => return None,
     })
 }
@@ -1190,13 +1246,16 @@ fn choose_index(model: &ResourceModel, clauses: &[Clause]) -> Scan {
         // Every alternative needs a range, or the clause cannot narrow the read at all.
         let Some(ranges) = values
             .iter()
-            .map(|value| probe_range(param.extractor.probe(value)))
+            .map(|value| probe_ranges(param.extractor.probe(value)))
             .collect::<Option<Vec<_>>>()
         else {
             continue;
         };
         let rank = ranges.iter().map(|(rank, _)| *rank).max().unwrap_or(0);
-        let intervals: Vec<Interval> = ranges.into_iter().map(|(_, interval)| interval).collect();
+        let intervals: Vec<Interval> = ranges
+            .into_iter()
+            .flat_map(|(_, intervals)| intervals)
+            .collect();
         // Ties go to the clause with fewer ranges to read.
         let replace = chosen
             .as_ref()

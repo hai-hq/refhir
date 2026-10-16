@@ -322,6 +322,77 @@ async fn http_crud_search_history_and_bundle() {
     assert_eq!(found.body["total"], 1);
 }
 
+fn observation_of(id: &str, patient_id: &str) -> Value {
+    json!({
+        "resourceType": "Observation",
+        "id": id,
+        "subject": {"reference": format!("Patient/{patient_id}")},
+        "code": {"coding": [{"code": "8480-6"}]},
+        "effectiveDateTime": "2020-01-02"
+    })
+}
+
+#[tokio::test]
+async fn a_bare_id_searches_like_type_slash_id_over_http_and_over_sync() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    for id in ["p1", "p2"] {
+        assert_eq!(put(&app, patient(id)).await.status, StatusCode::CREATED);
+    }
+    for (id, patient_id) in [("o1", "p1"), ("o2", "p2")] {
+        let created = put(&app, observation_of(id, patient_id)).await;
+        assert_eq!(created.status, StatusCode::CREATED);
+    }
+
+    let get = |query: &'static str| {
+        let app = app.clone();
+        async move { send(&app, "GET", &format!("/Observation?{query}"), None, None).await }
+    };
+    let bare = get("subject=p1&code=8480-6").await;
+    let typed = get("subject=Patient/p1&code=8480-6").await;
+    assert_eq!(bare.status, StatusCode::OK);
+    assert_eq!(bare.body["total"], 1);
+    assert_eq!(bare.body["entry"][0]["resource"]["id"], "o1");
+    assert_eq!(bare.body["entry"], typed.body["entry"]);
+    assert_eq!(get("subject=nobody").await.body["total"], 0);
+
+    // The same search, kept open, follows the writes that join its result.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let writes = app.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut socket, _) = connect(&format!("ws://{addr}/sync")).await;
+    socket
+        .send(Message::Text(
+            json!({"type": "ModifyQuerySet", "baseVersion": 0, "newVersion": 1, "modifications": [
+                {"type": "Add", "queryId": 1, "udfPath": "Observation/search", "args": {"subject": "p1"}}
+            ]})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let first = next_json(&mut socket).await;
+    assert_eq!(first["modifications"][0]["type"], "QueryUpdated", "{first}");
+    assert_eq!(first["modifications"][0]["value"]["total"], 1);
+    assert_eq!(
+        first["modifications"][0]["value"]["entry"][0]["resource"]["id"],
+        "o1"
+    );
+    // A write about someone else leaves it alone; one about p1 joins it.
+    let created = put(&writes, observation_of("o3", "p2")).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let created = put(&writes, observation_of("o4", "p1")).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let joined = next_json(&mut socket).await;
+    assert_eq!(
+        joined["modifications"][0]["type"], "QueryUpdated",
+        "{joined}"
+    );
+    assert_eq!(joined["modifications"][0]["value"]["total"], 2);
+}
+
 #[tokio::test]
 async fn a_search_value_that_cannot_be_read_is_a_400_unless_the_client_asks_for_lenient() {
     let (db, catalog, store) = memory();

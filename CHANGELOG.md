@@ -83,6 +83,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   token, as a search does not return them. A match that another match refers to is no longer
   repeated as an include. The CapabilityStatement's `rest.documentation` states how search treats
   commas, repeated parameters, `:iterate` and the limits above.
+- A bare id given to a reference parameter that can point at any resource (`Task?subject=123`) or
+  that lists no `target` is now a `400` that asks for `Type/id`; it used to find nothing.
 - **A search whose parameter value cannot be read is now a `400`, where it used to return an empty
   result.** `GET /Patient?birthdate=notadate` and `GET /Observation?value-quantity=abc` answered
   `200` with an empty Bundle, which looks the same as a search that matches nothing; they now answer
@@ -108,6 +110,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 - **`_include:iterate` and `_revinclude:iterate` are accepted** instead of refused as an unknown
   parameter. They apply a rule to the matches and to the resources already added, until none is
   added, and a search that would add more than 1000 resources that way is a `400`.
+- **A reference search given just an id found nothing.** `Observation?patient=123` now returns
+  what `Observation?patient=Patient/123` returns. A bare id is looked up as a reference to each
+  type the search parameter can point at, so `subject=123` finds a `Patient/123` or a `Group/123`.
+  Live queries over `/sync` read ids the same way, and are woken only by writes that reference
+  that id.
 
 ## [0.0.1] - 2026-10-15
 
