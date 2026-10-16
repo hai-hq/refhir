@@ -1180,7 +1180,7 @@ async fn search(
         return response;
     }
     let xml = prefer_xml(&headers, &params);
-    let mut args = query_object(params);
+    let mut args = search_object(params);
     args.remove("access_token");
     limit_to_patient(&app, &headers, uri.query(), &mut args);
     let args = Value::Object(args);
@@ -1255,6 +1255,20 @@ fn query_object(params: Vec<(String, String)>) -> serde_json::Map<String, Value>
     args
 }
 
+/// The query of a search as arguments. A parameter given more than once is AND in a search
+/// (`date=ge2020&date=lt2021`) and a comma inside one value is OR, so the occurrences are not
+/// joined by a comma as `query_object` joins them.
+fn search_object(params: Vec<(String, String)>) -> serde_json::Map<String, Value> {
+    let mut folded = std::collections::BTreeMap::new();
+    for (key, value) in params {
+        refhir_fhir::add_param(&mut folded, key, value);
+    }
+    folded
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect()
+}
+
 async fn type_history(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
@@ -1288,7 +1302,7 @@ async fn conditional_update(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let query = query_object(params)
+    let query = search_object(params)
         .iter()
         .map(|(key, value)| format!("{key}={}", value.as_str().unwrap_or("")))
         .collect::<Vec<_>>()
@@ -1319,7 +1333,7 @@ async fn conditional_delete(
     Path(resource_type): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let query = query_object(params)
+    let query = search_object(params)
         .iter()
         .map(|(key, value)| format!("{key}={}", value.as_str().unwrap_or("")))
         .collect::<Vec<_>>()
@@ -1417,7 +1431,7 @@ async fn compartment_search(
     uri: axum::http::Uri,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let mut args = query_object(params);
+    let mut args = search_object(params);
     args.insert(
         "_compartment".into(),
         Value::String(format!("{compartment}/{id}")),

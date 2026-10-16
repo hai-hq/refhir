@@ -486,6 +486,7 @@ impl Catalog {
             "format": ["json", "application/fhir+json"],
             "rest": [{
                 "mode": "server",
+                "documentation": crate::search::capability_notes(),
                 "resource": resources,
                 "interaction": [
                     {"code": "transaction"},

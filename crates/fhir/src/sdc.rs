@@ -419,7 +419,7 @@ fn split_params(
     for (name, value) in params {
         let base = name.split(':').next().unwrap_or(name);
         if base.starts_with('_') || model.ready_param(base).is_some() {
-            indexed.insert((*name).to_string(), value.clone());
+            search::add_param(&mut indexed, (*name).to_string(), value.clone());
         } else {
             rest.push(((*name).to_string(), value.clone()));
         }

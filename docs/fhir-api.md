@@ -45,12 +45,29 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
   compared as written, so a bare id never matches a reference that is stored as a URL. A parameter
   that can point at more than 16 types in the resource (`Task?subject` points at any resource) or
   lists no `target` cannot place a bare id: that search, and a `_filter` comparison, is a `400`
-  that asks for `Type/id`. A [live query](sync-protocol.md) re-runs the same search, so it reads
-  ids the same way.
+  that asks for `Type/id`. In a comma list each id is read this way, and an id counts once for
+  every type it stands for toward the 1000 index ranges a search may read. A
+  [live query](sync-protocol.md) re-runs the same search, so it reads ids the same way.
+- A comma between the values of one parameter is OR, for every kind of parameter:
+  `Slot?status=free,busy`, `HealthcareService?_id=a,b`. Write `\,` for a comma that is part of a
+  value. A value lists at most 1000 alternatives. With `:not` and `:not-in`, a list leaves out
+  every value in it, and `:missing` takes one value.
+- Giving a parameter twice is AND (`date=ge2026-01-01&date=lt2026-02-01`) in a query string, in the
+  URL of a Bundle entry and in Subscription criteria. A GraphQL argument or a live query's
+  arguments have one value per name, so they cannot say it.
+- `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`. The `:iterate` forms
+  (`_include=Slot:schedule&_include:iterate=Schedule:actor`) apply a rule to the matches and to
+  every resource the rules have added, until none is added. A search that would add more than
+  1000 resources that way is a `400`; name the parameters to follow instead of `*`, or search for
+  fewer resources.
+- Under a patient-scoped token, `_include` and `_revinclude` leave out the resources of other
+  patients, as a search does. Resource types that are in no patient's compartment (a Practitioner,
+  an Organization) are still included.
+- `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
+  `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
-- A reference parameter matches the full reference, so write `Observation?patient=Patient/123`. A
-  bare id such as `patient=123` matches nothing, and neither does a date that is not well formed:
-  `birthdate=notadate` answers `200` with an empty Bundle.
+- A date that is not well formed matches nothing: `birthdate=notadate` answers `200` with an empty
+  Bundle.
 
 ## Operations
 

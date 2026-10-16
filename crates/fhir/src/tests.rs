@@ -2343,6 +2343,15 @@ fn a_bare_id_finds_what_type_slash_id_finds() {
     assert!(search(json!({"patient": "g1"})).is_empty());
     assert!(search(json!({"patient": "Group/g1"})).is_empty());
 
+    // A comma lists alternatives, and each is read as it would be alone: a bare id, a `Type/id`,
+    // or one of each.
+    let either = ["o1", "o2", "o3", "o5", "o6"];
+    assert_eq!(search(json!({"patient": "p1,p2"})), either);
+    assert_eq!(search(json!({"patient": "p1,Patient/p2"})), either);
+    assert_eq!(search(json!({"patient": "Patient/p1,Patient/p2"})), either);
+    assert_eq!(search(json!({"subject": "p1,g1"})), ["o1", "o3", "o4"]);
+    assert_eq!(search(json!({"patient:not": "p1,p2"})), ["o4"]);
+
     // The modifiers that take an id read a bare one the same way. `:missing` takes true or false,
     // which are valid ids and are not looked for as one.
     assert_eq!(
@@ -2431,6 +2440,24 @@ fn a_bare_id_the_parameter_cannot_place_is_refused_and_says_what_to_send() {
     ] {
         let found = commit(&harness, "Task/search", query.clone()).unwrap();
         assert_eq!(found["total"], 0, "{query}");
+    }
+
+    // An id counts once for every type it stands for toward the 1000 index ranges a search may
+    // read: `Observation.subject` points at four types, so 250 ids are 1000 ranges and 251 are too
+    // many.
+    let ids = |count: usize| {
+        (0..count)
+            .map(|n| format!("p{n}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let found = commit(&harness, "Observation/search", json!({"subject": ids(250)})).unwrap();
+    assert_eq!(found["total"], 0);
+    match commit(&harness, "Observation/search", json!({"subject": ids(251)})) {
+        Err(RunError::Fhir(FhirError::Invalid(message))) => {
+            assert!(message.contains("1004 index ranges"), "{message}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
     }
 
     // A parameter that lists no target type cannot place an id either.
@@ -3963,6 +3990,31 @@ mod search_paging {
         &[("_id", "p1")],
         &[("_id", "p8")],
         &[("_id", "nobody")],
+        // A comma is OR: values that find different documents, overlapping ranges that find the
+        // same ones, one that finds nothing, an alternative no index range can narrow, an
+        // escaped comma, and an alternative empty on both sides.
+        &[("family", "Smith,Jones")],
+        &[("family", "sm,smith,smithers")],
+        &[("family", "zzz,Nguyen")],
+        &[("family", "O'Neil\\,x")],
+        &[("family", "Smith,,Jones,")],
+        &[("family:exact", "Smith,smith")],
+        &[("family:contains", "mit,jon")],
+        &[("gender", "male,female")],
+        &[("gender", "other,unknown,nothing")],
+        &[("gender:not", "male,female")],
+        &[("active", "true,false")],
+        &[("identifier", "http://hospital.example|mrn-7,mrn-9")],
+        &[("birthdate", "1985,ge1990-01-01")],
+        &[("birthdate", "ne1960-06-01,1985")],
+        &[("_id", "p1,p2,nobody")],
+        &[("_id", "p8,p1")],
+        &[("family", "Smith,Jones"), ("gender", "male,female")],
+        &[("family", "Sm,Jo"), ("birthdate", "ge1980-01-01")],
+        // A repeated parameter is AND.
+        &[("birthdate", "ge1960-01-01\u{1f}lt1970-01-01")],
+        &[("gender", "male\u{1f}female")],
+        &[("family", "sm\u{1f}smith,jones")],
     ];
 
     const PAGING: &[&[(&str, &str)]] = &[
@@ -4133,8 +4185,107 @@ mod search_paging {
         assert!(!want.is_empty());
     }
 
+    #[test]
+    fn a_comma_finds_what_any_of_its_values_finds_and_a_document_once() {
+        let (harness, now) = seeded();
+        let starts = |resource: &Value, prefixes: &[&str]| {
+            families(resource)
+                .iter()
+                .any(|family| prefixes.iter().any(|prefix| family.starts_with(prefix)))
+        };
+        // Tokens: the union of the values.
+        let want = expected(&now, |resource| {
+            resource["gender"] == "male" || resource["gender"] == "female"
+        });
+        let (ids, total) = found(&harness, &[("gender", "male,female")]);
+        assert_eq!(ids, want);
+        assert_eq!(total as usize, want.len());
+        // Strings: separate prefixes, and prefixes of each other. A patient with two names that
+        // both match is one match, and is not counted twice in the total.
+        for query in ["jones,nguyen", "sm,smith,smithers", "smith,zzz", "zzz,yyy"] {
+            let prefixes: Vec<&str> = query.split(',').collect();
+            let want = expected(&now, |resource| starts(resource, &prefixes));
+            let (ids, total) = found(&harness, &[("family", query)]);
+            assert_eq!(ids, want, "family={query}");
+            assert_eq!(total as usize, want.len(), "total for family={query}");
+        }
+        // Ids; a deleted patient has none.
+        let want = expected(&now, |resource| {
+            ["p1", "p2"].contains(&resource["id"].as_str().unwrap())
+        });
+        assert_eq!(found(&harness, &[("_id", "p1,p2,nobody")]).0, want);
+        assert_eq!(want.len(), 2);
+        let want = expected(&now, |resource| resource["id"] == "p3");
+        assert_eq!(found(&harness, &[("_id", "p8,p3")]).0, want);
+        // `:not` leaves out every value, and keeps a patient that has no value at all.
+        let want = expected(&now, |resource| {
+            resource["gender"] != "male" && resource["gender"] != "female"
+        });
+        assert_eq!(found(&harness, &[("gender:not", "male,female")]).0, want);
+        assert!(want.iter().any(|id| id == "p96"), "no gender: {want:?}");
+        // Both clauses of two lists have to hold.
+        let want = expected(&now, |resource| {
+            starts(resource, &["jones", "nguyen"])
+                && (resource["gender"] == "male" || resource["gender"] == "other")
+        });
+        assert_eq!(
+            found(
+                &harness,
+                &[("family", "Jones,Nguyen"), ("gender", "male,other")]
+            )
+            .0,
+            want
+        );
+        // A repeated parameter is AND: a range written as two bounds.
+        let want = expected(&now, |resource| {
+            resource["birthDate"]
+                .as_str()
+                .is_some_and(|date| ("1960-01-01".."1970-01-01").contains(&date))
+        });
+        let range = crate::join_repeated("birthdate", "ge1960-01-01", "lt1970-01-01");
+        assert_eq!(found(&harness, &[("birthdate", &range)]).0, want);
+        assert!(!want.is_empty());
+    }
+
     fn work(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work) {
         both(harness, "Patient", query).expect("the search works")
+    }
+
+    #[test]
+    fn a_page_of_a_comma_search_reads_the_page_and_not_every_match() {
+        let harness = many_smiths(300);
+        // Two ranges, one of them empty; two that are the same range; both orders.
+        for family in ["Smith,Jones", "Jones,Smith", "Smith,smith"] {
+            let (bundle, work) = self::work(
+                &harness,
+                &[("family", family), ("_count", "10"), ("_total", "none")],
+            );
+            assert_eq!(bundle["entry"].as_array().unwrap().len(), 10, "{family}");
+            assert_eq!(work.rows, 11, "{family}: the page and one row more");
+            assert_eq!((work.fetched, work.decoded), (10, 10), "{family}");
+            assert!(bundle["link"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|link| link["relation"] == "next"));
+            let (bundle, work) = self::work(
+                &harness,
+                &[
+                    ("family", family),
+                    ("_count", "10"),
+                    ("_offset", "200"),
+                    ("_total", "none"),
+                ],
+            );
+            assert_eq!(bundle["entry"].as_array().unwrap().len(), 10, "{family}");
+            assert_eq!(
+                work.rows, 211,
+                "{family}: the offset, the page and one more"
+            );
+        }
+        // With a total every row is counted, as for one value.
+        let (bundle, _) = self::work(&harness, &[("family", "Smith,Jones"), ("_count", "10")]);
+        assert_eq!(bundle["total"], 300);
     }
 
     fn many_smiths(count: usize) -> Harness {
@@ -5928,4 +6079,819 @@ fn a_search_in_a_batch_is_not_refused_for_the_scopes_every_entry_carries() {
     assert_eq!(batch["entry"][0]["response"]["status"], "200 OK", "{batch}");
     assert_eq!(batch["entry"][0]["resource"]["total"], 1);
     assert_eq!(batch["entry"][1]["resource"]["id"], "p1");
+}
+
+/// A comma between the values of a parameter is OR, a repeated parameter is AND, and `:iterate`
+/// follows references from the resources `_include` and `_revinclude` have added. The data is the
+/// shape of a booking system: slots on schedules, whose actors are a healthcare service and a
+/// location.
+mod or_and_iterate {
+    use super::*;
+
+    fn create(harness: &Harness, resource: Value) {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        apply(harness, &path, json!({"resource": resource}));
+    }
+
+    fn r4() -> Harness {
+        let harness = empty();
+        install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+        harness
+    }
+
+    fn slot(id: &str, schedule: &str, status: &str, hour: u8, types: &[&str]) -> Value {
+        let mut slot = json!({
+            "resourceType": "Slot",
+            "id": id,
+            "schedule": {"reference": format!("Schedule/{schedule}")},
+            "status": status,
+            "start": format!("2026-11-01T{hour:02}:00:00Z"),
+            "end": format!("2026-11-01T{hour:02}:30:00Z")
+        });
+        if !types.is_empty() {
+            slot["serviceType"] = types
+                .iter()
+                .map(|code| json!({"coding": [{"system": "http://example.org/st", "code": code}]}))
+                .collect();
+        }
+        slot
+    }
+
+    /// The booking data the tests that only search share: seeded once for the module, not once
+    /// per test.
+    struct Booking(&'static Harness);
+
+    impl std::ops::Deref for Booking {
+        type Target = Harness;
+
+        fn deref(&self) -> &Harness {
+            self.0
+        }
+    }
+
+    fn booking() -> Booking {
+        static SEEDED: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
+        Booking(SEEDED.get_or_init(seed))
+    }
+
+    /// Two healthcare services, four locations (`l2` is part of `l1`; `l3` and `l4` are part of
+    /// each other), two schedules (`s1` has `hs1` and `l1` as actors, `s2` has `hs2`) and four
+    /// slots: `sl1` and `sl3` are free, `sl2` is busy and `sl4` is busy-unavailable.
+    fn seed() -> Harness {
+        let harness = r4();
+        create(
+            &harness,
+            json!({"resourceType": "HealthcareService", "id": "hs1", "name": "Cardiology"}),
+        );
+        create(
+            &harness,
+            json!({"resourceType": "HealthcareService", "id": "hs2", "name": "Dermatology"}),
+        );
+        create(
+            &harness,
+            json!({"resourceType": "Location", "id": "l1", "name": "Wing A, North"}),
+        );
+        create(
+            &harness,
+            json!({
+                "resourceType": "Location", "id": "l2", "name": "North Annex",
+                "partOf": {"reference": "Location/l1"}
+            }),
+        );
+        create(
+            &harness,
+            json!({"resourceType": "Location", "id": "l3", "name": "Cycle A"}),
+        );
+        create(
+            &harness,
+            json!({
+                "resourceType": "Location", "id": "l4", "name": "Cycle B",
+                "partOf": {"reference": "Location/l3"}
+            }),
+        );
+        apply(
+            &harness,
+            "Location/update",
+            json!({"id": "l3", "resource": {
+                "resourceType": "Location", "id": "l3", "name": "Cycle A",
+                "partOf": {"reference": "Location/l4"}
+            }}),
+        );
+        create(
+            &harness,
+            json!({
+                "resourceType": "Schedule", "id": "s1",
+                "actor": [
+                    {"reference": "HealthcareService/hs1"},
+                    {"reference": "Location/l1"}
+                ]
+            }),
+        );
+        create(
+            &harness,
+            json!({
+                "resourceType": "Schedule", "id": "s2",
+                "actor": [{"reference": "HealthcareService/hs2"}]
+            }),
+        );
+        create(&harness, slot("sl1", "s1", "free", 9, &["general", "xray"]));
+        create(&harness, slot("sl2", "s1", "busy", 10, &["general"]));
+        create(&harness, slot("sl3", "s2", "free", 11, &["xray"]));
+        create(&harness, slot("sl4", "s2", "busy-unavailable", 12, &[]));
+        harness
+    }
+
+    fn search(harness: &Harness, type_name: &str, args: Value) -> Value {
+        apply(harness, &format!("{type_name}/search"), args)
+    }
+
+    /// The `Type/id` of the entries with this search mode, sorted.
+    fn with_mode(bundle: &Value, mode: &str) -> Vec<String> {
+        let mut found: Vec<String> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == mode)
+            .map(|entry| {
+                format!(
+                    "{}/{}",
+                    entry["resource"]["resourceType"].as_str().unwrap(),
+                    entry["resource"]["id"].as_str().unwrap()
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn total(harness: &Harness, type_name: &str, args: Value) -> u64 {
+        search(harness, type_name, args)["total"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn a_comma_between_token_values_is_or() {
+        let harness = booking();
+        assert_eq!(total(&harness, "Slot", json!({"status": "free"})), 2);
+        assert_eq!(total(&harness, "Slot", json!({"status": "free,busy"})), 3);
+        assert_eq!(total(&harness, "Slot", json!({"status": "free,zzz"})), 2);
+        assert_eq!(total(&harness, "Slot", json!({"status": "zzz,yyy"})), 0);
+        assert_eq!(
+            total(
+                &harness,
+                "Slot",
+                json!({"status": "free,busy,busy-unavailable"})
+            ),
+            4
+        );
+        // A repeated alternative, or an empty one, changes nothing.
+        assert_eq!(
+            total(&harness, "Slot", json!({"status": "free,,busy,free,"})),
+            3
+        );
+        let found = search(&harness, "Slot", json!({"status": "free,busy"}));
+        assert_eq!(
+            with_mode(&found, "match"),
+            ["Slot/sl1", "Slot/sl2", "Slot/sl3"]
+        );
+    }
+
+    #[test]
+    fn a_page_of_an_or_search_counts_every_match_and_can_be_followed() {
+        let harness = booking();
+        let next = |bundle: &Value| {
+            bundle["link"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|link| link["relation"] == "next")
+                .map(|link| link["url"].as_str().unwrap().to_string())
+        };
+        let mut query = json!({"status": "free,busy", "_count": "2"});
+        let first = search(&harness, "Slot", query.clone());
+        assert_eq!(first["total"], 3);
+        let mut found = with_mode(&first, "match");
+        assert_eq!(found.len(), 2);
+        let url = next(&first).expect("a next page");
+        query["_cursor"] = json!(url.split("_cursor=").nth(1).unwrap());
+        let second = search(&harness, "Slot", query);
+        assert_eq!(second["total"], 3);
+        found.extend(with_mode(&second, "match"));
+        found.sort();
+        assert_eq!(found, ["Slot/sl1", "Slot/sl2", "Slot/sl3"]);
+        assert!(next(&second).is_none());
+        // No total asked for: the same pages.
+        let quick = search(
+            &harness,
+            "Slot",
+            json!({"status": "free,busy", "_count": "2", "_total": "none"}),
+        );
+        assert_eq!(with_mode(&quick, "match").len(), 2);
+        assert!(next(&quick).is_some());
+    }
+
+    #[test]
+    fn a_comma_between_ids_is_or() {
+        let harness = booking();
+        let ids = |value: &str| total(&harness, "HealthcareService", json!({"_id": value}));
+        assert_eq!(ids("hs1"), 1);
+        assert_eq!(ids("hs1,zzz"), 1);
+        assert_eq!(ids("zzz,hs1"), 1);
+        assert_eq!(ids("hs1,hs2"), 2);
+        assert_eq!(ids("hs2,hs2,hs1"), 2);
+        assert_eq!(ids("zzz,yyy"), 0);
+        let found = search(
+            &harness,
+            "HealthcareService",
+            json!({"_id": "hs1,zzz", "_include": "HealthcareService:location"}),
+        );
+        assert_eq!(with_mode(&found, "match"), ["HealthcareService/hs1"]);
+    }
+
+    #[test]
+    fn a_comma_is_or_for_every_kind_of_parameter() {
+        let harness = booking();
+        // A document that several of the values find is listed once.
+        assert_eq!(
+            total(&harness, "Slot", json!({"service-type": "general,xray"})),
+            3
+        );
+        assert_eq!(
+            total(
+                &harness,
+                "Slot",
+                json!({"service-type": "http://example.org/st|general,http://example.org/st|xray"})
+            ),
+            3
+        );
+        // A reference.
+        assert_eq!(
+            total(
+                &harness,
+                "Schedule",
+                json!({"actor": "HealthcareService/hs1,Location/l1"})
+            ),
+            1
+        );
+        assert_eq!(
+            total(
+                &harness,
+                "Schedule",
+                json!({"actor": "HealthcareService/hs1,HealthcareService/hs2"})
+            ),
+            2
+        );
+        // A string: two prefixes that do not overlap, and two that do.
+        assert_eq!(
+            total(&harness, "HealthcareService", json!({"name": "Card,Derm"})),
+            2
+        );
+        assert_eq!(
+            total(&harness, "HealthcareService", json!({"name": "C,Cardio"})),
+            1
+        );
+        // A date: a prefix and a bound.
+        assert_eq!(
+            total(
+                &harness,
+                "Slot",
+                json!({"start": "2026-11-01T09,ge2026-11-01T12:00:00Z"})
+            ),
+            2
+        );
+        // `:exact` and `:contains` are matched against each value.
+        assert_eq!(
+            total(
+                &harness,
+                "HealthcareService",
+                json!({"name:exact": "Cardiology,dermatology"})
+            ),
+            1
+        );
+        assert_eq!(
+            total(
+                &harness,
+                "HealthcareService",
+                json!({"name:contains": "ology,matol"})
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn not_excludes_every_value_a_comma_lists() {
+        let harness = booking();
+        let found = search(&harness, "Slot", json!({"status:not": "free,busy"}));
+        assert_eq!(with_mode(&found, "match"), ["Slot/sl4"]);
+        let found = search(&harness, "Slot", json!({"status:not": "free"}));
+        assert_eq!(with_mode(&found, "match"), ["Slot/sl2", "Slot/sl4"]);
+    }
+
+    #[test]
+    fn an_escaped_comma_is_part_of_the_value() {
+        let harness = booking();
+        // Two alternatives: "Wing A" (the first location) and "North" (the second).
+        assert_eq!(
+            total(&harness, "Location", json!({"name": "Wing A,North"})),
+            2
+        );
+        // One value, with a comma in it.
+        let found = search(&harness, "Location", json!({"name": r"Wing A\, North"}));
+        assert_eq!(with_mode(&found, "match"), ["Location/l1"]);
+        let found = search(&harness, "Location", json!({"name": r"Wing A\, North,Zzz"}));
+        assert_eq!(with_mode(&found, "match"), ["Location/l1"]);
+    }
+
+    #[test]
+    fn a_repeated_parameter_is_and() {
+        let harness = booking();
+        let range =
+            crate::join_repeated("start", "ge2026-11-01T10:00:00Z", "lt2026-11-01T12:00:00Z");
+        let found = search(&harness, "Slot", json!({"start": range}));
+        assert_eq!(with_mode(&found, "match"), ["Slot/sl2", "Slot/sl3"]);
+        // AND of OR lists.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({"start": range, "status": "free,busy"}),
+        );
+        assert_eq!(with_mode(&found, "match"), ["Slot/sl2", "Slot/sl3"]);
+        let found = search(
+            &harness,
+            "Slot",
+            json!({"status": crate::join_repeated("status", "free,busy", "free")}),
+        );
+        assert_eq!(with_mode(&found, "match"), ["Slot/sl1", "Slot/sl3"]);
+        // Nothing is both free and busy.
+        let none = crate::join_repeated("status", "free", "busy");
+        assert_eq!(total(&harness, "Slot", json!({"status": none})), 0);
+        // The links of a page give a repeated parameter back as it was sent, and follow.
+        let first = search(&harness, "Slot", json!({"start": range, "_count": "1"}));
+        let next = first["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["relation"] == "next")
+            .map(|link| link["url"].as_str().unwrap().to_string())
+            .expect("a next page");
+        assert!(!next.contains('\u{1f}'), "{next}");
+        assert!(
+            next.contains("start=ge2026-11-01T10:00:00Z&start=lt2026-11-01T12:00:00Z"),
+            "{next}"
+        );
+        let own = first["link"][0]["url"].as_str().unwrap();
+        assert!(
+            !own.contains('\u{1f}') && own.contains("&start=lt"),
+            "{own}"
+        );
+        let cursor = next.split("_cursor=").nth(1).unwrap();
+        let second = search(
+            &harness,
+            "Slot",
+            json!({"start": range, "_count": "1", "_cursor": cursor}),
+        );
+        let mut paged = with_mode(&first, "match");
+        paged.extend(with_mode(&second, "match"));
+        paged.sort();
+        assert_eq!(paged, ["Slot/sl2", "Slot/sl3"]);
+        // A query string repeats a parameter as a client does.
+        let params =
+            crate::patch::parse_query("status=free,busy&status=free&_include=a&_include=b");
+        assert_eq!(params["status"], "free,busy\u{1f}free");
+        assert_eq!(params["_include"], "a,b");
+    }
+
+    fn entries(harness: &Harness, type_name: &str, args: Value) -> Vec<(String, String)> {
+        search(harness, type_name, args)["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["search"]["mode"].as_str().unwrap().to_string(),
+                    format!(
+                        "{}/{}",
+                        entry["resource"]["resourceType"].as_str().unwrap(),
+                        entry["resource"]["id"].as_str().unwrap()
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(mode, id)| (mode.to_string(), id.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn include_iterate_follows_a_link_from_an_included_resource() {
+        let harness = booking();
+        // One hop: the schedule of the slot.
+        assert_eq!(
+            entries(
+                &harness,
+                "Slot",
+                json!({"_id": "sl1", "_include": "Slot:schedule"})
+            ),
+            pairs(&[("match", "Slot/sl1"), ("include", "Schedule/s1")])
+        );
+        // Plain rules apply to the matches only, so the schedule's actors are not followed.
+        assert_eq!(
+            entries(
+                &harness,
+                "Slot",
+                json!({"_id": "sl1", "_include": "Slot:schedule,Schedule:actor"})
+            ),
+            pairs(&[("match", "Slot/sl1"), ("include", "Schedule/s1")])
+        );
+        // The second hop: from the included schedule to its healthcare service and location.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({
+                "_id": "sl1",
+                "_include": "Slot:schedule",
+                "_include:iterate": "Schedule:actor"
+            }),
+        );
+        assert_eq!(with_mode(&found, "match"), ["Slot/sl1"]);
+        assert_eq!(
+            with_mode(&found, "include"),
+            ["HealthcareService/hs1", "Location/l1", "Schedule/s1"]
+        );
+        assert_eq!(found["total"], 1);
+        // A third segment names the type the reference has to point at.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({
+                "_id": "sl1",
+                "_include": "Slot:schedule",
+                "_include:iterate": "Schedule:actor:Location"
+            }),
+        );
+        assert_eq!(with_mode(&found, "include"), ["Location/l1", "Schedule/s1"]);
+        // An iterate rule needs no plain one: it applies to the matches, and then to what it adds.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({"_id": "sl1", "_include:iterate": "Slot:schedule,Schedule:actor"}),
+        );
+        assert_eq!(
+            with_mode(&found, "include"),
+            ["HealthcareService/hs1", "Location/l1", "Schedule/s1"]
+        );
+        // The same, marked on the value.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({"_id": "sl1", "_include": "Slot:schedule,Schedule:actor:iterate"}),
+        );
+        assert_eq!(
+            with_mode(&found, "include"),
+            ["HealthcareService/hs1", "Location/l1", "Schedule/s1"]
+        );
+    }
+
+    #[test]
+    fn include_iterate_with_a_page_of_slots_and_a_comma_search() {
+        let harness = booking();
+        // The request that found both gaps: free slots, their schedules, and the actors of those.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({
+                "status": "free,busy",
+                "_count": "2",
+                "_include": "Slot:schedule",
+                "_include:iterate": "Schedule:actor"
+            }),
+        );
+        assert_eq!(found["total"], 3);
+        let matched = with_mode(&found, "match");
+        assert_eq!(matched.len(), 2);
+        let included = with_mode(&found, "include");
+        // Every include is reached from the two matches only, and none is listed twice.
+        assert!(
+            included.contains(&"Schedule/s1".to_string()),
+            "{included:?}"
+        );
+        let mut unique = included.clone();
+        unique.dedup();
+        assert_eq!(unique, included);
+        assert!(included.iter().all(|id| !matched.contains(id)));
+    }
+
+    #[test]
+    fn include_iterate_stops_when_references_go_round() {
+        let harness = booking();
+        // `l3` is part of `l4`, which is part of `l3`.
+        assert_eq!(
+            entries(
+                &harness,
+                "Location",
+                json!({"_id": "l3", "_include:iterate": "Location:partof"})
+            ),
+            pairs(&[("match", "Location/l3"), ("include", "Location/l4")])
+        );
+    }
+
+    #[test]
+    fn revinclude_iterate_follows_a_link_to_an_included_resource() {
+        let harness = booking();
+        // One hop: the schedules that name the healthcare service as an actor.
+        let found = search(
+            &harness,
+            "HealthcareService",
+            json!({"_id": "hs1", "_revinclude": "Schedule:actor"}),
+        );
+        assert_eq!(with_mode(&found, "include"), ["Schedule/s1"]);
+        // Two hops: and the slots of those schedules.
+        let found = search(
+            &harness,
+            "HealthcareService",
+            json!({
+                "_id": "hs1",
+                "_revinclude": "Schedule:actor",
+                "_revinclude:iterate": "Slot:schedule"
+            }),
+        );
+        assert_eq!(with_mode(&found, "match"), ["HealthcareService/hs1"]);
+        assert_eq!(
+            with_mode(&found, "include"),
+            ["Schedule/s1", "Slot/sl1", "Slot/sl2"]
+        );
+        // An iterate rule applies to the matches as well.
+        let found = search(
+            &harness,
+            "Schedule",
+            json!({"_id": "s1", "_revinclude:iterate": "Slot:schedule"}),
+        );
+        assert_eq!(with_mode(&found, "include"), ["Slot/sl1", "Slot/sl2"]);
+        // A third segment names the type that is pointed at.
+        let found = search(
+            &harness,
+            "Schedule",
+            json!({"_id": "s1", "_revinclude": "Slot:schedule:Schedule"}),
+        );
+        assert_eq!(with_mode(&found, "include"), ["Slot/sl1", "Slot/sl2"]);
+        let found = search(
+            &harness,
+            "Schedule",
+            json!({"_id": "s1", "_revinclude": "Slot:schedule:Location"}),
+        );
+        assert!(with_mode(&found, "include").is_empty());
+    }
+
+    #[test]
+    fn include_and_revinclude_iterate_work_together() {
+        let harness = booking();
+        // From a slot to its schedule and the actors, and from the schedule to its other slots.
+        let found = search(
+            &harness,
+            "Slot",
+            json!({
+                "_id": "sl1",
+                "_include": "Slot:schedule",
+                "_include:iterate": "Schedule:actor",
+                "_revinclude:iterate": "Slot:schedule"
+            }),
+        );
+        assert_eq!(
+            with_mode(&found, "include"),
+            [
+                "HealthcareService/hs1",
+                "Location/l1",
+                "Schedule/s1",
+                "Slot/sl2"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reverse_include_cannot_take_a_wildcard() {
+        let harness = booking();
+        for args in [
+            json!({"_revinclude": "*"}),
+            json!({"_revinclude": "Slot:*"}),
+            json!({"_revinclude:iterate": "*"}),
+        ] {
+            let refused = run_op(&harness, "Schedule/search", &args).unwrap_err();
+            assert!(
+                matches!(&refused, RunError::Fhir(FhirError::Invalid(message))
+                    if message.contains("not supported")),
+                "{args}: {refused:?}"
+            );
+        }
+        // A forward include still takes one.
+        let found = search(&harness, "Slot", json!({"_id": "sl1", "_include": "*"}));
+        assert_eq!(with_mode(&found, "include"), ["Schedule/s1"]);
+    }
+
+    #[test]
+    fn iterating_rules_are_capped_where_they_read() {
+        let harness = booking();
+        // `s2` has two slots. One more than the cap in a single range is refused when the range
+        // is read, and a cap of two lets it through.
+        let reverse = json!({"_id": "s2", "_revinclude:iterate": "Slot:schedule"});
+        {
+            let _cap = crate::search::LoweredCap::to(1);
+            let refused = run_op(&harness, "Schedule/search", &reverse).unwrap_err();
+            assert!(
+                matches!(&refused, RunError::Fhir(FhirError::Invalid(message))
+                    if message.contains("more than 1 resources")),
+                "{refused:?}"
+            );
+            // A plain rule has the page to bound it, not this cap.
+            let found = search(
+                &harness,
+                "Schedule",
+                json!({"_id": "s2", "_revinclude": "Slot:schedule"}),
+            );
+            assert_eq!(with_mode(&found, "include").len(), 2);
+        }
+        {
+            let _cap = crate::search::LoweredCap::to(2);
+            let found = search(&harness, "Schedule", reverse);
+            assert_eq!(with_mode(&found, "include").len(), 2);
+        }
+        // The cap is for everything the rules add over all the rounds: the schedule is the
+        // first, its healthcare service the second.
+        let forward = json!({"_id": "sl3", "_include:iterate": "Slot:schedule,Schedule:actor"});
+        {
+            let _cap = crate::search::LoweredCap::to(1);
+            assert!(run_op(&harness, "Slot/search", &forward).is_err());
+        }
+        {
+            let _cap = crate::search::LoweredCap::to(2);
+            let found = search(&harness, "Slot", forward);
+            assert_eq!(
+                with_mode(&found, "include"),
+                ["HealthcareService/hs2", "Schedule/s2"]
+            );
+        }
+    }
+
+    #[test]
+    fn a_count_follows_no_include() {
+        let harness = booking();
+        // Nothing is shown, so nothing is followed, and no cap is reached.
+        let _cap = crate::search::LoweredCap::to(0);
+        let found = search(
+            &harness,
+            "Slot",
+            json!({
+                "_summary": "count",
+                "_include": "Slot:schedule",
+                "_include:iterate": "Schedule:actor",
+                "_revinclude:iterate": "Slot:schedule"
+            }),
+        );
+        assert_eq!(found["total"], 4);
+        assert!(found["entry"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn comma_and_repeated_values_reach_chains_and_reverse_chains() {
+        let harness = booking();
+        let actor_name = "actor:HealthcareService.name";
+        // A chain: a comma is OR for the parameter of the referenced resource.
+        assert_eq!(
+            total(&harness, "Schedule", json!({actor_name: "Cardio"})),
+            1
+        );
+        assert_eq!(
+            total(&harness, "Schedule", json!({actor_name: "Cardio,Derm"})),
+            2
+        );
+        assert_eq!(
+            total(&harness, "Schedule", json!({actor_name: "Zzz,Derm"})),
+            1
+        );
+        // A repeated chained parameter is AND: no schedule has both services as actors.
+        let both = crate::join_repeated(actor_name, "Cardio", "Derm");
+        assert_eq!(total(&harness, "Schedule", json!({actor_name: both})), 0);
+        let either_and_one = crate::join_repeated(actor_name, "Cardio,Derm", "Derm");
+        assert_eq!(
+            total(&harness, "Schedule", json!({actor_name: either_and_one})),
+            1
+        );
+        // A reverse chain.
+        let has = "_has:Slot:schedule:status";
+        assert_eq!(total(&harness, "Schedule", json!({has: "free,busy"})), 2);
+        assert_eq!(
+            total(&harness, "Schedule", json!({has: "busy-unavailable"})),
+            1
+        );
+        assert_eq!(
+            total(&harness, "Schedule", json!({has: "busy,busy-unavailable"})),
+            2
+        );
+        let and = crate::join_repeated(has, "free,busy", "busy-unavailable");
+        let found = search(&harness, "Schedule", json!({has: and}));
+        assert_eq!(with_mode(&found, "match"), ["Schedule/s2"]);
+    }
+
+    #[test]
+    fn the_capability_statement_says_what_search_does_not_do() {
+        let harness = ready();
+        let statement = harness.catalog.read().unwrap().capability_statement();
+        let notes = statement["rest"][0]["documentation"].as_str().unwrap();
+        for expected in [
+            "`status=free,busy`",
+            r"`\,` is a literal comma",
+            "at most 1000 alternatives",
+            "more than once is AND",
+            "one value per name",
+            "`_include:iterate` and `_revinclude:iterate`",
+            "more than 1000 resources",
+            "`_revinclude=*`",
+            r"`\$`",
+            r"`\|`",
+        ] {
+            assert!(notes.contains(expected), "{expected} is not in: {notes}");
+        }
+    }
+
+    #[test]
+    fn the_patient_limit_holds_for_what_iterate_reaches() {
+        let harness = r4();
+        for id in ["p1", "p2"] {
+            create(&harness, json!({"resourceType": "Patient", "id": id}));
+        }
+        create(
+            &harness,
+            json!({"resourceType": "Practitioner", "id": "pr1"}),
+        );
+        // `o1` has the other patient's `o2` as a member.
+        for (id, subject, member) in [("o2", "p2", None), ("o1", "p1", Some("o2"))] {
+            let mut observation = json!({
+                "resourceType": "Observation", "id": id, "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                "subject": {"reference": format!("Patient/{subject}")},
+                "performer": [{"reference": "Practitioner/pr1"}]
+            });
+            if let Some(member) = member {
+                observation["hasMember"] = json!([{"reference": format!("Observation/{member}")}]);
+            }
+            create(&harness, observation);
+        }
+        let query = json!({
+            "_id": "o1",
+            "_include": "Observation:performer",
+            "_revinclude:iterate": "Observation:performer"
+        });
+        // Without a limit the practitioner leads to the other patient's observation...
+        let found = search(&harness, "Observation", query.clone());
+        assert_eq!(
+            with_mode(&found, "include"),
+            ["Observation/o2", "Practitioner/pr1"]
+        );
+        // ...and with the server's limit it does not (the reverse rule here, the forward one below).
+        let mut limited = query.clone();
+        limited["_patientCompartment"] = json!("Patient/p1");
+        let found = search(&harness, "Observation", limited);
+        assert_eq!(with_mode(&found, "match"), ["Observation/o1"]);
+        assert_eq!(with_mode(&found, "include"), ["Practitioner/pr1"]);
+        // A forward include: the member of `o1` is another patient's observation.
+        let member = json!({"_id": "o1", "_include": "Observation:has-member"});
+        let found = search(&harness, "Observation", member.clone());
+        assert_eq!(with_mode(&found, "include"), ["Observation/o2"]);
+        let mut limited = member;
+        limited["_patientCompartment"] = json!("Patient/p1");
+        let found = search(&harness, "Observation", limited);
+        assert!(with_mode(&found, "include").is_empty(), "{found}");
+        // A reference that only ends in the patient's id is not the patient: the subject of `o3`
+        // is a Group that happens to be called `p1`.
+        create(
+            &harness,
+            json!({"resourceType": "Group", "id": "p1", "type": "person", "actual": true}),
+        );
+        create(
+            &harness,
+            json!({
+                "resourceType": "Observation", "id": "o3", "status": "final",
+                "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+                "subject": {"reference": "Group/p1"}
+            }),
+        );
+        let found = search(
+            &harness,
+            "Observation",
+            json!({"_patientCompartment": "Patient/p1"}),
+        );
+        assert_eq!(with_mode(&found, "match"), ["Observation/o1"]);
+        // The patient's own resources are still included.
+        let found = search(
+            &harness,
+            "Observation",
+            json!({
+                "_id": "o1", "_patientCompartment": "Patient/p1",
+                "_include": "Observation:subject", "_revinclude:iterate": "Observation:subject"
+            }),
+        );
+        assert_eq!(with_mode(&found, "include"), ["Patient/p1"]);
+    }
 }
