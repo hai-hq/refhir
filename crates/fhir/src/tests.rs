@@ -37,6 +37,13 @@ fn empty() -> Harness {
     }
 }
 
+/// The whole R4 package, which is most of what a test that needs it costs.
+fn r4() -> Harness {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    harness
+}
+
 fn ready() -> Harness {
     let harness = empty();
     install_package_dir(&harness.store, &harness.db, &harness.catalog, minir4_dir()).unwrap();
@@ -3417,13 +3424,7 @@ mod takeover {
 mod search_paging {
     use super::*;
     use crate::extract::compile_parameter;
-    use crate::search::{search_counted, search_reference, Work};
-
-    fn r4() -> Harness {
-        let harness = empty();
-        install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
-        harness
-    }
+    use crate::search::{search_counted, search_reference, Handling, Work};
 
     const FAMILIES: [&str; 8] = [
         "Smith",
@@ -3529,7 +3530,7 @@ mod search_paging {
         let model = catalog.get(type_name).expect("model");
         let params = params(query);
         let mut current_tx = harness.db.begin();
-        let current = search_counted(&mut current_tx, &catalog, model, &params);
+        let current = search_counted(&mut current_tx, &catalog, model, &params, Handling::Strict);
         let mut reference_tx = harness.db.begin();
         let reference = search_reference(&mut reference_tx, &catalog, model, &params);
         match (current, reference) {
@@ -3959,6 +3960,403 @@ mod search_paging {
                 "{expression}"
             );
         }
+    }
+}
+
+/// A search value that cannot be read as the type of its parameter (a date that is not one, a
+/// number that is not a number) is refused with a message that names it, or, when the client asked
+/// for that, left out of the search. It was once read as matching nothing, which an empty result
+/// cannot be told from.
+mod unreadable_values {
+    use super::*;
+    use crate::search::{search_handling, Handling};
+
+    /// The harnesses the read-only tests share, since installing the R4 package is most of what
+    /// each would cost. A test that writes builds its own with `seeded()`.
+    fn shared() -> &'static Harness {
+        static SEEDED: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
+        SEEDED.get_or_init(seeded)
+    }
+
+    fn blank() -> &'static Harness {
+        static BLANK: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
+        BLANK.get_or_init(r4)
+    }
+
+    /// Two patients, and an observation of the first, so that a clause set aside has a visible
+    /// effect: it would have matched both patients.
+    fn seeded() -> Harness {
+        let harness = r4();
+        for (id, gender, born) in [("p1", "female", "1990-01-01"), ("p2", "male", "1985-05-05")] {
+            let resource = json!({
+                "resourceType": "Patient", "id": id, "gender": gender, "birthDate": born,
+                "name": [{"family": "Smith"}]
+            });
+            apply(&harness, "Patient/create", json!({"resource": resource}));
+        }
+        let observation = json!({
+            "resourceType": "Observation", "id": "o1", "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "29463-7"}]},
+            "subject": {"reference": "Patient/p1"},
+            "effectiveDateTime": "2024-01-10T08:00:00Z",
+            "valueQuantity": {"value": 5.4, "system": "http://unitsofmeasure.org", "code": "mg"}
+        });
+        apply(
+            &harness,
+            "Observation/create",
+            json!({"resource": observation}),
+        );
+        harness
+    }
+
+    fn find(
+        harness: &Harness,
+        type_name: &str,
+        query: &[(&str, &str)],
+        handling: Handling,
+    ) -> Result<Value, FhirError> {
+        let catalog = harness.catalog.read().expect("catalog");
+        let model = catalog.get(type_name).expect("model");
+        let params: BTreeMap<String, String> = query
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        let mut tx = harness.db.begin();
+        search_handling(&mut tx, &catalog, model, &params, handling)
+    }
+
+    fn refusal(harness: &Harness, type_name: &str, query: &[(&str, &str)]) -> String {
+        match find(harness, type_name, query, Handling::Strict) {
+            Err(FhirError::Invalid(message)) => message,
+            other => panic!("{type_name} {query:?} was not refused: {other:?}"),
+        }
+    }
+
+    fn ids(bundle: &Value) -> Vec<String> {
+        bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    fn outcomes(bundle: &Value) -> Vec<&Value> {
+        bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "outcome")
+            .map(|entry| &entry["resource"])
+            .collect()
+    }
+
+    const UNREADABLE: [(&str, &str, &str); 11] = [
+        ("Patient", "birthdate", "notadate"),
+        ("Patient", "birthdate", "1990-02-30"),
+        ("Patient", "birthdate", "ge1990,le2000"),
+        ("Observation", "date", "gtlater"),
+        ("Observation", "value-quantity", "abc"),
+        ("Observation", "code-value-quantity", "29463-7"),
+        ("RiskAssessment", "probability", "nan"),
+        ("Patient", "name:missing", "maybe"),
+        ("Patient", "identifier:of-type", "mrn|1"),
+        ("Observation", "subject:Patient.birthdate", "bad"),
+        ("Patient", "_has:Observation:patient:date", "bad"),
+    ];
+
+    #[test]
+    fn a_value_that_cannot_be_read_is_refused_by_name_whatever_is_stored() {
+        let (empty, full) = (blank(), shared());
+        for (type_name, name, value) in UNREADABLE {
+            let message = refusal(empty, type_name, &[(name, value)]);
+            assert!(
+                message.contains(&format!("{value:?}"))
+                    && message.contains(&format!("search parameter {name} on {type_name}")),
+                "{message}"
+            );
+            assert_eq!(
+                refusal(full, type_name, &[(name, value)]),
+                message,
+                "the answer follows the value, not the rows: {type_name} {name}"
+            );
+        }
+        // The case that started this, word for word.
+        let message = refusal(empty, "Patient", &[("birthdate", "notadate")]);
+        assert!(message.starts_with("invalid value \"notadate\" for search parameter birthdate"));
+        assert!(message.contains("expected a date"), "{message}");
+    }
+
+    #[test]
+    fn a_value_that_can_be_read_still_searches() {
+        let harness = shared();
+        let run = |type_name: &str, query: &[(&str, &str)]| {
+            let found = find(harness, type_name, query, Handling::Strict).unwrap();
+            (ids(&found), found["total"].as_u64().unwrap())
+        };
+        assert_eq!(run("Patient", &[("birthdate", "ge1990-01-01")]).0, ["p1"]);
+        assert_eq!(run("Patient", &[("birthdate", "1985")]).0, ["p2"]);
+        assert_eq!(run("Patient", &[("birthdate", "lt1990-01-01")]).0, ["p2"]);
+        assert_eq!(run("Patient", &[("name:missing", "false")]).1, 2);
+        assert_eq!(run("Observation", &[("date", "2024-01")]).0, ["o1"]);
+        assert_eq!(
+            run("Observation", &[("date", "ge2024-01-10T08:00:00+00:00")]).0,
+            ["o1"]
+        );
+        assert_eq!(
+            run("Observation", &[("value-quantity", "5.4||mg")]).0,
+            ["o1"]
+        );
+        assert_eq!(run("Observation", &[("value-quantity", "gt5")]).0, ["o1"]);
+        assert_eq!(run("Observation", &[("value-quantity", "gt6")]).1, 0);
+        assert_eq!(
+            run("Observation", &[("code-value-quantity", "29463-7$5.4||mg")]).0,
+            ["o1"]
+        );
+        assert_eq!(
+            run("Patient", &[("_has:Observation:patient:date", "2024")]).0,
+            ["p1"]
+        );
+        assert_eq!(
+            run("Observation", &[("subject:Patient.birthdate", "1990")]).0,
+            ["o1"]
+        );
+    }
+
+    #[test]
+    fn a_lenient_search_leaves_the_parameter_out_and_says_so() {
+        let harness = shared();
+        let query = [("gender", "female"), ("birthdate", "notadate")];
+        assert!(find(harness, "Patient", &query, Handling::Strict).is_err());
+
+        let found = find(harness, "Patient", &query, Handling::Lenient).unwrap();
+        assert_eq!(ids(&found), ["p1"], "the rest of the search still holds");
+        assert_eq!(found["total"], 1, "the outcome is not a match");
+        let issued = outcomes(&found);
+        assert_eq!(issued.len(), 1, "{found}");
+        let issue = &issued[0]["issue"][0];
+        assert_eq!(issue["severity"], "warning");
+        assert_eq!(issue["expression"][0], "birthdate");
+        let said = issue["diagnostics"].as_str().unwrap();
+        assert!(
+            said.contains("\"notadate\"") && said.contains("ignored"),
+            "{said}"
+        );
+        // The self link is the search that ran.
+        let links = found["link"].as_array().unwrap();
+        assert_eq!(links[0]["url"], "Patient?gender=female", "{found}");
+
+        // With every parameter read, lenient and strict are the same search.
+        let clean = [("gender", "female"), ("birthdate", "1990")];
+        assert_eq!(
+            find(harness, "Patient", &clean, Handling::Lenient).unwrap(),
+            find(harness, "Patient", &clean, Handling::Strict).unwrap()
+        );
+        // Every unreadable parameter is reported, and a search left with none is the whole type.
+        let all = find(
+            harness,
+            "Patient",
+            &[("birthdate", "notadate"), ("name:missing", "maybe")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert_eq!(ids(&all), ["p1", "p2"]);
+        assert_eq!(outcomes(&all)[0]["issue"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_lenient_search_leaves_out_a_chain_and_a_has_clause_it_cannot_read() {
+        let harness = shared();
+        let found = find(
+            harness,
+            "Observation",
+            &[("subject:Patient.birthdate", "bad"), ("code", "29463-7")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert_eq!(ids(&found), ["o1"]);
+        assert_eq!(outcomes(&found).len(), 1);
+        let found = find(
+            harness,
+            "Patient",
+            &[("_has:Observation:patient:date", "bad"), ("gender", "male")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert_eq!(ids(&found), ["p2"]);
+        assert_eq!(outcomes(&found).len(), 1);
+    }
+
+    #[test]
+    fn lenient_does_not_reach_what_is_not_a_value_to_read() {
+        let harness = shared();
+        for (query, said) in [
+            (vec![("_count", "abc")], "_count must be an integer"),
+            (
+                vec![("bogus", "1")],
+                "unsupported search parameter bogus on Patient",
+            ),
+            (vec![("_filter", "gender eq")], "invalid _filter"),
+            (vec![("_cursor", "!")], "invalid _cursor"),
+        ] {
+            let err = find(harness, "Patient", &query, Handling::Lenient).unwrap_err();
+            assert_eq!(err.to_string(), said, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_search_a_client_asked_for_can_be_lenient() {
+        let harness = shared();
+        let unreadable = json!({"birthdate": "notadate"});
+        // The operation a `GET` runs takes the handling from the server's own argument.
+        let lenient = apply(
+            harness,
+            "Patient/search",
+            json!({"birthdate": "notadate", "_handling": "lenient"}),
+        );
+        assert_eq!(ids(&lenient), ["p1", "p2"]);
+        assert_eq!(outcomes(&lenient).len(), 1);
+        assert!(run_op(harness, "Patient/search", &unreadable).is_err());
+        let other = json!({"birthdate": "notadate", "_handling": "other"});
+        assert!(run_op(harness, "Patient/search", &other).is_err());
+
+        // Nothing else a client can send is lenient, however it asks. A conditional delete that
+        // set a clause aside would match every patient, and delete the only one there is.
+        let single = seeded();
+        apply(&single, "Patient/delete", json!({"id": "p2"}));
+        for query in ["birthdate=notadate", "_handling=lenient&birthdate=notadate"] {
+            let err = run_op(
+                &single,
+                "Patient/conditional-delete",
+                &json!({"query": query, "_handling": "lenient"}),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, RunError::Fhir(FhirError::Invalid(_))),
+                "{err}"
+            );
+        }
+        assert_eq!(apply(&single, "Patient/search", json!({}))["total"], 1);
+
+        // A batch entry's URL is the client's, `_handling` included.
+        let bundle = json!({"resourceType": "Bundle", "type": "batch", "entry": [
+            {"request": {"method": "GET", "url": "Patient?birthdate=notadate&_handling=lenient"}}
+        ]});
+        let answered = apply(harness, "Bundle/batch", json!({"resource": bundle}));
+        let status = answered["entry"][0]["response"]["status"].as_str().unwrap();
+        assert!(status.starts_with("400"), "{answered}");
+    }
+
+    #[test]
+    fn a_filter_reads_its_values_like_any_other_clause() {
+        let harness = shared();
+        for (type_name, filter, in_param) in [
+            ("Patient", "birthdate gt notadate", "in birthdate"),
+            ("Patient", "birthdate pr maybe", "in birthdate"),
+            (
+                "Patient",
+                "gender eq female and birthdate lt 1990-13-01",
+                "in birthdate",
+            ),
+            ("Observation", "value-quantity gt abc", "in value-quantity"),
+        ] {
+            let message = refusal(harness, type_name, &[("_filter", filter)]);
+            assert!(
+                message.contains(&format!("search parameter _filter on {type_name}"))
+                    && message.contains(in_param),
+                "{message}"
+            );
+        }
+        // A parameter that does not exist was once a comparison that matched nothing.
+        let unknown = refusal(harness, "Patient", &[("_filter", "nosuch eq 1")]);
+        assert_eq!(unknown, "unsupported search parameter nosuch on Patient");
+
+        let readable = find(
+            harness,
+            "Patient",
+            &[("_filter", "birthdate gt 1986-01-01")],
+            Handling::Strict,
+        )
+        .unwrap();
+        assert_eq!(ids(&readable), ["p1"]);
+
+        // Lenient sets the whole `_filter` aside, as it does any parameter it cannot read.
+        let found = find(
+            harness,
+            "Patient",
+            &[("_filter", "birthdate gt notadate")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert_eq!(ids(&found), ["p1", "p2"]);
+        assert_eq!(outcomes(&found)[0]["issue"][0]["expression"][0], "_filter");
+        assert_eq!(found["link"][0]["url"], "Patient");
+    }
+
+    #[test]
+    fn a_lenient_search_pages_like_a_strict_one() {
+        let harness = shared();
+        let query = [
+            ("name", "Smith"),
+            ("birthdate", "notadate"),
+            ("_count", "1"),
+        ];
+        let first = find(harness, "Patient", &query, Handling::Lenient).unwrap();
+        assert_eq!(ids(&first).len(), 1);
+        let links = first["link"].as_array().unwrap();
+        let next = links
+            .iter()
+            .find(|link| link["relation"] == "next")
+            .expect("a next link")["url"]
+            .as_str()
+            .unwrap();
+        assert!(!next.contains("birthdate"), "{next}");
+        let cursor = next.split("_cursor=").nth(1).expect("a cursor");
+
+        // The link as it is, and the client's own query with the cursor added, give the same page.
+        let mut again = query.to_vec();
+        again.push(("_cursor", cursor));
+        let second = find(harness, "Patient", &again, Handling::Lenient).unwrap();
+        let by_link = find(
+            harness,
+            "Patient",
+            &[("name", "Smith"), ("_count", "1"), ("_cursor", cursor)],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert_eq!(ids(&second).len(), 1);
+        assert_ne!(ids(&second), ids(&first));
+        assert_eq!(ids(&second), ids(&by_link));
+    }
+
+    #[test]
+    fn a_lenient_count_has_no_entries_and_its_link_shows_what_ran() {
+        let found = find(
+            shared(),
+            "Patient",
+            &[("birthdate", "notadate"), ("_summary", "count")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert_eq!(found["total"], 2);
+        assert!(found["entry"].as_array().unwrap().is_empty(), "{found}");
+        assert_eq!(found["link"][0]["url"], "Patient?_summary=count");
+    }
+
+    #[test]
+    fn a_long_value_is_not_echoed_whole() {
+        let long = "x".repeat(5000);
+        let message = refusal(blank(), "Patient", &[("birthdate", long.as_str())]);
+        assert!(message.len() < 400, "{} characters", message.len());
+        assert!(
+            message.contains(&format!("{}…", "x".repeat(64))),
+            "{message}"
+        );
+        // A value at the limit is echoed as it is.
+        let exact = "y".repeat(64);
+        let message = refusal(blank(), "Patient", &[("birthdate", exact.as_str())]);
+        assert!(message.contains(&format!("\"{exact}\"")), "{message}");
     }
 }
 #[test]

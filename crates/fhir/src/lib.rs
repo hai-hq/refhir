@@ -43,4 +43,4 @@ pub use run::{
     dispatch, import_resource, run, stamp_stored_json, RunError, RunResult, CONTROL_ARGS,
     MAX_OCC_FAILURES,
 };
-pub use search::{resource_in_compartment, PATIENT_COMPARTMENT};
+pub use search::{resource_in_compartment, HANDLING, PATIENT_COMPARTMENT};

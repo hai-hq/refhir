@@ -72,6 +72,9 @@ async fn execute_document(
         for (key, value) in &field.args {
             args.insert(key.clone(), Value::String(value.clone()));
         }
+        // How to treat an unreadable value is asked for with a `Prefer` header, which GraphQL does
+        // not read, so a field argument of that name is not the server's word.
+        args.remove(refhir_fhir::HANDLING);
         let result = execute(
             &app.db,
             &app.catalog,

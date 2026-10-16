@@ -887,6 +887,17 @@ mod tests {
             ..SyncSession::default()
         };
         assert!(session.prepare("Patient/search", &json!({}), true).is_ok());
+        // Leniency is the server's to give a `GET`, never a live query's: whatever a client sent
+        // under that name is dropped.
+        let prepared = session
+            .prepare(
+                "Patient/search",
+                &json!({"active": "true", "_handling": "lenient"}),
+                true,
+            )
+            .unwrap();
+        assert!(prepared.get("_handling").is_none(), "{prepared}");
+        assert_eq!(prepared["active"], "true");
         assert!(session
             .prepare("Patient/update", &json!({"id": "p1"}), false)
             .is_err());

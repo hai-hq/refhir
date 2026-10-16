@@ -220,6 +220,271 @@ async fn http_crud_search_history_and_bundle() {
 }
 
 #[tokio::test]
+async fn a_search_value_that_cannot_be_read_is_a_400_unless_the_client_asks_for_lenient() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    assert_eq!(put(&app, patient("p1")).await.status, StatusCode::CREATED);
+    let get = |uri: &'static str, prefer: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let headers: Vec<(&str, &str)> =
+                prefer.map(|value| ("prefer", value)).into_iter().collect();
+            let (status, text) = send_text(&app, "GET", uri, "", &headers).await;
+            (status, serde_json::from_str::<Value>(&text).unwrap())
+        }
+    };
+
+    // The default is to refuse, naming the parameter and the value, and not to answer with an empty
+    // bundle: a date that is not one matches nothing, and so does a date nobody has.
+    for uri in [
+        "/Observation?date=notadate",
+        "/Patient/p1/Observation?date=notadate",
+        "/Patient?name:missing=maybe",
+        // A range written as a parameter given twice reaches the search as one value, joined by a
+        // comma.
+        "/Observation?date=ge2024-01-01&date=le2024-12-31",
+    ] {
+        let (status, body) = get(uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(body["resourceType"], "OperationOutcome", "{uri}");
+        assert_eq!(body["issue"][0]["code"], "invalid", "{uri}");
+        let said = body["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(said.starts_with("invalid value "), "{uri}: {said}");
+    }
+    let (_, body) = get("/Observation?date=ge2024-01-01&date=le2024-12-31", None).await;
+    let said = body["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(said.contains("not supported"), "{said}");
+    let (_, body) = get("/Observation?date=notadate", None).await;
+    let said = body["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(
+        said.contains("\"notadate\"") && said.contains("search parameter date on Observation"),
+        "{said}"
+    );
+    // A value that reads is an ordinary search, and so are the control parameters that already failed.
+    let (status, body) = get("/Observation?date=ge2024-01-01", None).await;
+    assert_eq!(
+        (status, &body["total"]),
+        (StatusCode::OK, &json!(0)),
+        "{body}"
+    );
+    let (status, body) = get("/Patient?_count=abc", None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // `Prefer: handling=lenient` leaves the parameter out and says so in the bundle.
+    for prefer in [
+        "handling=lenient",
+        "return=minimal, handling=\"lenient\"; q=1",
+        "Handling=Lenient",
+    ] {
+        let (status, body) = get("/Patient?name:missing=maybe&active=true", Some(prefer)).await;
+        assert_eq!(status, StatusCode::OK, "{prefer}: {body}");
+        assert_eq!(
+            body["total"], 1,
+            "{prefer}: the rest of the search ran: {body}"
+        );
+        let entries = body["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 2, "{prefer}: {body}");
+        assert_eq!(entries[0]["resource"]["id"], "p1");
+        assert_eq!(entries[1]["search"]["mode"], "outcome");
+        assert_eq!(entries[1]["resource"]["resourceType"], "OperationOutcome");
+        assert_eq!(entries[1]["resource"]["issue"][0]["severity"], "warning");
+        assert_eq!(body["link"][0]["url"], "Patient?active=true", "{prefer}");
+    }
+    let (status, body) = get(
+        "/Patient/p1/Observation?date=notadate",
+        Some("handling=lenient"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Only that header asks for it, and only for a value. A query string cannot, strict is a
+    // request too, and a parameter that does not exist, or a control parameter that cannot be
+    // read, is refused either way.
+    for (uri, prefer) in [
+        ("/Observation?date=notadate&_handling=lenient", None),
+        ("/Observation?date=notadate", Some("handling=strict")),
+        ("/Observation?date=notadate", Some("handling=lenient-ish")),
+        ("/Observation?date=notadate", Some("return=minimal")),
+        ("/Patient?bogus=1", Some("handling=lenient")),
+        ("/Patient?_count=abc", Some("handling=lenient")),
+    ] {
+        let (status, body) = get(uri, prefer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {prefer:?}: {body}");
+    }
+
+    // A conditional delete that skipped a clause it could not read would match every patient and
+    // delete the only one there is.
+    let (status, _) = send_text(
+        &app,
+        "DELETE",
+        "/Patient?name:missing=maybe",
+        "",
+        &[("prefer", "handling=lenient")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        send(&app, "GET", "/Patient/p1", None, None).await.status,
+        StatusCode::OK
+    );
+
+    // Nor does a conditional create or update, with the header or without, create the resource
+    // because a condition it could not read matched nothing.
+    let body = patient("p2").to_string();
+    for prefer in [None, Some("handling=lenient")] {
+        let mut headers = vec![("content-type", "application/fhir+json")];
+        headers.extend(prefer.map(|value| ("prefer", value)));
+        let mut create = headers.clone();
+        create.push(("if-none-exist", "name:missing=maybe"));
+        let (status, _) = send_text(&app, "POST", "/Patient", &body, &create).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "conditional create {prefer:?}"
+        );
+        let uri = "/Patient?name:missing=maybe";
+        let (status, _) = send_text(&app, "PUT", uri, &body, &headers).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "conditional update {prefer:?}"
+        );
+    }
+    let (_, body) = get("/Patient", None).await;
+    assert_eq!(body["total"], 1, "nothing was created: {body}");
+}
+
+#[tokio::test]
+async fn a_search_says_it_depends_on_prefer_and_when_it_was_lenient() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    assert_eq!(put(&app, patient("p1")).await.status, StatusCode::CREATED);
+    let headers_of = |uri: &'static str, prefer: Option<&'static str>| {
+        let app = app.clone();
+        async move {
+            let mut builder = Request::builder().method("GET").uri(uri);
+            if let Some(value) = prefer {
+                builder = builder.header("prefer", value);
+            }
+            let response = app
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            (response.status(), response.headers().clone())
+        }
+    };
+    let varies_on_prefer = |headers: &axum::http::HeaderMap| {
+        headers
+            .get_all("vary")
+            .iter()
+            .any(|value| value.to_str().unwrap_or("").eq_ignore_ascii_case("prefer"))
+    };
+
+    // Every search varies on `Prefer`, whatever it answered, so a cache keeps the answers apart.
+    // Only the one that honored lenient says so.
+    for (uri, prefer, status, applied) in [
+        ("/Observation?date=2024", None, StatusCode::OK, false),
+        (
+            "/Observation?date=notadate",
+            None,
+            StatusCode::BAD_REQUEST,
+            false,
+        ),
+        (
+            "/Observation?date=2024",
+            Some("handling=lenient"),
+            StatusCode::OK,
+            true,
+        ),
+        (
+            "/Observation?date=notadate",
+            Some("handling=lenient"),
+            StatusCode::OK,
+            true,
+        ),
+        (
+            "/Patient/p1/Observation?date=notadate",
+            Some("handling=lenient"),
+            StatusCode::OK,
+            true,
+        ),
+        (
+            "/Observation?date=notadate",
+            Some("handling=strict"),
+            StatusCode::BAD_REQUEST,
+            false,
+        ),
+        (
+            "/Patient?bogus=1",
+            Some("handling=lenient"),
+            StatusCode::BAD_REQUEST,
+            false,
+        ),
+    ] {
+        let (got, headers) = headers_of(uri, prefer).await;
+        assert_eq!(got, status, "{uri} {prefer:?}");
+        assert!(varies_on_prefer(&headers), "{uri} {prefer:?}: {headers:?}");
+        let said = headers
+            .get("preference-applied")
+            .and_then(|value| value.to_str().ok());
+        let want = applied.then_some("handling=lenient");
+        assert_eq!(said, want, "{uri} {prefer:?}");
+    }
+    // A browser can read it too, and CORS does not replace the `Vary` the search set.
+    let request = Request::builder()
+        .method("GET")
+        .uri("/Observation?date=2024")
+        .header("prefer", "handling=lenient")
+        .header("origin", "http://127.0.0.1:3000")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let varied: Vec<_> = response
+        .headers()
+        .get_all("vary")
+        .iter()
+        .map(|value| value.to_str().unwrap().to_string())
+        .collect();
+    assert!(varied.iter().any(|value| value == "Prefer"), "{varied:?}");
+    assert!(varied.iter().any(|value| value == "Origin"), "{varied:?}");
+    let exposed = response
+        .headers()
+        .get("access-control-expose-headers")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    assert!(exposed.contains("Preference-Applied"), "{exposed}");
+}
+
+#[tokio::test]
+async fn a_graphql_argument_cannot_ask_for_lenient() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    let listed = send(
+        &app,
+        "POST",
+        "/graphql",
+        Some(json!({
+            "query": "{ ObservationList(date: \"notadate\", _handling: \"lenient\") { id } }"
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::BAD_REQUEST, "{}", listed.body);
+    let said = listed.body["errors"][0]["message"].as_str().unwrap_or("");
+    assert!(said.starts_with("invalid value "), "{said}");
+    // And a value that reads is listed as ever.
+    let listed = send(
+        &app,
+        "POST",
+        "/graphql",
+        Some(json!({"query": "{ ObservationList(date: \"2024\") { id } }"})),
+        None,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+}
+
+#[tokio::test]
 async fn the_server_assigns_ids_and_put_to_a_new_id_is_off_by_default() {
     let (db, catalog, store) = strict();
     let app = app(db, catalog, store);
@@ -5788,6 +6053,45 @@ mod sync_gaps {
             "a subscribed write ran: {}",
             found.body
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_query_with_a_value_that_cannot_be_read_fails_instead_of_staying_empty() {
+        let (db, catalog, store) = memory();
+        let addr = serve(app(db, catalog, store)).await;
+        let (mut socket, _) = connect(&format!("ws://{addr}/sync")).await;
+        // The second asks to be lenient, which only the header of a `GET` can do: a live query is
+        // never set aside to wait for a date that will never parse.
+        let queries = [
+            json!({"date": "notadate"}),
+            json!({"date": "notadate", "_handling": "lenient"}),
+        ];
+        for (index, args) in queries.into_iter().enumerate() {
+            let base = index as u64;
+            add(&mut socket, base, 10 + base, "Observation/search", args).await;
+            let reply = next_json(&mut socket).await;
+            let item = &reply["modifications"][0];
+            assert_eq!(item["type"], "QueryFailed", "{reply}");
+            assert_eq!(item["queryId"], 10 + base);
+            let error = item["error"].as_str().unwrap_or("");
+            assert!(
+                error.contains("\"notadate\"")
+                    && error.contains("search parameter date on Observation"),
+                "{reply}"
+            );
+        }
+        // A value it can read still subscribes.
+        add(
+            &mut socket,
+            2,
+            12,
+            "Observation/search",
+            json!({"date": "2024"}),
+        )
+        .await;
+        let reply = next_json(&mut socket).await;
+        assert_eq!(reply["modifications"][0]["type"], "QueryUpdated", "{reply}");
+        assert_eq!(reply["modifications"][0]["value"]["total"], 0);
     }
 
     #[tokio::test]
