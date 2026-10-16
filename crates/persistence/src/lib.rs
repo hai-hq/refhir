@@ -10,6 +10,7 @@ pub mod migrate;
 
 pub use pool::{Pool, PoolGuard, PoolStats};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
@@ -602,6 +603,108 @@ pub fn plan_search_parameter(
     })
 }
 
+/// A stored search parameter row with the base and code it is looked up by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParameterRow {
+    pub base: String,
+    pub code: String,
+    pub row: InstalledParam,
+}
+
+/// A stored row that installing a package replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParameterRemoval {
+    pub package_id: i64,
+    pub url: String,
+    pub base: String,
+    pub code: String,
+}
+
+/// What installing all the search parameters of one package comes to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageParameterPlan {
+    /// The parameters to store, as positions in the package's list, with the status each is
+    /// stored under, in the order they are stored.
+    pub inserts: Vec<(usize, ParamStatus)>,
+    /// Rows that were stored before the install and go away.
+    pub removals: Vec<ParameterRemoval>,
+    pub newly_pending: Vec<PendingParam>,
+}
+
+/// [`plan_search_parameter`] for every parameter of a package, in order, as if each one had been
+/// stored before the next was looked at: a package may carry two definitions of one parameter,
+/// and the later one then meets the earlier one. `stored` holds the rows that already exist for
+/// the bases and codes of `parameters`, so a store reads them in one query rather than one per
+/// parameter, then writes the result in a few statements.
+pub fn plan_package_parameters(
+    package_id: i64,
+    parameters: &[NewSearchParameter],
+    stored: Vec<StoredParameterRow>,
+) -> Result<PackageParameterPlan, InstallError> {
+    let mut by_key: HashMap<(String, String), Vec<InstalledParam>> = HashMap::new();
+    for stored in stored {
+        by_key
+            .entry((stored.base, stored.code))
+            .or_default()
+            .push(stored.row);
+    }
+    let mut plan = PackageParameterPlan::default();
+    for (position, param) in parameters.iter().enumerate() {
+        let key = (param.base.clone(), param.code.clone());
+        let installed = by_key.entry(key).or_default();
+        let (existing, remove) = match plan_search_parameter(param, installed)? {
+            ParamPlan::Conflict => {
+                return Err(InstallError::Expression {
+                    base: param.base.clone(),
+                    code: param.code.clone(),
+                });
+            }
+            ParamPlan::Skip => continue,
+            ParamPlan::Insert { status, remove } => (status, remove),
+        };
+        for (owner, url) in remove {
+            installed.retain(|row| !(row.package_id == owner && row.url == url));
+            // A row this package inserted earlier in the plan was never stored.
+            let earlier = (owner == package_id)
+                .then(|| {
+                    plan.inserts.iter().position(|(held, _)| {
+                        let held = &parameters[*held];
+                        held.url == url && held.base == param.base && held.code == param.code
+                    })
+                })
+                .flatten();
+            match earlier {
+                Some(index) => {
+                    plan.inserts.remove(index);
+                }
+                None => plan.removals.push(ParameterRemoval {
+                    package_id: owner,
+                    url,
+                    base: param.base.clone(),
+                    code: param.code.clone(),
+                }),
+            }
+        }
+        let is_new = existing.is_none();
+        let status = existing.unwrap_or(param.status);
+        if is_new && status == ParamStatus::Pending {
+            plan.newly_pending.push(PendingParam {
+                base: param.base.clone(),
+                code: param.code.clone(),
+            });
+        }
+        installed.push(InstalledParam {
+            package_id,
+            url: param.url.clone(),
+            expression: param.expression.clone().unwrap_or_default(),
+            status: status.as_str().to_string(),
+            json: param.json.clone(),
+        });
+        plan.inserts.push((position, status));
+    }
+    Ok(plan)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredTerminology {
     pub package_id: i64,
@@ -975,11 +1078,43 @@ pub trait ConformanceStore: Send + Sync {
         done: bool,
     ) -> Result<(), PersistError>;
 
+    /// [`ConformanceStore::insert_backfill`] for each of `tablets`, each snapshotting every
+    /// parameter of the package that is pending for it. A package that adds parameters to
+    /// a hundred resource types queues a hundred jobs; a store that makes this one step spares
+    /// a round trip and a commit each.
+    fn insert_backfills(
+        &self,
+        package_id: i64,
+        watermark_ts: i64,
+        tablets: &[String],
+    ) -> Result<(), PersistError> {
+        for tablet in tablets {
+            self.insert_backfill(package_id, watermark_ts, tablet, &[])?;
+        }
+        Ok(())
+    }
+
     /// Records that this writer is the one running backfill `id`, taking it over from an
     /// earlier writer that died with it half done. Returns false if the job is finished and
     /// there is nothing to run. Fails with `PersistError::Fenced` if a *newer* writer has
     /// already claimed it: this process is the stale one.
     fn claim_backfill(&self, id: i64) -> Result<bool, PersistError>;
+
+    /// Claims, completes and marks done each of `jobs`, which the caller found nothing to index
+    /// for: the resource type holds no document that is not already past the job's cursor. It
+    /// is [`ConformanceStore::claim_backfill`], [`ConformanceStore::complete_backfill`] and
+    /// [`ConformanceStore::update_backfill`] for each job in turn, except that a job that is
+    /// already finished is passed over, and a store may do all of it in one step.
+    fn complete_empty_backfills(&self, jobs: &[StoredBackfill]) -> Result<(), PersistError> {
+        for job in jobs {
+            if !self.claim_backfill(job.id)? {
+                continue;
+            }
+            self.complete_backfill(job.id, job.package_id, &job.tablet)?;
+            self.update_backfill(job.id, job.cursor_id.as_deref(), true)?;
+        }
+        Ok(())
+    }
 
     fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError>;
 }
@@ -1078,6 +1213,157 @@ mod clash_tests {
             resolve_expression_clash("not json", real),
             ExpressionClash::Conflict
         );
+    }
+
+    fn incoming(url: &str, expression: &str, experimental: bool) -> NewSearchParameter {
+        NewSearchParameter {
+            url: url.into(),
+            ..param(expression, experimental)
+        }
+    }
+
+    type Rows = Vec<(i64, String, String)>;
+
+    /// The rows left after storing `parameters` one at a time, each looked up against what the
+    /// ones before it left: how a store that goes parameter by parameter ends up.
+    fn one_at_a_time(
+        package_id: i64,
+        parameters: &[NewSearchParameter],
+        mut rows: Vec<InstalledParam>,
+    ) -> Result<(Rows, Vec<PendingParam>), InstallError> {
+        let mut pending = Vec::new();
+        for param in parameters {
+            let (existing, remove) = match plan_search_parameter(param, &rows)? {
+                ParamPlan::Conflict => {
+                    return Err(InstallError::Expression {
+                        base: param.base.clone(),
+                        code: param.code.clone(),
+                    })
+                }
+                ParamPlan::Skip => continue,
+                ParamPlan::Insert { status, remove } => (status, remove),
+            };
+            for (owner, url) in remove {
+                rows.retain(|row| !(row.package_id == owner && row.url == url));
+            }
+            let status = existing.unwrap_or(param.status);
+            if existing.is_none() && status == ParamStatus::Pending {
+                pending.push(PendingParam {
+                    base: param.base.clone(),
+                    code: param.code.clone(),
+                });
+            }
+            rows.push(InstalledParam {
+                package_id,
+                url: param.url.clone(),
+                expression: param.expression.clone().unwrap_or_default(),
+                status: status.as_str().into(),
+                json: param.json.clone(),
+            });
+        }
+        let mut rows: Rows = rows
+            .into_iter()
+            .map(|row| (row.package_id, row.url, row.status))
+            .collect();
+        rows.sort();
+        Ok((rows, pending))
+    }
+
+    /// The same, from the plan a store gets for the whole package and applies in bulk.
+    fn all_at_once(
+        package_id: i64,
+        parameters: &[NewSearchParameter],
+        rows: Vec<InstalledParam>,
+    ) -> Result<(Rows, Vec<PendingParam>), InstallError> {
+        let stored = rows
+            .iter()
+            .cloned()
+            .map(|row| StoredParameterRow {
+                base: "Patient".into(),
+                code: "maiden".into(),
+                row,
+            })
+            .collect();
+        let plan = plan_package_parameters(package_id, parameters, stored)?;
+        let mut rows = rows;
+        for removal in &plan.removals {
+            rows.retain(|row| !(row.package_id == removal.package_id && row.url == removal.url));
+        }
+        for (position, status) in &plan.inserts {
+            let param = &parameters[*position];
+            rows.push(InstalledParam {
+                package_id,
+                url: param.url.clone(),
+                expression: param.expression.clone().unwrap_or_default(),
+                status: status.as_str().into(),
+                json: param.json.clone(),
+            });
+        }
+        let mut rows: Rows = rows
+            .into_iter()
+            .map(|row| (row.package_id, row.url, row.status))
+            .collect();
+        rows.sort();
+        Ok((rows, plan.newly_pending))
+    }
+
+    #[test]
+    fn a_package_is_planned_as_if_its_parameters_were_stored_one_by_one() {
+        // Rows of other packages that are already stored, and the definitions a package may
+        // carry for one parameter: drafts and real ones, one of them twice under another URL.
+        let stored: [Vec<InstalledParam>; 4] = [
+            Vec::new(),
+            vec![row(1, "Patient.draft", true)],
+            vec![row(1, "Patient.real", false)],
+            vec![
+                row(1, "Patient.draft", true),
+                row(2, "Patient.draft2", true),
+            ],
+        ];
+        let definitions = [
+            incoming("http://example.org/a", "Patient.draft", true),
+            incoming("http://example.org/b", "Patient.draft2", true),
+            incoming("http://example.org/c", "Patient.real", false),
+            incoming("http://example.org/d", "Patient.real", false),
+            incoming("http://example.org/e", "Patient.other", false),
+        ];
+        let mut compared = 0;
+        for rows in &stored {
+            for first in 0..definitions.len() {
+                for second in 0..definitions.len() {
+                    for third in 0..definitions.len() {
+                        let package = [
+                            definitions[first].clone(),
+                            definitions[second].clone(),
+                            definitions[third].clone(),
+                        ];
+                        let one = one_at_a_time(9, &package, rows.clone());
+                        let all = all_at_once(9, &package, rows.clone());
+                        match (one, all) {
+                            (Ok(one), Ok(all)) => assert_eq!(one, all, "{rows:?} {package:?}"),
+                            (Err(one), Err(all)) => {
+                                assert_eq!(one.to_string(), all.to_string())
+                            }
+                            (one, all) => panic!("{rows:?} {package:?}: {one:?} against {all:?}"),
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 4 * 5 * 5 * 5);
+    }
+
+    #[test]
+    fn a_definition_the_package_replaces_itself_is_never_stored() {
+        let package = [
+            incoming("http://example.org/draft", "Patient.draft", true),
+            incoming("http://example.org/real", "Patient.real", false),
+        ];
+        let plan = plan_package_parameters(9, &package, Vec::new()).unwrap();
+        assert_eq!(plan.inserts, [(1, ParamStatus::Pending)]);
+        assert!(plan.removals.is_empty(), "{plan:?}");
+        assert_eq!(plan.newly_pending.len(), 2);
     }
 }
 
@@ -2425,6 +2711,240 @@ pub mod conformance {
     /// Search parameters that meet in different packages: a draft yields to a real definition
     /// in either install order, and two real ones that disagree are refused. `tag` keeps
     /// package names unique on a database that already holds earlier runs.
+    /// A package that carries several search parameters, a definition and the draft it replaces,
+    /// a parameter with no expression, and two pieces of terminology for one URL goes in as the
+    /// same rows a one-by-one install would leave, and a second package with the same
+    /// parameters finds them there and inherits their status.
+    pub fn exercise_package_install(store: &dyn ConformanceStore, tag: &str) {
+        let parameter = |url: &str, code: &str, expression: Option<&str>, experimental: bool| {
+            NewSearchParameter {
+                url: format!("http://example.org/sp/{tag}/{url}"),
+                base: "Patient".into(),
+                code: format!("{code}-{tag}"),
+                param_type: "string".into(),
+                expression: expression.map(str::to_string),
+                status: ParamStatus::Pending,
+                json: format!(r#"{{"experimental":{experimental}}}"#),
+            }
+        };
+        let package = |name: &str| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: ["one", "two"]
+                .iter()
+                .map(|id| NewStructureDefinition {
+                    url: format!("http://example.org/sd/{tag}/{id}"),
+                    type_name: "Thing".into(),
+                    kind: "resource".into(),
+                    is_abstract: *id == "two",
+                    json: format!(r#"{{"id":"{id}"}}"#),
+                })
+                .collect(),
+            search_parameters: vec![
+                parameter("none", "bare", None, false),
+                parameter("draft", "replaced", Some("Patient.draft"), true),
+                parameter("real", "replaced", Some("Patient.real"), false),
+                parameter("plain", "plain", Some("Patient.plain"), false),
+            ],
+            terminology: ["first", "second"]
+                .iter()
+                .map(|which| NewTerminology {
+                    resource_type: "CodeSystem".into(),
+                    url: format!("http://example.org/cs/{tag}"),
+                    json: format!(r#"{{"which":"{which}"}}"#),
+                })
+                .collect(),
+            expansions: Vec::new(),
+        };
+        let mine = |row: &StoredSearchParameter| row.code.ends_with(&format!("-{tag}"));
+        let first = store.install_package(&package("bulk-one")).unwrap();
+        assert!(first.inserted);
+        let mut pending: Vec<String> = first
+            .newly_pending
+            .iter()
+            .map(|param| param.code.clone())
+            .collect();
+        pending.sort();
+        // The draft was new and pending when it went in, then the real one replaced it.
+        assert_eq!(
+            pending,
+            [
+                format!("bare-{tag}"),
+                format!("plain-{tag}"),
+                format!("replaced-{tag}"),
+                format!("replaced-{tag}"),
+            ]
+        );
+        let rows: Vec<StoredSearchParameter> = store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(mine)
+            .collect();
+        let mut stored: Vec<(&str, Option<&str>, ParamStatus)> = rows
+            .iter()
+            .map(|row| (row.code.as_str(), row.expression.as_deref(), row.status))
+            .collect();
+        stored.sort_by_key(|row| row.0);
+        let (bare, plain, replaced) = (
+            format!("bare-{tag}"),
+            format!("plain-{tag}"),
+            format!("replaced-{tag}"),
+        );
+        assert_eq!(
+            stored,
+            [
+                (bare.as_str(), None, ParamStatus::Pending),
+                (plain.as_str(), Some("Patient.plain"), ParamStatus::Pending),
+                (
+                    replaced.as_str(),
+                    Some("Patient.real"),
+                    ParamStatus::Pending
+                ),
+            ]
+        );
+        let definitions: Vec<StoredStructureDefinition> = store
+            .load_structure_definitions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.contains(&format!("/{tag}/")))
+            .collect();
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions.iter().any(|row| row.is_abstract));
+        assert!(definitions.iter().any(|row| !row.is_abstract));
+        let terminology: Vec<StoredTerminology> = store
+            .load_terminology()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.ends_with(&format!("/cs/{tag}")))
+            .collect();
+        assert_eq!(terminology.len(), 1);
+        assert_eq!(terminology[0].json, r#"{"which":"first"}"#);
+
+        // The package that follows carries the same parameters: they are found installed, keep
+        // their status, and nothing in it is waiting for a backfill that is not queued already.
+        let second = store.install_package(&package("bulk-two")).unwrap();
+        assert!(second.inserted);
+        assert!(
+            second.newly_pending.is_empty(),
+            "{:?}",
+            second.newly_pending
+        );
+        let rows: Vec<StoredSearchParameter> = store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(|row| mine(row) && row.package_id == second.package_id)
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|row| row.status == ParamStatus::Pending));
+    }
+
+    /// Queueing and finishing backfill jobs in bulk does what doing it one at a time does: each
+    /// job is queued over the parameters pending for its type, finishing jobs that had nothing to
+    /// index marks exactly those parameters ready, a job that was limited to some parameters
+    /// leaves the others pending, and one that is already finished is passed over.
+    pub fn exercise_backfill_batches(store: &dyn ConformanceStore, tag: &str) {
+        let parameter = |base: &str, code: &str| NewSearchParameter {
+            url: format!("http://example.org/sp/{tag}/{base}-{code}"),
+            base: base.into(),
+            code: format!("{code}-{tag}"),
+            param_type: "string".into(),
+            expression: Some(format!("{base}.{code}")),
+            status: ParamStatus::Pending,
+            json: "{}".into(),
+        };
+        let package = NewPackage {
+            name: format!("backfills.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: vec![
+                parameter("Patient", "a"),
+                parameter("Observation", "a"),
+                parameter("Encounter", "a"),
+                parameter("Encounter", "b"),
+                parameter("Group", "a"),
+                parameter("Group", "b"),
+            ],
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        let package_id = store.install_package(&package).unwrap().package_id;
+        let status_of = |base: &str, code: &str| -> ParamStatus {
+            store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .find(|row| {
+                    row.package_id == package_id && row.base == base && row.code.starts_with(code)
+                })
+                .unwrap()
+                .status
+        };
+        let mine = || -> Vec<StoredBackfill> {
+            store
+                .load_backfills()
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.package_id == package_id)
+                .collect()
+        };
+
+        let tablets: Vec<String> = ["Encounter", "Observation", "Patient"]
+            .iter()
+            .map(|tablet| tablet.to_string())
+            .collect();
+        store.insert_backfills(package_id, 7, &tablets).unwrap();
+        let queued = mine();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|job| job.tablet.as_str())
+                .collect::<Vec<_>>(),
+            ["Encounter", "Observation", "Patient"],
+            "queued in the order given"
+        );
+        assert!(queued
+            .iter()
+            .all(|job| !job.done && job.cursor_id.is_none() && job.watermark_ts == 7));
+        assert!(queued.windows(2).all(|pair| pair[0].id < pair[1].id));
+
+        // The first two have nothing to index; the third is still to run.
+        store.complete_empty_backfills(&queued[..2]).unwrap();
+        let after = mine();
+        assert!(
+            after[0].done && after[1].done && !after[2].done,
+            "{after:?}"
+        );
+        assert!(after[0].claimed_epoch.is_some() && after[1].claimed_epoch.is_some());
+        assert_eq!(status_of("Encounter", "a"), ParamStatus::Ready);
+        assert_eq!(status_of("Encounter", "b"), ParamStatus::Ready);
+        assert_eq!(status_of("Observation", "a"), ParamStatus::Ready);
+        assert_eq!(status_of("Patient", "a"), ParamStatus::Pending);
+
+        // Finished jobs are passed over, so asking again for all three finishes only the last.
+        store.complete_empty_backfills(&queued).unwrap();
+        assert!(mine().iter().all(|job| job.done));
+        assert_eq!(status_of("Patient", "a"), ParamStatus::Ready);
+
+        // A job limited to one parameter of its type marks that one and no other.
+        let limited = store
+            .insert_backfill(
+                package_id,
+                7,
+                "Group",
+                &[format!("http://example.org/sp/{tag}/Group-a")],
+            )
+            .unwrap();
+        let job = mine().into_iter().find(|job| job.id == limited).unwrap();
+        store.complete_empty_backfills(&[job]).unwrap();
+        assert!(mine().iter().find(|job| job.id == limited).unwrap().done);
+        assert_eq!(status_of("Group", "a"), ParamStatus::Ready);
+        assert_eq!(status_of("Group", "b"), ParamStatus::Pending);
+    }
+
     pub fn exercise_parameter_clashes(store: &dyn ConformanceStore, tag: &str) {
         let package = |name: &str, expression: &str, experimental: bool| NewPackage {
             name: format!("{name}.{tag}"),

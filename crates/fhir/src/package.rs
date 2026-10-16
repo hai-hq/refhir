@@ -136,11 +136,10 @@ impl PendingBackfill {
             .latest_ts()
             .to_i64()
             .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
-        for base in &self.bases {
-            store
-                .insert_backfill(self.package_id, watermark, base, &[])
-                .map_err(FhirError::from)?;
-        }
+        let bases: Vec<String> = self.bases.iter().cloned().collect();
+        store
+            .insert_backfills(self.package_id, watermark, &bases)
+            .map_err(FhirError::from)?;
         Ok(())
     }
 }
@@ -370,7 +369,28 @@ pub fn run_backfills(
 ) -> Result<(), FhirError> {
     let jobs = store.load_backfills().map_err(FhirError::from)?;
     let mut refreshed = false;
+    // A resource type with no document has nothing to index, and installing a package into a
+    // database that holds no resources yet leaves a job for every type it adds parameters to.
+    // Those are finished together. The documents that exist now are all the ones the backfill
+    // is for: one written after the job was queued is indexed by the writer, which already
+    // knows the parameter. A job that has begun is not looked at this way: its cursor says where
+    // it stands.
+    let mut empty = Vec::new();
+    let mut busy = Vec::new();
     for job in jobs.into_iter().filter(|job| !job.done) {
+        if job.cursor_id.is_none() && !holds_documents(db, &job.tablet)? {
+            empty.push(job);
+        } else {
+            busy.push(job);
+        }
+    }
+    if !empty.is_empty() {
+        store
+            .complete_empty_backfills(&empty)
+            .map_err(FhirError::from)?;
+        refreshed = true;
+    }
+    for job in busy {
         // This writer owns the job from here. If an earlier writer died with it half done, the
         // claim moves to this one and the cursor tells where to resume; if a newer writer has
         // already claimed it, this process is the stale one and is refused.
@@ -412,7 +432,31 @@ pub fn run_backfills(
         refreshed = true;
     }
     if refreshed {
-        publish(store, catalog)?;
+        publish_parameters(store, catalog)?;
+    }
+    Ok(())
+}
+
+/// [`publish`] for a change that only moved search parameters from pending to ready, which is all
+/// a backfill changes: the parameters are read and compiled again, and the rest of the catalog,
+/// which is what takes the time to build, is kept.
+fn publish_parameters(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+) -> Result<(), FhirError> {
+    let parameters = store.load_search_parameters()?;
+    let compiled = catalog
+        .read()
+        .expect("catalog")
+        .compiled_parameters(&parameters);
+    let stable = {
+        let mut current = catalog.write().expect("catalog");
+        current.set_parameters(compiled);
+        !current.has_pending_parameters()
+    };
+    store.bump_catalog_revision()?;
+    if stable {
+        store.bump_catalog_version()?;
     }
     Ok(())
 }
@@ -607,6 +651,20 @@ pub fn watch_catalog(
         loaded,
         thread,
     }
+}
+
+/// Whether any document of `type_name` is live: the first row of its id index, read without the
+/// documents.
+fn holds_documents(db: &Database, type_name: &str) -> Result<bool, FhirError> {
+    let index = IndexId::new(format!("{type_name}/by_id"));
+    let first = db.reader().index_scan_ids(
+        &index,
+        db.latest_ts(),
+        &Interval::all(),
+        Order::Asc,
+        Some(1),
+    )?;
+    Ok(!first.is_empty())
 }
 
 pub(crate) fn live_ids(db: &Database, type_name: &str) -> Result<Vec<String>, FhirError> {

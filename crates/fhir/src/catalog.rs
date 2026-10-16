@@ -197,6 +197,44 @@ impl Catalog {
             .any(|model| model.pending_params().next().is_some())
     }
 
+    /// The search parameters [`Catalog::open`] would attach to the resource types this catalog
+    /// has, for `parameters` as they are stored now. A backfill that completes changes the status
+    /// of stored parameters and nothing else, and these are all it changes in a catalog, so the
+    /// schema and the terminology, which are most of what a load builds, need not be built again.
+    /// The result is made under a read lock; [`Catalog::set_parameters`] applies it.
+    pub fn compiled_parameters(
+        &self,
+        parameters: &[StoredSearchParameter],
+    ) -> BTreeMap<String, Vec<SearchParam>> {
+        let mut types: BTreeMap<String, ResourceModel> = self
+            .types
+            .iter()
+            .map(|(name, model)| {
+                let bare = ResourceModel {
+                    name: model.name.clone(),
+                    references: model.references.clone(),
+                    params: Vec::new(),
+                };
+                (name.clone(), bare)
+            })
+            .collect();
+        add_parameters(&mut types, parameters);
+        types
+            .into_iter()
+            .map(|(name, model)| (name, model.params))
+            .collect()
+    }
+
+    /// Replace the search parameters of the types in `compiled`, which
+    /// [`Catalog::compiled_parameters`] made. A type the catalog gained since is left as it is.
+    pub fn set_parameters(&mut self, compiled: BTreeMap<String, Vec<SearchParam>>) {
+        for (name, params) in compiled {
+            if let Some(model) = self.types.get_mut(&name) {
+                model.params = params;
+            }
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             fhir_version: None,
@@ -896,5 +934,52 @@ mod tests {
         // Whatever the sizes, every row is in exactly one batch and the order is kept.
         let sizes: Vec<usize> = (1..500).map(|n| n * 997).collect();
         assert_eq!(batched(&sizes).concat(), sizes);
+    }
+
+    /// What a type's parameters come to, for comparing two catalogs.
+    fn parameters_of(catalog: &Catalog) -> BTreeMap<String, String> {
+        catalog
+            .types
+            .iter()
+            .map(|(name, model)| (name.clone(), format!("{:?}", model.params)))
+            .collect()
+    }
+
+    #[test]
+    fn the_parameters_of_a_catalog_are_what_a_fresh_load_gives_once_a_backfill_is_done() {
+        use std::sync::{Arc, RwLock};
+
+        use refhir_database::Database;
+        use refhir_sqlite::SqlitePersistence;
+
+        use crate::package::{
+            extra_dir, install_package_dir, minir4_dir, publish, run_backfills,
+            stage_package_deferred,
+        };
+
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let catalog = RwLock::new(Catalog::empty());
+        install_package_dir(&store, &db, &catalog, minir4_dir()).unwrap();
+        let pending = stage_package_deferred(&store, &db, &catalog, extra_dir())
+            .unwrap()
+            .expect("the package has pending search parameters");
+        publish(&store, &catalog).unwrap();
+        pending.create(&store, &db).unwrap();
+        assert!(catalog.read().unwrap().has_pending_parameters());
+
+        // The backfill refreshes the parameters in the catalog it is given.
+        run_backfills(&store, &db, &catalog).unwrap();
+        let kept = catalog.read().unwrap();
+        assert!(!kept.has_pending_parameters());
+        let fresh = Catalog::open(&store).unwrap();
+        assert_eq!(parameters_of(&kept), parameters_of(&fresh));
+        assert!(
+            kept.get("Patient")
+                .unwrap()
+                .ready_param("birthdate")
+                .is_some(),
+            "the parameter the package added is searchable"
+        );
     }
 }

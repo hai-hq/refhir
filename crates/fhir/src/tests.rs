@@ -824,6 +824,131 @@ fn dependency_versions_resolve_to_the_highest_one_installed_once() {
     }
 }
 
+/// A registry that counts what is fetched from it, and how many fetches are under way at once.
+struct CountingFetcher {
+    inner: MapFetcher,
+    fetched: std::sync::Mutex<BTreeMap<(String, String), usize>>,
+    running: std::sync::atomic::AtomicUsize,
+    most_at_once: std::sync::atomic::AtomicUsize,
+}
+
+impl PackageFetcher for CountingFetcher {
+    fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        *self
+            .fetched
+            .lock()
+            .unwrap()
+            .entry((name.to_string(), version.to_string()))
+            .or_default() += 1;
+        let now = self.running.fetch_add(1, SeqCst) + 1;
+        self.most_at_once.fetch_max(now, SeqCst);
+        // Long enough that fetches that are meant to overlap do.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let result = self.inner.fetch(name, version, dest);
+        self.running.fetch_sub(1, SeqCst);
+        result
+    }
+}
+
+#[test]
+fn packages_that_do_not_need_each_other_are_fetched_side_by_side_and_once() {
+    let names = [
+        "example.a",
+        "example.b",
+        "example.c",
+        "example.d",
+        "example.e",
+    ];
+    let deps: Vec<(&str, &str)> = names.iter().map(|name| (*name, "1.0.0")).collect();
+    let app = dep_package("example.app", "1.0.0", &deps);
+    // The last one is needed by two of the others: still fetched once.
+    let libs: Vec<PathBuf> = names
+        .iter()
+        .map(|name| {
+            let needs: &[(&str, &str)] = if *name == "example.e" {
+                &[]
+            } else {
+                &[("example.shared", "1.0.0")]
+            };
+            dep_package(name, "1.0.0", needs)
+        })
+        .collect();
+    let shared = dep_package("example.shared", "1.0.0", &[]);
+    let mut listed: Vec<(&str, &str, &PathBuf)> = names
+        .iter()
+        .zip(&libs)
+        .map(|(name, dir)| (*name, "1.0.0", dir))
+        .collect();
+    listed.push(("example.shared", "1.0.0", &shared));
+    let fetcher = CountingFetcher {
+        inner: registry(&listed),
+        fetched: Default::default(),
+        running: Default::default(),
+        most_at_once: Default::default(),
+    };
+    let db = empty();
+    let cache = temp_dir("side-by-side-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    let mut expected: Vec<String> = names.iter().map(|name| format!("{name}@1.0.0")).collect();
+    expected.push("example.app@1.0.0".into());
+    expected.push("example.shared@1.0.0".into());
+    expected.sort();
+    assert_eq!(installed_packages(&db), expected);
+    let fetched = fetcher.fetched.lock().unwrap();
+    assert_eq!(fetched.len(), 6, "{fetched:?}");
+    assert!(fetched.values().all(|count| *count == 1), "{fetched:?}");
+    assert!(
+        fetcher
+            .most_at_once
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 1,
+        "the five that app needs were fetched one after another"
+    );
+    drop(fetched);
+    for dir in libs.into_iter().chain([app, shared, cache]) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_package_that_cannot_be_fetched_stops_the_install_before_anything_is_stored() {
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.a", "1.0.0"), ("example.missing", "1.0.0")],
+    );
+    let a = dep_package("example.a", "1.0.0", &[]);
+    let fetcher = registry(&[("example.a", "1.0.0", &a)]);
+    let db = empty();
+    let cache = temp_dir("missing-sibling-cache");
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, FhirError::NotFound(message) if message.contains("example.missing")),
+        "{err:?}"
+    );
+    assert!(installed_packages(&db).is_empty());
+    for dir in [app, a, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 #[test]
 fn a_cycle_created_only_by_version_substitution_is_allowed() {
     // Mirrors hl7.fhir.uv.extensions.r4 5.3.0-ballot <-> hl7.terminology.r4 6.5.0/7.1.0.

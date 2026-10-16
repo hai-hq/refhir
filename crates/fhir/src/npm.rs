@@ -43,7 +43,8 @@ pub enum PackageSpec {
     Npm { name: String, version: String },
 }
 
-pub trait PackageFetcher {
+/// `Sync` because the packages one round of a dependency walk needs are fetched side by side.
+pub trait PackageFetcher: Sync {
     fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError>;
 }
 
@@ -322,7 +323,15 @@ fn install_tree(
         .map_err(FhirError::from)?
         .into_iter()
         .map(|package| (package.name, package.version));
+    let resolving = std::time::Instant::now();
     let order = Resolver::new(installed, fetcher, cache).resolve(root, name, version)?;
+    // Fetching and unpacking the tree is most of the time before the first package is stored.
+    tracing::info!(
+        target: ENGINE,
+        "fetched {} package(s) to install in {:.1?}",
+        order.len(),
+        resolving.elapsed()
+    );
     // Store every package first and rebuild the catalog once at the end: the rebuild grows
     // with the catalog, so doing it after each package of a large tree costs minutes.
     let mut staged = false;
@@ -358,6 +367,10 @@ pub(crate) struct Node {
 
 /// More rounds than any real package graph needs; reaching it means versions keep flipping.
 const MAX_ROUNDS: usize = 64;
+
+/// Packages fetched at once. Each is unpacked from memory to its own directory, so this is as
+/// many cores as the unpacking can use, and as many tarballs as are held at the same time.
+const PREFETCH_THREADS: usize = 4;
 
 /// Picks one version per package name across a dependency tree.
 ///
@@ -451,7 +464,9 @@ impl<'a> Resolver<'a> {
         );
         for _ in 0..MAX_ROUNDS {
             let mut changed = false;
-            for (dep, (wanted, requester)) in self.best_requests(&name) {
+            let requests = self.best_requests(&name);
+            self.prefetch(&requests);
+            for (dep, (wanted, requester)) in requests {
                 changed |= self.settle(&dep, &wanted, &requester)?;
             }
             if !changed {
@@ -495,23 +510,70 @@ impl<'a> Resolver<'a> {
         best
     }
 
-    /// Choose the version of `name` for a request of `wanted`. True if the choice changed.
-    fn settle(&mut self, name: &str, wanted: &str, requester: &str) -> Result<bool, FhirError> {
-        let target = if self.requested.contains(name) {
+    /// The version of `name` that a request of `wanted` settles on: the one asked for, unless a
+    /// newer one is installed. `None` when the request is one that [`Resolver::settle`] refuses.
+    fn target_for(&self, name: &str, wanted: &str) -> Option<String> {
+        if self.requested.contains(name) {
             let current = self.chosen[name].clone();
             if compare_versions(wanted, &current) == Ordering::Greater {
-                return Err(FhirError::Invalid(format!(
-                    "version conflict: {requester} needs {name}@{wanted}, but {name}@{current} was requested"
-                )));
+                return None;
             }
-            current
-        } else {
-            match self.installed_latest.get(name) {
-                Some(latest) if compare_versions(latest, wanted) != Ordering::Less => {
-                    latest.clone()
-                }
-                _ => wanted.to_string(),
+            return Some(current);
+        }
+        Some(match self.installed_latest.get(name) {
+            Some(latest) if compare_versions(latest, wanted) != Ordering::Less => latest.clone(),
+            _ => wanted.to_string(),
+        })
+    }
+
+    /// Fetch the packages this round will settle on that are not yet here, a few at a time. The
+    /// time is in unpacking tens of thousands of files, and one package does not wait on
+    /// another. The cache is how the results are handed on: [`Resolver::settle`] asks for each
+    /// package as before and finds it complete. A package that cannot be fetched is left to
+    /// `settle`, which tries again and reports the error.
+    fn prefetch(&self, requests: &BTreeMap<String, (String, String)>) {
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        for (name, (version, _)) in requests {
+            let Some(target) = self.target_for(name, version) else {
+                continue;
+            };
+            let key = (name.clone(), target);
+            if !self.installed.contains(&key)
+                && !self.nodes.contains_key(&key)
+                && !wanted.contains(&key)
+            {
+                wanted.push(key);
             }
+        }
+        if wanted.len() < 2 {
+            return;
+        }
+        let threads = wanted.len().min(PREFETCH_THREADS);
+        let queue = std::sync::Mutex::new(wanted.into_iter());
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| loop {
+                    let next = queue.lock().expect("fetch queue").next();
+                    let Some((name, version)) = next else {
+                        return;
+                    };
+                    let _ = materialize(
+                        &PackageSpec::Npm { name, version },
+                        self.fetcher,
+                        self.cache,
+                    );
+                });
+            }
+        });
+    }
+
+    /// Choose the version of `name` for a request of `wanted`. True if the choice changed.
+    fn settle(&mut self, name: &str, wanted: &str, requester: &str) -> Result<bool, FhirError> {
+        let Some(target) = self.target_for(name, wanted) else {
+            return Err(FhirError::Invalid(format!(
+                "version conflict: {requester} needs {name}@{wanted}, but {name}@{} was requested",
+                self.chosen[name]
+            )));
         };
         if let Some(current) = self.chosen.get(name) {
             if compare_versions(current, &target) == Ordering::Equal {
@@ -943,6 +1005,8 @@ fn extract_tarball_limited(
         remaining: max_uncompressed,
     };
     let mut archive = tar::Archive::new(decoder);
+    // Nothing reads the times of the unpacked files, and setting them is a call per file.
+    archive.set_preserve_mtime(false);
     let entries = archive
         .entries()
         .map_err(|err| FhirError::Invalid(format!("invalid package tarball: {err}")))?;

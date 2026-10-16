@@ -1121,6 +1121,18 @@ mod tests {
     }
 
     #[test]
+    fn a_package_goes_in_with_the_rows_a_one_by_one_install_would_leave() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_package_install(&store, "sqlite");
+    }
+
+    #[test]
+    fn backfill_jobs_are_queued_and_finished_in_bulk() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_backfill_batches(&store, "sqlite");
+    }
+
+    #[test]
     fn parameters_from_different_packages_resolve_clashes() {
         let store = SqlitePersistence::open_in_memory().unwrap();
         refhir_persistence::conformance::exercise_parameter_clashes(&store, "sqlite");

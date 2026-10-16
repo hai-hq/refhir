@@ -153,6 +153,20 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   populating from nothing. Each alternative of a comma list, and each occurrence of a parameter
   given twice, is read on its own. A client that relied on the empty result can send
   `Prefer: handling=lenient`.
+- **A first start installs the default packages more than twice as fast on PostgreSQL.** The
+  time went to round trips and commits, not to work: every definition, search parameter and
+  piece of terminology was a statement of its own, every resource type a package adds search
+  parameters to cost four committed transactions of bookkeeping (even with no resource stored to
+  index), the catalog was rebuilt a second time only to mark those parameters ready, and the
+  packages one install needs were downloaded and unpacked one after another. A package now goes
+  in a few statements per table, the bookkeeping is queued and finished in one step per package
+  (a type with no stored resources is not scanned), only the search parameters are recompiled
+  after it, and the packages a dependency walk needs at the same time are fetched side by side.
+  The log has a new line, `fetched N package(s) to install in …`, for the part before the first
+  package is stored. With the default R4 packages from a local mirror (so no download time) the
+  start after the lease took about 70 s on PostgreSQL and about 25 s now, and on SQLite about
+  26 s and about 24 s; peak memory did not rise. A database whose packages are already installed
+  starts as before.
 
 ### Fixed
 

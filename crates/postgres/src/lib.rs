@@ -1731,6 +1731,17 @@ mod tests {
     }
 
     #[test]
+    fn postgres_package_install_and_backfill_batches_when_configured() {
+        let Some(url) = test_url("postgres package install and backfill batches") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let tag = format!("pgbulk{}", std::process::id());
+        refhir_persistence::conformance::exercise_package_install(&persistence, &tag);
+        refhir_persistence::conformance::exercise_backfill_batches(&persistence, &tag);
+    }
+
+    #[test]
     fn postgres_parameter_clashes_when_configured() {
         let Some(url) = test_url("postgres parameter clashes") else {
             return;
