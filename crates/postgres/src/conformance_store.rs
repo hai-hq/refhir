@@ -10,6 +10,232 @@ use refhir_persistence::{
 use crate::scope::Scope;
 use crate::{definite, PostgresPersistence};
 
+/// The first half of the two-part advisory lock that serializes building one shared package. A
+/// different space from the writer lease's, the audit chain's and the migrations'.
+const SHARED_PACKAGE_LOCK: i32 = 0x7265_6663;
+
+/// What asking for the shared copy of a package came to.
+enum Shared {
+    /// The tenant had the package already.
+    Own,
+    /// There is no shared copy of it yet.
+    Missing,
+    /// There is one, made from other content than the tenant asks for.
+    Different,
+    /// The tenant has it now.
+    Activated(InstallOutcome),
+}
+
+/// A shared package being built inside a transaction. Definitions and terminology are rows under the
+/// shared catalog's instance; search parameters and expansions go to the tables tenants copy from.
+struct SharedRows<'a, 'c> {
+    tx: &'a mut Transaction<'c>,
+    package_id: i64,
+    /// How many search parameters came before: the next one's place in the package's order.
+    next_ord: i64,
+    heaviest: usize,
+}
+
+impl SharedRows<'_, '_> {
+    fn note(&mut self, bytes: usize) {
+        self.heaviest = self.heaviest.max(bytes);
+    }
+}
+
+impl PackageRows for SharedRows<'_, '_> {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_structure_definitions(self.tx, Scope::Tenant(0), self.package_id, rows)
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        for run in runs(rows, |row| row.json.len() + row.url.len()) {
+            let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
+            let bases: Vec<&str> = run.iter().map(|row| row.base.as_str()).collect();
+            let codes: Vec<&str> = run.iter().map(|row| row.code.as_str()).collect();
+            let types: Vec<&str> = run.iter().map(|row| row.param_type.as_str()).collect();
+            let expressions: Vec<Option<&str>> =
+                run.iter().map(|row| row.expression.as_deref()).collect();
+            let statuses: Vec<&str> = run.iter().map(|row| row.status.as_str()).collect();
+            let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
+            self.tx
+                .execute(
+                    "INSERT INTO base_search_parameters \
+                     (package_id, ord, url, base, code, param_type, expression, status, json) \
+                     SELECT $1, $2::bigint + n, url, base, code, param_type, expression, status, json \
+                     FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], \
+                                 $8::text[], $9::text[]) \
+                          WITH ORDINALITY AS rows(url, base, code, param_type, expression, \
+                                                  status, json, n)",
+                    &[
+                        &self.package_id,
+                        &self.next_ord,
+                        &urls,
+                        &bases,
+                        &codes,
+                        &types,
+                        &expressions,
+                        &statuses,
+                        &documents,
+                    ],
+                )
+                .map_err(definite)?;
+            self.next_ord += run.len() as i64;
+        }
+        Ok(())
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_terminology(self.tx, Scope::Tenant(0), self.package_id, rows)
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        for run in runs(rows, |row| row.json.len() + row.url.len()) {
+            let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
+            let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
+            self.tx
+                .execute(
+                    "INSERT INTO base_expansions (package_id, url, json) \
+                     SELECT $1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)",
+                    &[&self.package_id, &urls, &documents],
+                )
+                .map_err(definite)?;
+        }
+        Ok(())
+    }
+}
+
+/// Gives a tenant a package: it is the tenant's, in the order it got it. `owner` is whose rows hold
+/// the package's definitions and terminology.
+fn link_package(
+    tx: &mut Transaction<'_>,
+    tenant: i32,
+    package_id: i64,
+    owner: i32,
+) -> Result<(), PersistError> {
+    tx.execute(
+        "INSERT INTO tenant_packages (instance_id, package_id, owner) VALUES ($1, $2, $3)",
+        &[&tenant, &package_id, &owner],
+    )
+    .map_err(definite)?;
+    Ok(())
+}
+
+// What a tenant reads differs from what a classic database does: its packages are the ones in its
+// own list, in the order it got them, and the rows of a package that every tenant shares are held
+// under the shared catalog. The statements are functions so a test can ask Postgres about them.
+
+fn sql_load_packages(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT id, name, version, fhir_version FROM packages ORDER BY id".into(),
+        Scope::Tenant(id) => format!(
+            "SELECT p.id, p.name, p.version, p.fhir_version FROM tenant_packages t \
+             JOIN packages p ON p.id = t.package_id WHERE t.instance_id = {id} ORDER BY t.seq"
+        ),
+    }
+}
+
+/// The release the first of the tenant's packages is for, which every other must match.
+fn sql_first_fhir_version(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT fhir_version FROM packages LIMIT 1".into(),
+        Scope::Tenant(id) => format!(
+            "SELECT p.fhir_version FROM tenant_packages t JOIN packages p ON p.id = t.package_id \
+             WHERE t.instance_id = {id} ORDER BY t.seq LIMIT 1"
+        ),
+    }
+}
+
+/// The package `$1` of version `$2` that the tenant has: its id.
+fn sql_find_package(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT id FROM packages WHERE name = $1 AND version = $2".into(),
+        Scope::Tenant(id) => format!(
+            "SELECT p.id, t.owner FROM tenant_packages t JOIN packages p ON p.id = t.package_id \
+             WHERE t.instance_id = {id} AND p.name = $1 AND p.version = $2"
+        ),
+    }
+}
+
+fn sql_load_structure_definitions(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT package_id, url, type_name, kind, is_abstract, json \
+                           FROM structure_definitions ORDER BY package_id, url"
+            .into(),
+        Scope::Tenant(id) => format!(
+            "SELECT d.package_id, d.url, d.type_name, d.kind, d.is_abstract, d.json \
+             FROM tenant_packages t JOIN structure_definitions d \
+               ON d.instance_id = t.owner AND d.package_id = t.package_id \
+             WHERE t.instance_id = {id} ORDER BY t.seq, d.url"
+        ),
+    }
+}
+
+fn sql_load_search_parameters(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT package_id, url, base, code, param_type, expression, status, json \
+                           FROM search_parameters ORDER BY package_id, base, code"
+            .into(),
+        Scope::Tenant(id) => format!(
+            "SELECT s.package_id, s.url, s.base, s.code, s.param_type, s.expression, s.status, s.json \
+             FROM tenant_packages t JOIN search_parameters s \
+               ON s.instance_id = t.instance_id AND s.package_id = t.package_id \
+             WHERE t.instance_id = {id} ORDER BY t.seq, s.base, s.code"
+        ),
+    }
+}
+
+fn sql_load_terminology(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT package_id, resource_type, url, json FROM terminology \
+                           ORDER BY package_id, url"
+            .into(),
+        Scope::Tenant(id) => format!(
+            "SELECT m.package_id, m.resource_type, m.url, m.json \
+             FROM tenant_packages t JOIN terminology m \
+               ON m.instance_id = t.owner AND m.package_id = t.package_id \
+             WHERE t.instance_id = {id} ORDER BY t.seq, m.url"
+        ),
+    }
+}
+
+/// The terminology rows with the urls in `$1`, a bare url also matching its versions.
+fn sql_load_terminology_for(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT package_id, resource_type, url, json FROM terminology \
+                           WHERE (url = ANY($1) OR split_part(url, '|', 1) = ANY($1)) \
+                           ORDER BY package_id, url"
+            .into(),
+        Scope::Tenant(id) => format!(
+            "SELECT m.package_id, m.resource_type, m.url, m.json \
+             FROM tenant_packages t JOIN terminology m \
+               ON m.instance_id = t.owner AND m.package_id = t.package_id \
+             WHERE t.instance_id = {id} \
+               AND (m.url = ANY($1) OR split_part(m.url, '|', 1) = ANY($1)) \
+             ORDER BY t.seq, m.url"
+        ),
+    }
+}
+
+fn sql_load_expansions(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT package_id, url, json FROM value_set_expansion \
+                           ORDER BY package_id, url"
+            .into(),
+        Scope::Tenant(id) => format!(
+            "SELECT e.package_id, e.url, e.json FROM tenant_packages t JOIN value_set_expansion e \
+               ON e.instance_id = t.instance_id AND e.package_id = t.package_id \
+             WHERE t.instance_id = {id} ORDER BY t.seq, e.url"
+        ),
+    }
+}
+
 fn structure_definition_from(row: &postgres::Row) -> StoredStructureDefinition {
     let abstract_flag: i32 = row.get(4);
     StoredStructureDefinition {
@@ -85,24 +311,278 @@ impl PostgresPersistence {
         }
     }
 
-    /// The `json` of the row of `table` (a conformance table keyed by `(package_id, url)`) with
-    /// this key.
+    fn install_shared(
+        &self,
+        tenant: i32,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        content: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        // Whether `feed` has been called: after that the package cannot be read again, so what
+        // follows must be the shared copy that was just built.
+        let mut fed = false;
+        for _ in 0..3 {
+            match self.activate_shared(tenant, name, version, fhir_version, content)? {
+                Shared::Activated(outcome) => return Ok(outcome),
+                Shared::Missing if !fed => {
+                    fed = self.build_shared(name, version, fhir_version, content, feed)?;
+                }
+                // The tenant has the package, or the shared copy is made from other content: it is
+                // stored for the tenant alone, as any package is.
+                Shared::Own | Shared::Different if !fed => {
+                    return self.install_package_in_pieces(name, version, fhir_version, feed);
+                }
+                Shared::Own | Shared::Different | Shared::Missing => {
+                    return Err(InstallError::Persist(PersistError::Definite(format!(
+                        "the shared copy of {name}@{version} was not as expected right after it \
+                         was built"
+                    ))));
+                }
+            }
+        }
+        Err(InstallError::Persist(PersistError::Definite(format!(
+            "the shared copy of {name}@{version} did not settle"
+        ))))
+    }
+
+    /// Gives the tenant the shared copy of a package, if there is one made from `content`.
+    fn activate_shared(
+        &self,
+        tenant: i32,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        content: &str,
+    ) -> Result<Shared, InstallError> {
+        let scope = self.scope;
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        if tx
+            .query_opt(&sql_find_package(scope), &[&name, &version])
+            .map_err(definite)?
+            .is_some()
+        {
+            return Ok(Shared::Own);
+        }
+        let Some(shared) = tx
+            .query_opt(
+                "SELECT id, digest FROM packages \
+                 WHERE instance_id = 0 AND name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .map_err(definite)?
+        else {
+            return Ok(Shared::Missing);
+        };
+        let package_id: i64 = shared.get(0);
+        let digest: Option<String> = shared.get(1);
+        if digest.as_deref() != Some(content) {
+            return Ok(Shared::Different);
+        }
+        if let Some(row) = tx
+            .query_opt(&sql_first_fhir_version(scope), &[])
+            .map_err(definite)?
+        {
+            let existing: String = row.get(0);
+            if existing != fhir_version {
+                return Err(InstallError::FhirVersion {
+                    existing,
+                    incoming: fhir_version.to_string(),
+                });
+            }
+        }
+        link_package(&mut tx, tenant, package_id, 0)?;
+        // The tenant's own search parameters, planned against what it has as an install would.
+        let rows = tx
+            .query(
+                "SELECT url, base, code, param_type, expression, status, json \
+                 FROM base_search_parameters WHERE package_id = $1 ORDER BY ord",
+                &[&package_id],
+            )
+            .map_err(definite)?;
+        let mut parameters = Vec::with_capacity(rows.len());
+        for row in &rows {
+            parameters.push(NewSearchParameter {
+                url: row.get(0),
+                base: row.get(1),
+                code: row.get(2),
+                param_type: row.get(3),
+                expression: row.get(4),
+                status: ParamStatus::parse(&row.get::<_, String>(5))?,
+                json: row.get(6),
+            });
+        }
+        let newly_pending = insert_search_parameters(&mut tx, scope, package_id, &parameters)?;
+        tx.execute(
+            &format!(
+                "INSERT INTO value_set_expansion ({}package_id, url, json) \
+                 SELECT {}package_id, url, json FROM base_expansions WHERE package_id = $1",
+                scope.cols(),
+                scope.vals()
+            ),
+            &[&package_id],
+        )
+        .map_err(definite)?;
+        tx.commit().map_err(definite)?;
+        Ok(Shared::Activated(InstallOutcome {
+            package_id,
+            inserted: true,
+            newly_pending,
+            shared: true,
+        }))
+    }
+
+    /// Builds the shared copy of a package, unless another process built it while this waited for
+    /// the lock. Returns whether `feed` was called, and so whether the package was read.
+    fn build_shared(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        content: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<bool, InstallError> {
+        let _gate = self.gate();
+        let mut guard = self.inner.lock()?;
+        let mut tx = guard.client.transaction().map_err(definite)?;
+        self.fence(&mut tx)?;
+        tx.batch_execute("SET LOCAL lock_timeout = '300s'")
+            .map_err(definite)?;
+        tx.execute(
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            &[&SHARED_PACKAGE_LOCK, &format!("{name}@{version}")],
+        )
+        .map_err(definite)?;
+        // Decided again under the lock: another process may have just built it.
+        let built = tx
+            .query_opt(
+                "SELECT 1 FROM packages WHERE instance_id = 0 AND name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .map_err(definite)?;
+        if built.is_some() {
+            return Ok(false);
+        }
+        // Only this transaction may write the shared catalog, and only here.
+        tx.batch_execute("SET LOCAL refhir.shared_writer = 'on'")
+            .map_err(definite)?;
+        let inserted = tx
+            .query_one(
+                "INSERT INTO packages (instance_id, name, version, fhir_version, digest) \
+                 VALUES (0, $1, $2, $3, $4) RETURNING id",
+                &[&name, &version, &fhir_version, &content],
+            )
+            .map_err(definite)?;
+        let package_id: i64 = inserted.get(0);
+        let mut rows = SharedRows {
+            tx: &mut tx,
+            package_id,
+            next_ord: 0,
+            heaviest: 0,
+        };
+        feed(&mut rows)?;
+        let heaviest = rows.heaviest;
+        tx.commit().map_err(definite)?;
+        retire_if_swollen(&mut guard, heaviest);
+        Ok(true)
+    }
+
+    /// The packages a tenant has, as (package id, owner), in the order it got them. Only a tenant has
+    /// them: a classic database has packages and no such list.
+    fn tenant_packages(&self, tenant: i32) -> Result<Vec<(i64, i32)>, PersistError> {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let rows = guard
+                .client
+                .query(
+                    &format!(
+                        "SELECT package_id, owner FROM tenant_packages \
+                         WHERE instance_id = {tenant} ORDER BY seq"
+                    ),
+                    &[],
+                )
+                .map_err(definite)?;
+            Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+        })
+    }
+
+    /// [`PostgresPersistence::visit_pages`] for a tenant: the rows of each of its packages, in the
+    /// order it got them and by url within one, a page at a time. `columns` are what to read, the
+    /// first two being `package_id` and `url`. `shared` says whether the rows of a package that every
+    /// tenant shares are held under the catalog's instance (definitions and terminology are) or are
+    /// always the tenant's own (expansions).
+    #[allow(clippy::too_many_arguments)]
+    fn visit_tenant_pages<T: Send>(
+        &self,
+        tenant: i32,
+        table: &str,
+        columns: &str,
+        shared: bool,
+        read: impl Fn(&postgres::Row) -> T + Sync,
+        url_of: impl Fn(&T) -> String,
+        visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        for (package_id, owner) in self.tenant_packages(tenant)? {
+            let instance = if shared { owner } else { tenant };
+            let held = format!("instance_id = {instance} AND package_id = {package_id}");
+            let first = format!(
+                "SELECT {columns} FROM {table} WHERE {held} \
+                 ORDER BY url LIMIT {CONFORMANCE_PAGE_ROWS}"
+            );
+            let next = format!(
+                "SELECT {columns} FROM {table} WHERE {held} AND url > $1 \
+                 ORDER BY url LIMIT {CONFORMANCE_PAGE_ROWS}"
+            );
+            let mut after: Option<String> = None;
+            loop {
+                let page: Vec<T> = crate::off_runtime(|| {
+                    let mut guard = self.inner.lock()?;
+                    let rows = match &after {
+                        None => guard.client.query(first.as_str(), &[]),
+                        Some(url) => guard.client.query(next.as_str(), &[url]),
+                    }
+                    .map_err(definite)?;
+                    Ok::<_, PersistError>(rows.iter().map(&read).collect())
+                })?;
+                let Some(last) = page.last() else {
+                    break;
+                };
+                after = Some(url_of(last));
+                let done = page.len() < CONFORMANCE_PAGE_ROWS;
+                visit(page)?;
+                if done {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn row_json(
         &self,
         table: &str,
+        shared: bool,
         package_id: i64,
         url: &str,
     ) -> Result<Option<String>, PersistError> {
+        // A package every tenant shares has its rows under the catalog's instance, so for the
+        // tables it may be in, a tenant reads its own and the catalog's.
+        let held = if shared {
+            self.scope.and_shared()
+        } else {
+            self.scope.and()
+        };
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
             let row = guard
                 .client
                 .query_opt(
-                    format!(
-                        "SELECT json FROM {table} WHERE {}package_id = $1 AND url = $2",
-                        self.scope.and()
-                    )
-                    .as_str(),
+                    format!("SELECT json FROM {table} WHERE {held}package_id = $1 AND url = $2")
+                        .as_str(),
                     &[&package_id, &url],
                 )
                 .map_err(definite)?;
@@ -195,13 +675,7 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(
-                    &format!(
-                        "SELECT id, name, version, fhir_version FROM packages{} ORDER BY id",
-                        self.scope.where_only()
-                    ),
-                    &[],
-                )
+                .query(&sql_load_packages(self.scope), &[])
                 .map_err(definite)?;
             Ok(rows
                 .iter()
@@ -220,7 +694,7 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         url: &str,
     ) -> Result<Option<String>, PersistError> {
-        self.row_json("structure_definitions", package_id, url)
+        self.row_json("structure_definitions", true, package_id, url)
     }
 
     fn load_terminology_json(
@@ -228,7 +702,7 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         url: &str,
     ) -> Result<Option<String>, PersistError> {
-        self.row_json("terminology", package_id, url)
+        self.row_json("terminology", true, package_id, url)
     }
 
     fn load_expansion_json(
@@ -236,7 +710,7 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         url: &str,
     ) -> Result<Option<String>, PersistError> {
-        self.row_json("value_set_expansion", package_id, url)
+        self.row_json("value_set_expansion", false, package_id, url)
     }
 
     fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
@@ -248,29 +722,9 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(
-                    &format!(
-                        "SELECT package_id, url, type_name, kind, is_abstract, json \
-                         FROM structure_definitions{} ORDER BY package_id, url",
-                        self.scope.where_only()
-                    ),
-                    &[],
-                )
+                .query(&sql_load_structure_definitions(self.scope), &[])
                 .map_err(definite)?;
-            Ok(rows
-                .iter()
-                .map(|row| {
-                    let abstract_flag: i32 = row.get(4);
-                    StoredStructureDefinition {
-                        package_id: row.get(0),
-                        url: row.get(1),
-                        type_name: row.get(2),
-                        kind: row.get(3),
-                        is_abstract: abstract_flag != 0,
-                        json: row.get(5),
-                    }
-                })
-                .collect())
+            Ok(rows.iter().map(structure_definition_from).collect())
         })
     }
 
@@ -278,12 +732,24 @@ impl ConformanceStore for PostgresPersistence {
         &self,
         visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
-        self.visit_pages(
-            "SELECT package_id, url, type_name, kind, is_abstract, json FROM structure_definitions",
-            structure_definition_from,
-            |row| (row.package_id, row.url.clone()),
-            visit,
-        )
+        const COLUMNS: &str = "package_id, url, type_name, kind, is_abstract, json";
+        match self.scope {
+            Scope::Classic => self.visit_pages(
+                "SELECT package_id, url, type_name, kind, is_abstract, json FROM structure_definitions",
+                structure_definition_from,
+                |row| (row.package_id, row.url.clone()),
+                visit,
+            ),
+            Scope::Tenant(tenant) => self.visit_tenant_pages(
+                tenant,
+                "structure_definitions",
+                COLUMNS,
+                true,
+                structure_definition_from,
+                |row| row.url.clone(),
+                visit,
+            ),
+        }
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
@@ -291,14 +757,7 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(
-                    &format!(
-                        "SELECT package_id, url, base, code, param_type, expression, status, json \
-                         FROM search_parameters{} ORDER BY package_id, base, code",
-                        self.scope.where_only()
-                    ),
-                    &[],
-                )
+                .query(&sql_load_search_parameters(self.scope), &[])
                 .map_err(definite)?;
             rows.iter()
                 .map(|row| {
@@ -323,24 +782,9 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(
-                    &format!(
-                        "SELECT package_id, resource_type, url, json FROM terminology{} \
-                     ORDER BY package_id, url",
-                        self.scope.where_only()
-                    ),
-                    &[],
-                )
+                .query(&sql_load_terminology(self.scope), &[])
                 .map_err(definite)?;
-            Ok(rows
-                .iter()
-                .map(|row| StoredTerminology {
-                    package_id: row.get(0),
-                    resource_type: row.get(1),
-                    url: row.get(2),
-                    json: row.get(3),
-                })
-                .collect())
+            Ok(rows.iter().map(terminology_from).collect())
         })
     }
 
@@ -348,12 +792,23 @@ impl ConformanceStore for PostgresPersistence {
         &self,
         visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
-        self.visit_pages(
-            "SELECT package_id, resource_type, url, json FROM terminology",
-            terminology_from,
-            |row| (row.package_id, row.url.clone()),
-            visit,
-        )
+        match self.scope {
+            Scope::Classic => self.visit_pages(
+                "SELECT package_id, resource_type, url, json FROM terminology",
+                terminology_from,
+                |row| (row.package_id, row.url.clone()),
+                visit,
+            ),
+            Scope::Tenant(tenant) => self.visit_tenant_pages(
+                tenant,
+                "terminology",
+                "package_id, resource_type, url, json",
+                true,
+                terminology_from,
+                |row| row.url.clone(),
+                visit,
+            ),
+        }
     }
 
     fn load_terminology_for(
@@ -367,25 +822,9 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(
-                    &format!(
-                        "SELECT package_id, resource_type, url, json FROM terminology \
-                         WHERE {}(url = ANY($1) OR split_part(url, '|', 1) = ANY($1)) \
-                         ORDER BY package_id, url",
-                        self.scope.and()
-                    ),
-                    &[&urls],
-                )
+                .query(&sql_load_terminology_for(self.scope), &[&urls])
                 .map_err(definite)?;
-            Ok(rows
-                .iter()
-                .map(|row| StoredTerminology {
-                    package_id: row.get(0),
-                    resource_type: row.get(1),
-                    url: row.get(2),
-                    json: row.get(3),
-                })
-                .collect())
+            Ok(rows.iter().map(terminology_from).collect())
         })
     }
 
@@ -435,20 +874,12 @@ impl ConformanceStore for PostgresPersistence {
                     &format!(
                         "SELECT package_id, resource_type, url, json FROM terminology \
                          WHERE {}package_id = $1 ORDER BY url",
-                        self.scope.and()
+                        self.scope.and_shared()
                     ),
                     &[&package_id],
                 )
                 .map_err(definite)?;
-            Ok(rows
-                .iter()
-                .map(|row| StoredTerminology {
-                    package_id: row.get(0),
-                    resource_type: row.get(1),
-                    url: row.get(2),
-                    json: row.get(3),
-                })
-                .collect())
+            Ok(rows.iter().map(terminology_from).collect())
         })
     }
 
@@ -492,23 +923,9 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(
-                    &format!(
-                        "SELECT package_id, url, json FROM value_set_expansion{} \
-                     ORDER BY package_id, url",
-                        self.scope.where_only()
-                    ),
-                    &[],
-                )
+                .query(&sql_load_expansions(self.scope), &[])
                 .map_err(definite)?;
-            Ok(rows
-                .iter()
-                .map(|row| StoredExpansion {
-                    package_id: row.get(0),
-                    url: row.get(1),
-                    json: row.get(2),
-                })
-                .collect())
+            Ok(rows.iter().map(expansion_from).collect())
         })
     }
 
@@ -516,12 +933,23 @@ impl ConformanceStore for PostgresPersistence {
         &self,
         visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
-        self.visit_pages(
-            "SELECT package_id, url, json FROM value_set_expansion",
-            expansion_from,
-            |row| (row.package_id, row.url.clone()),
-            visit,
-        )
+        match self.scope {
+            Scope::Classic => self.visit_pages(
+                "SELECT package_id, url, json FROM value_set_expansion",
+                expansion_from,
+                |row| (row.package_id, row.url.clone()),
+                visit,
+            ),
+            Scope::Tenant(tenant) => self.visit_tenant_pages(
+                tenant,
+                "value_set_expansion",
+                "package_id, url, json",
+                false,
+                expansion_from,
+                |row| row.url.clone(),
+                visit,
+            ),
+        }
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -556,6 +984,22 @@ impl ConformanceStore for PostgresPersistence {
             retire_if_swollen(&mut guard, heaviest);
             Ok(outcome)
         })
+    }
+
+    fn install_shared_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        content: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        match self.scope {
+            Scope::Classic => self.install_package_in_pieces(name, version, fhir_version, feed),
+            Scope::Tenant(tenant) => crate::off_runtime(|| {
+                self.install_shared(tenant, name, version, fhir_version, content, feed)
+            }),
+        }
     }
 
     fn set_search_parameter_status(
@@ -605,13 +1049,7 @@ impl ConformanceStore for PostgresPersistence {
                 return Ok(row.get(0));
             }
             let current = tx
-                .query_opt(
-                    &format!(
-                        "SELECT fhir_version FROM packages{} LIMIT 1",
-                        self.scope.where_only()
-                    ),
-                    &[],
-                )
+                .query_opt(&sql_first_fhir_version(self.scope), &[])
                 .map_err(definite)?;
             let version = current
                 .map(|row| row.get::<_, String>(0))
@@ -628,6 +1066,10 @@ impl ConformanceStore for PostgresPersistence {
                 )
                 .map_err(definite)?;
             let id: i64 = inserted.get(0);
+            if let Scope::Tenant(tenant) = self.scope {
+                // The tenant's own package: its rows are the tenant's.
+                link_package(&mut tx, tenant, id, tenant)?;
+            }
             tx.commit().map_err(definite)?;
             Ok(id)
         })
@@ -1181,6 +1623,9 @@ struct Installer<'a, 'c> {
     tx: &'a mut Transaction<'c>,
     scope: Scope,
     package_id: i64,
+    /// Whose rows hold the package: 0 when it is one every tenant shares, which a tenant cannot add
+    /// to. Only meaningful for a tenant.
+    owner: i32,
     /// Whether the package was there before this install.
     existing: bool,
     newly_pending: Vec<PendingParam>,
@@ -1199,20 +1644,16 @@ impl<'a, 'c> Installer<'a, 'c> {
         fhir_version: &str,
     ) -> Result<Self, InstallError> {
         let existing = tx
-            .query_opt(
-                &format!(
-                    "SELECT id FROM packages WHERE {}name = $1 AND version = $2",
-                    scope.and()
-                ),
-                &[&name, &version],
-            )
+            .query_opt(&sql_find_package(scope), &[&name, &version])
             .map_err(definite)?;
         if let Some(row) = existing {
             let package_id: i64 = row.get(0);
+            let owner: i32 = if row.len() > 1 { row.get(1) } else { 0 };
             return Ok(Self {
                 tx,
                 scope,
                 package_id,
+                owner,
                 existing: true,
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
@@ -1220,13 +1661,7 @@ impl<'a, 'c> Installer<'a, 'c> {
             });
         }
         let current = tx
-            .query_opt(
-                &format!(
-                    "SELECT fhir_version FROM packages{} LIMIT 1",
-                    scope.where_only()
-                ),
-                &[],
-            )
+            .query_opt(&sql_first_fhir_version(scope), &[])
             .map_err(definite)?;
         if let Some(row) = current {
             let existing: String = row.get(0);
@@ -1249,10 +1684,14 @@ impl<'a, 'c> Installer<'a, 'c> {
             )
             .map_err(definite)?;
         let package_id: i64 = inserted.get(0);
+        if let Scope::Tenant(tenant) = scope {
+            link_package(tx, tenant, package_id, tenant)?;
+        }
         Ok(Self {
             tx,
             scope,
             package_id,
+            owner: 0,
             existing: false,
             newly_pending: Vec::new(),
             expansions_cleared: false,
@@ -1289,6 +1728,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 package_id: self.package_id,
                 inserted: !self.existing,
                 newly_pending: self.newly_pending,
+                shared: false,
             },
             self.heaviest,
         ))
@@ -1318,6 +1758,11 @@ impl PackageRows for Installer<'_, '_> {
     }
 
     fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        // A package every tenant shares is the same for all of them: what an install of it brings
+        // is not added to it.
+        if matches!(self.scope, Scope::Tenant(_)) && self.owner == 0 && self.existing {
+            return Ok(());
+        }
         self.note(rows.iter().map(|row| row.json.len()).sum());
         insert_terminology(self.tx, self.scope, self.package_id, rows)
     }

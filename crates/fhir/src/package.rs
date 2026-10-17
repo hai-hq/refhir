@@ -277,33 +277,52 @@ impl PackageRows for Counting<'_> {
 /// at a time as the store asks for them, so storing the largest package takes the memory of a few
 /// rows and not of the package. The package is stored in one transaction, as it is when it is held
 /// whole, so it is there whole or not at all.
+///
+/// With `content` (a digest of the package's source), a store that shares what its tenants have in
+/// common may give the package from the copy it holds, and then `feed` is not called at all:
+/// whoever feeds from a stream must pass over what `feed` would have read.
 pub(crate) fn stage_package_in_pieces(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
     head: &PackageHead,
+    content: Option<&str>,
     feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
     publish_now: bool,
 ) -> Result<Option<PendingBackfill>, FhirError> {
     let started = std::time::Instant::now();
     let mut counts = (0, 0, 0);
-    let outcome = store
-        .install_package_in_pieces(&head.name, &head.version, &head.fhir_version, &mut |rows| {
-            let mut counting = Counting {
-                rows,
-                definitions: 0,
-                parameters: 0,
-                terminology: 0,
-            };
-            let fed = feed(&mut counting);
-            counts = (
-                counting.definitions,
-                counting.parameters,
-                counting.terminology,
-            );
-            fed
-        })
-        .map_err(install_error)?;
+    let mut counting_feed = |rows: &mut dyn PackageRows| {
+        let mut counting = Counting {
+            rows,
+            definitions: 0,
+            parameters: 0,
+            terminology: 0,
+        };
+        let fed = feed(&mut counting);
+        counts = (
+            counting.definitions,
+            counting.parameters,
+            counting.terminology,
+        );
+        fed
+    };
+    let outcome = match content {
+        Some(content) => store.install_shared_package_in_pieces(
+            &head.name,
+            &head.version,
+            &head.fhir_version,
+            content,
+            &mut counting_feed,
+        ),
+        None => store.install_package_in_pieces(
+            &head.name,
+            &head.version,
+            &head.fhir_version,
+            &mut counting_feed,
+        ),
+    }
+    .map_err(install_error)?;
     let stored = started.elapsed();
     crate::memory::release_unused_memory();
     finish_staging(
@@ -344,13 +363,21 @@ fn finish_staging(
     } else {
         String::new()
     };
-    tracing::info!(
-        target: "refhir_engine",
-        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; {stored_note}{catalog_time}",
-        counts.0,
-        counts.1,
-        counts.2,
-    );
+    if outcome.shared {
+        tracing::info!(
+            target: "refhir_engine",
+            "installed {name}@{version} from the catalog the tenants share, without reading it; \
+             {stored_note}{catalog_time}",
+        );
+    } else {
+        tracing::info!(
+            target: "refhir_engine",
+            "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; {stored_note}{catalog_time}",
+            counts.0,
+            counts.1,
+            counts.2,
+        );
+    }
     if !outcome.inserted {
         return Ok(None);
     }

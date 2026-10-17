@@ -26,6 +26,7 @@ pub(crate) const TENANT_TABLES: &[&str] = &[
     "documents",
     "indexes",
     "persistence_globals",
+    "tenant_packages",
     "packages",
     "structure_definitions",
     "search_parameters",

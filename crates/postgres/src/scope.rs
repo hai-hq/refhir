@@ -56,6 +56,15 @@ impl Scope {
         }
     }
 
+    /// For rows a tenant may read from the catalog every tenant shares as well as its own (shared
+    /// ones are held under instance 0): `instance_id IN (0, 7) AND `.
+    pub(crate) fn and_shared(self) -> String {
+        match self {
+            Scope::Classic => String::new(),
+            Scope::Tenant(id) => format!("instance_id IN (0, {id}) AND "),
+        }
+    }
+
     /// A whole `WHERE` for a statement that has no other condition: ` WHERE instance_id = 7`,
     /// with the leading space, or nothing.
     pub(crate) fn where_only(self) -> String {
@@ -94,6 +103,7 @@ mod tests {
         assert_eq!(scope.vals(), "");
         assert_eq!(scope.and(), "");
         assert_eq!(scope.and_in("B"), "");
+        assert_eq!(scope.and_shared(), "");
         assert_eq!(scope.where_only(), "");
         assert_eq!(scope.conflict("ts, table_id, id"), "(ts, table_id, id)");
         assert_eq!(scope.channel(), "refhir_published");
@@ -106,6 +116,7 @@ mod tests {
         assert_eq!(scope.vals(), "7, ");
         assert_eq!(scope.and(), "instance_id = 7 AND ");
         assert_eq!(scope.and_in("B"), "B.instance_id = 7 AND ");
+        assert_eq!(scope.and_shared(), "instance_id IN (0, 7) AND ");
         assert_eq!(scope.where_only(), " WHERE instance_id = 7");
         assert_eq!(
             scope.conflict("ts, table_id, id"),

@@ -56,11 +56,27 @@ CREATE TABLE persistence_globals (
 
 CREATE TABLE packages (
     id BIGSERIAL PRIMARY KEY,
+    -- 0 for a package every tenant shares, or the tenant that holds it alone.
     instance_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     version TEXT NOT NULL,
     fhir_version TEXT NOT NULL,
+    -- For a shared package: a digest of the source it was made from. A tenant is given the shared
+    -- copy only when it asks for the same source.
+    digest TEXT,
     UNIQUE (instance_id, name, version)
+);
+-- The packages a tenant has, in the order it got them. The order matters: the catalog settles a
+-- clash between two definitions by it, and a package shared by every tenant has one id for all of
+-- them, so the order is this table's `seq` and not the package id. `owner` is whose rows hold the
+-- package's definitions and terminology: 0 for a package every tenant shares, or the tenant itself.
+CREATE TABLE tenant_packages (
+    instance_id INTEGER NOT NULL,
+    package_id BIGINT NOT NULL REFERENCES packages (id),
+    owner INTEGER NOT NULL,
+    seq BIGSERIAL NOT NULL,
+    PRIMARY KEY (instance_id, package_id),
+    UNIQUE (instance_id, seq)
 );
 CREATE TABLE structure_definitions (
     instance_id INTEGER NOT NULL,
@@ -148,3 +164,72 @@ CREATE TABLE jobs (
     PRIMARY KEY (instance_id, id)
 );
 CREATE INDEX jobs_by_status ON jobs (instance_id, status, created_at);
+
+-- The catalog every tenant shares. A package that tenants have in common (the FHIR core, and what
+-- they depend on) is stored once, under instance 0: its definitions and terminology are rows of
+-- `structure_definitions` and `terminology` with `instance_id = 0`, and a tenant is given the
+-- package by a row in `tenant_packages`. What belongs to each tenant is copied to it when it is
+-- given the package, because it changes there: its search parameters (their status follows the
+-- tenant's own indexing) and its value set expansions (a code system the tenant writes changes
+-- them). These two tables hold the packages' versions of those, to copy from.
+CREATE TABLE base_search_parameters (
+    package_id BIGINT NOT NULL REFERENCES packages (id),
+    -- The order the package lists them in: a package may define one parameter twice, and the later
+    -- definition meets the earlier.
+    ord BIGINT NOT NULL,
+    url TEXT NOT NULL,
+    base TEXT NOT NULL,
+    code TEXT NOT NULL,
+    param_type TEXT NOT NULL,
+    expression TEXT,
+    status TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, ord)
+);
+CREATE TABLE base_expansions (
+    package_id BIGINT NOT NULL REFERENCES packages (id),
+    url TEXT NOT NULL,
+    json TEXT NOT NULL,
+    PRIMARY KEY (package_id, url)
+);
+
+-- The shared catalog is read-only to a tenant's process. Only the installer that builds a shared
+-- package says it may write (`SET LOCAL refhir.shared_writer = 'on'`, for one transaction), so a
+-- bug in code that serves a tenant cannot change what every tenant reads. This guards against
+-- mistakes, not against someone who can run any SQL in the database.
+CREATE FUNCTION refhir_guard_shared_rows() RETURNS trigger LANGUAGE plpgsql AS $guard$
+BEGIN
+    IF current_setting('refhir.shared_writer', true) IS DISTINCT FROM 'on'
+       AND ((TG_OP <> 'INSERT' AND OLD.instance_id = 0)
+            OR (TG_OP <> 'DELETE' AND NEW.instance_id = 0)) THEN
+        RAISE EXCEPTION 'the shared catalog (instance 0) is read-only to a tenant: % on %',
+            TG_OP, TG_TABLE_NAME;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END
+$guard$;
+CREATE FUNCTION refhir_guard_shared_tables() RETURNS trigger LANGUAGE plpgsql AS $guard$
+BEGIN
+    IF current_setting('refhir.shared_writer', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'the shared catalog is read-only to a tenant: % on %',
+            TG_OP, TG_TABLE_NAME;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END
+$guard$;
+CREATE TRIGGER guard_shared BEFORE INSERT OR UPDATE OR DELETE ON packages
+    FOR EACH ROW EXECUTE FUNCTION refhir_guard_shared_rows();
+CREATE TRIGGER guard_shared BEFORE INSERT OR UPDATE OR DELETE ON structure_definitions
+    FOR EACH ROW EXECUTE FUNCTION refhir_guard_shared_rows();
+CREATE TRIGGER guard_shared BEFORE INSERT OR UPDATE OR DELETE ON terminology
+    FOR EACH ROW EXECUTE FUNCTION refhir_guard_shared_rows();
+CREATE TRIGGER guard_shared BEFORE INSERT OR UPDATE OR DELETE ON base_search_parameters
+    FOR EACH ROW EXECUTE FUNCTION refhir_guard_shared_tables();
+CREATE TRIGGER guard_shared BEFORE INSERT OR UPDATE OR DELETE ON base_expansions
+    FOR EACH ROW EXECUTE FUNCTION refhir_guard_shared_tables();

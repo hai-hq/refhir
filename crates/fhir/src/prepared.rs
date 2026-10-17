@@ -306,6 +306,8 @@ type Pieces = serde_json::StreamDeserializer<
 /// few rows at a time instead.
 pub struct PreparedBundle {
     names: Vec<String>,
+    /// What each package was made from, as the header lists it.
+    sources: Vec<Source>,
     pieces: Pieces,
     origin: String,
     /// The value that was read to find where the last package ended, which starts the next.
@@ -331,6 +333,7 @@ impl PreparedBundle {
         }
         Ok(Self {
             names: header.packages,
+            sources: header.sources,
             pieces: values.into_iter(),
             origin,
             ahead: None,
@@ -341,6 +344,17 @@ impl PreparedBundle {
     /// `name@version` of each package in the file, in the order to install them.
     pub fn names(&self) -> &[String] {
         &self.names
+    }
+
+    /// A digest of what the package `name@version` was made from, when the file says. It
+    /// identifies the package's content: two files that give the same digest for a package were
+    /// made from the same source, so a store may keep one copy for both.
+    pub(crate) fn content_of(&self, name: &str, version: &str) -> Option<&str> {
+        let spec = format!("{name}@{version}");
+        self.sources
+            .iter()
+            .find(|source| source.package == spec)
+            .map(|source| source.sha256.as_str())
     }
 
     /// Whether every one of `specs` (`name@version`) is in the file.
@@ -515,15 +529,34 @@ pub fn install_prepared(
             continue;
         }
         staged += 1;
-        match stage_package_in_pieces(
+        let content = bundle
+            .content_of(&head.name, &head.version)
+            .map(String::from);
+        // A store that gives the package from a copy it already holds does not ask for its rows.
+        let mut read = false;
+        let stored = stage_package_in_pieces(
             store,
             db,
             catalog,
             &head,
-            &mut |rows| bundle.feed(rows),
+            content.as_deref(),
+            &mut |rows| {
+                read = true;
+                bundle.feed(rows)
+            },
             false,
-        ) {
-            Ok(backfill) => pending.extend(backfill),
+        );
+        match stored {
+            Ok(backfill) => {
+                pending.extend(backfill);
+                // The next package starts where this one ends, so what was not read is passed over.
+                if !read {
+                    if let Err(err) = bundle.skip_package() {
+                        result = Err(err);
+                        break;
+                    }
+                }
+            }
             Err(err) => {
                 // A file that cannot be read says why better than the install it failed.
                 result = Err(bundle.take_failure().unwrap_or(err));

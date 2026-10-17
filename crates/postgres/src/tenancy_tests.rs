@@ -879,6 +879,19 @@ fn the_hot_queries_read_an_index_range_not_the_table_with_many_tenants() {
     }
 }
 
+/// What the shared layout has that the classic one does not: the tenant registry, and what lets
+/// tenants share the packages they have in common. Nothing else is allowed to differ but the tenant
+/// column and the few indexes listed beside the check.
+const ADDED_TABLES: &[&str] = &[
+    "refhir_tenants",
+    "tenant_packages",
+    "base_search_parameters",
+    "base_expansions",
+];
+
+/// A column the shared layout adds to a table the classic one has, besides the tenant column.
+const ADDED_COLUMNS: &[(&str, &str)] = &[("packages", "digest")];
+
 /// (table, column) -> type, and index name -> its columns in order.
 type Columns = std::collections::BTreeMap<(String, String), String>;
 type Indexes = std::collections::BTreeMap<String, Vec<String>>;
@@ -947,12 +960,13 @@ fn the_shared_layout_is_the_classic_one_plus_the_tenant_column() {
         );
     }
     for (table, column) in shared_columns.keys() {
-        if table == "refhir_tenants" || table == "schema_migrations" {
+        if table == "schema_migrations" || ADDED_TABLES.contains(&table.as_str()) {
             continue;
         }
         assert!(
             classic_columns.contains_key(&(table.clone(), column.clone()))
-                || column == "instance_id",
+                || column == "instance_id"
+                || ADDED_COLUMNS.contains(&(table.as_str(), column.as_str())),
             "the shared layout has {table}.{column}, which the classic layout lacks"
         );
     }
@@ -1001,7 +1015,9 @@ fn the_shared_layout_is_the_classic_one_plus_the_tenant_column() {
         }
     }
     for name in shared_indexes.keys() {
-        if name.starts_with("schema_migrations") || name.starts_with("refhir_tenants") {
+        if name.starts_with("schema_migrations")
+            || ADDED_TABLES.iter().any(|table| name.starts_with(table))
+        {
             continue;
         }
         let known = classic_indexes.contains_key(name)

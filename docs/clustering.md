@@ -73,6 +73,11 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
 - **SMART.** Each tenant has its own clients, tokens and signing key, so give each tenant its own
   `--public-url`. The tenant's processes share `--smart-dcr-token` and
   `--smart-confidential-secret`, as above.
+- **Packages.** The FHIR packages that ship with ReFHIR (the core definitions, terminology and
+  what they depend on) are stored once for all tenants. A new tenant is given them in moments
+  instead of reading and storing its own copy, and its start-up does not grow with the number of
+  tenants. What a tenant writes (its own definitions, code systems and search parameters) and
+  every package installed from a registry or a directory stay its own.
 - **Files.** A tenant's package cache and export directory default to a folder named for it.
 - **Routing.** Route requests to a tenant's processes by host name or path in front of ReFHIR, with
   a load balancer or ingress: each tenant is its own set of processes.
