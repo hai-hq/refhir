@@ -47,6 +47,7 @@ fn a_reader_wakes_when_the_writer_publishes_not_when_its_timer_fires() {
     let options = ConnectOptions {
         pool_size: 2,
         create_schema: false,
+        ..ConnectOptions::default()
     };
     let reader_store =
         Arc::new(PostgresPersistence::connect_with(&database.url, &options).unwrap());

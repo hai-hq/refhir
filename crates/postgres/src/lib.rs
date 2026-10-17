@@ -19,10 +19,14 @@ use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 
 mod lease;
 mod migrate;
+mod scope;
+mod tenant;
 mod tls;
 
 pub use migrate::migration_report;
+use scope::Scope;
 use serde_json::Value as JsonValue;
+pub use tenant::{create_tenant, list_tenants, validate_tenant_name, Tenant};
 
 pub(crate) struct Inner {
     pub(crate) client: Conn,
@@ -74,6 +78,11 @@ pub struct ConnectOptions {
     /// Apply pending schema migrations. A process that only reads sets this to false and waits
     /// for the writer to have migrated the database, so it never runs DDL.
     pub create_schema: bool,
+    /// The tenant this process serves, in a database with the shared tenant layout. `None` is a
+    /// database in the classic layout, where the process owns every row. The two do not mix: a
+    /// tenant needs a database made by [`create_tenant`], and without one the database must not
+    /// have been.
+    pub tenant: Option<String>,
 }
 
 impl Default for ConnectOptions {
@@ -81,6 +90,7 @@ impl Default for ConnectOptions {
         Self {
             pool_size: 1,
             create_schema: true,
+            tenant: None,
         }
     }
 }
@@ -114,10 +124,9 @@ pub struct PostgresPersistence {
     gate: Arc<std::sync::Mutex<()>>,
     lease: Arc<lease::LeaseState>,
     url: Arc<str>,
+    /// Which tenant's rows this reads and writes, or the whole database's (classic).
+    scope: Scope,
 }
-
-/// Channel the writer notifies after recording a published timestamp.
-const PUBLISH_CHANNEL: &str = "refhir_published";
 
 impl PostgresPersistence {
     pub fn connect(url: &str) -> Result<Self, PersistError> {
@@ -127,11 +136,7 @@ impl PostgresPersistence {
     pub fn connect_with(url: &str, options: &ConnectOptions) -> Result<Self, PersistError> {
         off_runtime(|| {
             let mut client = Conn::new(connect_client(url)?);
-            if options.create_schema {
-                migrate::run(&mut client, migrate::MIGRATIONS)?;
-            } else {
-                migrate::wait_until_current(&mut client, migrate::MIGRATIONS)?;
-            }
+            let scope = open_layout(&mut client, options)?;
             let owned: Arc<str> = Arc::from(url);
             let factory_url = owned.clone();
             let pool = Pool::new(
@@ -148,11 +153,61 @@ impl PostgresPersistence {
                 inner: Arc::new(pool),
                 listener: Arc::new(std::sync::Mutex::new(None)),
                 gate: Arc::new(std::sync::Mutex::new(())),
-                lease: Arc::new(lease::LeaseState::default()),
+                lease: Arc::new(lease::LeaseState::new(scope)),
                 url: owned,
+                scope,
             })
         })
     }
+}
+
+/// Checks that the database has the layout this process expects, brings it up to date, and says
+/// which tenant (if any) this process is. A mismatch is refused before any row is read.
+fn open_layout(client: &mut Conn, options: &ConnectOptions) -> Result<Scope, PersistError> {
+    use tenant::Layout;
+    let layout = tenant::detect_layout(&mut **client)?;
+    let Some(name) = options.tenant.as_deref() else {
+        if layout == Layout::Shared {
+            return Err(definite(
+                "this database holds tenants (it has the shared tenant layout), so a process must \
+                 say which one it serves: pass --tenant NAME. `refhir tenant list` shows them",
+            ));
+        }
+        if options.create_schema {
+            migrate::run(client, migrate::MIGRATIONS)?;
+        } else {
+            migrate::wait_until_current(client, migrate::MIGRATIONS)?;
+        }
+        return Ok(Scope::Classic);
+    };
+    tenant::validate_tenant_name(name)?;
+    match layout {
+        Layout::Classic => {
+            return Err(definite(format!(
+                "--tenant {name} needs a database with the shared tenant layout, and this one was \
+                 created without tenants (a database keeps its layout). Use an empty database and \
+                 run `refhir tenant create {name}`"
+            )))
+        }
+        Layout::Empty => {
+            return Err(definite(format!(
+                "this database is empty. Create the tenant first: `refhir tenant create {name}`"
+            )))
+        }
+        Layout::Shared => {}
+    }
+    if options.create_schema {
+        migrate::run(client, migrate::SHARED_MIGRATIONS)?;
+    } else {
+        migrate::wait_until_current(client, migrate::SHARED_MIGRATIONS)?;
+    }
+    let id = tenant::tenant_id(&mut **client, name)?.ok_or_else(|| {
+        definite(format!(
+            "tenant `{name}` does not exist in this database. Create it first: \
+             `refhir tenant create {name}`"
+        ))
+    })?;
+    Ok(Scope::Tenant(id))
 }
 
 impl PostgresPersistence {
@@ -179,11 +234,7 @@ impl PersistenceReader for PostgresPersistence {
         order: Order,
     ) -> Result<Vec<DocumentLogEntry>, PersistError> {
         crate::off_runtime(|| {
-            let ord = order_sql(order);
-            let sql = format!(
-                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-             WHERE ts >= $1 AND ts < $2 ORDER BY ts {ord}, table_id {ord}, id {ord}"
-            );
+            let sql = sql_load_documents(self.scope, order);
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
@@ -204,14 +255,7 @@ impl PersistenceReader for PostgresPersistence {
         id: &DocumentId,
         snapshot: Timestamp,
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
-        crate::off_runtime(|| {
-            self.one(
-                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-                 WHERE table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC LIMIT 1",
-                id,
-                snapshot,
-            )
-        })
+        crate::off_runtime(|| self.one(&sql_latest_document(self.scope), id, snapshot))
     }
 
     fn previous_revision(
@@ -221,8 +265,11 @@ impl PersistenceReader for PostgresPersistence {
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
         crate::off_runtime(|| {
             self.one(
-                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-                 WHERE table_id = $1 AND id = $2 AND ts < $3 ORDER BY ts DESC LIMIT 1",
+                &format!(
+                    "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+                     WHERE {}table_id = $1 AND id = $2 AND ts < $3 ORDER BY ts DESC LIMIT 1",
+                    self.scope.and()
+                ),
                 id,
                 at,
             )
@@ -236,8 +283,11 @@ impl PersistenceReader for PostgresPersistence {
     ) -> Result<Option<DocumentLogEntry>, PersistError> {
         crate::off_runtime(|| {
             self.one(
-                "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-                 WHERE table_id = $1 AND id = $2 AND ts = $3",
+                &format!(
+                    "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+                     WHERE {}table_id = $1 AND id = $2 AND ts = $3",
+                    self.scope.and()
+                ),
                 id,
                 ts,
             )
@@ -254,8 +304,11 @@ impl PersistenceReader for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
-                 WHERE table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC",
+                    &format!(
+                        "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+                         WHERE {}table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC",
+                        self.scope.and()
+                    ),
                     &[&id.tablet.as_bytes(), &id.id, &i64_ts(snapshot)?],
                 )
                 .map_err(definite)?;
@@ -277,27 +330,35 @@ impl PersistenceReader for PostgresPersistence {
                 ""
             };
             let ord = order_sql(order);
+            // Every table the statement reads carries the tenant, so a join cannot pick up a row
+            // of another tenant that happens to share an index id, key, table id or document id.
+            let (on_a, on_b, on_c, on_d) = (
+                self.scope.and(),
+                self.scope.and_in("B"),
+                self.scope.and_in("C"),
+                self.scope.and_in("D"),
+            );
             let sql = format!(
                 r#"
 SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
 FROM (
     SELECT index_id, key, MAX(ts) as max_ts
     FROM indexes
-    WHERE index_id = $1 AND ts <= $2 AND key >= $3{upper}
+    WHERE {on_a}index_id = $1 AND ts <= $2 AND key >= $3{upper}
     GROUP BY index_id, key
 ) A
 JOIN indexes B
-  ON B.deleted = 0
+  ON {on_b}B.deleted = 0
  AND A.index_id = B.index_id
  AND A.key = B.key
  AND A.max_ts = B.ts
 JOIN documents C
-  ON C.table_id = B.table_id
+  ON {on_c}C.table_id = B.table_id
  AND C.id = B.document_id
  AND C.deleted = 0
  AND C.ts = (
     SELECT MAX(D.ts) FROM documents D
-    WHERE D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= $2
+    WHERE {on_d}D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= $2
  )
 ORDER BY B.key {ord}
 "#
@@ -388,11 +449,7 @@ ORDER BY B.key {ord}
                 let cap = chunk
                     .map(|rows| format!(" LIMIT {}", rows.min(i64::MAX as usize)))
                     .unwrap_or_default();
-                let sql = format!(
-                    "SELECT key, deleted, table_id, document_id FROM indexes \
-                 WHERE index_id = $1 AND ts <= $2 AND key >= $3{upper} \
-                 ORDER BY key {ord}, ts {ord}{cap}"
-                );
+                let sql = sql_index_scan_ids(self.scope, upper, ord, &cap);
                 let rows = {
                     let mut guard = self.inner.lock()?;
                     if let Some(end) = &interval.end {
@@ -454,7 +511,7 @@ ORDER BY B.key {ord}
     ) -> Result<Option<JsonValue>, PersistError> {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
-            read_global(&mut guard.client, key)
+            read_global(&mut guard.client, self.scope, key)
         })
     }
 
@@ -467,8 +524,7 @@ ORDER BY B.key {ord}
             let rows = guard
                 .client
                 .query(
-                    "SELECT index_id, ts, key, deleted, table_id, document_id FROM indexes \
-                 WHERE ts >= $1 AND ts < $2 ORDER BY ts, index_id, key",
+                    &sql_load_index_writes(self.scope),
                     &[
                         &i64_ts(range.start_inclusive)?,
                         &i64_ts(range.end_exclusive)?,
@@ -488,11 +544,7 @@ ORDER BY B.key {ord}
             let newest: Option<i64> = guard
                 .client
                 .query_one(
-                    "SELECT GREATEST(
-                     (SELECT MAX(ts) FROM documents),
-                     (SELECT json_value::bigint FROM persistence_globals
-                      WHERE key = $1 AND json_value ~ '^[0-9]+$')
-                 )",
+                    &sql_max_ts(self.scope),
                     &[&PersistenceGlobalKey::MaxRepeatableTimestamp.as_str()],
                 )
                 .map_err(definite)?
@@ -533,8 +585,11 @@ impl Persistence for PostgresPersistence {
             guard
                 .client
                 .query_one(
-                    "SELECT (SELECT COUNT(*) FROM documents) = 0 \
-                 AND (SELECT COUNT(*) FROM persistence_globals) = 0",
+                    &format!(
+                        "SELECT NOT EXISTS (SELECT 1 FROM documents{0}) \
+                         AND NOT EXISTS (SELECT 1 FROM persistence_globals{0})",
+                        self.scope.where_only()
+                    ),
                     &[],
                 )
                 .map(|row| row.get(0))
@@ -556,12 +611,12 @@ impl Persistence for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             if let Some(epoch) = self.lease.epoch() {
-                if let Err(err) = lease::check_epoch(&mut tx, epoch) {
+                if let Err(err) = lease::check_epoch(&mut tx, self.scope, epoch) {
                     let _ = tx.rollback();
                     return Err(err);
                 }
             }
-            let written = write_in_tx(&mut tx, documents, indexes, conflict_strategy);
+            let written = write_in_tx(&mut tx, self.scope, documents, indexes, conflict_strategy);
             if let Err(err) = written {
                 let _ = tx.rollback();
                 return Err(err);
@@ -586,12 +641,16 @@ impl Persistence for PostgresPersistence {
             // it from costing a WAL flush per commit.
             let wrote = guard.client.batch_execute(&format!(
                 "BEGIN; SET LOCAL synchronous_commit = off; \
-                 INSERT INTO persistence_globals (key, json_value) VALUES ('{key}', '{ts}') \
-                 ON CONFLICT (key) DO UPDATE SET json_value = GREATEST( \
+                 INSERT INTO persistence_globals ({cols}key, json_value) \
+                 VALUES ({vals}'{key}', '{ts}') \
+                 ON CONFLICT {conflict} DO UPDATE SET json_value = GREATEST( \
                      persistence_globals.json_value::bigint, EXCLUDED.json_value::bigint)::text; \
                  NOTIFY {channel}; \
                  COMMIT;",
-                channel = PUBLISH_CHANNEL,
+                cols = self.scope.cols(),
+                vals = self.scope.vals(),
+                conflict = self.scope.conflict("key"),
+                channel = self.scope.channel(),
                 key = PersistenceGlobalKey::PublishedTimestamp.as_str(),
                 ts = ts.as_u64(),
             ));
@@ -622,7 +681,7 @@ impl Persistence for PostgresPersistence {
                 let connected = connect_client(&self.url)
                     .map(Conn::new)
                     .and_then(|mut conn| {
-                        conn.batch_execute(&format!("LISTEN {PUBLISH_CHANNEL}"))
+                        conn.batch_execute(&format!("LISTEN {}", self.scope.channel()))
                             .map_err(definite)?;
                         Ok(conn)
                     });
@@ -670,8 +729,13 @@ impl Persistence for PostgresPersistence {
             guard
                 .client
                 .execute(
-                    "INSERT INTO persistence_globals (key, json_value) VALUES ($1, $2)
-                 ON CONFLICT (key) DO UPDATE SET json_value = EXCLUDED.json_value",
+                    &format!(
+                        "INSERT INTO persistence_globals ({}key, json_value) VALUES ({}$1, $2)
+                     ON CONFLICT {} DO UPDATE SET json_value = EXCLUDED.json_value",
+                        self.scope.cols(),
+                        self.scope.vals(),
+                        self.scope.conflict("key")
+                    ),
                     &[&key.as_str(), &value.to_string()],
                 )
                 .map_err(definite)?;
@@ -682,39 +746,43 @@ impl Persistence for PostgresPersistence {
 
 fn write_in_tx(
     tx: &mut Transaction<'_>,
+    scope: Scope,
     documents: &[DocumentLogEntry],
     indexes: &[PersistenceIndexEntry],
     conflict_strategy: ConflictStrategy,
 ) -> Result<(), PersistError> {
+    let (cols, vals) = (scope.cols(), scope.vals());
     let document_sql = match conflict_strategy {
-        ConflictStrategy::Error => {
-            "INSERT INTO documents (id, ts, table_id, json_value, deleted, prev_ts) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
-        }
-        ConflictStrategy::Overwrite => {
-            "INSERT INTO documents (id, ts, table_id, json_value, deleted, prev_ts) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (ts, table_id, id) DO UPDATE SET \
-             json_value = EXCLUDED.json_value, deleted = EXCLUDED.deleted, prev_ts = EXCLUDED.prev_ts"
-        }
+        ConflictStrategy::Error => format!(
+            "INSERT INTO documents ({cols}id, ts, table_id, json_value, deleted, prev_ts) \
+             VALUES ({vals}$1, $2, $3, $4, $5, $6)"
+        ),
+        ConflictStrategy::Overwrite => format!(
+            "INSERT INTO documents ({cols}id, ts, table_id, json_value, deleted, prev_ts) \
+             VALUES ({vals}$1, $2, $3, $4, $5, $6) \
+             ON CONFLICT {} DO UPDATE SET \
+             json_value = EXCLUDED.json_value, deleted = EXCLUDED.deleted, prev_ts = EXCLUDED.prev_ts",
+            scope.conflict("ts, table_id, id")
+        ),
     };
     let index_sql = match conflict_strategy {
-        ConflictStrategy::Error => {
-            "INSERT INTO indexes (index_id, ts, key, deleted, table_id, document_id) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
-        }
-        ConflictStrategy::Overwrite => {
-            "INSERT INTO indexes (index_id, ts, key, deleted, table_id, document_id) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
-             ON CONFLICT (index_id, key, ts) DO UPDATE SET \
-             deleted = EXCLUDED.deleted, table_id = EXCLUDED.table_id, document_id = EXCLUDED.document_id"
-        }
+        ConflictStrategy::Error => format!(
+            "INSERT INTO indexes ({cols}index_id, ts, key, deleted, table_id, document_id) \
+             VALUES ({vals}$1, $2, $3, $4, $5, $6)"
+        ),
+        ConflictStrategy::Overwrite => format!(
+            "INSERT INTO indexes ({cols}index_id, ts, key, deleted, table_id, document_id) \
+             VALUES ({vals}$1, $2, $3, $4, $5, $6) \
+             ON CONFLICT {} DO UPDATE SET \
+             deleted = EXCLUDED.deleted, table_id = EXCLUDED.table_id, document_id = EXCLUDED.document_id",
+            scope.conflict("index_id, key, ts")
+        ),
     };
     for document in documents {
         let deleted: i32 = if document.value.is_none() { 1 } else { 0 };
         let prev = document.prev_ts.and_then(|ts| ts.to_i64().ok());
         tx.execute(
-            document_sql,
+            &document_sql,
             &[
                 &document.id.id as &(dyn ToSql + Sync),
                 &i64_ts(document.ts)?,
@@ -731,7 +799,7 @@ fn write_in_tx(
         let table_id = index.value.as_ref().map(|id| id.tablet.as_bytes().to_vec());
         let document_id = index.value.as_ref().map(|id| id.id.clone());
         tx.execute(
-            index_sql,
+            &index_sql,
             &[
                 &index.index_id.as_bytes() as &(dyn ToSql + Sync),
                 &i64_ts(index.ts)?,
@@ -750,9 +818,14 @@ fn write_in_tx(
     if documents.is_empty() {
         if let Some(ts) = commit_timestamp(documents, indexes) {
             tx.execute(
-                "INSERT INTO persistence_globals (key, json_value) VALUES ($1, $2)
-                 ON CONFLICT (key) DO UPDATE SET json_value = GREATEST(
-                     persistence_globals.json_value::bigint, EXCLUDED.json_value::bigint)::text",
+                &format!(
+                    "INSERT INTO persistence_globals ({}key, json_value) VALUES ({}$1, $2)
+                     ON CONFLICT {} DO UPDATE SET json_value = GREATEST(
+                         persistence_globals.json_value::bigint, EXCLUDED.json_value::bigint)::text",
+                    scope.cols(),
+                    scope.vals(),
+                    scope.conflict("key")
+                ),
                 &[
                     &PersistenceGlobalKey::MaxRepeatableTimestamp.as_str() as &(dyn ToSql + Sync),
                     &ts.as_u64().to_string(),
@@ -777,11 +850,15 @@ fn commit_timestamp(
 
 fn read_global(
     client: &mut Client,
+    scope: Scope,
     key: PersistenceGlobalKey,
 ) -> Result<Option<JsonValue>, PersistError> {
     let row = client
         .query_opt(
-            "SELECT json_value FROM persistence_globals WHERE key = $1",
+            &format!(
+                "SELECT json_value FROM persistence_globals WHERE {}key = $1",
+                scope.and()
+            ),
             &[&key.as_str()],
         )
         .map_err(definite)?;
@@ -836,6 +913,63 @@ fn entry_from_row(row: &Row) -> Result<DocumentLogEntry, PersistError> {
     let deleted: i32 = row.get(4);
     let prev_ts: Option<i64> = row.get(5);
     document_from_parts(id, ts, table_id, json_value, deleted != 0, prev_ts)
+}
+
+// The statements below are the ones a read runs most, kept as functions so that a test can ask
+// Postgres how it plans exactly these (and not a copy of them) with many tenants in the tables.
+
+/// Documents written in a timestamp range, `$1` up to but not including `$2`.
+fn sql_load_documents(scope: Scope, order: Order) -> String {
+    let ord = order_sql(order);
+    let scoped = scope.and();
+    format!(
+        "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+         WHERE {scoped}ts >= $1 AND ts < $2 ORDER BY ts {ord}, table_id {ord}, id {ord}"
+    )
+}
+
+/// The newest revision of document `$2` of table `$1` at or before `$3`.
+fn sql_latest_document(scope: Scope) -> String {
+    format!(
+        "SELECT id, ts, table_id, json_value, deleted, prev_ts FROM documents \
+         WHERE {}table_id = $1 AND id = $2 AND ts <= $3 ORDER BY ts DESC LIMIT 1",
+        scope.and()
+    )
+}
+
+/// The rows of index `$1` from key `$3` (to `$4` when `upper` is ` AND key < $4`) at or before
+/// timestamp `$2`, in key order. `cap` is empty or ` LIMIT n`.
+fn sql_index_scan_ids(scope: Scope, upper: &str, ord: &str, cap: &str) -> String {
+    let scoped = scope.and();
+    format!(
+        "SELECT key, deleted, table_id, document_id FROM indexes \
+         WHERE {scoped}index_id = $1 AND ts <= $2 AND key >= $3{upper} \
+         ORDER BY key {ord}, ts {ord}{cap}"
+    )
+}
+
+/// What the commits from timestamp `$1` up to but not including `$2` wrote to the indexes: what
+/// a reader in another process turns into write-log entries.
+fn sql_load_index_writes(scope: Scope) -> String {
+    format!(
+        "SELECT index_id, ts, key, deleted, table_id, document_id FROM indexes \
+         WHERE {}ts >= $1 AND ts < $2 ORDER BY ts, index_id, key",
+        scope.and()
+    )
+}
+
+/// The newest timestamp written: the newest document, or the global an index-only commit keeps
+/// (key `$1`).
+fn sql_max_ts(scope: Scope) -> String {
+    format!(
+        "SELECT GREATEST(
+         (SELECT MAX(ts) FROM documents{}),
+         (SELECT json_value::bigint FROM persistence_globals
+          WHERE {}key = $1 AND json_value ~ '^[0-9]+$')
+     )",
+        scope.where_only(),
+        scope.and()
+    )
 }
 
 fn order_sql(order: Order) -> &'static str {
@@ -950,6 +1084,9 @@ mod auth_store;
 mod conformance_store;
 mod governance_store;
 mod job_store;
+
+#[cfg(test)]
+mod tenancy_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1167,6 +1304,7 @@ mod tests {
                 let options = ConnectOptions {
                     pool_size: 8,
                     create_schema: true,
+                    ..ConnectOptions::default()
                 };
                 let p = Arc::new(PostgresPersistence::connect_with(&url, &options).unwrap());
                 p.try_acquire_writer_lease().unwrap();
@@ -1216,6 +1354,7 @@ mod tests {
         let options = ConnectOptions {
             pool_size: 8,
             create_schema: true,
+            ..ConnectOptions::default()
         };
         let p = Arc::new(PostgresPersistence::connect_with(&url, &options).unwrap());
         p.try_acquire_writer_lease().unwrap();
@@ -1249,6 +1388,7 @@ mod tests {
             let options = ConnectOptions {
                 pool_size: 2,
                 create_schema: false,
+                ..ConnectOptions::default()
             };
             PostgresPersistence::connect_with(&reader_url, &options).map(|_| ())
         });
@@ -1400,6 +1540,7 @@ mod tests {
             let options = ConnectOptions {
                 pool_size: 1,
                 create_schema: false,
+                ..ConnectOptions::default()
             };
             PostgresPersistence::connect_with(&reader_url, &options).map(|_| ())
         });

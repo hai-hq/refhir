@@ -142,7 +142,7 @@ impl PostgresPersistence {
     /// behind its successor's back, in the moments before its lease keepalive stops it.
     fn fence(&self, tx: &mut Transaction<'_>) -> Result<(), PersistError> {
         match self.lease.epoch() {
-            Some(epoch) => crate::lease::check_epoch(tx, epoch),
+            Some(epoch) => crate::lease::check_epoch(tx, self.scope, epoch),
             None => Ok(()),
         }
     }

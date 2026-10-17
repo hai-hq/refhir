@@ -422,6 +422,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 pool_size,
                 // A replica never runs DDL: it waits for the primary to have created the tables.
                 create_schema: role != Role::Replica,
+                tenant: None,
             };
             let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
             (

@@ -141,6 +141,7 @@ fn run(admin: &str, with_watermark: bool, threads: usize, per_thread: usize) -> 
     let options = ConnectOptions {
         pool_size: 8,
         create_schema: true,
+        ..ConnectOptions::default()
     };
     let store = Arc::new(PostgresPersistence::connect_with(&database.url, &options).unwrap());
     store.try_acquire_writer_lease().unwrap();

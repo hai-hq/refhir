@@ -24,6 +24,21 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// The same two steps for a database in the shared tenant layout. A database has one stream or the
+/// other for good; see `crate::tenant::Layout`.
+pub(crate) static SHARED_MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "baseline",
+        sql: include_str!("../migrations-shared/0001_baseline.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "governance",
+        sql: include_str!("../migrations-shared/0002_governance.sql"),
+    },
+];
+
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
     version BIGINT PRIMARY KEY,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -228,10 +243,18 @@ pub(crate) fn wait_until_current(
     }
 }
 
-/// What the database at `url` holds and what startup would do to it, without changing it.
+/// What the database at `url` holds and what startup would do to it, without changing it. A
+/// database in the shared tenant layout is judged against the shared migrations.
 pub fn migration_report(url: &str) -> Result<Report, PersistError> {
     off_runtime(|| {
         let mut client = connect_client(url)?;
+        if crate::tenant::detect_layout(&mut client)? == crate::tenant::Layout::Shared {
+            return Ok(Report::new(
+                SHARED_MIGRATIONS,
+                read_applied(&mut client)?,
+                Existing::Complete,
+            ));
+        }
         Ok(Report::new(
             MIGRATIONS,
             read_applied(&mut client)?,
@@ -504,6 +527,7 @@ mod tests {
         let options = ConnectOptions {
             pool_size: 1,
             create_schema: false,
+            ..ConnectOptions::default()
         };
         assert!(PostgresPersistence::connect_with(&url, &options).is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -685,6 +709,7 @@ mod tests {
         let options = ConnectOptions {
             pool_size: 1,
             create_schema: false,
+            ..ConnectOptions::default()
         };
         // Its primary still runs the previous release: every table, no schema_migrations.
         let complete = fresh_database(&admin, "mreplicaok");
