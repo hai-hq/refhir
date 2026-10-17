@@ -53,6 +53,12 @@ pub const PATIENT_COMPARTMENT: &str = "_patientCompartment";
 /// `CONTROL_ARGS`.
 pub const HANDLING: &str = "_handling";
 
+/// The argument the server sets on a search `GET` to say how many matches a page has when the
+/// request names no `_count`. It is not a search parameter, and not the client's to set: see
+/// `CONTROL_ARGS`. The search then runs as if the request had said `_count`, so the Bundle's links
+/// show the page that applied, and nothing else sees a `_count` the client did not send.
+pub const DEFAULT_COUNT: &str = "_defaultCount";
+
 /// The compartment parameters are not part of a search's identity: a paging link or a cursor does
 /// not carry them, because each request gets its limit from the server again.
 fn is_compartment_param(key: &str) -> bool {
@@ -86,6 +92,12 @@ pub fn add_param(params: &mut BTreeMap<String, String>, name: String, value: Str
 /// Between the occurrences of a repeated search parameter in a value built by `join_repeated`.
 /// Control characters do not appear in a search value, so no value is cut in two by it.
 pub const AND: char = '\u{1f}';
+
+/// Whether `name` is a control that takes one value (`_count`, `_summary`, `_total`, ...), so it
+/// cannot be given more than once: two values are not an AND of anything, only two answers.
+pub(crate) fn is_single_valued_control(name: &str) -> bool {
+    is_control(name) && !is_list_control(name)
+}
 
 fn is_list_control(name: &str) -> bool {
     matches!(
@@ -261,6 +273,10 @@ pub(crate) struct Work {
     pub fetched: usize,
     /// Rows the search parameters were evaluated against.
     pub checked: usize,
+    /// Sort keys worked out: one for each match and sort term, however the matches compare.
+    pub keyed: usize,
+    /// Most matches held at once while the page was picked out of them.
+    pub retained: usize,
 }
 
 /// What a search does with a parameter whose value it cannot read (a date that is not one, a
@@ -471,6 +487,10 @@ fn page_from_index(
 ///
 /// Without `_sort` only the page is kept. Without a wanted total the scan ends one match after the
 /// page, which is all `links` needs to know whether there is a next page.
+///
+/// With `_sort` every match has to be seen, since any of them may sort first, but not kept: a
+/// match is given its sort key once, and only the `offset + count` that sort first are held (see
+/// `Ranked`), so a small page costs the same memory and sorting work however many resources match.
 fn page_by_checking(
     tx: &mut Transaction,
     catalog: &Catalog,
@@ -492,7 +512,10 @@ fn page_by_checking(
     } else {
         controls.offset.saturating_add(limit).saturating_add(1)
     };
+    // The matches that sort before the page, the page, and nothing after it.
+    let wanted = controls.offset.saturating_add(limit);
     let mut kept = Vec::new();
+    let mut ranked = Vec::new();
     let mut total = 0usize;
     for row in &rows {
         let json = row.json()?;
@@ -501,7 +524,19 @@ fn page_by_checking(
         if !row_matches(catalog, model, &json, checks, controls, &host) {
             continue;
         }
-        if sorted || (total >= controls.offset && kept.len() < limit) {
+        if sorted {
+            if wanted > 0 {
+                work.keyed += controls.sort.len();
+                ranked.push(Ranked {
+                    keys: sort_keys(catalog, model, &json, &controls.sort),
+                    id: row.id.id_str().unwrap_or("").to_string(),
+                    json,
+                    ts: row.ts,
+                });
+                work.retained = work.retained.max(ranked.len());
+                trim_ranked(&mut ranked, wanted, &controls.sort);
+            }
+        } else if total >= controls.offset && kept.len() < limit {
             let id = row.id.id_str().unwrap_or("").to_string();
             kept.push((id.clone(), decorate(json, &id, row.ts)));
         }
@@ -511,8 +546,13 @@ fn page_by_checking(
         }
     }
     if sorted {
-        sort_matches(catalog, model, &mut kept, &controls.sort);
-        let page = kept.into_iter().skip(controls.offset).take(limit).collect();
+        ranked.sort_by(|left, right| left.compare(right, &controls.sort));
+        let page = ranked
+            .into_iter()
+            .skip(controls.offset)
+            .take(limit)
+            .map(|item| (item.id.clone(), decorate(item.json, &item.id, item.ts)))
+            .collect();
         return Ok((page, total, work));
     }
     Ok((kept, total, work))
@@ -1650,6 +1690,9 @@ fn in_compartment(
     })
 }
 
+/// Sorts matches by comparing sort keys worked out for every comparison, as a search once did. The
+/// reference search keeps it, so a test can hold the current one to the same order.
+#[cfg(test)]
 fn sort_matches(
     catalog: &Catalog,
     model: &ResourceModel,
@@ -1684,6 +1727,55 @@ fn sort_key(catalog: &Catalog, model: &ResourceModel, resource: &Value, name: &s
         .next()
         .unwrap_or_default()
         .to_lowercase()
+}
+
+/// The sort keys of a resource, one for each `_sort` term.
+fn sort_keys(
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: &Value,
+    sort: &[(String, bool)],
+) -> Vec<String> {
+    sort.iter()
+        .map(|(name, _)| sort_key(catalog, model, resource, name))
+        .collect()
+}
+
+/// A match held while a sorted page is picked out of the matches, with the keys it sorts by. The
+/// keys are worked out once: evaluating the parameter's FHIRPath expression is the expensive part,
+/// and a comparison sort that did it for every comparison did it about twenty times for each match.
+struct Ranked {
+    keys: Vec<String>,
+    id: String,
+    json: Value,
+    ts: Option<Timestamp>,
+}
+
+impl Ranked {
+    /// The order the `_sort` terms give, each ascending or descending, and the id for a tie.
+    fn compare(&self, other: &Self, sort: &[(String, bool)]) -> std::cmp::Ordering {
+        for ((_, desc), (left, right)) in sort.iter().zip(self.keys.iter().zip(&other.keys)) {
+            let ordering = left.cmp(right);
+            let ordering = if *desc { ordering.reverse() } else { ordering };
+            if ordering != std::cmp::Ordering::Equal {
+                return ordering;
+            }
+        }
+        self.id.cmp(&other.id)
+    }
+}
+
+/// Drop what cannot be on the page: all but the `wanted` that sort first, once twice that many are
+/// held. Pruning that late makes the work for a match a constant, since the part of `ranked` that
+/// is kept is found without sorting it, and every match that is dropped was beaten by `wanted`.
+fn trim_ranked(ranked: &mut Vec<Ranked>, wanted: usize, sort: &[(String, bool)]) {
+    // Not worth a pass for a page of a few: sorting a few dozen costs nothing.
+    let limit = wanted.saturating_mul(2).max(64);
+    if ranked.len() < limit || wanted >= ranked.len() {
+        return;
+    }
+    ranked.select_nth_unstable_by(wanted, |left, right| left.compare(right, sort));
+    ranked.truncate(wanted);
 }
 
 struct SortHost;
@@ -1827,7 +1919,10 @@ pub(crate) fn capability_notes() -> String {
          `:not` and `:not-in` with several values leave out every one of them, and `:missing` \
          takes one value. A parameter given more than once is AND \
          (`date=ge2026-01-01&date=lt2026-02-01`) in a query string, a Bundle entry and \
-         Subscription criteria; GraphQL and live-query arguments have one value per name. \
+         Subscription criteria, each occurrence judged on its own so one resource can satisfy \
+         both through different elements of a repeating one; a live query gives the occurrences \
+         as an array of strings, and a GraphQL argument has one value per name. A search GET \
+         that names no `_count` returns one page with a `next` link, of a size the server sets. \
          `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`, once per \
          occurrence or comma-separated; `_include:iterate` and `_revinclude:iterate` apply a rule \
          to the matches and to every resource the rules have added, until none is added, and a \
@@ -2448,6 +2543,90 @@ fn eval_filter_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keeping only the first `wanted` matches while they arrive, in the batches `trim_ranked`
+    /// chooses, leaves the same page as sorting them all and cutting it. Keys repeat on purpose,
+    /// so the order of the ones that tie (their ids) is what is checked.
+    #[test]
+    fn trimming_the_ranked_matches_keeps_what_sorting_them_all_keeps() {
+        // A small generator: the tests of this crate have no random source of their own.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let terms: [&[(String, bool)]; 3] = [
+            &[],
+            &[(String::new(), false)],
+            &[(String::new(), true), (String::new(), false)],
+        ];
+        for sort in terms {
+            for (count, offset) in [(0usize, 0usize), (1, 0), (3, 0), (3, 40), (10, 5), (200, 0)] {
+                let wanted = count + offset;
+                let make = |n: usize, next: &mut dyn FnMut(u64) -> u64| Ranked {
+                    keys: sort.iter().map(|_| format!("k{}", next(7))).collect(),
+                    id: format!("id{n:05}"),
+                    json: json!({"n": n}),
+                    ts: None,
+                };
+                let all: Vec<Ranked> = (0..1500).map(|n| make(n, &mut next)).collect();
+                let mut want: Vec<&Ranked> = all.iter().collect();
+                want.sort_by(|left, right| left.compare(right, sort));
+                let want: Vec<&str> = want
+                    .iter()
+                    .skip(offset)
+                    .take(count)
+                    .map(|item| item.id.as_str())
+                    .collect();
+                let mut held = Vec::new();
+                let mut most = 0;
+                for item in &all {
+                    held.push(Ranked {
+                        keys: item.keys.clone(),
+                        id: item.id.clone(),
+                        json: item.json.clone(),
+                        ts: None,
+                    });
+                    most = most.max(held.len());
+                    if wanted > 0 {
+                        trim_ranked(&mut held, wanted, sort);
+                    } else {
+                        held.clear();
+                    }
+                }
+                held.sort_by(|left, right| left.compare(right, sort));
+                let got: Vec<&str> = held
+                    .iter()
+                    .skip(offset)
+                    .take(count)
+                    .map(|item| item.id.as_str())
+                    .collect();
+                assert_eq!(got, want, "{} terms, {count} from {offset}", sort.len());
+                assert!(
+                    most <= (2 * wanted).max(64),
+                    "held {most} for a page of {wanted}"
+                );
+            }
+        }
+    }
+
+    /// With no page size every match is kept, as the page is all of them.
+    #[test]
+    fn a_page_of_everything_trims_nothing() {
+        let sort = [(String::new(), false)];
+        let mut held: Vec<Ranked> = (0..300)
+            .map(|n| Ranked {
+                keys: vec![format!("k{}", n % 3)],
+                id: format!("id{n:03}"),
+                json: Value::Null,
+                ts: None,
+            })
+            .collect();
+        trim_ranked(&mut held, usize::MAX, &sort);
+        assert_eq!(held.len(), 300);
+    }
 
     fn or(text: &str) -> Vec<String> {
         or_values(text).unwrap()

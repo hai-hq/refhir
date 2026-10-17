@@ -39,7 +39,7 @@ The token is checked when the socket opens, and only when the server runs with `
 
 | Server mode | What happens |
 |-------------|--------------|
-| SMART off | No token is needed, and any token sent is ignored, not validated. The connection has no scopes and every operation is allowed, except `ImplementationGuide/$install`, which `/sync` refuses unless the connection is SMART-authenticated (so always, with SMART off). A client's `_readScopes` and `_sdcArchiver` arguments are stripped. |
+| SMART off | No token is needed, and any token sent is ignored, not validated. The connection has no scopes and every operation is allowed, except `ImplementationGuide/$install`, which `/sync` refuses unless the connection is SMART-authenticated (so always, with SMART off). A client's `_readScopes`, `_sdcArchiver`, `_patientCompartment`, `_handling` and `_defaultCount` arguments are stripped. |
 | SMART on, no token | The upgrade is refused with HTTP 401 (`a bearer token is required`). |
 | SMART on, unknown, expired, or scopeless token | HTTP 401 (`unknown token`, `token expired`, `token has no scopes`). |
 | SMART on, valid token | The upgrade succeeds. The token's scopes are copied into the connection. |
@@ -51,7 +51,7 @@ With SMART on, scopes are checked per message, not at the upgrade. A token that 
 - Each `udfPath` is mapped to an interaction (`search`, `read`, `create`, `update`, `delete`, `install`) and checked against the token's scopes. `search` needs `search`. The read-type operations (`read`, `vread`, `history` and the `$` operations such as `$everything`) need `read`. `create` and `conditional-create` need `create`. `update`, `patch`, `conditional-update`, `$meta-add` and `$meta-delete` need `update`.
 - `Bundle/transaction` and `Bundle/batch` are checked entry by entry, from each entry's resource type and `request.method`.
 - A patient-scoped token is limited to its patient's compartment: operations on another patient's data are refused, and a pushed result that falls outside the compartment removes the query (see [Errors](#errors)).
-- The server never trusts `_readScopes` or `_sdcArchiver` from a client. It removes them and, with SMART on, sets `_readScopes` itself.
+- The server never trusts the arguments it sets itself from a client: `_readScopes`, `_sdcArchiver`, `_patientCompartment` (the compartment of a patient-scoped token), `_handling` (the `Prefer: handling=lenient` of a REST search) and `_defaultCount` (the page size of a REST search). It removes them from every message and, with SMART on, sets `_readScopes` (and `_patientCompartment`, for a patient-scoped token) itself. A live query is not paged unless its own arguments say `_count`.
 
 ### Token lifetime
 
@@ -124,7 +124,7 @@ Names you may subscribe to (read-only):
 | Operation | Arguments |
 |-----------|-----------|
 | `{Type}/read` | `id`. The value is the resource. |
-| `{Type}/search` | A flat object whose values must all be strings, such as `{"active": "true"}` or `{"_id": "o1", "_include": "Observation:subject"}`. The value is a `searchset` Bundle. |
+| `{Type}/search` | A flat object whose values are strings, such as `{"active": "true"}` or `{"_id": "o1", "_include": "Observation:subject"}`. A parameter that a URL would give more than once, which FHIR reads as AND, is an array of strings: `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}`. A comma inside one string is OR. The array must not be empty. The value is a `searchset` Bundle, and it is not paged unless the arguments say `_count`. |
 | `{Type}/vread` | `id`, `versionId` |
 | `{Type}/history`, `system/history` | `id` (optional), `_since`, `_count`, `_offset` as strings |
 | `{Type}/$validate`, `$meta`, `$everything`, `$document` | `id`, or `resource` for `$validate` |

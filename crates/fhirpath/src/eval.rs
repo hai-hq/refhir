@@ -17,7 +17,9 @@ use crate::value::{
 struct Ctx<'a> {
     resource: &'a Json,
     root_resource: &'a Json,
-    context: Value,
+    /// The focus, borrowed: copying the resource for the context, and again for every `where` or
+    /// `select` that opens a scope of its own, is most of what evaluating a path costs.
+    context: &'a Value,
     model: &'a Model,
     host: &'a dyn Host,
     this_item: Option<Value>,
@@ -109,7 +111,7 @@ fn evaluate_focused(
     let ctx = Ctx {
         resource,
         root_resource,
-        context: focus_node.clone(),
+        context: &focus_node,
         model,
         host,
         this_item: None,
@@ -117,7 +119,7 @@ fn evaluate_focused(
         total: None,
         map_cast,
     };
-    let outcome = ctx.eval(expr, &[focus_node], true)?;
+    let outcome = ctx.eval(expr, std::slice::from_ref(&focus_node), true)?;
     Ok(outcome.items)
 }
 
@@ -938,7 +940,7 @@ impl Ctx<'_> {
         Ctx {
             resource: self.resource,
             root_resource: self.root_resource,
-            context: self.context.clone(),
+            context: self.context,
             model: self.model,
             host: self.host,
             this_item,
@@ -2405,6 +2407,77 @@ fn resource_type(json: &Json) -> Option<String> {
     json.get("resourceType")
         .and_then(|value| value.as_str())
         .map(|value| value.to_string())
+}
+
+/// The values a plain path of members (`Slot.start`, `Appointment.participant.actor`) reads out of
+/// a resource, as the JSON the evaluator would have given for each, without evaluating anything.
+///
+/// Evaluating is for the general case: it copies the whole resource into a node, and every member
+/// it reads into another, and a search does that for each row it checks and each sort key it needs.
+/// A path that is only members is a walk down the JSON. This gives what `evaluate` gives for it, or
+/// `None` where it cannot be sure of that, and the caller evaluates:
+///
+/// - the expression is not a bare path, or its first name is not the resource's own type (a
+///   supertype such as `Resource` is the evaluator's to read);
+/// - a member is a choice element (`value[x]`), is not an element the model holds at that point
+///   (the evaluator answers an unknown element with nothing or, for a strict host, an error), or is
+///   `id` or `resourceType`;
+/// - a member the model types as a boolean or a number is written as a string, which the evaluator
+///   turns into a boolean or a number.
+///
+/// An element that is absent is not in doubt: it reads as nothing, as evaluating gives.
+pub fn member_values<'a>(expr: &Expr, root: &'a Json, model: &Model) -> Option<Vec<&'a Json>> {
+    let (root_name, members) = expr.member_path()?;
+    if root.get("resourceType")?.as_str()? != root_name {
+        return None;
+    }
+    // Where the values read so far sit in the model, and a buffer for the path of the next element,
+    // so a step allocates nothing of its own.
+    let mut path = String::from(root_name);
+    let mut key = String::new();
+    let mut current = vec![root];
+    for name in members {
+        if name == "id" || name == "resourceType" {
+            return None;
+        }
+        // The same steps `child` takes, in the same order.
+        if model.choice_path(&path, name).is_some() || !model.known_child(&path, name) {
+            return None;
+        }
+        key.clear();
+        key.push_str(&path);
+        key.push('.');
+        key.push_str(name);
+        let element_path = model.canonical(&key);
+        let fhir_type = model.element_types(element_path).first();
+        let coerced = matches!(
+            fhir_type.map(String::as_str),
+            Some("boolean" | "integer" | "unsignedInt" | "positiveInt" | "decimal")
+        );
+        let mut next = Vec::new();
+        for node in current {
+            match node.get(name) {
+                Some(Json::Array(items)) => next.extend(items.iter()),
+                Some(value) => next.push(value),
+                None => {}
+            }
+        }
+        if coerced && next.iter().any(|value| value.is_string()) {
+            return None;
+        }
+        let child_path = match fhir_type {
+            Some(fhir_type)
+                if !model.has_descendants(element_path) && model.has_descendants(fhir_type) =>
+            {
+                fhir_type.as_str()
+            }
+            _ => element_path,
+        };
+        path.clear();
+        path.push_str(child_path);
+        current = next;
+    }
+    Some(current)
 }
 
 fn node_from_json(

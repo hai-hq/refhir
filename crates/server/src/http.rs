@@ -69,7 +69,15 @@ pub struct ServerConfig {
     /// database's own, so they outlive a restart. Without one they live in memory and end with
     /// the process.
     pub governance_store: Option<SharedGovernanceStore>,
+    /// How many matches a search `GET` returns on one page when it names no `_count`; the rest
+    /// follow behind the `next` link. `0` returns every match in one response, as a search used to.
+    /// Only the searches a client sends are paged this way: a conditional update or delete, a
+    /// `_has` or chained search, a live query and GraphQL read every match.
+    pub default_page_size: usize,
 }
+
+/// The page a search `GET` that names no `_count` gets. FHIR leaves the page size to the server.
+pub const DEFAULT_PAGE_SIZE: usize = 100;
 
 /// The database-backed governance tables, as passed in `ServerConfig::governance_store`.
 #[derive(Clone)]
@@ -112,6 +120,7 @@ impl Default for ServerConfig {
             jobs: None,
             governance: crate::governance::GovernanceConfig::default(),
             governance_store: None,
+            default_page_size: DEFAULT_PAGE_SIZE,
         }
     }
 }
@@ -1184,6 +1193,7 @@ async fn search(
     args.remove("access_token");
     limit_to_patient(&app, &headers, uri.query(), &mut args);
     let lenient = handle_unreadable_values(&headers, &mut args);
+    ask_for_default_page(&app, &mut args);
     let args = Value::Object(args);
     match execute(
         &app.db,
@@ -1439,6 +1449,7 @@ async fn compartment_search(
     );
     limit_to_patient(&app, &headers, uri.query(), &mut args);
     let lenient = handle_unreadable_values(&headers, &mut args);
+    ask_for_default_page(&app, &mut args);
     let response = run_read(
         &app,
         &format!("{resource_type}/search"),
@@ -1738,6 +1749,22 @@ fn handle_unreadable_values(
         args.insert(refhir_fhir::HANDLING.into(), json!("lenient"));
     }
     lenient
+}
+
+/// Ask for the server's page size on a search that names no `_count`, so a client that does not
+/// ask for a page is not sent every match in one response. The engine applies it, and the Bundle's
+/// `self` link shows the `_count` that applied while the audit trail keeps the query as the client
+/// sent it. A `_count` the client gave, `_count=0` included, is kept as it is. What the query
+/// string had under `_defaultCount` is dropped: only the server's setting says. The engine's
+/// `page_by_default` (in the fhir crate) is where the page is applied.
+fn ask_for_default_page(app: &AppState, args: &mut serde_json::Map<String, Value>) {
+    args.remove(refhir_fhir::DEFAULT_COUNT);
+    if app.config.default_page_size > 0 {
+        args.insert(
+            refhir_fhir::DEFAULT_COUNT.into(),
+            Value::String(app.config.default_page_size.to_string()),
+        );
+    }
 }
 
 /// What a search's answer says about `Prefer`, which it depends on: `Vary` for caches, so the

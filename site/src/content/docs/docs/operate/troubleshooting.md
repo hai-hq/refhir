@@ -93,6 +93,19 @@ A value that is not well formed is not an error: `GET /Patient?birthdate=notadat
 with an empty Bundle. Check the value. A control parameter does fail on a bad value:
 `_count must be an integer`.
 
+### A search returns 100 entries, and there are more
+
+A search that names no `_count` returns one page of 100 matches. `total` in the Bundle counts every
+match, and its `next` link leads to the rest:
+
+```text
+GET /Slot?status=free&_sort=start
+```
+
+Follow `next` until there is none, or ask for the size you want with `_count`. Send `_sort`: a
+page without it is in no order you can rely on. To change the page size, set `default_page_size`
+under `[server]` (or `REFHIR_DEFAULT_PAGE_SIZE`); `0` returns every match in one response.
+
 ### `unsupported search parameter bogus on Patient`
 
 An unknown search parameter is a `400`, not silently ignored. Check the spelling, and check

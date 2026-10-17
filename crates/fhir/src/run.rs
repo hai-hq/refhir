@@ -25,11 +25,12 @@ use crate::search;
 /// value it cannot read (`_handling`, from the `Prefer` header of a `GET`). They are not the
 /// client's, so a search does not take them for search parameters, and the code that adds them (and
 /// the code that makes sure a client did not) uses this same list.
-pub const CONTROL_ARGS: [&str; 4] = [
+pub const CONTROL_ARGS: [&str; 5] = [
     "_readScopes",
     "_sdcArchiver",
     search::PATIENT_COMPARTMENT,
     search::HANDLING,
+    search::DEFAULT_COUNT,
 ];
 
 /// Retries after an OCC conflict. The first attempt is not counted.
@@ -340,7 +341,8 @@ pub fn dispatch(
             )
         }
         "search" => {
-            let params = search_args(args)?;
+            let mut params = search_args(args)?;
+            page_by_default(&mut params, args)?;
             search::search_handling(tx, catalog, model, &params, handling_arg(args))
         }
         "$populate" | "$assemble" | "$next-question" | "$behavior" | "$extract" => {
@@ -401,12 +403,34 @@ fn search_args(args: &Value) -> Result<BTreeMap<String, String>, FhirError> {
         if CONTROL_ARGS.contains(&key.as_str()) {
             continue;
         }
-        let Some(text) = value.as_str() else {
-            return Err(FhirError::Invalid(format!(
-                "search parameter {key} must be a string"
-            )));
-        };
-        params.insert(key.clone(), text.to_string());
+        match value {
+            Value::String(text) => {
+                params.insert(key.clone(), text.clone());
+            }
+            Value::Array(_) if search::is_single_valued_control(key) => {
+                return Err(FhirError::Invalid(format!(
+                    "search parameter {key} takes one value, not an array"
+                )));
+            }
+            // A JSON object has one value for a name, so a parameter given more than once, which
+            // FHIR reads as AND, is an array: `"schedule.actor": ["HealthcareService/h1",
+            // "Location/l1"]` is what `schedule.actor=..&schedule.actor=..` says in a URL.
+            Value::Array(items) if !items.is_empty() => {
+                for item in items {
+                    let Some(text) = item.as_str() else {
+                        return Err(FhirError::Invalid(format!(
+                            "search parameter {key} must be a string or an array of strings"
+                        )));
+                    };
+                    search::add_param(&mut params, key.clone(), text.to_string());
+                }
+            }
+            _ => {
+                return Err(FhirError::Invalid(format!(
+                    "search parameter {key} must be a string or a non-empty array of strings"
+                )));
+            }
+        }
     }
     limit_to_caller(&mut params, args)?;
     Ok(params)
@@ -419,6 +443,25 @@ fn handling_arg(args: &Value) -> search::Handling {
         Some("lenient") => search::Handling::Lenient,
         _ => search::Handling::Strict,
     }
+}
+
+/// A search that names no `_count` gets the page size the server asked for (`_defaultCount`), if
+/// it did. Only the server puts that argument in a search, so this is its word, not a client's.
+/// The REST handlers say it (`ask_for_default_page` in the server crate); this is where it applies.
+fn page_by_default(params: &mut BTreeMap<String, String>, args: &Value) -> Result<(), FhirError> {
+    let Some(size) = args.get(search::DEFAULT_COUNT) else {
+        return Ok(());
+    };
+    let size = size
+        .as_str()
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| FhirError::Invalid(format!("{} must be a number", search::DEFAULT_COUNT)))?;
+    if size > 0 {
+        params
+            .entry("_count".to_string())
+            .or_insert_with(|| size.to_string());
+    }
+    Ok(())
 }
 
 /// Put the server's limit on the caller, if it set one, on the parameters of a search that was

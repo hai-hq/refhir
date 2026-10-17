@@ -604,6 +604,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             ready_cache: Duration::from_secs(1),
             min_ts_wait: Duration::from_millis(250),
             sync_token_recheck: Duration::from_secs(30),
+            default_page_size: cfg.default_page_size,
             // Export jobs are rows in the same database, so they outlive a restart.
             jobs: Some(refhir_server::SharedJobStore::new(job_store)),
             // So are usage, the request log and the audit trail.

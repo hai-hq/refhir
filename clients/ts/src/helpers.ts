@@ -2,10 +2,15 @@ import type { Client } from "./client.js"; // type-only
 import type { Args, JsonValue } from "./types.js";
 import type { Watch } from "./watch.js";
 
+/**
+ * Subscribe to `{resourceType}/search`. A parameter that a URL would give more than once, which
+ * FHIR reads as AND, is an array: `{ "schedule.actor": ["HealthcareService/h1", "Location/l1"] }`.
+ * A comma inside one string is OR.
+ */
 export async function search(
   client: Client,
   resourceType: string,
-  params: Record<string, string>,
+  params: Record<string, string | string[]>,
 ): Promise<Watch> {
   const args: Args = { ...params };
   return client.watch(`${resourceType}/search`, args);

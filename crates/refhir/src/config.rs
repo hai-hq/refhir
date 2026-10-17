@@ -95,6 +95,9 @@ pub struct ServerSection {
     /// The networks those proxies connect from, such as `["10.0.0.0/8"]`. See
     /// `[server] trusted_proxy_peers` in `refhir.toml.example`.
     pub trusted_proxy_peers: Option<Vec<String>>,
+    /// How many matches a search returns on a page when it names no `_count`. 0 returns them all.
+    /// See `[server] default_page_size` in `refhir.toml.example`.
+    pub default_page_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -322,6 +325,8 @@ pub struct ResolvedConfig {
     pub terminology_urls: Vec<String>,
     pub trace_engine: bool,
     pub sdc_archiver: bool,
+    /// Matches on the page of a search that names no `_count`; 0 is every match.
+    pub default_page_size: usize,
     /// Observing by default: usage, the request log and the audit trail are on, and nothing is
     /// limited until an operator sizes a limit for their traffic.
     pub governance: GovernanceConfig,
@@ -354,6 +359,7 @@ impl ResolvedConfig {
             terminology_urls: Vec::new(),
             trace_engine: false,
             sdc_archiver: false,
+            default_page_size: refhir_server::DEFAULT_PAGE_SIZE,
             governance: GovernanceConfig::observing(),
             role: Role::Primary,
             primary_url: None,
@@ -379,6 +385,9 @@ impl ResolvedConfig {
         }
         if file.server.public_url.is_some() {
             self.public_url = file.server.public_url.clone();
+        }
+        if let Some(size) = file.server.default_page_size {
+            self.default_page_size = size;
         }
 
         match file.database.kind.as_deref() {
@@ -826,6 +835,11 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     if let Some(url) = env_value("REFHIR_PUBLIC_URL") {
         cfg.public_url = Some(url);
     }
+    if let Some(size) = env_value("REFHIR_DEFAULT_PAGE_SIZE") {
+        cfg.default_page_size = size.parse::<usize>().map_err(|_| {
+            format!("REFHIR_DEFAULT_PAGE_SIZE must be a number (0 for no limit), not `{size}`")
+        })?;
+    }
     if let Some(value) = env_value("REFHIR_UPDATE_AS_CREATE") {
         cfg.update_as_create = matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes");
     }
@@ -1002,6 +1016,39 @@ mod tests {
             ..FileConfig::default()
         };
         assert!(cfg.apply_file(&no_url).is_err());
+    }
+
+    #[test]
+    fn the_default_page_size_comes_from_the_file_then_the_environment() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("REFHIR_DEFAULT_PAGE_SIZE");
+        assert_eq!(
+            ResolvedConfig::defaults().default_page_size,
+            refhir_server::DEFAULT_PAGE_SIZE
+        );
+        let mut cfg = resolved("[server]\ndefault_page_size = 25\n");
+        assert_eq!(cfg.default_page_size, 25);
+        assert_eq!(
+            resolved("[server]\ndefault_page_size = 0\n").default_page_size,
+            0
+        );
+        // The environment wins over the file.
+        std::env::set_var("REFHIR_DEFAULT_PAGE_SIZE", "7");
+        apply_env(&mut cfg).unwrap();
+        assert_eq!(cfg.default_page_size, 7);
+        // A value that is not a size is refused, and says which setting it was.
+        for bad in ["abc", "-1", "2.5", ""] {
+            std::env::set_var("REFHIR_DEFAULT_PAGE_SIZE", bad);
+            let mut cfg = ResolvedConfig::defaults();
+            // An empty variable is the same as none.
+            match apply_env(&mut cfg) {
+                Ok(()) => assert_eq!((bad, cfg.default_page_size), ("", 100)),
+                Err(message) => assert!(message.contains("REFHIR_DEFAULT_PAGE_SIZE"), "{message}"),
+            }
+        }
+        std::env::remove_var("REFHIR_DEFAULT_PAGE_SIZE");
+        // A negative size in the file does not parse.
+        assert!(toml::from_str::<FileConfig>("[server]\ndefault_page_size = -1\n").is_err());
     }
 
     fn resolved(text: &str) -> ResolvedConfig {

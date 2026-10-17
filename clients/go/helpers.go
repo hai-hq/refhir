@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 )
 
-// Search subscribes to {resourceType}/search. Parameter values are strings, matching the server.
+// Search subscribes to {resourceType}/search. Parameter values are strings, matching the server. A
+// comma inside a value is OR. A parameter that a URL would give more than once, which FHIR reads as
+// AND (schedule.actor=A&schedule.actor=B), takes a []string, which Search cannot carry: use Watch or
+// Query with a map[string]any, as the README shows.
 func (c *Client) Search(ctx context.Context, resourceType string, params map[string]string) (*Watch, error) {
 	args := make(map[string]any, len(params))
 	for key, value := range params {

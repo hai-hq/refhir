@@ -1,10 +1,11 @@
 //! Command-line flags, through the real binary: the ones that print something and exit, and the
 //! rules about which flags may be combined.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 mod common;
-use common::{exits, serves, Scratch, UNUSABLE_POSTGRES};
+use common::{exits, free_port, serves, start, Scratch, UNUSABLE_POSTGRES};
 
 fn refhir(flag: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_refhir"))
@@ -216,4 +217,59 @@ fn one_database_flag_still_overrides_the_settings() {
         "--sqlite did not replace the environment's database"
     );
     serves(&dir, &["--memory"], &postgres);
+}
+
+/// The setting reaches the server the binary starts: with a page of 2, a search that names no
+/// `_count` returns two of three patients and a `next` link, and one that names it gets what it
+/// asked for.
+#[test]
+fn the_default_page_size_setting_is_the_page_of_a_search_that_names_no_count() {
+    struct Stop(std::process::Child);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = Scratch::new("cli-page");
+    let bind = format!("127.0.0.1:{}", free_port());
+    let package = concat!(env!("CARGO_MANIFEST_DIR"), "/../fhir/fixtures/minir4");
+    let _server = Stop(start(
+        &dir,
+        &["--memory", "--bind", &bind, "--package", package],
+        &[("REFHIR_DEFAULT_PAGE_SIZE", "2")],
+        Stdio::null(),
+        Stdio::null(),
+    ));
+    let base = format!("http://{bind}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while ureq::get(&format!("{base}/readyz")).call().is_err() {
+        assert!(Instant::now() < deadline, "the server was not ready in 30s");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for family in ["A", "B", "C"] {
+        ureq::post(&format!("{base}/Patient"))
+            .set("content-type", "application/fhir+json")
+            .send_string(&format!(
+                r#"{{"resourceType":"Patient","name":[{{"family":"{family}"}}]}}"#
+            ))
+            .unwrap();
+    }
+    let search = |query: &str| -> serde_json::Value {
+        ureq::get(&format!("{base}/Patient{query}"))
+            .call()
+            .unwrap()
+            .into_string()
+            .map(|body| serde_json::from_str(&body).unwrap())
+            .unwrap()
+    };
+    let page = search("");
+    assert_eq!(page["entry"].as_array().unwrap().len(), 2, "{page}");
+    assert_eq!(page["total"], 3);
+    assert!(page["link"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|link| link["relation"] == "next"));
+    assert_eq!(search("?_count=3")["entry"].as_array().unwrap().len(), 3);
 }
