@@ -53,8 +53,30 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
   value. A value lists at most 1000 alternatives. With `:not` and `:not-in`, a list leaves out
   every value in it, and `:missing` takes one value.
 - Giving a parameter twice is AND (`date=ge2026-01-01&date=lt2026-02-01`) in a query string, in the
-  URL of a Bundle entry and in Subscription criteria. A GraphQL argument or a live query's
-  arguments have one value per name, so they cannot say it.
+  URL of a Bundle entry and in Subscription criteria. Each occurrence is judged against the
+  resource on its own, so a resource that repeats an element can satisfy both with different
+  elements: `Schedule?actor=HealthcareService/h1&actor=Location/l1` finds a Schedule whose `actor`
+  list holds both, and the same through a chain
+  (`Slot?schedule.actor=HealthcareService/h1&schedule.actor=Location/l1`) or on a nested list
+  (`Appointment?actor=Patient/p1&actor=Location/l1`). The same value twice is the same as once, and
+  AND and OR combine: `actor=Location/l1,Location/l2&actor=HealthcareService/h1`. A live query's
+  arguments are a JSON object, so it gives the occurrences as an array:
+  `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}`. A GraphQL argument has one value
+  per name and cannot say it.
+- **A search that names no `_count` returns one page of 100 matches** with a `next` link, instead
+  of every match in one response. The `self` link shows the `_count` that applied, and `total`
+  still counts every match. A `_count` in the request is used as it is, and `_count=0` returns the
+  total alone. Follow `next` (or ask for a larger `_count`) to read the rest. Set
+  `[server].default_page_size` or `REFHIR_DEFAULT_PAGE_SIZE` to change the page, or to `0` to
+  return every match as a search used to. Only a search a client sends with `GET` is paged this way:
+  a conditional update or delete, the searches behind a chain, `_has` or `_include`, a live query,
+  GraphQL, `$export` and the entries of a Bundle read every match. Without `_sort`, a page is in
+  index order, which is not an order a client can rely on: send `_sort` for a stable one.
+- `_sort` with a small `_count` costs about what the same search costs unsorted: it reads each
+  match once and keeps only the first page. The time follows the number of matches the filters
+  leave to be read, so a parameter whose index decides the match (`status`, `schedule`) keeps a
+  search small, and one that has to be checked against each document (a date range) costs a little
+  for every Slot it is checked against.
 - `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`. The `:iterate` forms
   (`_include=Slot:schedule&_include:iterate=Schedule:actor`) apply a rule to the matches and to
   every resource the rules have added, until none is added. A search that would add more than

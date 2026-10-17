@@ -6473,6 +6473,94 @@ fn server_controls() -> Value {
 }
 
 #[test]
+fn the_server_can_ask_for_a_page_when_a_search_names_no_count() {
+    let harness = ready();
+    for n in 0..5 {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": patient(&format!("p{n}"), true, "Ann")}),
+        );
+    }
+    let search = |args: Value| apply(&harness, "Patient/search", args);
+    let link = |bundle: &Value, relation: &str| -> Option<String> {
+        bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["relation"] == relation)
+            .map(|link| link["url"].as_str().unwrap().to_string())
+    };
+    // The page applies as if the request had said `_count`, and `total` counts every match.
+    let found = search(json!({"_defaultCount": "2"}));
+    assert_eq!(found["entry"].as_array().unwrap().len(), 2);
+    assert_eq!(found["total"], 5);
+    assert!(link(&found, "self").unwrap().contains("_count=2"));
+    let next = link(&found, "next").expect("a next link");
+    assert!(
+        next.contains("_count=2") && next.contains("_cursor="),
+        "{next}"
+    );
+    assert!(!next.contains("_defaultCount"), "{next}");
+    // The request's own `_count` is used, `_count=0` included.
+    let found = search(json!({"_defaultCount": "2", "_count": "4"}));
+    assert_eq!(found["entry"].as_array().unwrap().len(), 4);
+    let found = search(json!({"_defaultCount": "2", "_count": "0"}));
+    assert_eq!(found["entry"].as_array().unwrap().len(), 0);
+    assert_eq!(found["total"], 5);
+    // Nothing asked for, nothing paged; so for a size of 0.
+    for args in [json!({}), json!({"_defaultCount": "0"})] {
+        let found = search(args);
+        assert_eq!(found["entry"].as_array().unwrap().len(), 5);
+        assert!(link(&found, "next").is_none());
+    }
+    // The server's word is a number.
+    for bad in [json!("many"), json!(3), json!(["2"])] {
+        let refused =
+            run_op(&harness, "Patient/search", &json!({"_defaultCount": bad})).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("_defaultCount must be a number"),
+            "{refused}"
+        );
+    }
+}
+
+#[test]
+fn a_control_that_takes_one_value_is_refused_as_an_array_not_misread() {
+    let harness = ready();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
+    for name in [
+        "_count",
+        "_summary",
+        "_total",
+        "_offset",
+        "_cursor",
+        "_compartment",
+    ] {
+        let refused = run_op(&harness, "Patient/search", &json!({name: ["a", "b"]})).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains(&format!("{name} takes one value")),
+            "{name}: {refused}"
+        );
+    }
+    // The controls that are lists, and the parameters a repeat means something for, still take one.
+    let found = apply(
+        &harness,
+        "Patient/search",
+        json!({"_sort": ["name", "-_id"], "active": ["true", "true"], "_include": ["Patient:link"]}),
+    );
+    assert_eq!(found["total"], 1);
+}
+
+#[test]
 fn a_search_is_not_refused_for_the_controls_the_server_adds() {
     let harness = ready();
     apply(
@@ -6495,12 +6583,21 @@ fn a_search_is_not_refused_for_the_controls_the_server_adds() {
         "the controls did not become search parameters"
     );
     assert_eq!(found["entry"][0]["resource"]["id"], "p1");
-    // Nothing else about a search changed: an argument that is not a string is still refused.
-    let refused = run_op(&harness, "Patient/search", &json!({"active": ["true"]})).unwrap_err();
-    assert!(
-        refused.to_string().contains("must be a string"),
-        "{refused}"
-    );
+    // Nothing else about a search changed: an argument that is not a string (or, for a parameter
+    // given more than once, an array of them) is still refused.
+    for bad in [
+        json!(true),
+        json!(1),
+        json!([]),
+        json!(["true", 1]),
+        json!({}),
+    ] {
+        let refused = run_op(&harness, "Patient/search", &json!({"active": bad})).unwrap_err();
+        assert!(
+            refused.to_string().contains("must be a string"),
+            "{bad}: {refused}"
+        );
+    }
 }
 
 #[test]
@@ -7251,7 +7348,9 @@ mod or_and_iterate {
             r"`\,` is a literal comma",
             "at most 1000 alternatives",
             "more than once is AND",
+            "an array of strings",
             "one value per name",
+            "names no `_count` returns one page",
             "`_include:iterate` and `_revinclude:iterate`",
             "more than 1000 resources",
             "`_revinclude=*`",
@@ -7340,5 +7439,335 @@ mod or_and_iterate {
             }),
         );
         assert_eq!(with_mode(&found, "include"), ["Patient/p1"]);
+    }
+}
+
+/// A page of sorted matches among thousands of Slots, the shape of a booking agent's question:
+/// `Slot?status=free&start=ge{now}&_sort=start&_count=3`.
+///
+/// This used to cost about a millisecond for every match, because each comparison of the sort
+/// worked out both sort keys again from the FHIRPath expression, and every match was kept until the
+/// sort was done. The counters say what a search did, and do not depend on the machine, so they, and
+/// not a clock, are what the tests hold it to; the benchmark prints the times.
+mod sorted_pages {
+    use super::*;
+    use crate::search::{search_counted, search_reference, Handling, Work};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    const SCHEDULES: usize = 5;
+
+    struct Slot {
+        id: String,
+        schedule: String,
+        status: &'static str,
+        start: String,
+    }
+    const FROM: &str = "2030-02-10T00:00:00Z";
+
+    struct Seeded {
+        harness: Harness,
+        /// What the Slots are, for the answer the search is held to.
+        slots: Vec<Slot>,
+    }
+
+    /// `count` Slots on five schedules. Every fifth is busy, and the starts repeat, so several
+    /// Slots tie on the sort key and the id has to decide.
+    fn seed(count: usize) -> Seeded {
+        let harness = r4();
+        for n in 0..SCHEDULES {
+            let create = |resource: Value| {
+                let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+                apply(&harness, &path, json!({"resource": resource}));
+            };
+            create(json!({"resourceType": "HealthcareService", "id": format!("h{n}")}));
+            create(json!({"resourceType": "Location", "id": format!("l{n}")}));
+            create(
+                json!({"resourceType": "Schedule", "id": format!("s{n}"), "actor": [
+                {"reference": format!("HealthcareService/h{n}")},
+                {"reference": format!("Location/l{}", n % 2)}]}),
+            );
+        }
+        let mut slots = Vec::new();
+        for n in 0..count {
+            let day = 1 + (n * 7) % 28;
+            let hour = (n * 3) % 24;
+            let status = if n % 5 == 4 { "busy" } else { "free" };
+            let start = format!("2030-02-{day:02}T{hour:02}:00:00Z");
+            let id = format!("sl{n:05}");
+            apply(
+                &harness,
+                "Slot/create",
+                json!({"resource": {
+                    "resourceType": "Slot", "id": id,
+                    "schedule": {"reference": format!("Schedule/s{}", n % SCHEDULES)},
+                    "status": status, "start": start,
+                    "end": format!("2030-02-{day:02}T{hour:02}:30:00Z")
+                }}),
+            );
+            slots.push(Slot {
+                id,
+                schedule: format!("Schedule/s{}", n % SCHEDULES),
+                status,
+                start,
+            });
+        }
+        Seeded { harness, slots }
+    }
+
+    /// Four thousand Slots, seeded once for the module: 3,200 of them free, and 1,600 of those
+    /// from `FROM` on.
+    fn seeded() -> &'static Seeded {
+        static SEEDED: OnceLock<Seeded> = OnceLock::new();
+        SEEDED.get_or_init(|| seed(4000))
+    }
+
+    fn params(query: &[(&str, &str)]) -> BTreeMap<String, String> {
+        query
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn search(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work, Duration) {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get("Slot").unwrap();
+        let params = params(query);
+        let mut tx = harness.db.begin();
+        let started = Instant::now();
+        let (bundle, work) =
+            search_counted(&mut tx, &catalog, model, &params, Handling::Strict).unwrap();
+        (bundle, work, started.elapsed())
+    }
+
+    /// The bundle of the search as it was before pages were built lazily: every match kept and
+    /// sorted by comparing sort keys worked out afresh each time. Slow, so only a few searches ask.
+    fn reference(harness: &Harness, query: &[(&str, &str)]) -> Value {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get("Slot").unwrap();
+        let mut tx = harness.db.begin();
+        search_reference(&mut tx, &catalog, model, &params(query)).unwrap()
+    }
+
+    fn ids(bundle: &Value) -> Vec<String> {
+        bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// The free Slots that start at `since` or later, ordered as `order` says, ties going to the
+    /// lower id.
+    fn free_from(
+        seeded: &Seeded,
+        since: &str,
+        order: impl Fn(&Slot, &Slot) -> std::cmp::Ordering,
+    ) -> Vec<String> {
+        let mut found: Vec<&Slot> = seeded
+            .slots
+            .iter()
+            .filter(|slot| slot.status == "free" && slot.start.as_str() >= since)
+            .collect();
+        found.sort_by(|left, right| order(left, right).then(left.id.cmp(&right.id)));
+        found.into_iter().map(|slot| slot.id.clone()).collect()
+    }
+
+    fn by_start(left: &Slot, right: &Slot) -> std::cmp::Ordering {
+        left.start.cmp(&right.start)
+    }
+
+    #[test]
+    fn a_sorted_page_among_thousands_of_matches_is_the_right_page() {
+        let seeded = seeded();
+        let ascending = free_from(seeded, FROM, by_start);
+        let descending = free_from(seeded, FROM, |left, right| by_start(right, left));
+        assert!(ascending.len() > 1000, "{}", ascending.len());
+        for (sort, want) in [("start", &ascending), ("-start", &descending)] {
+            for (count, offset) in [(3usize, 0usize), (10, 7), (50, 1500)] {
+                let (count_text, offset_text) = (count.to_string(), offset.to_string());
+                let (bundle, _, _) = search(
+                    &seeded.harness,
+                    &[
+                        ("status", "free"),
+                        ("start", &format!("ge{FROM}")),
+                        ("_sort", sort),
+                        ("_count", &count_text),
+                        ("_offset", &offset_text),
+                    ],
+                );
+                let end = (offset + count).min(want.len());
+                assert_eq!(
+                    ids(&bundle),
+                    want[offset..end],
+                    "{sort} {count} from {offset}"
+                );
+                assert_eq!(bundle["total"], want.len(), "{sort}");
+            }
+        }
+        // Past the last match there is nothing, and the total is still the number of matches.
+        let (bundle, _, _) = search(
+            &seeded.harness,
+            &[
+                ("status", "free"),
+                ("start", &format!("ge{FROM}")),
+                ("_sort", "start"),
+                ("_count", "5"),
+                ("_offset", "100000"),
+            ],
+        );
+        assert!(ids(&bundle).is_empty());
+        assert_eq!(bundle["total"], ascending.len());
+        // Two sort terms, the second ordering what the first leaves tied.
+        let want = free_from(seeded, "", |left, right| {
+            left.schedule
+                .to_lowercase()
+                .cmp(&right.schedule.to_lowercase())
+                .then(by_start(right, left))
+        });
+        let (bundle, _, _) = search(
+            &seeded.harness,
+            &[
+                ("status", "free"),
+                ("_sort", "schedule,-start"),
+                ("_count", "25"),
+                ("_offset", "10"),
+            ],
+        );
+        assert_eq!(ids(&bundle), want[10..35]);
+        // The bundle is what sorting every match gives, which is what this search used to do.
+        for sort in ["start", "-start"] {
+            let query = [
+                ("status", "free"),
+                ("start", &*format!("ge{FROM}")),
+                ("_sort", sort),
+                ("_count", "3"),
+                ("_offset", "5"),
+            ];
+            assert_eq!(
+                search(&seeded.harness, &query).0,
+                reference(&seeded.harness, &query)
+            );
+        }
+    }
+
+    #[test]
+    fn a_sorted_page_works_out_each_sort_key_once_and_holds_only_what_it_may_need() {
+        let seeded = seeded();
+        let matches = free_from(seeded, FROM, by_start).len();
+        let wanted = |count: usize, offset: usize| count + offset;
+        for (count, offset) in [(3usize, 0usize), (3, 40), (100, 0)] {
+            let (count_text, offset_text) = (count.to_string(), offset.to_string());
+            let (_, work, _) = search(
+                &seeded.harness,
+                &[
+                    ("status", "free"),
+                    ("start", &format!("ge{FROM}")),
+                    ("_sort", "start"),
+                    ("_count", &count_text),
+                    ("_offset", &offset_text),
+                ],
+            );
+            // Every match is seen, once: the filter is checked on each row of the range, and the
+            // sort key, which used to be worked out for every comparison, once for each match.
+            assert_eq!(work.rows, 3200);
+            assert_eq!(work.checked, 3200);
+            assert_eq!(
+                work.keyed, matches,
+                "{count} from {offset}: one key for each match"
+            );
+            // And only a page and what sorts before it is held: never more than twice that, or a
+            // few dozen, however many matches there are.
+            let held = (2 * wanted(count, offset)).max(64);
+            assert!(
+                work.retained <= held,
+                "{count} from {offset}: held {} of {matches} matches, at most {held} expected",
+                work.retained
+            );
+            assert!(work.retained < matches / 4);
+        }
+        // Without `_sort` there is nothing to rank.
+        let (_, work, _) = search(
+            &seeded.harness,
+            &[
+                ("status", "free"),
+                ("start", &format!("ge{FROM}")),
+                ("_count", "3"),
+            ],
+        );
+        assert_eq!((work.keyed, work.retained), (0, 0));
+        // A count of 0 keeps nothing and still counts.
+        let (bundle, work, _) = search(
+            &seeded.harness,
+            &[
+                ("status", "free"),
+                ("start", &format!("ge{FROM}")),
+                ("_sort", "start"),
+                ("_count", "0"),
+            ],
+        );
+        assert_eq!(bundle["total"], matches);
+        assert_eq!((work.keyed, work.retained), (0, 0));
+    }
+
+    /// The best of a few runs, so a pause of the machine does not decide the answer.
+    fn fastest(harness: &Harness, query: &[(&str, &str)]) -> Duration {
+        (0..3)
+            .map(|_| search(harness, query).2)
+            .min()
+            .expect("a run")
+    }
+
+    /// Times for the search a booking agent sends, by the number of matches. Run it with
+    /// `cargo test --release -p refhir-fhir sorted_pages::benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: prints times, asserts nothing"]
+    fn benchmark() {
+        for count in [1900usize, 7600] {
+            let seeded = seed(count);
+            eprintln!("--- {count} Slots, {} free", count - count / 5);
+            let from = format!("ge{FROM}");
+            let queries: [(&str, Vec<(&str, &str)>); 6] = [
+                (
+                    "status=free&_count=2",
+                    vec![("status", "free"), ("_count", "2")],
+                ),
+                (
+                    "status=free&start=ge&_count=3",
+                    vec![("status", "free"), ("start", &from), ("_count", "3")],
+                ),
+                (
+                    "status=free&start=ge&_sort=start&_count=3",
+                    vec![
+                        ("status", "free"),
+                        ("start", &from),
+                        ("_sort", "start"),
+                        ("_count", "3"),
+                    ],
+                ),
+                (
+                    "status=free&_sort=start&_count=3",
+                    vec![("status", "free"), ("_sort", "start"), ("_count", "3")],
+                ),
+                (
+                    "status=free&schedule.actor=h1&_sort=start&_count=3",
+                    vec![
+                        ("status", "free"),
+                        ("schedule.actor", "HealthcareService/h1"),
+                        ("_sort", "start"),
+                        ("_count", "3"),
+                    ],
+                ),
+                ("status=free", vec![("status", "free")]),
+            ];
+            for (label, query) in queries {
+                let (_, work, _) = search(&seeded.harness, &query);
+                eprintln!(
+                    "{label:<55} {:>9.2?}  {work:?}",
+                    fastest(&seeded.harness, &query)
+                );
+            }
+        }
     }
 }
