@@ -68,16 +68,18 @@ impl JobStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    // The pick is a CTE that must run once (`MATERIALIZED`). As `WHERE id IN
-                    // (SELECT ... LIMIT n FOR UPDATE SKIP LOCKED)` the planner may run it again for
-                    // each row of the update (it does, for the statement as the driver sends it,
-                    // with the limit as a parameter): the rows the update has locked are skipped,
-                    // so each run picks others, and more than `n` jobs are claimed.
+                    // The pick is a CTE that must run once. As `WHERE id IN (SELECT ... LIMIT n FOR
+                    // UPDATE SKIP LOCKED)` the planner may run it again for each row of the update
+                    // (it does, for the statement as the driver sends it, with the limit as a
+                    // parameter): the rows the update has locked are skipped, so each run picks
+                    // others, and more than `n` jobs are claimed. A CTE that locks rows is never
+                    // inlined into the statement that uses it, on any Postgres version, so it runs
+                    // once. (No `MATERIALIZED`, which would need Postgres 12.)
                     //
                     // The tenant is in the pick and in the update: a claim that reached another
                     // tenant's jobs would run its export against this tenant's data.
                     &format!(
-                        "WITH picked AS MATERIALIZED (SELECT id AS picked_id FROM jobs \
+                        "WITH picked AS (SELECT id AS picked_id FROM jobs \
                              WHERE {scoped}status IN ('accepted', 'running') AND kind = ANY($3) \
                                AND (lease_owner IS NULL OR lease_until <= $4) \
                              ORDER BY created_at, id LIMIT $5 FOR UPDATE SKIP LOCKED) \

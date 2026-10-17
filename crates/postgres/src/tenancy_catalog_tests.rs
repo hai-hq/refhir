@@ -6,6 +6,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use refhir_persistence::{
     ConformanceStore, ExpansionChange, InstallError, InstallOutcome, NewExpansion, NewPackage,
@@ -776,4 +777,72 @@ fn a_tenant_does_not_read_another_tenants_snapshot_of_a_job() {
         ["ready", "ready", "ready"]
     );
     assert_eq!(digests(&url, "b"), before);
+}
+
+#[test]
+fn a_tenant_waits_for_as_long_as_another_tenant_builds_the_package() {
+    let Some(admin) = test_url("shared catalog slow build") else {
+        return;
+    };
+    let url = shared(&admin, "tcatwait", &["a", "b"]);
+    let package = Arc::new(demo("slow", "4.0.1"));
+    let (a, b) = (open(&url, "a"), open(&url, "b"));
+    let building = Arc::new(Barrier::new(2));
+    let builder = {
+        let (package, building) = (package.clone(), building.clone());
+        std::thread::spawn(move || {
+            a.install_shared_package_in_pieces(
+                &package.name,
+                &package.version,
+                &package.fhir_version,
+                "sha-slow",
+                &mut |rows| {
+                    // The build is under way and holds the package's lock for a while.
+                    building.wait();
+                    std::thread::sleep(Duration::from_millis(1500));
+                    rows.structure_definitions(&package.structure_definitions)?;
+                    rows.search_parameters(&package.search_parameters)?;
+                    rows.terminology(&package.terminology)?;
+                    rows.expansions(&package.expansions)?;
+                    Ok(())
+                },
+            )
+            .unwrap()
+        })
+    };
+    building.wait();
+    let started = Instant::now();
+    let (outcome, reads) = install(&b, &package, "sha-slow").unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "tenant b did not wait for the build ({:?})",
+        started.elapsed()
+    );
+    assert_eq!(reads, 0, "tenant b read the package instead of waiting");
+    assert_eq!(builder.join().unwrap().package_id, outcome.package_id);
+}
+
+#[test]
+fn a_shared_copy_that_lost_rows_is_not_given_to_another_tenant() {
+    let Some(admin) = test_url("shared catalog damage") else {
+        return;
+    };
+    let url = shared(&admin, "tcatdamage", &["a", "b"]);
+    let (a, b) = (open(&url, "a"), open(&url, "b"));
+    let package = demo("damaged", "4.0.1");
+    install(&a, &package, "sha-d").unwrap();
+    // Something removes a definition from the shared copy (as an administrator, saying it is the
+    // installer: the guard that keeps a tenant's process from doing it does not bind this).
+    client(&url)
+        .batch_execute(
+            "SET refhir.shared_writer = 'on'; \
+             DELETE FROM structure_definitions WHERE instance_id = 0 AND url LIKE '%/sd/1'",
+        )
+        .unwrap();
+    let refused = format!("{:?}", install(&b, &package, "sha-d").expect_err("refused"));
+    assert!(refused.contains("is damaged"), "{refused}");
+    assert!(
+        b.load_packages().unwrap().is_empty(),
+        "tenant b was given a damaged package"
+    );
 }

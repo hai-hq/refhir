@@ -31,13 +31,9 @@ fn lock_chain(tx: &mut postgres::Transaction<'_>, scope: Scope) -> Result<(), Pe
 /// A filter's ` WHERE`, with the tenant's condition in front of it (or alone when the filter has
 /// none).
 fn filtered(scope: Scope, clause: &Where) -> String {
-    let rest = clause.sql(true, 1);
-    match (scope, rest.strip_prefix(" WHERE ")) {
-        (Scope::Classic, _) => rest,
-        (Scope::Tenant(id), None) => format!(" WHERE instance_id = {id}"),
-        (Scope::Tenant(id), Some(conditions)) => {
-            format!(" WHERE instance_id = {id} AND {conditions}")
-        }
+    match scope {
+        Scope::Classic => clause.sql(true, 1),
+        Scope::Tenant(id) => clause.sql_led_by(true, 1, &format!("instance_id = {id}")),
     }
 }
 

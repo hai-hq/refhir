@@ -61,9 +61,13 @@ CREATE TABLE packages (
     name TEXT NOT NULL,
     version TEXT NOT NULL,
     fhir_version TEXT NOT NULL,
-    -- For a shared package: a digest of the source it was made from. A tenant is given the shared
-    -- copy only when it asks for the same source.
+    -- For a shared package: a digest of the source it was made from and the format it was prepared
+    -- in. A tenant is given the shared copy only when it asks for the same.
     digest TEXT,
+    -- For a shared package: how many definitions, terminology resources, search parameters and
+    -- expansions it was built with, as `d,t,p,e`. A tenant is given the copy only while it still
+    -- holds exactly that many.
+    row_counts TEXT,
     UNIQUE (instance_id, name, version)
 );
 -- The packages a tenant has, in the order it got them. The order matters: the catalog settles a

@@ -23,6 +23,12 @@ pub(crate) enum Scope {
 }
 
 impl Scope {
+    /// The shared catalog's rows: instance 0, which only the installer that builds a shared package
+    /// writes. It is not a tenant a process can serve (the registry never hands out 0), so it is
+    /// passed only to the statements that insert the catalog's rows, and never to one that looks
+    /// a tenant up, links a package to it, or names its channel.
+    pub(crate) const CATALOG: Scope = Scope::Tenant(0);
+
     /// For the front of a column list: `instance_id, `.
     pub(crate) fn cols(self) -> String {
         match self {
@@ -123,6 +129,13 @@ mod tests {
             "(instance_id, ts, table_id, id)"
         );
         assert_eq!(scope.channel(), "refhir_published_7");
+    }
+
+    #[test]
+    fn the_catalog_is_instance_zero() {
+        assert_eq!(Scope::CATALOG.cols(), "instance_id, ");
+        assert_eq!(Scope::CATALOG.vals(), "0, ");
+        assert_eq!(Scope::CATALOG.and(), "instance_id = 0 AND ");
     }
 
     #[test]

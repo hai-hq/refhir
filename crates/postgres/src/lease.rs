@@ -202,23 +202,19 @@ pub(crate) fn check_epoch(
     }
 }
 
-/// Whether some process holds tenant `id`'s writer lease. Takes the lock for an instant to ask, and
-/// gives it back at once, so it only reads as "held" while a primary has it.
+/// Whether some process holds tenant `id`'s writer lease. It reads the lock table and takes
+/// nothing, so asking cannot make a primary that is starting at that moment find the lease busy
+/// (a `try_lock` and release would, for the instant it held it).
 pub(crate) fn is_held(client: &mut impl GenericClient, id: i32) -> Result<bool, PersistError> {
-    let free: bool = client
+    // A two-part advisory lock shows as `classid`, `objid` and `objsubid = 2`.
+    let held: bool = client
         .query_one(
-            "SELECT pg_try_advisory_lock($1, $2)",
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND granted \
+             AND objsubid = 2 AND classid = $1::int4::oid AND objid = $2::int4::oid \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))",
             &[&LEASE_NAMESPACE, &id],
         )
         .map_err(definite)?
         .get(0);
-    if free {
-        client
-            .execute(
-                "SELECT pg_advisory_unlock($1, $2)",
-                &[&LEASE_NAMESPACE, &id],
-            )
-            .map_err(definite)?;
-    }
-    Ok(!free)
+    Ok(held)
 }

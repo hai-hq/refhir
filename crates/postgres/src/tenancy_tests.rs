@@ -25,58 +25,11 @@ pub(crate) fn client(url: &str) -> Client {
     Client::connect(url, NoTls).expect("connect")
 }
 
-/// The role the row-level security tests connect as: not a superuser, no BYPASSRLS, and the owner
-/// of the databases [`shared`] makes, as the application's own role is of its database.
-pub(crate) const APP_ROLE: &str = "refhir_rls_app";
-const APP_PASSWORD: &str = "refhir-rls-app";
-
-/// `url` with the user and password of `user`.
-pub(crate) fn as_role(url: &str, user: &str, password: &str) -> String {
-    if let Some((scheme, rest)) = url.split_once("://") {
-        let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        let host = authority
-            .rsplit_once('@')
-            .map_or(authority, |(_, host)| host);
-        format!("{scheme}://{user}:{password}@{host}/{tail}")
-    } else {
-        let kept: Vec<&str> = url
-            .split_whitespace()
-            .filter(|part| !part.starts_with("user=") && !part.starts_with("password="))
-            .collect();
-        format!("{} user={user} password={password}", kept.join(" "))
-    }
-}
+pub(crate) use crate::test_support::ORDINARY_ROLE as APP_ROLE;
 
 /// `url` as the application's role, which row-level security binds.
 pub(crate) fn app_url(url: &str) -> String {
-    as_role(url, APP_ROLE, APP_PASSWORD)
-}
-
-fn database_name(url: &str) -> String {
-    if let Some((_, rest)) = url.split_once("://") {
-        let path = rest.split_once('/').map_or("", |(_, path)| path);
-        path.split('?').next().unwrap_or("").to_string()
-    } else {
-        url.split_whitespace()
-            .find_map(|part| part.strip_prefix("dbname="))
-            .expect("dbname in the url")
-            .to_string()
-    }
-}
-
-/// Creates the application's role, once per cluster. The test role may need to be created by
-/// several test binaries at once, so a clash is not an error.
-fn ensure_app_role(admin: &str) {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        client(admin)
-            .batch_execute(&format!(
-                "DO $r$ BEGIN \
-                   CREATE ROLE {APP_ROLE} LOGIN PASSWORD '{APP_PASSWORD}' NOSUPERUSER NOBYPASSRLS; \
-                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $r$"
-            ))
-            .expect("create the application role (the test role needs CREATEROLE)");
-    });
+    crate::test_support::as_ordinary_role(url)
 }
 
 /// Whether the suites connect as the application's role instead of the superuser, which is how
@@ -134,12 +87,12 @@ fn refusal(result: Result<PostgresPersistence, PersistError>) -> String {
 /// A new database in the shared layout holding these tenants. The application's role owns it and
 /// made the layout, as it would in a deployment; the URL returned is the administrator's.
 pub(crate) fn shared(admin: &str, tag: &str, tenants: &[&str]) -> String {
-    ensure_app_role(admin);
+    crate::test_support::ensure_ordinary_role(admin);
     let url = fresh_database(admin, tag);
     client(&url)
         .batch_execute(&format!(
             "ALTER DATABASE {} OWNER TO {APP_ROLE}",
-            database_name(&url)
+            crate::test_support::database_name(&url)
         ))
         .expect("give the database to the application's role");
     let operator = app_url(&url);
@@ -1000,7 +953,7 @@ const ADDED_TABLES: &[&str] = &[
 ];
 
 /// A column the shared layout adds to a table the classic one has, besides the tenant column.
-const ADDED_COLUMNS: &[(&str, &str)] = &[("packages", "digest")];
+const ADDED_COLUMNS: &[(&str, &str)] = &[("packages", "digest"), ("packages", "row_counts")];
 
 /// (table, column) -> type, and index name -> its columns in order.
 type Columns = std::collections::BTreeMap<(String, String), String>;

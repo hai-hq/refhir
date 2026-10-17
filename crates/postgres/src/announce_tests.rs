@@ -111,6 +111,14 @@ fn settle(how_long: Duration) {
     std::thread::sleep(how_long);
 }
 
+/// Waits until `listener` has heard `count` announcements, for at most `within`.
+fn hear(listener: &Listener, count: usize, within: Duration) {
+    let deadline = Instant::now() + within;
+    while listener.times().len() < count && Instant::now() < deadline {
+        settle(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn the_first_publish_after_a_quiet_spell_is_announced_at_once() {
     let Some(admin) = test_url("announcements") else {
@@ -279,6 +287,85 @@ fn the_announcement_thread_ends_with_the_persistence() {
         assert!(
             Instant::now() < deadline,
             "the announcement thread still holds the announcer"
+        );
+        settle(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn an_announcement_that_could_not_be_sent_is_sent_when_the_connection_is_back() {
+    let Some(admin) = test_url("announcements") else {
+        return;
+    };
+    let url = fresh_database(&admin, "announce_reconnect");
+    let store = open_classic(&url, Duration::from_millis(50));
+    let listener = Listener::start(&url, "refhir_published");
+    settle(Duration::from_millis(100));
+
+    // A burst, so that the announcer's thread has connected and used its connection.
+    store.advance_published_ts(ts(1)).unwrap();
+    store.advance_published_ts(ts(2)).unwrap();
+    hear(&listener, 2, Duration::from_secs(5));
+    settle(Duration::from_millis(100));
+    assert_eq!(
+        listener.times().len(),
+        2,
+        "a leading and a trailing announcement"
+    );
+
+    // The connection goes away without the thread being told, as a link a NAT forgot would.
+    let ended: i64 = client(&url)
+        .query_one(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> pg_backend_pid() \
+               AND query = 'NOTIFY refhir_published'",
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    assert_eq!(ended, 1, "the announcer's connection");
+    settle(Duration::from_millis(200));
+
+    // The next burst's tail is still announced: the failed send is tried again on a new
+    // connection and not dropped.
+    store.advance_published_ts(ts(3)).unwrap();
+    store.advance_published_ts(ts(4)).unwrap();
+    let published = Instant::now();
+    hear(&listener, 4, Duration::from_secs(5));
+    let heard = listener.times();
+    assert_eq!(
+        heard.len(),
+        4,
+        "the announcement was lost with the connection"
+    );
+    assert!(*heard.last().unwrap() > published);
+    assert_eq!(watermark(&url), 4);
+}
+
+#[test]
+fn an_announcer_that_cannot_connect_keeps_the_announcement_owed_and_stops_with_its_owner() {
+    // Nothing listens on port 1: the thread cannot connect, and must neither lose what is owed
+    // nor outlive the announcer.
+    let announcer = crate::announce::Announcer::new(
+        Duration::from_millis(20),
+        "refhir_published".into(),
+        Arc::from("host=127.0.0.1 port=1 user=nobody dbname=nothing connect_timeout=1"),
+    );
+    announcer.owe();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut owed = false;
+    while !owed && Instant::now() < deadline {
+        owed = announcer.is_owed();
+        settle(Duration::from_millis(5));
+    }
+    assert!(owed, "an announcement that cannot be sent was forgotten");
+    let weak = Arc::downgrade(&announcer);
+    drop(announcer);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while weak.upgrade().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the thread still holds the announcer"
         );
         settle(Duration::from_millis(50));
     }

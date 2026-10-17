@@ -22,6 +22,8 @@ mod lease;
 mod migrate;
 mod scope;
 mod tenant;
+#[doc(hidden)]
+pub mod test_support;
 mod tls;
 
 pub use migrate::migration_report;
@@ -1047,8 +1049,17 @@ fn i64_ts(ts: Timestamp) -> Result<i64, PersistError> {
 /// TLS comes from the `ssl*` parameters of `url` (see [`tls`]); without `sslmode` the
 /// connection is not encrypted.
 pub(crate) fn connect_client(url: &str) -> Result<Client, PersistError> {
+    connect_client_tuned(url, |_| {})
+}
+
+/// [`connect_client`] with `tune` applied to the connection's settings first (keepalives, say).
+pub(crate) fn connect_client_tuned(
+    url: &str,
+    tune: impl FnOnce(&mut postgres::Config),
+) -> Result<Client, PersistError> {
     let (rest, settings) = tls::split(url).map_err(definite)?;
     let mut config: postgres::Config = rest.parse().map_err(definite)?;
+    tune(&mut config);
     // Like libpq, never use TLS over a Unix socket: it is a local, access-controlled channel.
     let local = tls::all_unix_sockets(&config);
     config.ssl_mode(if local {
@@ -1278,21 +1289,7 @@ mod tests {
         admin
             .batch_execute(&format!("CREATE DATABASE {name}"))
             .expect("create database");
-        if admin_url.contains("://") {
-            let (head, tail) = match admin_url.split_once('?') {
-                Some((head, query)) => (head, format!("?{query}")),
-                None => (admin_url, String::new()),
-            };
-            let slash = head.rfind('/').expect("database name in the url");
-            format!("{}/{name}{tail}", &head[..slash])
-        } else {
-            // The `host=... user=...` form: drop any database and name ours.
-            let kept: Vec<&str> = admin_url
-                .split_whitespace()
-                .filter(|part| !part.starts_with("dbname="))
-                .collect();
-            format!("{} dbname={name}", kept.join(" "))
-        }
+        crate::test_support::with_database(admin_url, &name)
     }
 
     fn write_doc(p: &PostgresPersistence, ts: u64, name: &str) -> Result<(), PersistError> {

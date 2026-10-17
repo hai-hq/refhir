@@ -37,23 +37,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// `admin_url` with its database replaced by `name`.
-fn database_url(admin_url: &str, name: &str) -> String {
-    if admin_url.contains("://") {
-        let (head, tail) = match admin_url.split_once('?') {
-            Some((head, query)) => (head, format!("?{query}")),
-            None => (admin_url, String::new()),
-        };
-        let slash = head.rfind('/').expect("database name in the url");
-        format!("{}/{name}{tail}", &head[..slash])
-    } else {
-        let kept: Vec<&str> = admin_url
-            .split_whitespace()
-            .filter(|part| !part.starts_with("dbname="))
-            .collect();
-        format!("{} dbname={name}", kept.join(" "))
-    }
-}
+use refhir_postgres::test_support::with_database as database_url;
 
 fn count(url: &str, sql: &str) -> i64 {
     Client::connect(url, NoTls)

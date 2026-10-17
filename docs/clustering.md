@@ -100,9 +100,10 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
 - **Managing tenants.** `refhir tenant list` shows the tenants and whether a primary of each is
   running. `refhir tenant delete NAME --yes` removes a tenant and everything it holds. It refuses
   while a primary of the tenant runs, and it cannot be undone, so take a backup first.
-- **Connections.** Every process opens its pool, one connection that holds the writer lease and one
-  that listens for the primary's announcements. `max_connections` must cover the processes of every
-  tenant. A proxy that pools connections per transaction (PgBouncer in transaction mode) cannot sit
+- **Connections.** Every process opens its pool. A primary also keeps a connection that holds the
+  writer lease and, for a tenant, another that announces its commits; a replica keeps one that
+  listens for those announcements. `max_connections` must cover all of them for the processes of
+  every tenant. A proxy that pools connections per transaction (PgBouncer in transaction mode) cannot sit
   between ReFHIR and the database: the lease and the announcements belong to a session.
 - **Sizing.** Each tenant adds a writer, so write capacity grows with the number of tenants until
   the Postgres server is the limit: its CPU, its disk, and the one lock a cluster takes to announce

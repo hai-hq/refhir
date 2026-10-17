@@ -346,15 +346,17 @@ impl PreparedBundle {
         &self.names
     }
 
-    /// A digest of what the package `name@version` was made from, when the file says. It
-    /// identifies the package's content: two files that give the same digest for a package were
-    /// made from the same source, so a store may keep one copy for both.
-    pub(crate) fn content_of(&self, name: &str, version: &str) -> Option<&str> {
+    /// A digest of what the package `name@version` was made from and the format it was prepared
+    /// in, when the file says. It identifies the package's content: two files that give the same
+    /// digest for a package were made from the same source in the same format, so a store may
+    /// keep one copy for both. A new format is a new identity, so what a release prepares
+    /// differently is not served from a copy an older release prepared.
+    pub(crate) fn content_of(&self, name: &str, version: &str) -> Option<String> {
         let spec = format!("{name}@{version}");
         self.sources
             .iter()
             .find(|source| source.package == spec)
-            .map(|source| source.sha256.as_str())
+            .map(|source| format!("{}:{FORMAT}", source.sha256))
     }
 
     /// Whether every one of `specs` (`name@version`) is in the file.
@@ -529,9 +531,7 @@ pub fn install_prepared(
             continue;
         }
         staged += 1;
-        let content = bundle
-            .content_of(&head.name, &head.version)
-            .map(String::from);
+        let content = bundle.content_of(&head.name, &head.version);
         // A store that gives the package from a copy it already holds does not ask for its rows.
         let mut read = false;
         let stored = stage_package_in_pieces(
@@ -778,6 +778,14 @@ mod tests {
         assert_eq!(written.sources.len(), 1);
         assert_eq!(written.sources[0].package, "example.pkg@1.0.0");
         assert_eq!(written.sources[0].sha256, "ab".repeat(32));
+        // What a store keeps one copy by: the source and the format it was prepared in, so a
+        // format a later release writes is not served from a copy this one made.
+        let bundle = PreparedBundle::open(&out).unwrap();
+        assert_eq!(
+            bundle.content_of("example.pkg", "1.0.0"),
+            Some(format!("{}:{FORMAT}", "ab".repeat(32)))
+        );
+        assert_eq!(bundle.content_of("example.pkg", "2.0.0"), None);
         let _ = fs::remove_dir_all(scratch);
     }
 }

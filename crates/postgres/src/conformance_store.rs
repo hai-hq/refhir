@@ -48,42 +48,22 @@ impl PackageRows for SharedRows<'_, '_> {
         rows: &[NewStructureDefinition],
     ) -> Result<(), InstallError> {
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        insert_structure_definitions(self.tx, Scope::Tenant(0), self.package_id, rows)
+        insert_structure_definitions(self.tx, Scope::CATALOG, self.package_id, rows)
     }
 
     fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
         self.note(rows.iter().map(|row| row.json.len()).sum());
         for run in runs(rows, |row| row.json.len() + row.url.len()) {
-            let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
-            let bases: Vec<&str> = run.iter().map(|row| row.base.as_str()).collect();
-            let codes: Vec<&str> = run.iter().map(|row| row.code.as_str()).collect();
-            let types: Vec<&str> = run.iter().map(|row| row.param_type.as_str()).collect();
-            let expressions: Vec<Option<&str>> =
-                run.iter().map(|row| row.expression.as_deref()).collect();
-            let statuses: Vec<&str> = run.iter().map(|row| row.status.as_str()).collect();
-            let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
-            self.tx
-                .execute(
-                    "INSERT INTO base_search_parameters \
-                     (package_id, ord, url, base, code, param_type, expression, status, json) \
-                     SELECT $1, $2::bigint + n, url, base, code, param_type, expression, status, json \
-                     FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], \
-                                 $8::text[], $9::text[]) \
-                          WITH ORDINALITY AS rows(url, base, code, param_type, expression, \
-                                                  status, json, n)",
-                    &[
-                        &self.package_id,
-                        &self.next_ord,
-                        &urls,
-                        &bases,
-                        &codes,
-                        &types,
-                        &expressions,
-                        &statuses,
-                        &documents,
-                    ],
-                )
-                .map_err(definite)?;
+            let stored: Vec<(&NewSearchParameter, ParamStatus)> =
+                run.iter().map(|row| (row, row.status)).collect();
+            insert_parameters(
+                self.tx,
+                ParameterTable::Catalog {
+                    first_ord: self.next_ord,
+                },
+                self.package_id,
+                &stored,
+            )?;
             self.next_ord += run.len() as i64;
         }
         Ok(())
@@ -91,24 +71,32 @@ impl PackageRows for SharedRows<'_, '_> {
 
     fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        insert_terminology(self.tx, Scope::Tenant(0), self.package_id, rows)
+        insert_terminology(self.tx, Scope::CATALOG, self.package_id, rows)
     }
 
     fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        for run in runs(rows, |row| row.json.len() + row.url.len()) {
-            let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
-            let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
-            self.tx
-                .execute(
-                    "INSERT INTO base_expansions (package_id, url, json) \
-                     SELECT $1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)",
-                    &[&self.package_id, &urls, &documents],
-                )
-                .map_err(definite)?;
-        }
-        Ok(())
+        // The catalog's copy has no tenant column: nothing leads its columns or values.
+        insert_expansions(self.tx, "base_expansions", "", "", self.package_id, rows)
     }
+}
+
+/// How many definitions, terminology resources, search parameters and expansions the shared copy of
+/// a package holds, as `d,t,p,e`: what is recorded when it is built and checked when a tenant is
+/// given it.
+fn shared_row_counts(tx: &mut Transaction<'_>, package_id: i64) -> Result<String, PersistError> {
+    let row = tx
+        .query_one(
+            "SELECT (SELECT count(*) FROM structure_definitions \
+                     WHERE instance_id = 0 AND package_id = $1)::text || ',' || \
+                    (SELECT count(*) FROM terminology \
+                     WHERE instance_id = 0 AND package_id = $1)::text || ',' || \
+                    (SELECT count(*) FROM base_search_parameters WHERE package_id = $1)::text \
+                    || ',' || (SELECT count(*) FROM base_expansions WHERE package_id = $1)::text",
+            &[&package_id],
+        )
+        .map_err(definite)?;
+    Ok(row.get(0))
 }
 
 /// Gives a tenant a package: it is the tenant's, in the order it got it. `owner` is whose rows hold
@@ -329,9 +317,19 @@ impl PostgresPersistence {
                 Shared::Missing if !fed => {
                     fed = self.build_shared(name, version, fhir_version, content, feed)?;
                 }
-                // The tenant has the package, or the shared copy is made from other content: it is
-                // stored for the tenant alone, as any package is.
-                Shared::Own | Shared::Different if !fed => {
+                // The tenant has the package: it is stored as any package is.
+                Shared::Own if !fed => {
+                    return self.install_package_in_pieces(name, version, fhir_version, feed);
+                }
+                // The shared copy is made from other content: the package is stored for the tenant
+                // alone. Every tenant that lands here stores and reads a full copy of its own, so
+                // it is said.
+                Shared::Different if !fed => {
+                    tracing::warn!(
+                        target: "refhir",
+                        "the shared copy of {name}@{version} was made from other content than \
+                         this tenant's package, so the package is stored for this tenant alone"
+                    );
                     return self.install_package_in_pieces(name, version, fhir_version, feed);
                 }
                 Shared::Own | Shared::Different | Shared::Missing => {
@@ -370,7 +368,7 @@ impl PostgresPersistence {
         }
         let Some(shared) = tx
             .query_opt(
-                "SELECT id, digest FROM packages \
+                "SELECT id, digest, row_counts FROM packages \
                  WHERE instance_id = 0 AND name = $1 AND version = $2",
                 &[&name, &version],
             )
@@ -382,6 +380,17 @@ impl PostgresPersistence {
         let digest: Option<String> = shared.get(1);
         if digest.as_deref() != Some(content) {
             return Ok(Shared::Different);
+        }
+        // The copy is whole: it holds what it was built with. A tenant is not given a package that
+        // is damaged, since every tenant added later would be given it too.
+        let recorded: Option<String> = shared.get(2);
+        let found = shared_row_counts(&mut tx, package_id)?;
+        if recorded.as_deref() != Some(found.as_str()) {
+            return Err(InstallError::Persist(PersistError::Definite(format!(
+                "the shared copy of {name}@{version} is damaged: it was built with {} (definitions, \
+                 terminology, search parameters, expansions) and holds {found}",
+                recorded.as_deref().unwrap_or("no count")
+            ))));
         }
         if let Some(row) = tx
             .query_opt(&sql_first_fhir_version(scope), &[])
@@ -450,13 +459,33 @@ impl PostgresPersistence {
         let mut guard = self.inner.lock()?;
         let mut tx = guard.client.transaction().map_err(definite)?;
         self.fence(&mut tx)?;
-        tx.batch_execute("SET LOCAL lock_timeout = '300s'")
-            .map_err(definite)?;
-        tx.execute(
-            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
-            &[&SHARED_PACKAGE_LOCK, &format!("{name}@{version}")],
-        )
-        .map_err(definite)?;
+        // Waits for as long as another process builds the same package, however long that takes
+        // (a very large one over a slow link may take minutes): the lock is tried, not waited
+        // for, so no lock timeout can end the wait with an error, and it is said now and then.
+        let spec = format!("{name}@{version}");
+        let waiting = std::time::Instant::now();
+        let mut said = std::time::Duration::ZERO;
+        loop {
+            let got: bool = tx
+                .query_one(
+                    "SELECT pg_try_advisory_xact_lock($1, hashtext($2))",
+                    &[&SHARED_PACKAGE_LOCK, &spec],
+                )
+                .map_err(definite)?
+                .get(0);
+            if got {
+                break;
+            }
+            if waiting.elapsed() >= said + std::time::Duration::from_secs(30) {
+                said = waiting.elapsed();
+                tracing::info!(
+                    target: "refhir",
+                    "waiting for another process to build {spec} for the tenants to share ({}s so far)",
+                    said.as_secs()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
         // Decided again under the lock: another process may have just built it.
         let built = tx
             .query_opt(
@@ -486,6 +515,13 @@ impl PostgresPersistence {
         };
         feed(&mut rows)?;
         let heaviest = rows.heaviest;
+        // What the copy holds, so that activation can tell it is still whole.
+        let counts = shared_row_counts(&mut tx, package_id)?;
+        tx.execute(
+            "UPDATE packages SET row_counts = $2 WHERE id = $1",
+            &[&package_id, &counts],
+        )
+        .map_err(definite)?;
         tx.commit().map_err(definite)?;
         retire_if_swollen(&mut guard, heaviest);
         Ok(true)
@@ -1648,7 +1684,11 @@ impl<'a, 'c> Installer<'a, 'c> {
             .map_err(definite)?;
         if let Some(row) = existing {
             let package_id: i64 = row.get(0);
-            let owner: i32 = if row.len() > 1 { row.get(1) } else { 0 };
+            // Whose rows hold the package: a tenant's list says, and a classic database has no list.
+            let owner: i32 = match scope {
+                Scope::Classic => 0,
+                Scope::Tenant(_) => row.get(1),
+            };
             return Ok(Self {
                 tx,
                 scope,
@@ -1770,7 +1810,14 @@ impl PackageRows for Installer<'_, '_> {
     fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
         self.clear_expansions()?;
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        insert_expansions(self.tx, self.scope, self.package_id, rows)
+        insert_expansions(
+            self.tx,
+            "value_set_expansion",
+            &self.scope.cols(),
+            &self.scope.vals(),
+            self.package_id,
+            rows,
+        )
     }
 }
 
@@ -1910,20 +1957,41 @@ fn insert_search_parameters(
             .iter()
             .map(|(at, status)| (&parameters[*at], *status))
             .collect();
-        let urls: Vec<&str> = rows.iter().map(|(row, _)| row.url.as_str()).collect();
-        let bases: Vec<&str> = rows.iter().map(|(row, _)| row.base.as_str()).collect();
-        let codes: Vec<&str> = rows.iter().map(|(row, _)| row.code.as_str()).collect();
-        let types: Vec<&str> = rows
-            .iter()
-            .map(|(row, _)| row.param_type.as_str())
-            .collect();
-        let expressions: Vec<Option<&str>> = rows
-            .iter()
-            .map(|(row, _)| row.expression.as_deref())
-            .collect();
-        let statuses: Vec<&str> = rows.iter().map(|(_, status)| status.as_str()).collect();
-        let documents: Vec<&str> = rows.iter().map(|(row, _)| row.json.as_str()).collect();
-        tx.execute(
+        insert_parameters(tx, ParameterTable::Own(scope), package_id, &rows)?;
+    }
+    Ok(plan.newly_pending)
+}
+
+/// Where a run of search parameters goes: a tenant's (or a classic database's) own table, or the
+/// shared catalog's copy that tenants are given theirs from, which keeps each row's place in the
+/// package (`ord`, counting from `first_ord`) since a package may define one parameter twice.
+enum ParameterTable {
+    Own(Scope),
+    Catalog { first_ord: i64 },
+}
+
+/// Inserts a run of search parameters, each with the status to store it with, as one statement.
+fn insert_parameters(
+    tx: &mut Transaction<'_>,
+    table: ParameterTable,
+    package_id: i64,
+    rows: &[(&NewSearchParameter, ParamStatus)],
+) -> Result<(), PersistError> {
+    let urls: Vec<&str> = rows.iter().map(|(row, _)| row.url.as_str()).collect();
+    let bases: Vec<&str> = rows.iter().map(|(row, _)| row.base.as_str()).collect();
+    let codes: Vec<&str> = rows.iter().map(|(row, _)| row.code.as_str()).collect();
+    let types: Vec<&str> = rows
+        .iter()
+        .map(|(row, _)| row.param_type.as_str())
+        .collect();
+    let expressions: Vec<Option<&str>> = rows
+        .iter()
+        .map(|(row, _)| row.expression.as_deref())
+        .collect();
+    let statuses: Vec<&str> = rows.iter().map(|(_, status)| status.as_str()).collect();
+    let documents: Vec<&str> = rows.iter().map(|(row, _)| row.json.as_str()).collect();
+    match table {
+        ParameterTable::Own(scope) => tx.execute(
             &format!(
                 "INSERT INTO search_parameters \
                  ({}package_id, url, base, code, param_type, expression, status, json) \
@@ -1944,10 +2012,30 @@ fn insert_search_parameters(
                 &statuses,
                 &documents,
             ],
-        )
-        .map_err(definite)?;
+        ),
+        ParameterTable::Catalog { first_ord } => tx.execute(
+            "INSERT INTO base_search_parameters \
+             (package_id, ord, url, base, code, param_type, expression, status, json) \
+             SELECT $1, $2::bigint + n, url, base, code, param_type, expression, status, json \
+             FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[], $7::text[], \
+                         $8::text[], $9::text[]) \
+                  WITH ORDINALITY AS rows(url, base, code, param_type, expression, \
+                                          status, json, n)",
+            &[
+                &package_id,
+                &first_ord,
+                &urls,
+                &bases,
+                &codes,
+                &types,
+                &expressions,
+                &statuses,
+                &documents,
+            ],
+        ),
     }
-    Ok(plan.newly_pending)
+    .map_err(definite)?;
+    Ok(())
 }
 
 fn insert_terminology(
@@ -1978,9 +2066,13 @@ fn insert_terminology(
     Ok(())
 }
 
+/// Inserts expansions into `table`, with `cols` and `vals` (a tenant's `instance_id, ` and its id, or
+/// nothing for a table that has no tenant column) in front of the package id.
 fn insert_expansions(
     tx: &mut Transaction<'_>,
-    scope: Scope,
+    table: &str,
+    cols: &str,
+    vals: &str,
     package_id: i64,
     rows: &[NewExpansion],
 ) -> Result<(), InstallError> {
@@ -1989,10 +2081,8 @@ fn insert_expansions(
         let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         tx.execute(
             &format!(
-                "INSERT INTO value_set_expansion ({}package_id, url, json) \
-                 SELECT {}$1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)",
-                scope.cols(),
-                scope.vals()
+                "INSERT INTO {table} ({cols}package_id, url, json) \
+                 SELECT {vals}$1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)"
             ),
             &[&package_id, &urls, &documents],
         )

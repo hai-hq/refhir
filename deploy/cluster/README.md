@@ -89,4 +89,5 @@ signing key live in the database, so a token issued by one process is accepted b
   database (see [Tenants](../../docs/clustering.md#tenants-on-one-database)). Do not point two
   clusters at the same database unless each serves a tenant of its own.
 - `max_connections` on Postgres must cover `REFHIR_DB_POOL` times the number of processes, plus
-  the one lease connection each writer keeps.
+  the lease connection each writer keeps (and a second one, which announces commits, for each
+  primary of a tenant).

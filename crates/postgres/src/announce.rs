@@ -108,9 +108,35 @@ impl Announcer {
         }
     }
 
+    /// The connection the thread announces on. It idles between announcements, so a link that a
+    /// NAT or a load balancer forgot without a reset must be noticed in about a minute (keepalives)
+    /// and not after the kernel's retransmission timeout, and an announcement that waits long for
+    /// the cluster's announcement lock fails and is tried again.
+    fn connect(&self) -> Result<Client, String> {
+        let mut client = crate::connect_client_tuned(&self.url, |config| {
+            config
+                .keepalives(true)
+                .keepalives_idle(Duration::from_secs(30))
+                .keepalives_interval(Duration::from_secs(10))
+                .keepalives_retries(3)
+                .tcp_user_timeout(Duration::from_secs(30));
+        })
+        .map_err(|err| err.to_string())?;
+        client
+            .batch_execute("SET statement_timeout = '5s'")
+            .map_err(|err| err.to_string())?;
+        Ok(client)
+    }
+
+    /// Whether an announcement is owed and not yet sent.
+    #[cfg(test)]
+    pub(crate) fn is_owed(&self) -> bool {
+        locked(&self.state).owed
+    }
+
     fn send(&self, client: &mut Option<Client>) -> Result<(), String> {
         if client.is_none() {
-            *client = Some(crate::connect_client(&self.url).map_err(|err| err.to_string())?);
+            *client = Some(self.connect()?);
         }
         let connected = client.as_mut().expect("connected above");
         connected
@@ -123,7 +149,10 @@ impl Announcer {
 fn run(announcer: std::sync::Weak<Announcer>) {
     let mut client: Option<Client> = announcer
         .upgrade()
-        .and_then(|announcer| crate::connect_client(&announcer.url).ok());
+        .and_then(|announcer| announcer.connect().ok());
+    // How many sends in a row have failed: the first is said, and so is the end of them, and the
+    // wait before trying again grows, so an outage is not ten log lines a second.
+    let mut failures: u32 = 0;
     loop {
         // Held for one pass only, so the thread never keeps its owner alive for long.
         let Some(announcer) = announcer.upgrade() else {
@@ -159,11 +188,24 @@ fn run(announcer: std::sync::Weak<Announcer>) {
         if !due {
             continue;
         }
-        if let Err(err) = announcer.send(&mut client) {
-            tracing::warn!(target: "refhir", "cannot announce a publish: {err}");
-            client = None;
-            locked(&announcer.state).owed = true;
-            std::thread::sleep(Duration::from_millis(100));
+        match announcer.send(&mut client) {
+            Ok(()) => {
+                if failures > 0 {
+                    tracing::info!(target: "refhir", "announcing publishes again");
+                    failures = 0;
+                }
+            }
+            Err(err) => {
+                if failures == 0 {
+                    tracing::warn!(target: "refhir", "cannot announce a publish: {err}");
+                }
+                failures = failures.saturating_add(1);
+                client = None;
+                locked(&announcer.state).owed = true;
+                // 100 ms, doubling, up to 5 s.
+                let wait = Duration::from_millis(100u64 << (failures - 1).min(6));
+                std::thread::sleep(wait.min(Duration::from_secs(5)));
+            }
         }
     }
 }
