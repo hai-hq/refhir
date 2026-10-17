@@ -84,7 +84,8 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
   The policies bind the owner too. A process that connects as a role the policies do not bind
   works, and logs a warning at start-up that the database is not keeping it to its tenant. Take
   backups as a superuser or a role with `BYPASSRLS`: `pg_dump` run as the ordinary role refuses,
-  because it would not see every tenant's rows.
+  because it would not see every tenant's rows, and `--enable-row-security` would let it run and
+  dump none of them.
 - **SMART.** Each tenant has its own clients, tokens and signing key, so give each tenant its own
   `--public-url`. The tenant's processes share `--smart-dcr-token` and
   `--smart-confidential-secret`, as above.
