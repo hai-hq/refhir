@@ -452,11 +452,16 @@ fn publish_parameters(
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
     let parameters = store.load_search_parameters()?;
-    let compiled = catalog
-        .read()
-        .expect("catalog")
-        .compiled_parameters(&parameters);
-    let stable = {
+    let stable = if catalog.read().expect("catalog").rebuild_in_place() {
+        // Nothing is answering, so the old parameters need not stay while the new are built.
+        let mut current = catalog.write().expect("catalog");
+        current.recompile_parameters(&parameters);
+        !current.has_pending_parameters()
+    } else {
+        let compiled = catalog
+            .read()
+            .expect("catalog")
+            .compiled_parameters(&parameters);
         let mut current = catalog.write().expect("catalog");
         current.set_parameters(compiled);
         !current.has_pending_parameters()

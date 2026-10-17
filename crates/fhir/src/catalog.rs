@@ -259,6 +259,17 @@ impl Catalog {
         }
     }
 
+    /// [`Self::compiled_parameters`] and [`Self::set_parameters`] in one step, for a catalog
+    /// nothing is answering from: the parameters it has are let go before the new ones are built,
+    /// so the two sets are not held at once. That is a server that is starting; see
+    /// [`Self::rebuild_in_place`].
+    pub fn recompile_parameters(&mut self, parameters: &[StoredSearchParameter]) {
+        for model in self.types.values_mut() {
+            model.params = Vec::new();
+        }
+        add_parameters(&mut self.types, parameters);
+    }
+
     pub fn empty() -> Self {
         Self {
             fhir_version: None,

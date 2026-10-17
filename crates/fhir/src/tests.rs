@@ -2126,6 +2126,39 @@ fn label_parameter(expression: &str) -> Value {
     })
 }
 
+/// What a catalog says about its search parameters: a line for each parameter of each type, with
+/// its name, kind and status.
+fn parameter_summary(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .resource_models()
+        .flat_map(|model| {
+            model.params.iter().map(|param| {
+                format!(
+                    "{}.{} {:?} {:?}",
+                    model.name, param.name, param.kind, param.status
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn compiling_the_parameters_in_place_gives_what_compiling_them_beside_the_catalog_gives() {
+    let harness = ready();
+    let parameters = harness.store.load_search_parameters().unwrap();
+    assert!(!parameters.is_empty());
+    let mut beside = harness.catalog.read().unwrap().clone();
+    let compiled = beside.compiled_parameters(&parameters);
+    beside.set_parameters(compiled);
+    let mut in_place = harness.catalog.read().unwrap().clone();
+    in_place.recompile_parameters(&parameters);
+    assert_eq!(parameter_summary(&in_place), parameter_summary(&beside));
+    assert_eq!(
+        parameter_summary(&in_place),
+        parameter_summary(&harness.catalog.read().unwrap())
+    );
+}
+
 #[test]
 fn user_search_parameter_reindexes_when_the_expression_changes() {
     let harness = ready();
