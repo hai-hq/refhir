@@ -88,5 +88,9 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
   that listens for the primary's announcements. `max_connections` must cover the processes of every
   tenant. A proxy that pools connections per transaction (PgBouncer in transaction mode) cannot sit
   between ReFHIR and the database: the lease and the announcements belong to a session.
+- **Sizing.** Each tenant adds a writer, so write capacity grows with the number of tenants until
+  the Postgres server is the limit: its CPU, its disk, and the one lock a cluster takes to announce
+  commits to listeners, which is shared by every database in it. Size the server for all its
+  tenants together, and give some tenants a cluster of their own when it is full.
 - **Upgrades.** The schema is shared, so it is migrated once for every tenant: run the same release
   in every tenant's processes (see [Schema migrations](migrations.md)).
