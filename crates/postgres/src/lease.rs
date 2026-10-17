@@ -64,7 +64,7 @@ impl LeaseState {
         // A `Conn`, so that giving it up (when another process holds the lease) closes it on a
         // thread of its own: dropping a bare `Client` blocks on a runtime, which a thread that
         // belongs to another runtime may not do.
-        let mut client = Conn::new(crate::connect_client(url)?);
+        let mut client = Conn::new(crate::connect_client_for(url, self.scope)?);
         let got: bool = match self.scope {
             Scope::Classic => client.query_one("SELECT pg_try_advisory_lock($1)", &[&LEASE_KEY]),
             Scope::Tenant(id) => client.query_one(

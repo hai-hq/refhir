@@ -16,7 +16,7 @@ use crate::tenancy_tests::{client, digests, open, shared};
 use crate::tests::test_url;
 use crate::{delete_tenant, PostgresPersistence};
 
-fn demo(name: &str, fhir_version: &str) -> NewPackage {
+pub(crate) fn demo(name: &str, fhir_version: &str) -> NewPackage {
     NewPackage {
         name: name.to_string(),
         version: "1.0.0".into(),
@@ -64,7 +64,7 @@ fn demo(name: &str, fhir_version: &str) -> NewPackage {
 
 /// Installs `package` for the tenant as a package that `content` identifies, and says how many
 /// times the store asked for the package to be read.
-fn install(
+pub(crate) fn install(
     store: &PostgresPersistence,
     package: &NewPackage,
     content: &str,
@@ -492,7 +492,7 @@ fn deleting_a_tenant_leaves_the_shared_catalog_and_the_other_tenants() {
     a.release_writer_lease();
     drop(a);
 
-    delete_tenant(&url, "a").expect("delete tenant a");
+    delete_tenant(&crate::tenancy_tests::operator_url(&url), "a").expect("delete tenant a");
 
     assert_eq!(
         count(&url, "SELECT count(*) FROM packages WHERE instance_id = 0"),

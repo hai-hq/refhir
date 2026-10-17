@@ -74,6 +74,11 @@ service, and sets `REFHIR_REQUIRE_POSTGRES=1` so that a missing database fails t
   `CREATE DATABASE`. The tests include `crates/refhir/tests/cluster.rs`, which starts real
   primary, standby and replica processes and kills the primary while writes are in flight. The
   lease tests make a database of their own each, so they do not disturb each other.
+  The tenancy tests make an ordinary role, `refhir_rls_app` (so the test role needs `CREATEROLE`),
+  and give it the databases they create. They run as the superuser by default, which row-level
+  security does not bind, so a statement that forgot its tenant fails them. Run them again with
+  `REFHIR_TEST_ROW_SECURITY=1 cargo test -p refhir-postgres tenancy` to run as the ordinary role,
+  which checks that everything the stores do works with the policies applied. CI runs both.
 - **Postgres over TLS.** `out="$(scripts/postgres-tls-test.sh up)" && eval "$out"` starts a
   throwaway TLS-only Postgres (a container named `refhir-tls-pg-test`) and exports the two
   variables the tests read. Then run `cargo test -p refhir-postgres tls`, and finish with
@@ -119,6 +124,13 @@ column and the short list of tables and columns the shared layout adds (`ADDED_T
 or writes a tenant's rows takes `Scope` (`scope.rs`) and names the tenant in every table it
 touches, and a new one needs a case in the `tenancy_*` tests that runs it beside another tenant
 holding the same keys.
+
+Row-level security is the shared stream's third migration: every table that holds tenants' rows
+(a column `instance_id`) needs `ENABLE` and `FORCE ROW LEVEL SECURITY` and a policy in the
+migration that adds it, and a test lists the tables that lack one. The policies read the tenant a
+connection serves from `refhir.tenant`, which every connection that touches tenant rows sets as it
+connects (`connect_client_for`). A migration that reads or rewrites tenant rows therefore runs
+with no tenant and sees none: it sets `refhir.tenant` for each tenant in turn.
 
 ## Regenerating fixtures
 

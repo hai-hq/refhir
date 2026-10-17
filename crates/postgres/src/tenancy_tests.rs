@@ -25,7 +25,92 @@ pub(crate) fn client(url: &str) -> Client {
     Client::connect(url, NoTls).expect("connect")
 }
 
+/// The role the row-level security tests connect as: not a superuser, no BYPASSRLS, and the owner
+/// of the databases [`shared`] makes, as the application's own role is of its database.
+pub(crate) const APP_ROLE: &str = "refhir_rls_app";
+const APP_PASSWORD: &str = "refhir-rls-app";
+
+/// `url` with the user and password of `user`.
+pub(crate) fn as_role(url: &str, user: &str, password: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        format!("{scheme}://{user}:{password}@{host}/{tail}")
+    } else {
+        let kept: Vec<&str> = url
+            .split_whitespace()
+            .filter(|part| !part.starts_with("user=") && !part.starts_with("password="))
+            .collect();
+        format!("{} user={user} password={password}", kept.join(" "))
+    }
+}
+
+/// `url` as the application's role, which row-level security binds.
+pub(crate) fn app_url(url: &str) -> String {
+    as_role(url, APP_ROLE, APP_PASSWORD)
+}
+
+fn database_name(url: &str) -> String {
+    if let Some((_, rest)) = url.split_once("://") {
+        let path = rest.split_once('/').map_or("", |(_, path)| path);
+        path.split('?').next().unwrap_or("").to_string()
+    } else {
+        url.split_whitespace()
+            .find_map(|part| part.strip_prefix("dbname="))
+            .expect("dbname in the url")
+            .to_string()
+    }
+}
+
+/// Creates the application's role, once per cluster. The test role may need to be created by
+/// several test binaries at once, so a clash is not an error.
+fn ensure_app_role(admin: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        client(admin)
+            .batch_execute(&format!(
+                "DO $r$ BEGIN \
+                   CREATE ROLE {APP_ROLE} LOGIN PASSWORD '{APP_PASSWORD}' NOSUPERUSER NOBYPASSRLS; \
+                 EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $r$"
+            ))
+            .expect("create the application role (the test role needs CREATEROLE)");
+    });
+}
+
+/// Whether the suites connect as the application's role instead of the superuser, which is how
+/// they check that everything the stores do works with row-level security applied:
+/// `REFHIR_TEST_ROW_SECURITY=1`. As the superuser, which row-level security does not bind, they
+/// check that the statements keep to their tenant on their own.
+pub(crate) fn restricted() -> bool {
+    std::env::var("REFHIR_TEST_ROW_SECURITY").is_ok()
+}
+
+/// What the tenant commands (`create`, `delete`) connect as in a test: the application's role in a
+/// restricted run, and the URL as it is otherwise.
+pub(crate) fn operator_url(url: &str) -> String {
+    if restricted() {
+        app_url(url)
+    } else {
+        url.to_string()
+    }
+}
+
 pub(crate) fn open(url: &str, tenant: &str) -> PostgresPersistence {
+    if restricted() {
+        open_restricted(url, tenant)
+    } else {
+        open_as(url, tenant)
+    }
+}
+
+/// A tenant opened as the application's role whatever the run.
+pub(crate) fn open_restricted(url: &str, tenant: &str) -> PostgresPersistence {
+    open_as(&app_url(url), tenant)
+}
+
+fn open_as(url: &str, tenant: &str) -> PostgresPersistence {
     PostgresPersistence::connect_with(
         url,
         &ConnectOptions {
@@ -46,11 +131,20 @@ fn refusal(result: Result<PostgresPersistence, PersistError>) -> String {
     }
 }
 
-/// A new database in the shared layout holding these tenants.
+/// A new database in the shared layout holding these tenants. The application's role owns it and
+/// made the layout, as it would in a deployment; the URL returned is the administrator's.
 pub(crate) fn shared(admin: &str, tag: &str, tenants: &[&str]) -> String {
+    ensure_app_role(admin);
     let url = fresh_database(admin, tag);
+    client(&url)
+        .batch_execute(&format!(
+            "ALTER DATABASE {} OWNER TO {APP_ROLE}",
+            database_name(&url)
+        ))
+        .expect("give the database to the application's role");
+    let operator = app_url(&url);
     for name in tenants {
-        create_tenant(&url, name).unwrap_or_else(|err| panic!("create {name}: {err}"));
+        create_tenant(&operator, name).unwrap_or_else(|err| panic!("create {name}: {err}"));
     }
     url
 }
@@ -134,7 +228,7 @@ fn poison_with(url: &str, tenant: &str, exact: bool) {
     c.batch_execute(
         r#"
 CREATE TABLE IF NOT EXISTS twin_log (tbl text NOT NULL, row jsonb NOT NULL);
-CREATE OR REPLACE FUNCTION make_twin() RETURNS trigger LANGUAGE plpgsql AS $f$
+CREATE OR REPLACE FUNCTION make_twin() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$
 DECLARE
     poisoned int := TG_ARGV[0]::int;
     exact boolean := TG_ARGV[1] = 'exact';
@@ -455,12 +549,14 @@ fn deleting_a_tenant_removes_its_rows_and_only_its_rows() {
 
     // While a primary of the tenant runs, it is refused and nothing is removed.
     a.try_acquire_writer_lease().unwrap();
-    let error = delete_tenant(&url, "a").unwrap_err().to_string();
+    let error = delete_tenant(&operator_url(&url), "a")
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("primary running"), "{error}");
     assert!(rows_of(&url, "a", "documents") > 0);
     a.release_writer_lease();
     let removed = (0..100)
-        .find_map(|_| match delete_tenant(&url, "a") {
+        .find_map(|_| match delete_tenant(&operator_url(&url), "a") {
             Ok(removed) => Some(removed),
             Err(_) => {
                 std::thread::sleep(Duration::from_millis(100));
@@ -502,9 +598,9 @@ fn deleting_a_tenant_removes_its_rows_and_only_its_rows() {
     assert!(error.contains("does not exist"), "{error}");
 
     // More than one batch, and the registry row goes with it; the name can be used again.
-    assert!(delete_tenant(&url, "big").unwrap() >= 25_000);
+    assert!(delete_tenant(&operator_url(&url), "big").unwrap() >= 25_000);
     assert_eq!(rows_of_id(&url, big, "documents"), 0);
-    create_tenant(&url, "big").expect("a deleted tenant's name is free again");
+    create_tenant(&operator_url(&url), "big").expect("a deleted tenant's name is free again");
 
     assert!(delete_tenant(&url, "ghost").is_err());
     let classic = fresh_database(&admin, "tdeletec");
@@ -869,13 +965,27 @@ fn the_hot_queries_read_an_index_range_not_the_table_with_many_tenants() {
             plan_args("text", "'max_repeatable_ts'"),
         ),
     ];
+    // As the administrator, and as the application's role with row-level security applying, whose
+    // policy adds a condition to every scan: the plans must stay index ranges of the tenant.
+    let mut restricted = client(&app_url(&url));
+    restricted
+        .batch_execute(&format!(
+            "SELECT set_config('refhir.tenant', '{}', false)",
+            tenant_id(&url, "t07")
+        ))
+        .unwrap();
     for (name, sql, (types, args)) in cases {
-        let text = plan(&mut c, &sql, types, &args);
-        assert!(
-            !text.contains("Seq Scan on documents") && !text.contains("Seq Scan on indexes"),
-            "{name} scans a whole table:\n{text}"
-        );
-        assert!(text.contains("Index"), "{name} uses no index:\n{text}");
+        for (who, conn) in [("administrator", &mut c), ("application", &mut restricted)] {
+            let text = plan(conn, &sql, types, &args);
+            assert!(
+                !text.contains("Seq Scan on documents") && !text.contains("Seq Scan on indexes"),
+                "{name} scans a whole table for the {who}:\n{text}"
+            );
+            assert!(
+                text.contains("Index"),
+                "{name} uses no index for the {who}:\n{text}"
+            );
+        }
     }
 }
 

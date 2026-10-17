@@ -214,3 +214,43 @@ pub fn with_database(admin: &str, name: &str) -> String {
         format!("{} dbname={name}", kept.join(" "))
     }
 }
+
+/// `url` with another user and password. Handles `postgres://...` URLs and the key/value form.
+pub fn with_role(url: &str, user: &str, password: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let (authority, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        format!("{scheme}://{user}:{password}@{host}/{tail}")
+    } else {
+        let kept: Vec<&str> = url
+            .split_whitespace()
+            .filter(|part| !part.starts_with("user=") && !part.starts_with("password="))
+            .collect();
+        format!("{} user={user} password={password}", kept.join(" "))
+    }
+}
+
+/// A database owned by a role that is not a superuser, as the application's own role is of its
+/// database, and the URL to connect to it as that role. Row-level security binds that role.
+pub fn database_of_an_ordinary_role(admin: &str, tag: &str) -> (TestDatabase, String) {
+    postgres::Client::connect(admin, postgres::NoTls)
+        .expect("admin connection")
+        .batch_execute(
+            "DO $r$ BEGIN \
+               CREATE ROLE refhir_rls_app LOGIN PASSWORD 'refhir-rls-app' NOSUPERUSER NOBYPASSRLS; \
+             EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $r$",
+        )
+        .expect("create the application role (the test role needs CREATEROLE)");
+    let database = fresh_database(admin, tag);
+    postgres::Client::connect(&database.url, postgres::NoTls)
+        .expect("connect")
+        .batch_execute(&format!(
+            "ALTER DATABASE {} OWNER TO refhir_rls_app",
+            database.name
+        ))
+        .expect("give the database to the application's role");
+    let url = with_role(&database.url, "refhir_rls_app", "refhir-rls-app");
+    (database, url)
+}

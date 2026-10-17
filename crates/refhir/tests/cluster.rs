@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 mod common;
-use common::{admin_url, free_port, fresh_database};
+use common::{admin_url, database_of_an_ordinary_role, free_port, fresh_database};
 
 /// A directory with the resource types a user needs to author conformance resources.
 fn types_package() -> PathBuf {
@@ -982,6 +982,116 @@ fn tenants_share_a_database_and_each_has_its_own_primary_and_replica() {
     acme.kill();
     assert!(put_patient(&beta.base(), "after").unwrap().status < 300);
     assert_eq!(beta.health().unwrap().0, 200);
+}
+
+#[test]
+fn a_tenant_runs_as_a_role_that_row_security_binds_and_a_superuser_is_told_it_does_not() {
+    let Some(admin) = admin_url("cluster: row-level security") else {
+        return;
+    };
+    // The database belongs to an ordinary role, which made the layout and runs the processes.
+    let (database, app) = database_of_an_ordinary_role(&admin, "tenantsrls");
+    for name in ["acme", "beta", "gamma"] {
+        let (code, said) = tenant_command(&app, &["create", name]);
+        assert_eq!(code, 0, "{said}");
+    }
+    let mut acme = Node::start("rls-acme", &app, &["--tenant", "acme"]);
+    let mut beta = Node::start("rls-beta", &app, &["--tenant", "beta"]);
+    acme.wait_ready(60);
+    beta.wait_ready(60);
+    assert!(put_patient(&acme.base(), "p1").unwrap().status < 300);
+    assert_eq!(get_patient(&beta.base(), "p1", None).unwrap().status, 404);
+    assert!(put_patient(&beta.base(), "p1").unwrap().status < 300);
+    assert_eq!(get_patient(&acme.base(), "p1", None).unwrap().status, 200);
+
+    // A replica, which has its own connections and listens for the primary, works the same way.
+    let mut replica = Node::start(
+        "rls-replica",
+        &app,
+        &[
+            "--tenant",
+            "acme",
+            "--role",
+            "replica",
+            "--primary-url",
+            &acme.base(),
+        ],
+    );
+    replica.wait_ready(60);
+    let written = put_patient(&replica.base(), "via-replica").unwrap();
+    assert!(written.status < 300, "{}", written.body);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let read = get_patient(&replica.base(), "via-replica", None).unwrap();
+        if (read.status, read.role.as_str()) == (200, "replica") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the replica never caught up");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // The role is bound: said nothing, and there was nothing to say.
+    for node in [&acme, &beta, &replica] {
+        assert!(
+            !node.log().contains("row-level security"),
+            "{} warned:\n{}",
+            node.name,
+            node.log()
+        );
+    }
+    // And the database really does keep a connection to its tenant: this one serves acme, asks
+    // for every document, and gets acme's.
+    let mut raw = postgres::Client::connect(&app, postgres::NoTls).unwrap();
+    let tenants: Vec<(String, i32)> = postgres::Client::connect(&database.url, postgres::NoTls)
+        .unwrap()
+        .query("SELECT name, id FROM refhir_tenants WHERE id > 0", &[])
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    let id = |name: &str| tenants.iter().find(|(n, _)| n == name).unwrap().1;
+    let everything = "SELECT count(*) FROM documents";
+    let nobody: i64 = raw.query_one(everything, &[]).unwrap().get(0);
+    assert_eq!(
+        nobody, 0,
+        "a connection that serves no tenant saw documents"
+    );
+    raw.batch_execute(&format!(
+        "SELECT set_config('refhir.tenant', '{}', false)",
+        id("acme")
+    ))
+    .unwrap();
+    let seen: i64 = raw.query_one(everything, &[]).unwrap().get(0);
+    let held: i64 = postgres::Client::connect(&database.url, postgres::NoTls)
+        .unwrap()
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM documents WHERE instance_id = {}",
+                id("acme")
+            ),
+            &[],
+        )
+        .unwrap()
+        .get(0);
+    let all: i64 = postgres::Client::connect(&database.url, postgres::NoTls)
+        .unwrap()
+        .query_one(everything, &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        held > 0 && seen == held && all > held,
+        "{seen} {held} {all}"
+    );
+
+    // A process that connects as a superuser works, and says that the database is not helping.
+    let mut gamma = Node::start("rls-gamma", &database.url, &["--tenant", "gamma"]);
+    gamma.wait_ready(60);
+    assert!(put_patient(&gamma.base(), "p1").unwrap().status < 300);
+    let log = gamma.log();
+    assert!(
+        log.contains("bypasses row-level security"),
+        "no warning for a superuser:\n{log}"
+    );
 }
 
 #[test]

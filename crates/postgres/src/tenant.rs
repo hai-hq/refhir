@@ -234,6 +234,9 @@ pub fn delete_tenant(url: &str, name: &str) -> Result<u64, PersistError> {
         }
         let id = tenant_id(&mut client, name)?
             .ok_or_else(|| definite(format!("no tenant `{name}` in this database")))?;
+        // Row-level security shows a connection only the rows of the tenant it serves, and these
+        // are the rows to remove.
+        crate::set_tenant(&mut client, crate::Scope::Tenant(id))?;
         let got: bool = client
             .query_one(
                 "SELECT pg_try_advisory_lock($1, $2)",

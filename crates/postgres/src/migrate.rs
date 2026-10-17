@@ -37,6 +37,11 @@ pub(crate) static SHARED_MIGRATIONS: &[Migration] = &[
         name: "governance",
         sql: include_str!("../migrations-shared/0002_governance.sql"),
     },
+    Migration {
+        version: 3,
+        name: "row_security",
+        sql: include_str!("../migrations-shared/0003_row_security.sql"),
+    },
 ];
 
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (

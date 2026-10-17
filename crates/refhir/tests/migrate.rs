@@ -317,7 +317,7 @@ fn status_says_when_a_postgres_database_is_shared_by_tenants() {
     assert!(shared.status.success(), "{}", stderr(&shared));
     let said = stdout(&shared);
     assert!(said.contains("layout: shared by tenants"), "{said}");
-    assert!(said.contains("up to date at version 2"), "{said}");
+    assert!(said.contains("up to date at version 3"), "{said}");
 
     // A database made without tenants says nothing of the kind.
     let plain = common::fresh_database(&admin, "migrateplain");

@@ -144,6 +144,10 @@ pub struct PostgresPersistence {
     scope: Scope,
     /// Decides which publishes are announced to listening replicas, and announces the rest.
     announcer: Arc<announce::Announcer>,
+    /// Whether the database's row-level security binds this process's role, so that it cannot see
+    /// another tenant's rows whatever it asks. False for the classic layout, and for a role that
+    /// bypasses row-level security (a superuser, or one with BYPASSRLS).
+    row_security: bool,
 }
 
 impl PostgresPersistence {
@@ -155,6 +159,8 @@ impl PostgresPersistence {
         off_runtime(|| {
             let mut client = Conn::new(connect_client(url)?);
             let scope = open_layout(&mut client, options)?;
+            set_tenant(&mut client, scope)?;
+            let row_security = check_row_security(&mut client, scope);
             let owned: Arc<str> = Arc::from(url);
             let factory_url = owned.clone();
             let interval = options.announce_interval.unwrap_or(match scope {
@@ -166,7 +172,7 @@ impl PostgresPersistence {
                 options.pool_size,
                 vec![Inner { client }],
                 move || {
-                    connect_client(&factory_url).map(|client| Inner {
+                    connect_client_for(&factory_url, scope).map(|client| Inner {
                         client: Conn::new(client),
                     })
                 },
@@ -180,6 +186,7 @@ impl PostgresPersistence {
                 url: owned,
                 scope,
                 announcer,
+                row_security,
             })
         })
     }
@@ -235,6 +242,12 @@ fn open_layout(client: &mut Conn, options: &ConnectOptions) -> Result<Scope, Per
 }
 
 impl PostgresPersistence {
+    /// Whether the database itself keeps this process to its own tenant's rows (see the
+    /// `row_security` field).
+    pub fn row_security_applies(&self) -> bool {
+        self.row_security
+    }
+
     /// Gives up the writer lease: the dedicated connection is closed, which frees the advisory
     /// lock, and the lease thread stops without treating that as a loss. For an orderly shutdown,
     /// and for a test that is about to drop the database. Writes made after this are still fenced
@@ -717,7 +730,7 @@ impl Persistence for PostgresPersistence {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if listener.is_none() {
-                let connected = connect_client(&self.url)
+                let connected = connect_client_for(&self.url, self.scope)
                     .map(Conn::new)
                     .and_then(|mut conn| {
                         conn.batch_execute(&format!("LISTEN {}", self.scope.channel()))
@@ -1060,6 +1073,57 @@ pub(crate) fn connect_client(url: &str) -> Result<Client, PersistError> {
         .map_err(definite)
 }
 
+/// Tells the database which tenant a connection serves, which the row-level security policies
+/// read (migration 0003 of the shared layout). A connection that has not said sees no tenant's
+/// rows. Nothing to say for the classic layout.
+pub(crate) fn set_tenant(client: &mut Client, scope: Scope) -> Result<(), PersistError> {
+    if let Scope::Tenant(id) = scope {
+        client
+            .batch_execute(&format!(
+                "SELECT set_config('refhir.tenant', '{id}', false)"
+            ))
+            .map_err(definite)?;
+    }
+    Ok(())
+}
+
+/// [`connect_client`], for a connection that reads or writes the rows of `scope`.
+pub(crate) fn connect_client_for(url: &str, scope: Scope) -> Result<Client, PersistError> {
+    let mut client = connect_client(url)?;
+    set_tenant(&mut client, scope)?;
+    Ok(client)
+}
+
+/// Whether row-level security binds the role this connection is, and a warning when it does not,
+/// since then another tenant's rows are kept out of reach by the process's own statements alone.
+fn check_row_security(client: &mut Client, scope: Scope) -> bool {
+    if scope == Scope::Classic {
+        return false;
+    }
+    let bypass = client.query_one(
+        "SELECT rolsuper OR rolbypassrls, current_user::text FROM pg_roles WHERE rolname = current_user",
+        &[],
+    );
+    match bypass {
+        Ok(row) if row.get::<_, bool>(0) => {
+            tracing::warn!(
+                target: "refhir",
+                "the database role `{}` is a superuser or bypasses row-level security, so the \
+                 database does not keep this tenant away from other tenants' rows: only this \
+                 process's own statements do. Connect as a role that is neither (see \
+                 docs/clustering.md)",
+                row.get::<_, String>(1)
+            );
+            false
+        }
+        Ok(_) => true,
+        Err(err) => {
+            tracing::warn!(target: "refhir", "cannot tell whether row-level security applies: {err}");
+            false
+        }
+    }
+}
+
 /// What to say about a failure. `postgres::Error` prints only "db error", which hides the
 /// reason; this adds the server's message, code and detail.
 pub(crate) trait ErrorText {
@@ -1135,6 +1199,9 @@ mod announce_tests;
 
 #[cfg(test)]
 mod tenancy_catalog_tests;
+
+#[cfg(test)]
+mod tenancy_rls_tests;
 
 #[cfg(test)]
 mod tenancy_foreign_tests;

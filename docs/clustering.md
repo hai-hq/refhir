@@ -76,6 +76,15 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
 - **A replica writes into its own tenant only.** The primary a replica forwards to refuses the
   request (`421`) if it serves a different tenant, so a wrong `--primary-url` cannot write into a
   tenant that is not the replica's own.
+- **Row-level security.** Every table that holds tenants' rows has a policy that shows a connection
+  only the rows of the tenant it serves and lets it write only its own, so a process cannot read or
+  change another tenant's rows even if a statement asks for them. Superusers, and roles with
+  `BYPASSRLS`, are never bound by policies, so run ReFHIR as an ordinary role that owns its
+  database (`CREATE ROLE refhir LOGIN PASSWORD '…'`, then `CREATE DATABASE refhir OWNER refhir`).
+  The policies bind the owner too. A process that connects as a role the policies do not bind
+  works, and logs a warning at start-up that the database is not keeping it to its tenant. Take
+  backups as a superuser or a role with `BYPASSRLS`: `pg_dump` run as the ordinary role refuses,
+  because it would not see every tenant's rows.
 - **SMART.** Each tenant has its own clients, tokens and signing key, so give each tenant its own
   `--public-url`. The tenant's processes share `--smart-dcr-token` and
   `--smart-confidential-secret`, as above.

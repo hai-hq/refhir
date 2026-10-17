@@ -77,7 +77,8 @@ look". It does not apply anything; the server applies migrations itself when it 
 Restore-and-test first, then upgrade in place:
 
 1. Back up the database (`pg_dump`, or copy the SQLite file with its `-wal`/`-shm` while ReFHIR
-   is stopped).
+   is stopped). For a database that holds [tenants](clustering.md), do it as a superuser or a role
+   with `BYPASSRLS`, which row-level security does not hide rows from.
 2. Restore the backup into a scratch database and run `refhir migrate --dry-run` against it with
    the **new** binary. Start the new binary on it and test.
 3. Stop every old process that uses the production database before the new one starts. An old
