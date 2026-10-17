@@ -26,7 +26,9 @@ mod tls;
 pub use migrate::migration_report;
 use scope::Scope;
 use serde_json::Value as JsonValue;
-pub use tenant::{create_tenant, list_tenants, validate_tenant_name, Tenant};
+pub use tenant::{
+    create_tenant, delete_tenant, holds_tenants, list_tenants, validate_tenant_name, Tenant,
+};
 
 pub(crate) struct Inner {
     pub(crate) client: Conn,

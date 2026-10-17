@@ -22,6 +22,9 @@ kind = "postgres"
 # verify-full checks the server certificate and its host name against the CA in sslrootcert.
 # `sslmode=require` alone encrypts but trusts anyone who answers.
 postgres_url = "postgresql://refhir:CHANGE_ME@postgres:5432/refhir?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt"
+# One database for many tenants: create each with `refhir tenant create NAME`, and name the one
+# this process serves (or set REFHIR_TENANT). See docs/clustering.md.
+# tenant = "acme"
 
 [conformance]
 reference_policy = "strict"

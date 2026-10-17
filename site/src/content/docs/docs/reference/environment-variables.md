@@ -18,6 +18,7 @@ between deployments, so they stay out of the config file.
 | `REFHIR_ROLE` | `primary`, `standby` or `replica`. The same as `--role`. See [Several processes](/docs/operate/clustering/). |
 | `REFHIR_PRIMARY_URL` | Where a replica sends writes. The same as `--primary-url`. |
 | `REFHIR_DB_POOL` | A positive number: the most Postgres connections (default 8), or on SQLite the read connections next to the one writer (default 4). The same as `--db-pool`. |
+| `REFHIR_TENANT` | The tenant this process serves, in a Postgres database that many tenants share. The same as `--tenant`, and `[database].tenant`. Create tenants with `refhir tenant create`. See [Tenants](/docs/operate/clustering/#tenants-on-one-database). |
 | `REFHIR_DEFAULT_PAGE_SIZE` | How many matches a search `GET` returns on a page when it names no `_count`, with a `next` link for the rest. The default is 100, and `0` returns every match in one response. Overrides `[server].default_page_size`. There is no flag. |
 | `REFHIR_UPDATE_AS_CREATE` | Set to `true` to let `PUT [type]/[id]` create a resource under the id the client names. The same as `--update-as-create`. |
 
@@ -28,7 +29,7 @@ between deployments, so they stay out of the config file.
 | `REFHIR_PACKAGE_DOWNLOAD` | `true` lets the server download FHIR packages: the release defaults when there is no prepared file, `name@version` entries of `[conformance].packages`, and `$install`. Off by default, so nothing is downloaded unless it is set. |
 | `REFHIR_PACKAGE_REGISTRY` | Where FHIR packages are downloaded from once downloading is on: a registry or mirror URL, or `s3://bucket/prefix`. The default is `https://packages.fhir.org`. |
 | `REFHIR_PACKAGE_BUNDLE` | The file of prepared packages (made by `refhir package-bundle`) that a first start installs. Found beside the binary when unset; `off` says not to look. A file that is named and is not there, or that is there and unusable, stops the start. |
-| `REFHIR_PACKAGE_CACHE` | The on-disk cache for downloaded packages. Without it the cache is `package-cache` next to the SQLite file, or `.refhir/packages` for an in-memory or Postgres database. |
+| `REFHIR_PACKAGE_CACHE` | The on-disk cache for downloaded packages. Without it the cache is `package-cache` next to the SQLite file, or `.refhir/packages` for an in-memory or Postgres database (`.refhir/packages/<tenant>` for a tenant). |
 | `REFHIR_SKIP_DEFAULT_PACKAGES` | Skips installing the release's default packages, so the server knows no resource types until you add a package with `--package`. Not for production. |
 | `REFHIR_S3_ACCESS_KEY_ID` | The access key for an `s3://` package source. |
 | `REFHIR_S3_SECRET_ACCESS_KEY` | The secret key for an `s3://` package source. |

@@ -74,6 +74,11 @@ pub struct ServerConfig {
     /// Only the searches a client sends are paged this way: a conditional update or delete, a
     /// `_has` or chained search, a live query and GraphQL read every match.
     pub default_page_size: usize,
+    /// The tenant this process serves, when the database is shared by tenants. It is sent to the
+    /// primary with everything a replica forwards, and a primary refuses what arrives from a
+    /// process of another tenant, so a replica pointed at the wrong primary cannot write into a
+    /// tenant that is not its own. `None` is a database with no tenants.
+    pub tenant: Option<String>,
 }
 
 /// The page a search `GET` that names no `_count` gets. FHIR leaves the page size to the server.
@@ -121,6 +126,7 @@ impl Default for ServerConfig {
             governance: crate::governance::GovernanceConfig::default(),
             governance_store: None,
             default_page_size: DEFAULT_PAGE_SIZE,
+            tenant: None,
         }
     }
 }
@@ -737,6 +743,9 @@ async fn sync_ws(
     RawQuery(query): RawQuery,
     session: Option<Extension<crate::auth::SyncSession>>,
 ) -> Response {
+    if let Some(refusal) = crate::cluster::tenant_mismatch(&app, &headers) {
+        return refusal;
+    }
     if app.config.auth && session.is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -759,6 +768,7 @@ async fn sync_ws(
             .map(|base| sync::Upstream {
                 url: crate::cluster::sync_url(base),
                 bearer: crate::auth::resolve_token(&headers, query.as_deref()),
+                tenant: app.config.tenant.clone(),
             })
     } else {
         None

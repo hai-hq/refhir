@@ -17,7 +17,9 @@ use refhir_types::{DocumentId, IndexId, TabletId, Timestamp};
 
 use crate::tenant::TENANT_TABLES;
 use crate::tests::{fresh_database, test_url};
-use crate::{create_tenant, list_tenants, ConnectOptions, PostgresPersistence, Scope};
+use crate::{
+    create_tenant, delete_tenant, list_tenants, ConnectOptions, PostgresPersistence, Scope,
+};
 
 pub(crate) fn client(url: &str) -> Client {
     Client::connect(url, NoTls).expect("connect")
@@ -100,6 +102,141 @@ pub(crate) fn rows_of(url: &str, tenant: &str, table: &str) -> i64 {
 pub(crate) fn suite(p: &PostgresPersistence) {
     conformance::exercise(p);
     conformance::exercise_index_scan_ids(p);
+}
+
+/// Makes `tenant` a poison tenant: from now on, every row any other tenant inserts into any
+/// tenant table gets a twin in `tenant` at the moment it is inserted. The twin has the same keys
+/// (the same ids, urls, kinds, timestamps) and a newer sequence id where the table has one.
+///
+/// A decoy twin (`exact = false`) has different content: a decoy payload, a far-future expiry, a
+/// job waiting to be claimed. An exact twin has the very content of the row it copies, so a
+/// statement that selects by content or state (`DELETE ... AND json = $3`, `WHERE lease_owner =
+/// $3`, `WHERE exp <= $1`) matches it as it matches the original. Each kind exposes what the other
+/// hides, so a test uses a poison tenant of each.
+///
+/// So a statement that forgot its tenant meets an ambiguous row: a read returns two, an update or
+/// delete takes the twin too, a keyed lookup by an id the other tenant owns finds both. The suites
+/// clean up after themselves, so a decoy made once, afterwards, would find nothing left to hit; a
+/// twin made as each row appears does. [`check_twins`] then requires every twin to be exactly as it
+/// was made.
+pub(crate) fn poison(url: &str, tenant: &str) {
+    poison_with(url, tenant, false);
+}
+
+/// [`poison`] with exact twins.
+pub(crate) fn poison_exact(url: &str, tenant: &str) {
+    poison_with(url, tenant, true);
+}
+
+fn poison_with(url: &str, tenant: &str, exact: bool) {
+    let id = tenant_id(url, tenant);
+    let mut c = client(url);
+    c.batch_execute(
+        r#"
+CREATE TABLE IF NOT EXISTS twin_log (tbl text NOT NULL, row jsonb NOT NULL);
+CREATE OR REPLACE FUNCTION make_twin() RETURNS trigger LANGUAGE plpgsql AS $f$
+DECLARE
+    poisoned int := TG_ARGV[0]::int;
+    exact boolean := TG_ARGV[1] = 'exact';
+    made jsonb;
+    seq text;
+    inserted int;
+BEGIN
+    -- Only for the row a test wrote, not for the twins the poison tenants make of it.
+    IF pg_trigger_depth() > 1 OR NEW.instance_id = poisoned THEN
+        RETURN NULL;
+    END IF;
+    made := to_jsonb(NEW) || jsonb_build_object('instance_id', poisoned);
+    IF made ? 'id' THEN
+        seq := pg_get_serial_sequence(TG_TABLE_NAME, 'id');
+    END IF;
+    IF seq IS NOT NULL THEN
+        made := made || jsonb_build_object('id', nextval(seq));
+    END IF;
+    IF NOT exact THEN
+        IF made ? 'json' AND jsonb_typeof(made -> 'json') = 'string' THEN
+            made := made || jsonb_build_object('json', '{"decoy":true}');
+        END IF;
+        IF made ? 'json_value' AND jsonb_typeof(made -> 'json_value') = 'string'
+           AND TG_TABLE_NAME <> 'persistence_globals' THEN
+            made := made || jsonb_build_object('json_value', '{"decoy":true}');
+        END IF;
+        IF TG_TABLE_NAME = 'smart_oauth' THEN
+            made := made || jsonb_build_object('exp', 9000000000000000000);
+        END IF;
+        IF TG_TABLE_NAME = 'jobs' THEN
+            made := made || jsonb_build_object(
+                'status', 'accepted', 'lease_owner', NULL::text, 'lease_until', NULL::bigint,
+                'result', NULL::text, 'error', NULL::text, 'completed_at', NULL::bigint);
+        END IF;
+    END IF;
+    EXECUTE format(
+        'INSERT INTO %I SELECT * FROM jsonb_populate_record(NULL::%I, $1) ON CONFLICT DO NOTHING',
+        TG_TABLE_NAME, TG_TABLE_NAME) USING made;
+    GET DIAGNOSTICS inserted = ROW_COUNT;
+    IF inserted = 1 THEN
+        INSERT INTO twin_log VALUES (TG_TABLE_NAME, made);
+    END IF;
+    RETURN NULL;
+END
+$f$;
+"#,
+    )
+    .expect("twin function");
+    for table in TENANT_TABLES {
+        c.batch_execute(&format!(
+            "CREATE TRIGGER twin_{id} AFTER INSERT ON {table} \
+             FOR EACH ROW EXECUTE FUNCTION make_twin({id}, '{}')",
+            if exact { "exact" } else { "decoy" }
+        ))
+        .expect("twin trigger");
+    }
+}
+
+/// Requires that the poison tenant `tenant` holds exactly the twins [`poison`] made, each as made:
+/// nothing another tenant did changed, removed or added a row of it. Returns how many twins there
+/// were, so a test can check it saw some.
+pub(crate) fn check_twins(url: &str, tenant: &str) -> i64 {
+    let id = tenant_id(url, tenant);
+    let mut c = client(url);
+    let mut twins = 0;
+    for table in TENANT_TABLES {
+        let made: i64 = c
+            .query_one(
+                "SELECT count(*) FROM twin_log WHERE tbl = $1 AND (row ->> 'instance_id')::int = $2",
+                &[table, &id],
+            )
+            .unwrap()
+            .get(0);
+        let altered: i64 = c
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM twin_log l WHERE l.tbl = '{table}' \
+                     AND (l.row ->> 'instance_id')::int = {id} AND NOT EXISTS \
+                     (SELECT 1 FROM {table} t WHERE t.instance_id = {id} AND to_jsonb(t) = l.row)"
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let held: i64 = c
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE instance_id = {id}"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            altered, 0,
+            "{altered} twins in {table} were changed or removed"
+        );
+        assert_eq!(
+            held, made,
+            "{table} holds rows the poison tenant was never given"
+        );
+        twins += made;
+    }
+    twins
 }
 
 /// Gives `tenant` a decoy revision of every document and index row it has, at every timestamp from
@@ -264,13 +401,17 @@ fn a_tenant_passes_the_persistence_suite_beside_a_tenant_holding_the_same_data()
     let Some(admin) = test_url("tenant persistence suite") else {
         return;
     };
-    let url = shared(&admin, "suite", &["a", "b"]);
+    let url = shared(&admin, "suite", &["a", "b", "twins", "exact"]);
     let (a, b) = (open(&url, "a"), open(&url, "b"));
 
     // Tenant b first: it writes the very ids, keys and timestamps the suite uses, and then a decoy
     // revision of each of them at every timestamp.
     suite(&b);
     decoy(&url, "b");
+    // From here, `twins` and `exact` get a twin of every row tenant `a` writes, as it is written:
+    // a decoy one and an exact copy. (After the decoys, which are thousands of rows.)
+    poison(&url, "twins");
+    poison_exact(&url, "exact");
     let before = digests(&url, "b");
     assert!(rows_of(&url, "b", "documents") > 100);
     assert_eq!(rows_of(&url, "a", "documents"), 0);
@@ -283,6 +424,102 @@ fn a_tenant_passes_the_persistence_suite_beside_a_tenant_holding_the_same_data()
         before,
         "tenant a's suite changed tenant b's rows"
     );
+    for poisoned in ["twins", "exact"] {
+        assert!(
+            check_twins(&url, poisoned) > 0,
+            "the poison tenant {poisoned} was given no twins"
+        );
+    }
+}
+
+#[test]
+fn deleting_a_tenant_removes_its_rows_and_only_its_rows() {
+    let Some(admin) = test_url("tenant delete") else {
+        return;
+    };
+    let url = shared(&admin, "tdelete", &["a", "b", "big"]);
+    let (a, b) = (open(&url, "a"), open(&url, "b"));
+    suite(&a);
+    suite(&b);
+    // Tenant `big` holds more rows than one batch of the deletion removes.
+    let big = tenant_id(&url, "big");
+    client(&url)
+        .batch_execute(&format!(
+            "INSERT INTO documents (instance_id, id, ts, table_id, json_value, deleted) \
+             SELECT {big}, convert_to('doc-' || g, 'UTF8'), g, convert_to('t', 'UTF8'), '{{}}', 0 \
+             FROM generate_series(1, 25000) g"
+        ))
+        .unwrap();
+    let kept = digests(&url, "b");
+    let a_id = tenant_id(&url, "a");
+
+    // While a primary of the tenant runs, it is refused and nothing is removed.
+    a.try_acquire_writer_lease().unwrap();
+    let error = delete_tenant(&url, "a").unwrap_err().to_string();
+    assert!(error.contains("primary running"), "{error}");
+    assert!(rows_of(&url, "a", "documents") > 0);
+    a.release_writer_lease();
+    let removed = (0..100)
+        .find_map(|_| match delete_tenant(&url, "a") {
+            Ok(removed) => Some(removed),
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(100));
+                None
+            }
+        })
+        .expect("the tenant could be deleted once its primary was gone");
+    assert!(removed > 0);
+
+    let mut c = client(&url);
+    for table in TENANT_TABLES {
+        let left: i64 = c
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE instance_id = {a_id}"),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(left, 0, "{table} still holds rows of the deleted tenant");
+    }
+    assert_eq!(
+        digests(&url, "b"),
+        kept,
+        "deleting tenant a changed tenant b"
+    );
+    let names: Vec<_> = list_tenants(&url)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    assert_eq!(names, ["b", "big"]);
+    let error = refusal(PostgresPersistence::connect_with(
+        &url,
+        &ConnectOptions {
+            tenant: Some("a".into()),
+            ..ConnectOptions::default()
+        },
+    ));
+    assert!(error.contains("does not exist"), "{error}");
+
+    // More than one batch, and the registry row goes with it; the name can be used again.
+    assert!(delete_tenant(&url, "big").unwrap() >= 25_000);
+    assert_eq!(rows_of_id(&url, big, "documents"), 0);
+    create_tenant(&url, "big").expect("a deleted tenant's name is free again");
+
+    assert!(delete_tenant(&url, "ghost").is_err());
+    let classic = fresh_database(&admin, "tdeletec");
+    PostgresPersistence::connect(&classic).unwrap();
+    assert!(delete_tenant(&classic, "a").is_err());
+}
+
+fn rows_of_id(url: &str, id: i32, table: &str) -> i64 {
+    client(url)
+        .query_one(
+            &format!("SELECT count(*) FROM {table} WHERE instance_id = {id}"),
+            &[],
+        )
+        .unwrap()
+        .get(0)
 }
 
 #[test]

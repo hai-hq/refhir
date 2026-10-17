@@ -22,8 +22,6 @@ const MAX_NAME: usize = 63;
 
 /// Every table that holds a tenant's rows, in the shared layout. Each has `instance_id`. The
 /// registry itself does not, and neither does `schema_migrations`.
-// Used by the tests until `refhir tenant delete` needs it too.
-#[cfg(test)]
 pub(crate) const TENANT_TABLES: &[&str] = &[
     "documents",
     "indexes",
@@ -73,6 +71,14 @@ pub(crate) fn detect_layout(client: &mut impl GenericClient) -> Result<Layout, P
         Layout::Classic
     } else {
         Layout::Empty
+    })
+}
+
+/// Whether the database at `url` has the shared tenant layout.
+pub fn holds_tenants(url: &str) -> Result<bool, PersistError> {
+    off_runtime(|| {
+        let mut client = connect_client(url)?;
+        Ok(detect_layout(&mut client)? == Layout::Shared)
     })
 }
 
@@ -193,6 +199,71 @@ pub fn list_tenants(url: &str) -> Result<Vec<Tenant>, PersistError> {
             });
         }
         Ok(tenants)
+    })
+}
+
+/// Most rows one statement of `delete_tenant` removes. The log tables of a busy tenant are large,
+/// so they go in pieces: no one statement holds locks, or writes WAL, for long.
+const DELETE_BATCH: i64 = 10_000;
+
+/// Removes tenant `name` and every row it holds, and returns how many rows that was.
+///
+/// It takes the tenant's writer lease first and keeps it until it is done, so it refuses while a
+/// primary of the tenant runs (stop the tenant's processes first: a standby or replica left running
+/// would serve what it already has until it noticed), and no primary can start halfway through. The
+/// rows go in batches, one statement each, so a tenant with a great deal of history does not hold
+/// the tables for the length of its deletion. Rows other tenants hold, and the shared catalog,
+/// are not touched. There is no undo: take a backup first.
+pub fn delete_tenant(url: &str, name: &str) -> Result<u64, PersistError> {
+    validate_tenant_name(name)?;
+    off_runtime(|| {
+        let mut client = connect_client(url)?;
+        match detect_layout(&mut client)? {
+            Layout::Shared => {}
+            Layout::Classic => {
+                return Err(definite(
+                    "this database was created without tenants, so it has none to delete",
+                ))
+            }
+            Layout::Empty => {
+                return Err(definite(format!(
+                    "no tenant `{name}`: the database is empty"
+                )))
+            }
+        }
+        let id = tenant_id(&mut client, name)?
+            .ok_or_else(|| definite(format!("no tenant `{name}` in this database")))?;
+        let got: bool = client
+            .query_one(
+                "SELECT pg_try_advisory_lock($1, $2)",
+                &[&crate::lease::LEASE_NAMESPACE, &id],
+            )
+            .map_err(definite)?
+            .get(0);
+        if !got {
+            return Err(definite(format!(
+                "tenant `{name}` has a primary running. Stop the tenant's processes first"
+            )));
+        }
+        let mut removed: u64 = 0;
+        for table in TENANT_TABLES {
+            let batch = format!(
+                "DELETE FROM {table} WHERE ctid IN \
+                 (SELECT ctid FROM {table} WHERE instance_id = $1 LIMIT {DELETE_BATCH})"
+            );
+            loop {
+                let rows = client.execute(&batch, &[&id]).map_err(definite)?;
+                removed += rows;
+                if rows == 0 {
+                    break;
+                }
+            }
+        }
+        client
+            .execute(&format!("DELETE FROM {REGISTRY} WHERE id = $1"), &[&id])
+            .map_err(definite)?;
+        // The lease is the session's, and goes with it.
+        Ok(removed)
     })
 }
 

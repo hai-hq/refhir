@@ -38,5 +38,7 @@ Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or 
 | `--standby` | Same as `--role standby` |
 | `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
 | `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
+| `--tenant name` | The tenant this process serves, in a Postgres database that many tenants share (`tenant` under `[database]`, or `REFHIR_TENANT`). See [Tenants](clustering.md#tenants-on-one-database) |
 | `refhir package-bundle [--out file]` | Prepare the release's FHIR packages ahead of time into one file that a first start installs instead of downloading them. See [Preparing the packages](../deploy/production.md#preparing-the-packages) |
+| `refhir tenant create\|list\|delete` | Add, list and remove the tenants of a shared Postgres database. See [Tenants](clustering.md#tenants-on-one-database) |
 | `refhir migrate --status\|--dry-run` | Report the database's schema version and what startup would do to it, without changing anything. See [Schema migrations](migrations.md) |

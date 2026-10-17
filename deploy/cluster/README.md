@@ -85,7 +85,8 @@ signing key live in the database, so a token issued by one process is accepted b
 
 - Each process has its own package cache and export directory (`/data` volumes). An `$export` job
   belongs to the process that accepted it, and replicas send export requests to the primary.
-- The writer lease needs one database and one primary at a time; do not point two clusters at the
-  same database.
+- The writer lease needs one primary at a time for each database, or for each tenant of a shared
+  database (see [Tenants](../../docs/clustering.md#tenants-on-one-database)). Do not point two
+  clusters at the same database unless each serves a tenant of its own.
 - `max_connections` on Postgres must cover `REFHIR_DB_POOL` times the number of processes, plus
   the one lease connection each writer keeps.

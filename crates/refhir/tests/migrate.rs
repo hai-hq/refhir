@@ -306,6 +306,26 @@ fn postgres_status_reports_the_recorded_versions() {
     );
 }
 
+#[test]
+fn status_says_when_a_postgres_database_is_shared_by_tenants() {
+    let Some(admin) = common::admin_url("refhir migrate on a shared postgres") else {
+        return;
+    };
+    let database = common::fresh_database(&admin, "migrateshared");
+    refhir_postgres::create_tenant(&database.url, "acme").unwrap();
+    let shared = migrate(&["--status", "--postgres", &database.url]);
+    assert!(shared.status.success(), "{}", stderr(&shared));
+    let said = stdout(&shared);
+    assert!(said.contains("layout: shared by tenants"), "{said}");
+    assert!(said.contains("up to date at version 2"), "{said}");
+
+    // A database made without tenants says nothing of the kind.
+    let plain = common::fresh_database(&admin, "migrateplain");
+    drop(refhir_postgres::PostgresPersistence::connect(&plain.url).unwrap());
+    let said = stdout(&migrate(&["--status", "--postgres", &plain.url]));
+    assert!(!said.contains("tenants"), "{said}");
+}
+
 /// Settings `migrate` does not use must not stop it from looking at a database.
 #[test]
 fn unrelated_bad_settings_do_not_stop_a_status_check() {

@@ -111,4 +111,7 @@ volumes:
 {{- if and .Values.cluster.enabled (ne .Values.database.kind "postgres") -}}
 {{- fail "cluster.enabled needs database.kind: postgres (SQLite cannot be shared between pods)" -}}
 {{- end -}}
+{{- if and .Values.database.tenant (ne .Values.database.kind "postgres") -}}
+{{- fail "database.tenant needs database.kind: postgres (tenants share one Postgres database)" -}}
+{{- end -}}
 {{- end }}

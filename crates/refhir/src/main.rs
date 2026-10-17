@@ -1,6 +1,7 @@
 mod config;
 mod migrate;
 mod package_bundle;
+mod tenant;
 
 use std::env;
 use std::io::IsTerminal;
@@ -45,6 +46,9 @@ fn main() -> ExitCode {
     }
     if args.first().map(String::as_str) == Some("package-bundle") {
         return package_bundle::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("tenant") {
+        return tenant::run(&args[1..]);
     }
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -101,6 +105,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_role: Option<Role> = None;
     let mut cli_primary_url: Option<String> = None;
     let mut cli_db_pool: Option<usize> = None;
+    let mut cli_tenant: Option<String> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -206,6 +211,10 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "--primary-url" => {
                 index += 1;
                 cli_primary_url = Some(required(&args, index, "--primary-url")?);
+            }
+            "--tenant" => {
+                index += 1;
+                cli_tenant = Some(required(&args, index, "--tenant")?);
             }
             "--db-pool" => {
                 index += 1;
@@ -328,6 +337,9 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if cli_db_pool.is_some() {
         cfg.db_pool = cli_db_pool;
     }
+    if cli_tenant.is_some() {
+        cfg.tenant = cli_tenant;
+    }
 
     // A limit that cannot work is refused now, and not discovered by the first caller to hit it.
     cfg.governance.validate(cfg.auth)?;
@@ -381,7 +393,15 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    check_tenant(&cfg)?;
     check_role(&cfg)?;
+    // A tenant's files are its own: another tenant's process on this host must not write in them.
+    if let Some(tenant) = &cfg.tenant {
+        if cfg.export_dir == "export" {
+            cfg.export_dir = format!("export/{tenant}");
+        }
+        tracing::info!("serving tenant {tenant}");
+    }
     ensure_package_cache_env(&cfg);
     tracing::info!("{}", cfg.describe_governance());
     if cfg.governance.audit.enabled && cfg.governance.audit.chain_key.is_none() {
@@ -422,7 +442,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 pool_size,
                 // A replica never runs DDL: it waits for the primary to have created the tables.
                 create_schema: role != Role::Replica,
-                tenant: None,
+                tenant: cfg.tenant.clone(),
             };
             let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
             (
@@ -612,6 +632,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             smart_demo_login: cfg.smart_demo_login,
             smart,
             primary_url: cfg.primary_url,
+            tenant: cfg.tenant,
             max_staleness: Duration::from_secs(5),
             ready_timeout: Duration::from_secs(2),
             ready_cache: Duration::from_secs(1),
@@ -625,6 +646,22 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             governance_store: Some(refhir_server::SharedGovernanceStore::new(governance_store)),
         },
     ))?;
+    Ok(())
+}
+
+/// A tenant is a part of a Postgres database that many tenants share: nothing else holds one.
+fn check_tenant(cfg: &ResolvedConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(name) = &cfg.tenant else {
+        return Ok(());
+    };
+    refhir_postgres::validate_tenant_name(name).map_err(|err| err.to_string())?;
+    if cfg.postgres.is_none() {
+        return Err(
+            "--tenant needs --postgres: tenants share one Postgres database (SQLite and --memory \
+             hold one deployment)"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -769,7 +806,12 @@ fn ensure_package_cache_env(cfg: &ResolvedConfig) {
         return;
     }
     let cache = if cfg.memory || cfg.postgres.is_some() {
-        Path::new(".refhir").join("packages")
+        let shared = Path::new(".refhir").join("packages");
+        match &cfg.tenant {
+            // Two processes must not fill one cache at once, and a tenant's are on one host.
+            Some(tenant) => shared.join(tenant),
+            None => shared,
+        }
     } else {
         let file = cfg
             .sqlite
@@ -969,7 +1011,9 @@ fn print_help() {
          [--oidc-issuer url --oidc-client-id id] [--smart-demo-login]\n\
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
          [--role primary|standby|replica] [--standby] [--primary-url url] [--db-pool n]\n\
+         [--tenant name]\n\
          refhir migrate --status | --dry-run   (schema versions; see refhir migrate --help)\n\
+         refhir tenant create|list|delete      (tenants of a shared Postgres database; see --help)\n\
          refhir package-bundle [--out file]    (prepare the packages ahead of time; see --help)\n\
          refhir --version | -V                 (print the version and exit)\n\
          \n\
@@ -1007,7 +1051,12 @@ fn print_help() {
          database answers, and 503 {{\"status\":\"starting\"|\"unavailable\",\"reason\":...}} otherwise.\n\
          \n\
          --db-pool sets the most Postgres connections (default 8), or, on SQLite, the read\n\
-         connections next to the one writer (default 4)."
+         connections next to the one writer (default 4).\n\
+         \n\
+         Tenants: one Postgres database can hold many, each a separate FHIR server sharing its\n\
+         tables. `refhir tenant create NAME` adds one, and --tenant NAME (or REFHIR_TENANT, or\n\
+         [database] tenant) makes this process serve it. Each tenant has its own writer, and\n\
+         its own standbys and replicas. A database made without tenants cannot hold them."
     );
 }
 
@@ -1066,6 +1115,32 @@ mod tests {
         cfg.role = role;
         cfg.postgres = Some("postgres://example/db".into());
         cfg
+    }
+
+    #[test]
+    fn a_tenant_needs_postgres_and_a_name_the_registry_accepts() {
+        let mut cfg = config(Role::Primary);
+        assert!(check_tenant(&cfg).is_ok(), "no tenant needs nothing");
+
+        cfg.tenant = Some("acme".into());
+        assert!(check_tenant(&cfg).is_ok());
+        cfg.tenant = Some("st-marys-2".into());
+        assert!(check_tenant(&cfg).is_ok());
+
+        for bad in ["", "Acme", "has space", "_base", "-x", "a/b"] {
+            cfg.tenant = Some(bad.into());
+            assert!(check_tenant(&cfg).is_err(), "{bad:?} was accepted");
+        }
+
+        // Tenants share one Postgres database: SQLite and memory hold one deployment.
+        cfg.tenant = Some("acme".into());
+        cfg.postgres = None;
+        cfg.sqlite = Some("refhir.sqlite".into());
+        let err = check_tenant(&cfg).unwrap_err().to_string();
+        assert!(err.contains("--postgres"), "{err}");
+        cfg.sqlite = None;
+        cfg.memory = true;
+        assert!(check_tenant(&cfg).is_err());
     }
 
     #[test]

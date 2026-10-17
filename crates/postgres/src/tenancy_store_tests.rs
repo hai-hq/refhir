@@ -12,7 +12,9 @@ use std::sync::Arc;
 
 use refhir_persistence::{auth, conformance, governance_checks, jobs, GovernanceStore, JobStore};
 
-use crate::tenancy_tests::{client, digests, open, shared, tenant_id};
+use crate::tenancy_tests::{
+    check_twins, client, digests, open, poison, poison_exact, shared, tenant_id,
+};
 use crate::tests::test_url;
 
 fn unique() -> u32 {
@@ -27,7 +29,12 @@ fn beside_another_tenant(what: &str, tag: &str, decoy: &str, run: impl Fn(&str, 
     let Some(admin) = test_url(what) else {
         return;
     };
-    let url = shared(&admin, tag, &["a", "b"]);
+    // `twins` and `exact` get a twin of every row `a` and `b` write, as it is written: a decoy one
+    // and an exact copy. `b` holds what the suite writes before `a` starts (and, with the decoy, a
+    // version that is live and wrong).
+    let url = shared(&admin, tag, &["a", "b", "twins", "exact"]);
+    poison(&url, "twins");
+    poison_exact(&url, "exact");
     run(&url, "b");
     if !decoy.is_empty() {
         let b = tenant_id(&url, "b");
@@ -42,6 +49,12 @@ fn beside_another_tenant(what: &str, tag: &str, decoy: &str, run: impl Fn(&str, 
         before,
         "tenant a's {what} run changed tenant b's rows"
     );
+    for poisoned in ["twins", "exact"] {
+        assert!(
+            check_twins(&url, poisoned) > 0,
+            "the poison tenant {poisoned} was given no twins"
+        );
+    }
 }
 
 #[test]

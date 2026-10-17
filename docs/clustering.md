@@ -46,3 +46,42 @@ refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
 
 Running it: [deploy/cluster](../deploy/cluster/README.md) (Docker Compose with HAProxy) and the Helm
 chart's `cluster.enabled`.
+
+## Tenants on one database
+
+One Postgres database can hold many tenants. A tenant is a separate FHIR server: its resources,
+SMART clients and audit trail are its own, and nothing one tenant does reaches another. Tenants
+share the database's tables, so a new tenant is a registration and not a new database, and each
+tenant has a writer of its own: write capacity grows with the number of tenants.
+
+```bash
+refhir tenant create acme --postgres $URL                                          # once per tenant
+refhir --postgres $URL --tenant acme                                               # its primary
+refhir --postgres $URL --tenant acme --standby                                     # takes over
+refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:8080 # reads
+```
+
+- **A database keeps its layout.** The first `refhir tenant create` in an empty database makes it a
+  shared one. A database that already holds a ReFHIR made without tenants cannot hold tenants, and
+  a shared database cannot be opened without naming a tenant: each is refused before a row is read.
+- **Roles.** A tenant has its own primary, standbys and replicas, as above. A process never reads,
+  writes or waits for another tenant's rows, and holds its own writer lease. `GET /healthz` names
+  the tenant.
+- **A replica writes into its own tenant only.** The primary a replica forwards to refuses the
+  request (`421`) if it serves a different tenant, so a wrong `--primary-url` cannot write into a
+  tenant that is not the replica's own.
+- **SMART.** Each tenant has its own clients, tokens and signing key, so give each tenant its own
+  `--public-url`. The tenant's processes share `--smart-dcr-token` and
+  `--smart-confidential-secret`, as above.
+- **Files.** A tenant's package cache and export directory default to a folder named for it.
+- **Routing.** Route requests to a tenant's processes by host name or path in front of ReFHIR, with
+  a load balancer or ingress: each tenant is its own set of processes.
+- **Managing tenants.** `refhir tenant list` shows the tenants and whether a primary of each is
+  running. `refhir tenant delete NAME --yes` removes a tenant and everything it holds. It refuses
+  while a primary of the tenant runs, and it cannot be undone, so take a backup first.
+- **Connections.** Every process opens its pool, one connection that holds the writer lease and one
+  that listens for the primary's announcements. `max_connections` must cover the processes of every
+  tenant. A proxy that pools connections per transaction (PgBouncer in transaction mode) cannot sit
+  between ReFHIR and the database: the lease and the announcements belong to a session.
+- **Upgrades.** The schema is shared, so it is migrated once for every tenant: run the same release
+  in every tenant's processes (see [Schema migrations](migrations.md)).
