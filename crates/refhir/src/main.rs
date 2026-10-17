@@ -443,6 +443,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 // A replica never runs DDL: it waits for the primary to have created the tables.
                 create_schema: role != Role::Replica,
                 tenant: cfg.tenant.clone(),
+                ..ConnectOptions::default()
             };
             let persistence = Arc::new(PostgresPersistence::connect_with(url, &options)?);
             (

@@ -17,6 +17,7 @@ use refhir_persistence::{
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 
+mod announce;
 mod lease;
 mod migrate;
 mod scope;
@@ -85,7 +86,19 @@ pub struct ConnectOptions {
     /// tenant needs a database made by [`create_tenant`], and without one the database must not
     /// have been.
     pub tenant: Option<String>,
+    /// The least time between two announcements that the writer published, to the replicas
+    /// listening for them (see [`announce`]). `None` is the layout's own choice: a tenant
+    /// announces at most every [`TENANT_ANNOUNCE_INTERVAL`], and a database in the classic layout
+    /// announces every publish. `Some(Duration::ZERO)` announces every publish.
+    pub announce_interval: Option<std::time::Duration>,
 }
+
+/// How often a tenant's primary announces a publish. Postgres makes every transaction that
+/// announces queue on one lock for the whole cluster, so many busy tenants must not announce each
+/// of their commits; this bounds a tenant to a few dozen announcements a second, and a replica
+/// hears of a commit at most this much later than it would have (the first after a quiet spell is
+/// not delayed at all).
+pub const TENANT_ANNOUNCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 impl Default for ConnectOptions {
     fn default() -> Self {
@@ -93,6 +106,7 @@ impl Default for ConnectOptions {
             pool_size: 1,
             create_schema: true,
             tenant: None,
+            announce_interval: None,
         }
     }
 }
@@ -128,6 +142,8 @@ pub struct PostgresPersistence {
     url: Arc<str>,
     /// Which tenant's rows this reads and writes, or the whole database's (classic).
     scope: Scope,
+    /// Decides which publishes are announced to listening replicas, and announces the rest.
+    announcer: Arc<announce::Announcer>,
 }
 
 impl PostgresPersistence {
@@ -141,6 +157,11 @@ impl PostgresPersistence {
             let scope = open_layout(&mut client, options)?;
             let owned: Arc<str> = Arc::from(url);
             let factory_url = owned.clone();
+            let interval = options.announce_interval.unwrap_or(match scope {
+                Scope::Tenant(_) => TENANT_ANNOUNCE_INTERVAL,
+                Scope::Classic => std::time::Duration::ZERO,
+            });
+            let announcer = announce::Announcer::new(interval, scope.channel(), owned.clone());
             let pool = Pool::new(
                 options.pool_size,
                 vec![Inner { client }],
@@ -158,6 +179,7 @@ impl PostgresPersistence {
                 lease: Arc::new(lease::LeaseState::new(scope)),
                 url: owned,
                 scope,
+                announcer,
             })
         })
     }
@@ -638,6 +660,10 @@ impl Persistence for PostgresPersistence {
     fn advance_published_ts(&self, ts: Timestamp) -> Result<(), PersistError> {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
+            // Whether this commit announces the publish, or leaves it to the announcer's thread
+            // (see `announce`). Announcing is what makes a commit wait for the cluster's one
+            // announcement lock, so it is rationed; recording the watermark is not.
+            let announce = self.announcer.announce_with_commit();
             // Not durable on its own commit: the watermark is rebuilt from the log on a primary
             // restart, so a crash that loses the last few values only delays replicas. That keeps
             // it from costing a WAL flush per commit.
@@ -647,19 +673,30 @@ impl Persistence for PostgresPersistence {
                  VALUES ({vals}'{key}', '{ts}') \
                  ON CONFLICT {conflict} DO UPDATE SET json_value = GREATEST( \
                      persistence_globals.json_value::bigint, EXCLUDED.json_value::bigint)::text; \
-                 NOTIFY {channel}; \
+                 {notify}\
                  COMMIT;",
                 cols = self.scope.cols(),
                 vals = self.scope.vals(),
                 conflict = self.scope.conflict("key"),
-                channel = self.scope.channel(),
+                notify = if announce {
+                    format!("NOTIFY {}; ", self.announcer.channel())
+                } else {
+                    String::new()
+                },
                 key = PersistenceGlobalKey::PublishedTimestamp.as_str(),
                 ts = ts.as_u64(),
             ));
             if let Err(err) = wrote {
                 // A failure inside the explicit transaction leaves the connection aborted.
                 guard.discard();
+                if announce {
+                    // The announcement this commit was to make has not been made.
+                    self.announcer.owe();
+                }
                 return Err(definite(err));
+            }
+            if !announce {
+                self.announcer.owe();
             }
             Ok(())
         })
@@ -1092,6 +1129,9 @@ mod tenancy_tests;
 
 #[cfg(test)]
 mod tenancy_store_tests;
+
+#[cfg(test)]
+mod announce_tests;
 
 #[cfg(test)]
 mod tenancy_catalog_tests;

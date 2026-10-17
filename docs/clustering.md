@@ -67,6 +67,12 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
 - **Roles.** A tenant has its own primary, standbys and replicas, as above. A process never reads,
   writes or waits for another tenant's rows, and holds its own writer lease. `GET /healthz` names
   the tenant.
+- **Replica latency.** A tenant's primary tells its replicas about new commits at most every 20 ms:
+  the first commit after a quiet spell at once, and the rest of a burst together. Announcing every
+  commit would have each one take a lock that the whole Postgres server shares and wake the
+  listening connections of the database, so many busy tenants would slow each other down. A replica
+  can be up to 20 ms later than it would have been inside a burst of writes, and not at all when
+  writes are sparse.
 - **A replica writes into its own tenant only.** The primary a replica forwards to refuses the
   request (`421`) if it serves a different tenant, so a wrong `--primary-url` cannot write into a
   tenant that is not the replica's own.
