@@ -161,6 +161,11 @@ fn inspect(args: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
         }
     };
     println!("database: {target}");
+    if let Some(url) = &cfg.postgres {
+        if refhir_postgres::holds_tenants(url)? {
+            println!("layout: shared by tenants (`refhir tenant list` shows them)");
+        }
+    }
     print!("{}", report.render(mode == Mode::DryRun));
     Ok(report.can_start())
 }

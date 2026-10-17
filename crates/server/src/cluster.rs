@@ -33,6 +33,9 @@ pub const READ_ONLY: &str = "x-refhir-read-only";
 pub const ROLE: &str = "x-refhir-role";
 /// Set on a request a replica forwarded, so a misconfigured pair cannot bounce it forever.
 pub const FORWARDED: &str = "x-refhir-forwarded";
+/// Set on what a replica forwards when it serves a tenant: the tenant's name. A primary of another
+/// tenant (or of no tenant) refuses it.
+pub const TENANT: &str = "x-refhir-tenant";
 
 /// How much of a request body a replica buffers so it can replay it: what the primary's handlers
 /// accept, which is axum's default body limit (the server sets none of its own). A replica holding
@@ -103,6 +106,46 @@ fn not_caught_up_response(min: u64) -> Response {
 pub(crate) const READ_ONLY_MESSAGE: &str =
     "this server is a read-only replica; send writes to the primary";
 
+/// Refuses a request that a replica of another tenant sent. What a replica forwards carries the
+/// tenant it serves (and says it was forwarded); a process that serves a different tenant, or none,
+/// must not act on it, or a replica pointed at the wrong primary would write into a tenant that is
+/// not its own. A client that calls this process directly sends neither header and is not checked.
+pub(crate) fn tenant_mismatch(app: &AppState, headers: &HeaderMap) -> Option<Response> {
+    let theirs = headers.get(TENANT).and_then(|value| value.to_str().ok());
+    if theirs.is_none() && !headers.contains_key(FORWARDED) {
+        return None;
+    }
+    let ours = app.config.tenant.as_deref();
+    if theirs == ours {
+        return None;
+    }
+    let name = |tenant: Option<&str>| match tenant {
+        Some(tenant) => format!("tenant `{tenant}`"),
+        None => "no tenant".to_string(),
+    };
+    Some(
+        (
+            StatusCode::MISDIRECTED_REQUEST,
+            [(header::CONTENT_TYPE, "application/fhir+json")],
+            json!({
+                "resourceType": "OperationOutcome",
+                "issue": [{
+                    "severity": "error",
+                    "code": "invalid",
+                    "diagnostics": format!(
+                        "this server serves {}, and the request comes from a replica of {}: \
+                         check that --primary-url points at a primary of the same tenant",
+                        name(ours),
+                        name(theirs)
+                    )
+                }]
+            })
+            .to_string(),
+        )
+            .into_response(),
+    )
+}
+
 /// Why this process should get no traffic although it is up, from what it already knows
 /// (nothing is queried). Shared by `/healthz` and `/readyz` so they agree: a replica that has not
 /// refreshed within `max_staleness`, or a writer that cannot record its published watermark.
@@ -134,6 +177,9 @@ pub(crate) async fn healthz(
         "role": if replica { "replica" } else { "primary" },
         "latest_ts": app.db.latest_ts().to_string(),
     });
+    if let Some(tenant) = &app.config.tenant {
+        body["tenant"] = json!(tenant);
+    }
     if replica {
         body["refreshed_ms_ago"] = match app.db.refreshed_ago() {
             Some(age) => json!(age.as_millis() as u64),
@@ -265,6 +311,9 @@ pub(crate) async fn cluster_layer(
     let path = request.uri().path();
     if path == "/healthz" || path == "/sync" {
         return next.run(request).await;
+    }
+    if let Some(refusal) = tenant_mismatch(&app, request.headers()) {
+        return refusal;
     }
     let replica = app.db.is_read_only();
     let role = if replica { "replica" } else { "primary" };
@@ -424,11 +473,12 @@ pub(crate) async fn forward(
     // processes' logs for one request can be put together.
     let scope = crate::governance::current();
     let request_id = scope.as_ref().map(|scope| scope.request_id.clone());
+    let tenant = app.config.tenant.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut request = forward_agent().request(method.as_str(), &target);
         for (name, value) in &headers {
             let name = name.as_str();
-            if is_hop_by_hop(name) || name == MIN_TS || name == FORWARDED {
+            if is_hop_by_hop(name) || name == MIN_TS || name == FORWARDED || name == TENANT {
                 continue;
             }
             if let Ok(value) = value.to_str() {
@@ -436,6 +486,9 @@ pub(crate) async fn forward(
             }
         }
         request = request.set(FORWARDED, "1");
+        if let Some(tenant) = &tenant {
+            request = request.set(TENANT, tenant);
+        }
         if let Some(id) = &request_id {
             request = request.set("x-request-id", id);
         }

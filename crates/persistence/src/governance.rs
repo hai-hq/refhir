@@ -206,11 +206,22 @@ impl Where {
     /// ` WHERE a AND b`, or nothing. With `numbered`, placeholders are `$1`, `$2`, … counting
     /// from `first`; without, they stay `?`.
     pub fn sql(&self, numbered: bool, first: usize) -> String {
-        if self.conditions.is_empty() {
+        self.render(numbered, first, None)
+    }
+
+    /// [`Where::sql`] with `leading`, a condition that binds nothing, in front of the filter's own
+    /// (and as the whole clause when the filter has none). For a backend that keeps every query to
+    /// one part of a table, such as one tenant's rows.
+    pub fn sql_led_by(&self, numbered: bool, first: usize, leading: &str) -> String {
+        self.render(numbered, first, Some(leading))
+    }
+
+    fn render(&self, numbered: bool, first: usize, leading: Option<&str>) -> String {
+        if self.conditions.is_empty() && leading.is_none() {
             return String::new();
         }
         let mut next = first;
-        let joined: Vec<String> = self
+        let own: Vec<String> = self
             .conditions
             .iter()
             .map(|condition| {
@@ -223,7 +234,8 @@ impl Where {
                 }
             })
             .collect();
-        format!(" WHERE {}", joined.join(" AND "))
+        let all: Vec<String> = leading.map(String::from).into_iter().chain(own).collect();
+        format!(" WHERE {}", all.join(" AND "))
     }
 }
 
@@ -1385,5 +1397,18 @@ pub mod governance_checks {
         );
         assert_eq!(clause.params, vec![Param::Text("p".into()), Param::Int(5)]);
         assert_eq!(AuditFilter::default().to_where().sql(true, 1), "");
+
+        // A leading condition goes first and binds nothing, so the numbering is the filter's own,
+        // and a filter that has no conditions still gets its `WHERE`.
+        assert_eq!(
+            clause.sql_led_by(true, 1, "instance_id = 7"),
+            " WHERE instance_id = 7 AND patient = $1 AND outcome <> 0 AND ts >= $2"
+        );
+        assert_eq!(
+            AuditFilter::default()
+                .to_where()
+                .sql_led_by(true, 1, "instance_id = 7"),
+            " WHERE instance_id = 7"
+        );
     }
 }

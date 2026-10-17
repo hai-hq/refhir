@@ -774,6 +774,9 @@ pub struct InstallOutcome {
     pub package_id: i64,
     pub inserted: bool,
     pub newly_pending: Vec<PendingParam>,
+    /// The package was not stored: this store keeps one copy of what its tenants have in common,
+    /// and the package is now the tenant's from that copy. Its rows were not read.
+    pub shared: bool,
 }
 
 #[derive(Debug)]
@@ -1055,6 +1058,28 @@ pub trait ConformanceStore: Send + Sync {
         };
         feed(&mut package)?;
         self.install_package(&package)
+    }
+
+    /// [`ConformanceStore::install_package_in_pieces`] for a package that `content` (a digest of
+    /// its source) identifies, so a store that keeps one copy of what its tenants have in common
+    /// may keep one of this package for all of them: the first tenant to have it stores it, and
+    /// each other tenant that asks for the same `content` is given it from that copy.
+    ///
+    /// A store that gives the package from a copy it already holds does **not call `feed`**, and the
+    /// outcome says `shared`: a caller that reads the rows from a stream must pass over what `feed`
+    /// would have read. A package of the same name and version with other content is stored for the
+    /// tenant alone. The default stores the package as `install_package_in_pieces` does, calling
+    /// `feed`, since a store without tenants has nobody to share with.
+    fn install_shared_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        content: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        let _ = content;
+        self.install_package_in_pieces(name, version, fhir_version, feed)
     }
 
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError>;

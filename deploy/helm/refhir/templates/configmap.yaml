@@ -26,6 +26,9 @@ data:
     {{- end }}
     {{- if eq .Values.database.kind "postgres" }}
     postgres_url = "{{ .Values.database.postgresUrl }}"
+    {{- if .Values.database.tenant }}
+    tenant = "{{ .Values.database.tenant }}"
+    {{- end }}
     {{- end }}
 
     {{- if .Values.cluster.enabled }}

@@ -67,6 +67,7 @@ test('the command-line page holds both helps and the config page holds the examp
 const TEST_ONLY = new Set([
   'REFHIR_TEST_POSTGRES_URL',
   'REFHIR_REQUIRE_POSTGRES',
+  'REFHIR_TEST_ROW_SECURITY',
   'REFHIR_TLS_POSTGRES_ADDR',
   'REFHIR_TLS_POSTGRES_DIR',
   'REFHIR_REQUIRE_POSTGRES_TLS',

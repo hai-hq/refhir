@@ -9,8 +9,13 @@ impl AuthStore for PostgresPersistence {
             guard
                 .client
                 .execute(
-                    "INSERT INTO smart_oauth (kind, id, json, exp) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (kind, id) DO UPDATE SET json = excluded.json, exp = excluded.exp",
+                    &format!(
+                        "INSERT INTO smart_oauth ({}kind, id, json, exp) VALUES ({}$1, $2, $3, $4) \
+                         ON CONFLICT {} DO UPDATE SET json = excluded.json, exp = excluded.exp",
+                        self.scope.cols(),
+                        self.scope.vals(),
+                        self.scope.conflict("kind, id")
+                    ),
                     &[&kind, &id, &json, &auth_exp(exp)],
                 )
                 .map_err(definite)?;
@@ -31,9 +36,14 @@ impl AuthStore for PostgresPersistence {
             let changed = guard
                 .client
                 .execute(
-                    "INSERT INTO smart_oauth (kind, id, json, exp) VALUES ($1, $2, $3, $4) \
-                 ON CONFLICT (kind, id) DO UPDATE SET json = excluded.json, exp = excluded.exp \
-                 WHERE smart_oauth.exp <= $5",
+                    &format!(
+                        "INSERT INTO smart_oauth ({}kind, id, json, exp) VALUES ({}$1, $2, $3, $4) \
+                         ON CONFLICT {} DO UPDATE SET json = excluded.json, exp = excluded.exp \
+                         WHERE smart_oauth.exp <= $5",
+                        self.scope.cols(),
+                        self.scope.vals(),
+                        self.scope.conflict("kind, id")
+                    ),
                     &[&kind, &id, &json, &auth_exp(exp), &auth_exp(now)],
                 )
                 .map_err(definite)?;
@@ -47,7 +57,10 @@ impl AuthStore for PostgresPersistence {
             let row = guard
                 .client
                 .query_opt(
-                    "SELECT json FROM smart_oauth WHERE kind = $1 AND id = $2 AND exp > $3",
+                    &format!(
+                        "SELECT json FROM smart_oauth WHERE {}kind = $1 AND id = $2 AND exp > $3",
+                        self.scope.and()
+                    ),
                     &[&kind, &id, &auth_exp(now)],
                 )
                 .map_err(definite)?;
@@ -61,7 +74,10 @@ impl AuthStore for PostgresPersistence {
             let row = guard
                 .client
                 .query_opt(
-                    "DELETE FROM smart_oauth WHERE kind = $1 AND id = $2 RETURNING json, exp",
+                    &format!(
+                        "DELETE FROM smart_oauth WHERE {}kind = $1 AND id = $2 RETURNING json, exp",
+                        self.scope.and()
+                    ),
                     &[&kind, &id],
                 )
                 .map_err(definite)?;
@@ -77,7 +93,10 @@ impl AuthStore for PostgresPersistence {
             let deleted = guard
                 .client
                 .execute(
-                    "DELETE FROM smart_oauth WHERE kind = $1 AND id = $2 AND json = $3",
+                    &format!(
+                        "DELETE FROM smart_oauth WHERE {}kind = $1 AND id = $2 AND json = $3",
+                        self.scope.and()
+                    ),
                     &[&kind, &id, &json],
                 )
                 .map_err(definite)?;
@@ -91,7 +110,10 @@ impl AuthStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT json FROM smart_oauth WHERE kind = $1 AND exp > $2 ORDER BY id",
+                    &format!(
+                        "SELECT json FROM smart_oauth WHERE {}kind = $1 AND exp > $2 ORDER BY id",
+                        self.scope.and()
+                    ),
                     &[&kind, &auth_exp(now)],
                 )
                 .map_err(definite)?;
@@ -104,7 +126,13 @@ impl AuthStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             guard
                 .client
-                .execute("DELETE FROM smart_oauth WHERE exp <= $1", &[&auth_exp(now)])
+                .execute(
+                    &format!(
+                        "DELETE FROM smart_oauth WHERE {}exp <= $1",
+                        self.scope.and()
+                    ),
+                    &[&auth_exp(now)],
+                )
                 .map_err(definite)?;
             Ok(())
         })

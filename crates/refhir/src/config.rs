@@ -106,6 +106,9 @@ pub struct DatabaseSection {
     pub kind: Option<String>,
     pub sqlite_path: Option<String>,
     pub postgres_url: Option<String>,
+    /// The tenant this process serves, in a Postgres database that many tenants share. Created
+    /// with `refhir tenant create`.
+    pub tenant: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -340,6 +343,9 @@ pub struct ResolvedConfig {
     pub primary_url: Option<String>,
     /// Database connections to open at most; `None` means the default.
     pub db_pool: Option<usize>,
+    /// The tenant this process serves, in a Postgres database that many tenants share; `None` is a
+    /// database that holds one deployment.
+    pub tenant: Option<String>,
 }
 
 impl ResolvedConfig {
@@ -370,6 +376,7 @@ impl ResolvedConfig {
             role: Role::Primary,
             primary_url: None,
             db_pool: None,
+            tenant: None,
         }
     }
 
@@ -435,6 +442,10 @@ impl ResolvedConfig {
             self.postgres = file.database.postgres_url.clone();
             self.memory = false;
             self.sqlite = None;
+        }
+
+        if let Some(tenant) = &file.database.tenant {
+            self.tenant = Some(tenant.clone());
         }
 
         self.packages = package_plan_from_file(&file.fhir, &file.conformance)?;
@@ -835,6 +846,9 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     if let Some(url) = env_value("REFHIR_PRIMARY_URL") {
         cfg.primary_url = Some(url);
     }
+    if let Some(tenant) = env_value("REFHIR_TENANT") {
+        cfg.tenant = Some(tenant);
+    }
     if let Some(size) = env_value("REFHIR_DB_POOL") {
         cfg.db_pool = Some(
             size.parse::<usize>()
@@ -962,6 +976,32 @@ mod tests {
         std::env::remove_var("REFHIR_SMART_CONFIDENTIAL_SECRET");
         assert_eq!(cfg.postgres.as_deref(), Some("postgres://real"));
         assert_eq!(cfg.smart_confidential_secret.as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn the_tenant_comes_from_the_file_and_the_environment_overrides_it() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("REFHIR_TENANT");
+        let file: FileConfig = toml::from_str(
+            "[database]\nkind = \"postgres\"\npostgres_url = \"postgres://x/y\"\n\
+             tenant = \"from-file\"\n",
+        )
+        .unwrap();
+        let mut cfg = ResolvedConfig::defaults();
+        assert_eq!(cfg.tenant, None, "no tenant unless one is named");
+        cfg.apply_file(&file).unwrap();
+        assert_eq!(cfg.tenant.as_deref(), Some("from-file"));
+
+        std::env::set_var("REFHIR_TENANT", "from-env");
+        apply_env(&mut cfg).unwrap();
+        std::env::remove_var("REFHIR_TENANT");
+        assert_eq!(cfg.tenant.as_deref(), Some("from-env"));
+
+        // An empty variable counts as unset, as for every other setting.
+        std::env::set_var("REFHIR_TENANT", "");
+        apply_env(&mut cfg).unwrap();
+        std::env::remove_var("REFHIR_TENANT");
+        assert_eq!(cfg.tenant.as_deref(), Some("from-env"));
     }
 
     #[test]

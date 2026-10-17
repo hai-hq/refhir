@@ -5491,6 +5491,14 @@ mod cluster {
     /// A primary serving on a real port and a replica of the same database file, as two
     /// processes would be. The replica refreshes only when a test says so.
     async fn pair(config: impl FnOnce(&mut ServerConfig)) -> Pair {
+        pair_with(|_| {}, config).await
+    }
+
+    /// `pair`, with a say in the primary's settings too.
+    async fn pair_with(
+        primary: impl FnOnce(&mut ServerConfig),
+        config: impl FnOnce(&mut ServerConfig),
+    ) -> Pair {
         // A counter, not just the clock: tests start in the same microsecond.
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -5510,14 +5518,16 @@ mod cluster {
         .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary_addr = listener.local_addr().unwrap();
+        let mut primary_settings = ServerConfig {
+            export_dir: path.with_extension("export").display().to_string(),
+            ..ServerConfig::default()
+        };
+        primary(&mut primary_settings);
         let primary_app = app_with(
             primary_db.clone(),
             primary_catalog.clone(),
             primary_store.clone(),
-            ServerConfig {
-                export_dir: path.with_extension("export").display().to_string(),
-                ..ServerConfig::default()
-            },
+            primary_settings,
         );
         tokio::spawn(async move {
             axum::serve(listener, primary_app).await.unwrap();
@@ -5947,6 +5957,137 @@ mod cluster {
         .await;
         assert_eq!(caught_up.status, StatusCode::OK);
         assert_eq!(header(&caught_up, "x-refhir-role"), "replica");
+    }
+
+    #[tokio::test]
+    async fn a_replica_writes_only_through_a_primary_of_its_own_tenant() {
+        // (the replica's tenant, the primary's tenant, whether the write is accepted)
+        let cases: [(Option<&str>, Option<&str>, bool); 5] = [
+            (Some("a"), Some("a"), true),
+            (None, None, true),
+            (Some("a"), Some("b"), false),
+            (None, Some("b"), false),
+            (Some("a"), None, false),
+        ];
+        for (mine, theirs, accepted) in cases {
+            let cluster = pair_with(
+                |primary| primary.tenant = theirs.map(String::from),
+                |replica| replica.tenant = mine.map(String::from),
+            )
+            .await;
+            let before = cluster.primary_db.latest_ts();
+            let created = call(
+                &cluster.replica_app,
+                "POST",
+                "/Patient",
+                Some(patient("via-replica")),
+                &[],
+            )
+            .await;
+            if accepted {
+                assert_eq!(
+                    created.status,
+                    StatusCode::CREATED,
+                    "{mine:?} to {theirs:?}"
+                );
+                continue;
+            }
+            assert_eq!(
+                created.status,
+                StatusCode::MISDIRECTED_REQUEST,
+                "{mine:?} to {theirs:?}: {}",
+                created.body
+            );
+            let said = created.body["issue"][0]["diagnostics"].as_str().unwrap();
+            assert!(said.contains("--primary-url"), "{said}");
+            assert_eq!(
+                cluster.primary_db.latest_ts(),
+                before,
+                "the refused write reached the primary ({mine:?} to {theirs:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_is_not_a_replica_is_not_held_to_a_tenant() {
+        let cluster = pair_with(|primary| primary.tenant = Some("b".into()), |_| {}).await;
+        let primary = format!("http://{}", cluster.primary_addr);
+        let status = tokio::task::spawn_blocking(move || {
+            ureq::post(&format!("{primary}/Patient"))
+                .set("content-type", "application/fhir+json")
+                .send_string(&patient("direct").to_string())
+                .map(|response| response.status())
+                .unwrap_or(0)
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, 201);
+    }
+
+    #[tokio::test]
+    async fn a_mutation_over_sync_goes_only_to_a_primary_of_the_same_tenant() {
+        for (primary_tenant, accepted) in [("a", true), ("b", false)] {
+            let cluster = pair_with(
+                |primary| primary.tenant = Some(primary_tenant.into()),
+                |replica| replica.tenant = Some("a".into()),
+            )
+            .await;
+            create_on_primary(&cluster, "p1");
+            let db = cluster.replica_db.clone();
+            tokio::task::spawn_blocking(move || db.refresh().unwrap())
+                .await
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let replica_addr = listener.local_addr().unwrap();
+            let replica = cluster.replica_app.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, replica).await.unwrap();
+            });
+            let before = cluster.primary_db.latest_ts();
+            let (mut writer, _) = connect(&format!("ws://{replica_addr}/sync")).await;
+            writer
+                .send(Message::Text(
+                    json!({
+                        "type": "Mutation",
+                        "requestId": 3,
+                        "udfPath": "Patient/update",
+                        "args": {
+                            "id": "p1",
+                            "resource": {"resourceType": "Patient", "id": "p1", "active": true}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            let reply = next_json(&mut writer).await;
+            assert_eq!(reply["type"], "MutationResponse");
+            assert_eq!(
+                reply["success"], accepted,
+                "primary of tenant {primary_tenant}: {reply}"
+            );
+            if !accepted {
+                assert_eq!(
+                    cluster.primary_db.latest_ts(),
+                    before,
+                    "the refused mutation reached the primary"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn healthz_names_the_tenant_a_process_serves() {
+        let cluster = pair_with(
+            |primary| primary.tenant = Some("acme".into()),
+            |replica| replica.tenant = Some("acme".into()),
+        )
+        .await;
+        let health = call(&cluster.replica_app, "GET", "/healthz", None, &[]).await;
+        assert_eq!(health.body["tenant"], "acme");
+        let plain = pair(|_| {}).await;
+        let health = call(&plain.replica_app, "GET", "/healthz", None, &[]).await;
+        assert!(health.body.get("tenant").is_none(), "{}", health.body);
     }
 
     #[tokio::test]

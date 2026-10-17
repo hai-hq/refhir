@@ -26,6 +26,8 @@ pub struct Upstream {
     pub url: String,
     /// The caller's bearer token, so the primary applies the same scopes.
     pub bearer: Option<String>,
+    /// The tenant this replica serves, which the primary checks against its own.
+    pub tenant: Option<String>,
 }
 
 /// Runs one mutation on the primary over a connection of its own and returns its
@@ -51,6 +53,16 @@ async fn forward_mutation(
             .parse()
             .map_err(|_| "the bearer token is not a valid header value".to_string())?;
         request.headers_mut().insert("Authorization", value);
+    }
+    // Says that a replica is asking and which tenant it serves, as a forwarded request does.
+    request.headers_mut().insert(
+        crate::cluster::FORWARDED,
+        "1".parse().expect("a valid header value"),
+    );
+    if let Some(tenant) = &upstream.tenant {
+        if let Ok(value) = tenant.parse() {
+            request.headers_mut().insert(crate::cluster::TENANT, value);
+        }
     }
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),

@@ -30,6 +30,10 @@ database:
   tlsSecret: ""
   sqlitePath: /data/refhir.sqlite
   postgresUrl: ""
+  # The tenant these pods serve, in a Postgres database that many tenants share. Create it first
+  # with `refhir tenant create NAME`. Install one release per tenant, all with the same
+  # postgresUrl. Unset, the database belongs to this release alone.
+  tenant: ""
 
 fhir:
   version: r4

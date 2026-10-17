@@ -142,8 +142,20 @@ jobs:
       - name: Test Postgres backend
         run: cargo test -p refhir-postgres --locked
 
+      # The tenancy tests again as an ordinary role, which row-level security binds. The run above
+      # is as the superuser, which it does not, so that a statement that forgot its tenant fails.
+      - name: Test Postgres backend under row-level security
+        env:
+          REFHIR_TEST_ROW_SECURITY: "1"
+        run: cargo test -p refhir-postgres --locked tenancy
+
       - name: Test installing packages into Postgres
         run: cargo test -p refhir-fhir --locked --test install_memory_postgres
+
+      # Two tenants on one database are given the packages the first installed, without storing
+      # them again.
+      - name: Test tenants sharing packages
+        run: cargo test -p refhir-fhir --locked --test shared_catalog
 
       # The service above does not speak TLS, so this starts a TLS-only Postgres of its own
       # (certificates, client-certificate role and all) and runs the TLS tests against it.
@@ -155,8 +167,8 @@ jobs:
           eval "$out"
           cargo test -p refhir-postgres --locked tls
 
-      # Starts real refhir processes (primary, standby, replicas) on databases of their own and
-      # kills the primary while writes are in flight. The Postgres role may create databases.
+      # Starts real refhir processes (primary, standby, replicas, tenants) on databases of their own
+      # and kills the primary while writes are in flight. The Postgres role may create databases.
       - name: Test several processes on one database
         run: cargo test -p refhir --locked --test cluster -- --test-threads=4
 

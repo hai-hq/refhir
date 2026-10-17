@@ -26,8 +26,12 @@ impl JobStore for PostgresPersistence {
             guard
                 .client
                 .execute(
-                    "INSERT INTO jobs (id, kind, status, request, attempts, created_at, \
-                     lease_owner, lease_until) VALUES ($1, $2, $3, $4, 0, $5, $6, $7)",
+                    &format!(
+                        "INSERT INTO jobs ({}id, kind, status, request, attempts, created_at, \
+                         lease_owner, lease_until) VALUES ({}$1, $2, $3, $4, 0, $5, $6, $7)",
+                        self.scope.cols(),
+                        self.scope.vals()
+                    ),
                     &[
                         &id,
                         &kind,
@@ -64,14 +68,26 @@ impl JobStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
+                    // The pick is a CTE that must run once. As `WHERE id IN (SELECT ... LIMIT n FOR
+                    // UPDATE SKIP LOCKED)` the planner may run it again for each row of the update
+                    // (it does, for the statement as the driver sends it, with the limit as a
+                    // parameter): the rows the update has locked are skipped, so each run picks
+                    // others, and more than `n` jobs are claimed. A CTE that locks rows is never
+                    // inlined into the statement that uses it, on any Postgres version, so it runs
+                    // once. (No `MATERIALIZED`, which would need Postgres 12.)
+                    //
+                    // The tenant is in the pick and in the update: a claim that reached another
+                    // tenant's jobs would run its export against this tenant's data.
                     &format!(
-                        "UPDATE jobs SET status = 'running', attempts = attempts + 1, \
-                         lease_owner = $1, lease_until = $2 \
-                         WHERE id IN (SELECT id FROM jobs \
-                             WHERE status IN ('accepted', 'running') AND kind = ANY($3) \
+                        "WITH picked AS (SELECT id AS picked_id FROM jobs \
+                             WHERE {scoped}status IN ('accepted', 'running') AND kind = ANY($3) \
                                AND (lease_owner IS NULL OR lease_until <= $4) \
                              ORDER BY created_at, id LIMIT $5 FOR UPDATE SKIP LOCKED) \
-                         RETURNING {JOB_COLUMNS}"
+                         UPDATE jobs SET status = 'running', attempts = attempts + 1, \
+                         lease_owner = $1, lease_until = $2 \
+                         FROM picked WHERE {scoped}jobs.id = picked.picked_id \
+                         RETURNING {JOB_COLUMNS}",
+                        scoped = self.scope.and()
                     ),
                     &[
                         &owner,
@@ -106,8 +122,9 @@ impl JobStore for PostgresPersistence {
                     &format!(
                         "UPDATE jobs SET status = 'running', attempts = attempts + 1, \
                          lease_until = $1 \
-                         WHERE id = $2 AND lease_owner = $3 AND status IN ('accepted', 'running') \
-                         RETURNING {JOB_COLUMNS}"
+                         WHERE {}id = $2 AND lease_owner = $3 AND status IN ('accepted', 'running') \
+                         RETURNING {JOB_COLUMNS}",
+                        self.scope.and()
                     ),
                     &[&lease_until(now_ms, lease_ms), &id, &owner],
                 )
@@ -128,8 +145,11 @@ impl JobStore for PostgresPersistence {
             let changed = guard
                 .client
                 .execute(
-                    "UPDATE jobs SET lease_until = $1 \
-                     WHERE id = $2 AND lease_owner = $3 AND status IN ('accepted', 'running')",
+                    &format!(
+                        "UPDATE jobs SET lease_until = $1 \
+                         WHERE {}id = $2 AND lease_owner = $3 AND status IN ('accepted', 'running')",
+                        self.scope.and()
+                    ),
                     &[&lease_until(now_ms, lease_ms), &id, &owner],
                 )
                 .map_err(definite)?;
@@ -152,9 +172,12 @@ impl JobStore for PostgresPersistence {
             let changed = guard
                 .client
                 .execute(
-                    "UPDATE jobs SET status = $1, result = $2, error = $3, completed_at = $4, \
-                     lease_owner = NULL, lease_until = NULL \
-                     WHERE id = $5 AND lease_owner = $6 AND status IN ('accepted', 'running')",
+                    &format!(
+                        "UPDATE jobs SET status = $1, result = $2, error = $3, completed_at = $4, \
+                         lease_owner = NULL, lease_until = NULL \
+                         WHERE {}id = $5 AND lease_owner = $6 AND status IN ('accepted', 'running')",
+                        self.scope.and()
+                    ),
                     &[
                         &end.status,
                         &end.result,
@@ -190,7 +213,10 @@ impl JobStore for PostgresPersistence {
             let row = guard
                 .client
                 .query_opt(
-                    &format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = $1"),
+                    &format!(
+                        "SELECT {JOB_COLUMNS} FROM jobs WHERE {}id = $1",
+                        self.scope.and()
+                    ),
                     &[&id],
                 )
                 .map_err(definite)?;

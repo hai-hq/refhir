@@ -196,21 +196,21 @@ pub fn fresh_database(admin: &str, tag: &str) -> TestDatabase {
     }
 }
 
-/// `admin` with its database replaced by `name`. Handles `postgres://...` URLs and the
-/// `host=... user=...` key/value form CI uses.
-pub fn with_database(admin: &str, name: &str) -> String {
-    if admin.contains("://") {
-        let (head, tail) = match admin.split_once('?') {
-            Some((head, query)) => (head, format!("?{query}")),
-            None => (admin, String::new()),
-        };
-        let slash = head.rfind('/').expect("database name in the url");
-        format!("{}/{name}{tail}", &head[..slash])
-    } else {
-        let kept: Vec<&str> = admin
-            .split_whitespace()
-            .filter(|part| !part.starts_with("dbname="))
-            .collect();
-        format!("{} dbname={name}", kept.join(" "))
-    }
+pub use refhir_postgres::test_support::with_database;
+
+/// A database owned by a role that is not a superuser, as the application's own role is of its
+/// database, and the URL to connect to it as that role. Row-level security binds that role.
+pub fn database_of_an_ordinary_role(admin: &str, tag: &str) -> (TestDatabase, String) {
+    refhir_postgres::test_support::ensure_ordinary_role(admin);
+    let database = fresh_database(admin, tag);
+    postgres::Client::connect(&database.url, postgres::NoTls)
+        .expect("connect")
+        .batch_execute(&format!(
+            "ALTER DATABASE {} OWNER TO {}",
+            database.name,
+            refhir_postgres::test_support::ORDINARY_ROLE
+        ))
+        .expect("give the database to the application's role");
+    let url = refhir_postgres::test_support::as_ordinary_role(&database.url);
+    (database, url)
 }

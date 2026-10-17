@@ -31,6 +31,7 @@ kind = "sqlite" # sqlite | memory | postgres
 sqlite_path = "/data/refhir.sqlite"
 # postgres_url = "postgresql://refhir:refhir@postgres:5432/refhir"
 # Or set REFHIR_POSTGRES_URL instead of postgres_url.
+# tenant = "acme" # serve one tenant of a Postgres database that many tenants share; REFHIR_TENANT
 # TLS: no sslmode means no TLS. In production use
 #   ?sslmode=verify-full&sslrootcert=/etc/refhir-pg-tls/ca.crt
 # (also sslcert/sslkey for client certificates; see docs/operations.md, "Postgres and TLS").

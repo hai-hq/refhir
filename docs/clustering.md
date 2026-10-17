@@ -46,3 +46,68 @@ refhir --postgres $URL --role replica --primary-url http://primary:8080 # reads
 
 Running it: [deploy/cluster](../deploy/cluster/README.md) (Docker Compose with HAProxy) and the Helm
 chart's `cluster.enabled`.
+
+## Tenants on one database
+
+One Postgres database can hold many tenants. A tenant is a separate FHIR server: its resources,
+SMART clients and audit trail are its own, and nothing one tenant does reaches another. Tenants
+share the database's tables, so a new tenant is a registration and not a new database, and each
+tenant has a writer of its own: write capacity grows with the number of tenants.
+
+```bash
+refhir tenant create acme --postgres $URL                                          # once per tenant
+refhir --postgres $URL --tenant acme                                               # its primary
+refhir --postgres $URL --tenant acme --standby                                     # takes over
+refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:8080 # reads
+```
+
+- **A database keeps its layout.** The first `refhir tenant create` in an empty database makes it a
+  shared one. A database that already holds a ReFHIR made without tenants cannot hold tenants, and
+  a shared database cannot be opened without naming a tenant: each is refused before a row is read.
+- **Roles.** A tenant has its own primary, standbys and replicas, as above. A process never reads,
+  writes or waits for another tenant's rows, and holds its own writer lease. `GET /healthz` names
+  the tenant.
+- **Replica latency.** A tenant's primary tells its replicas about new commits at most every 20 ms:
+  the first commit after a quiet spell at once, and the rest of a burst together. Announcing every
+  commit would have each one take a lock that the whole Postgres server shares and wake the
+  listening connections of the database, so many busy tenants would slow each other down. A replica
+  can be up to 20 ms later than it would have been inside a burst of writes, and not at all when
+  writes are sparse.
+- **A replica writes into its own tenant only.** The primary a replica forwards to refuses the
+  request (`421`) if it serves a different tenant, so a wrong `--primary-url` cannot write into a
+  tenant that is not the replica's own.
+- **Row-level security.** Every table that holds tenants' rows has a policy that shows a connection
+  only the rows of the tenant it serves and lets it write only its own, so a process cannot read or
+  change another tenant's rows even if a statement asks for them. Superusers, and roles with
+  `BYPASSRLS`, are never bound by policies, so run ReFHIR as an ordinary role that owns its
+  database (`CREATE ROLE refhir LOGIN PASSWORD '…'`, then `CREATE DATABASE refhir OWNER refhir`).
+  The policies bind the owner too. A process that connects as a role the policies do not bind
+  works, and logs a warning at start-up that the database is not keeping it to its tenant. Take
+  backups as a superuser or a role with `BYPASSRLS`: `pg_dump` run as the ordinary role refuses,
+  because it would not see every tenant's rows, and `--enable-row-security` would let it run and
+  dump none of them.
+- **SMART.** Each tenant has its own clients, tokens and signing key, so give each tenant its own
+  `--public-url`. The tenant's processes share `--smart-dcr-token` and
+  `--smart-confidential-secret`, as above.
+- **Packages.** The FHIR packages that ship with ReFHIR (the core definitions, terminology and
+  what they depend on) are stored once for all tenants. A new tenant is given them in moments
+  instead of reading and storing its own copy, and its start-up does not grow with the number of
+  tenants. What a tenant writes (its own definitions, code systems and search parameters) and
+  every package installed from a registry or a directory stay its own.
+- **Files.** A tenant's package cache and export directory default to a folder named for it.
+- **Routing.** Route requests to a tenant's processes by host name or path in front of ReFHIR, with
+  a load balancer or ingress: each tenant is its own set of processes.
+- **Managing tenants.** `refhir tenant list` shows the tenants and whether a primary of each is
+  running. `refhir tenant delete NAME --yes` removes a tenant and everything it holds. It refuses
+  while a primary of the tenant runs, and it cannot be undone, so take a backup first.
+- **Connections.** Every process opens its pool. A primary also keeps a connection that holds the
+  writer lease and, for a tenant, another that announces its commits; a replica keeps one that
+  listens for those announcements. `max_connections` must cover all of them for the processes of
+  every tenant. A proxy that pools connections per transaction (PgBouncer in transaction mode) cannot sit
+  between ReFHIR and the database: the lease and the announcements belong to a session.
+- **Sizing.** Each tenant adds a writer, so write capacity grows with the number of tenants until
+  the Postgres server is the limit: its CPU, its disk, and the one lock a cluster takes to announce
+  commits to listeners, which is shared by every database in it. Size the server for all its
+  tenants together, and give some tenants a cluster of their own when it is full.
+- **Upgrades.** The schema is shared, so it is migrated once for every tenant: run the same release
+  in every tenant's processes (see [Schema migrations](migrations.md)).

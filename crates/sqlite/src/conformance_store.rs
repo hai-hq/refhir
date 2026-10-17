@@ -971,6 +971,7 @@ impl<'a, 'c> Installer<'a, 'c> {
             package_id: self.package_id,
             inserted: !self.existing,
             newly_pending: self.newly_pending,
+            shared: false,
         })
     }
 }
