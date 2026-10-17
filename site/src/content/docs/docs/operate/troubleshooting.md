@@ -17,8 +17,10 @@ download …: Connection Failed … Point [conformance].package_registry (or REF
 reachable registry, an HTTPS mirror, or s3://bucket/prefix
 ```
 
-ReFHIR ships no FHIR packages, and a first start downloads them. If the registry cannot be reached
-the server does not start. Either make `packages.fhir.org` reachable, point
+This is what a server that was told it may download meets when there is no prepared file and the
+registry cannot be reached. Release archives and images have the file and download nothing. A
+server that was not told it may download, and has no usable file, stops with a different error that
+says so (`there is no prepared file …` or `… does not hold …`). Either make `packages.fhir.org` reachable, point
 `REFHIR_PACKAGE_REGISTRY` (or `[conformance].package_registry`) at a mirror or an `s3://` bundle, or
 start from a persistent volume that already holds the package cache. Packages are cached after the
 first successful install, and later starts skip the download. See

@@ -5,18 +5,23 @@
 //! parameters writers and search may use.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use refhir_fhirpath::{Host, Model};
+use refhir_fhirpath::{Host, Model, ModelBuilder};
 use refhir_persistence::{
     ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
 };
 use refhir_types::{exact_key, valid_id, IndexId, TabletId};
-use refhir_validate::{expansion_is_current, MemoryTerminology, Schema};
+use refhir_validate::{
+    expansion_is_current, DefinitionSource, MemoryTerminology, Schema, SchemaBuilder, TermSource,
+    TerminologyBuilder,
+};
 use serde_json::{json, Value};
 
 use crate::compartment::{self, Compartment};
 use crate::error::FhirError;
 use crate::extract::{self, Extractor, SearchKind};
+use crate::lazy::StoreSource;
 
 /// Parse `rows` into JSON values, in order, spread over the available cores.
 fn parse_all<T: Sync>(
@@ -27,7 +32,7 @@ fn parse_all<T: Sync>(
     let workers = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
-        .min(rows.len() / 64 + 1);
+        .min(rows.len() / 32 + 1);
     let parse = |chunk: &[T]| -> Result<Vec<Value>, PersistError> {
         chunk
             .iter()
@@ -140,6 +145,9 @@ impl ResourceModel {
 /// ready. A replica never writes, so it follows `Stable` and never loads a parameter whose index
 /// is incomplete. A standby may have to finish the backfill when it takes over, so it follows
 /// `Latest` and already knows about the pending parameters.
+///
+/// Either also follows the terminology counter, which a change to the terminology alone moves
+/// instead of these. See [`CatalogStamp`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CatalogClock {
     Stable,
@@ -153,6 +161,34 @@ impl CatalogClock {
             CatalogClock::Latest => store.catalog_revision(),
         }
     }
+
+    /// Both counters a process that follows this clock compares with what it loaded at.
+    pub fn stamp(self, store: &dyn ConformanceStore) -> Result<CatalogStamp, PersistError> {
+        Ok(CatalogStamp {
+            clock: self.read(store)?,
+            terminology: store.terminology_version()?,
+        })
+    }
+}
+
+/// What a catalog was loaded at, or what the database says now: the value of the clock a process
+/// follows and the terminology counter.
+///
+/// If `clock` moved, the whole catalog is loaded again. If only `terminology` moved, a change was
+/// made to the terminology alone, and loading that again is enough: the structure definitions and
+/// search parameters are as they were, and none is loaded, so a replica cannot pick up a
+/// parameter whose index is incomplete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CatalogStamp {
+    pub clock: u64,
+    pub terminology: u64,
+}
+
+/// What a catalog has read from the store lately and still keeps.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Warmth {
+    structures: Vec<String>,
+    terminology: refhir_validate::Resident,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +205,9 @@ pub struct Catalog {
     /// Whether a PUT to an id that does not exist creates it under that id. Off by default: the
     /// server assigns ids.
     update_create: bool,
+    /// Whether a rebuild of this catalog lets go of it before it builds the new one, instead of
+    /// holding both. See [`Catalog::set_rebuild_in_place`].
+    rebuild_in_place: bool,
     /// Whether any stored expansion was made under other rules than the current ones, so that it
     /// may be wrong and the stored expansions need rebuilding.
     stale_expansions: bool,
@@ -182,6 +221,55 @@ impl Catalog {
             .any(|model| model.pending_params().next().is_some())
     }
 
+    /// The search parameters [`Catalog::open`] would attach to the resource types this catalog
+    /// has, for `parameters` as they are stored now. A backfill that completes changes the status
+    /// of stored parameters and nothing else, and these are all it changes in a catalog, so the
+    /// schema and the terminology, which are most of what a load builds, need not be built again.
+    /// The result is made under a read lock; [`Catalog::set_parameters`] applies it.
+    pub fn compiled_parameters(
+        &self,
+        parameters: &[StoredSearchParameter],
+    ) -> BTreeMap<String, Vec<SearchParam>> {
+        let mut types: BTreeMap<String, ResourceModel> = self
+            .types
+            .iter()
+            .map(|(name, model)| {
+                let bare = ResourceModel {
+                    name: model.name.clone(),
+                    references: model.references.clone(),
+                    params: Vec::new(),
+                };
+                (name.clone(), bare)
+            })
+            .collect();
+        add_parameters(&mut types, parameters);
+        types
+            .into_iter()
+            .map(|(name, model)| (name, model.params))
+            .collect()
+    }
+
+    /// Replace the search parameters of the types in `compiled`, which
+    /// [`Catalog::compiled_parameters`] made. A type the catalog gained since is left as it is.
+    pub fn set_parameters(&mut self, compiled: BTreeMap<String, Vec<SearchParam>>) {
+        for (name, params) in compiled {
+            if let Some(model) = self.types.get_mut(&name) {
+                model.params = params;
+            }
+        }
+    }
+
+    /// [`Self::compiled_parameters`] and [`Self::set_parameters`] in one step, for a catalog
+    /// nothing is answering from: the parameters it has are let go before the new ones are built,
+    /// so the two sets are not held at once. That is a server that is starting; see
+    /// [`Self::rebuild_in_place`].
+    pub fn recompile_parameters(&mut self, parameters: &[StoredSearchParameter]) {
+        for model in self.types.values_mut() {
+            model.params = Vec::new();
+        }
+        add_parameters(&mut self.types, parameters);
+    }
+
     pub fn empty() -> Self {
         Self {
             fhir_version: None,
@@ -193,166 +281,164 @@ impl Catalog {
             compartments: compartment::load(&[]),
             sdc_archiver: false,
             update_create: false,
+            rebuild_in_place: false,
             stale_expansions: false,
         }
     }
 
-    /// The catalog and the value of `clock` it reflects. `open` reads five tables one after
-    /// another, so a change made in between could give a catalog that mixes two states; this
-    /// reads the clock before and after and tries again if it moved. If it never holds still the
-    /// catalog is returned with the *older* reading, so a caller that watches the clock sees it
-    /// differ and loads again, rather than trusting a catalog that may mix two states.
+    /// The catalog and the counters it reflects. `open` reads five tables one after another, so a
+    /// change made in between could give a catalog that mixes two states; this reads the clock
+    /// before and after and tries again if it moved. If it never holds still the catalog is
+    /// returned with the *older* reading, so a caller that watches the clock sees it differ and
+    /// loads again, rather than trusting a catalog that may mix two states.
+    ///
+    /// Only the clock decides. A terminology write that lands during the load leaves that counter
+    /// ahead of the stamp returned, which is read before the load, so whoever watches it loads the
+    /// terminology again: much cheaper than loading everything again here.
     pub fn open_consistent(
         store: &dyn ConformanceStore,
         clock: CatalogClock,
-    ) -> Result<(Self, u64), PersistError> {
+    ) -> Result<(Self, CatalogStamp), PersistError> {
         let mut attempts = 0;
         loop {
-            let before = clock.read(store)?;
+            let before = clock.stamp(store)?;
             let catalog = Self::open(store)?;
             let after = clock.read(store)?;
             attempts += 1;
-            if before == after || attempts >= 5 {
+            if before.clock == after || attempts >= 5 {
                 return Ok((catalog, before));
             }
         }
     }
 
-    pub fn open(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
-        Self::load(
-            &store.load_packages()?,
-            &store.load_structure_definitions()?,
-            &store.load_search_parameters()?,
-            &store.load_terminology()?,
-            &store.load_expansions()?,
-        )
+    /// What the terminology and expansion tables hold now, for a process that was told only the
+    /// terminology changed. Nothing else is read, and the counters are not: the caller read them
+    /// before this, so that a change made during the load is found by the next poll (see
+    /// [`crate::package::reload_catalog`]).
+    pub(crate) fn open_terminology(
+        store: &dyn ConformanceStore,
+    ) -> Result<CompiledTerminology, PersistError> {
+        let fhir_version = store
+            .load_packages()?
+            .first()
+            .map(|package| package.fhir_version.clone());
+        let source = store
+            .shared()
+            .map(|shared| Arc::new(StoreSource::new(shared)) as Arc<dyn TermSource>);
+        CompiledTerminology::open(store, fhir_version.as_deref(), source)
     }
 
-    pub fn load(
-        packages: &[refhir_persistence::StoredPackage],
-        definitions: &[StoredStructureDefinition],
-        parameters: &[StoredSearchParameter],
-        terminology: &[refhir_persistence::StoredTerminology],
-        expansions: &[refhir_persistence::StoredExpansion],
+    /// Make terminology read by [`Self::open_terminology`] ready to replace this catalog's own: it
+    /// holds what a full load holds of it and has read what this catalog's terminology has been
+    /// asked for lately. This reads from the store, so it is done under a read lock, while the
+    /// catalog being replaced is still answering; [`Self::replace_terminology`] then only swaps.
+    /// What is held depends on the definitions, which a terminology-only reload does not change.
+    pub(crate) fn prepare_terminology(&self, part: &mut CompiledTerminology) {
+        part.terms.hold(&self.schema.checked_value_sets());
+        part.terms.warm(&self.terms.resident());
+        crate::memory::release_unused_memory();
+    }
+
+    /// Put terminology read by [`Self::open_terminology`] in place of this catalog's own.
+    pub(crate) fn replace_terminology(&mut self, part: CompiledTerminology) {
+        self.terms = part.terms;
+        self.compartments = part.compartments;
+        self.stale_expansions = part.stale_expansions;
+    }
+
+    /// Read the conformance tables and compile them.
+    ///
+    /// The tables are read a page at a time and each page is compiled and dropped before the next
+    /// is read. A parsed StructureDefinition or code system is several times the size of its
+    /// text, and the catalog keeps only a fraction of it; holding every table's rows and parsed
+    /// JSON at once is what made loading the R4 packages take several times the memory the
+    /// finished catalog uses. The terminology goes first because it has the most to hold while
+    /// it is built: loaded before the schema exists, its peak does not sit on top of the schema.
+    ///
+    /// A store that can give a handle to itself (see [`ConformanceStore::shared`]) gets a catalog
+    /// that keeps an index of its definitions and reads each from the store when it is first
+    /// used; any other is read whole, as [`Self::open_whole`] does.
+    pub fn open(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
+        let source = store
+            .shared()
+            .map(|shared| Arc::new(StoreSource::new(shared)));
+        Self::open_from(store, source)
+    }
+
+    /// [`Self::open`] with every definition read and compiled now, whatever the store can do. It
+    /// answers what `open` answers, and is what that is checked against.
+    pub fn open_whole(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
+        Self::open_from(store, None)
+    }
+
+    pub(crate) fn open_from(
+        store: &dyn ConformanceStore,
+        source: Option<Arc<StoreSource>>,
     ) -> Result<Self, PersistError> {
+        let lazy = source.is_some();
+        let packages = store.load_packages()?;
         let fhir_version = packages.first().map(|package| package.fhir_version.clone());
-        // Loading is dominated by parsing thousands of stored JSON documents, so parse them on
-        // every core, then build the two independent indexes side by side.
-        let definition_json = parse_all(definitions, |row| &row.json, "structure definition json")?;
-        let term_json = parse_all(terminology, |row| &row.json, "terminology json")?;
-        let expansion_json = parse_all(expansions, |row| &row.json, "value set expansion json")?;
-        // Each resource with the package it came from, so a value set reads the code systems of
-        // its own package first, as installing the package expanded it.
-        let scoped: Vec<(i64, &serde_json::Value)> = terminology
-            .iter()
-            .map(|row| row.package_id)
-            .zip(&term_json)
-            .collect();
-        // Each stored expansion with the package that stored it, so that a value set more than one
-        // package defines is answered by the definition in use, not by the package installed last.
-        let stored: Vec<(i64, &serde_json::Value)> = expansions
-            .iter()
-            .map(|row| row.package_id)
-            .zip(&expansion_json)
-            .collect();
-        let (schema, terms) = std::thread::scope(|scope| {
-            let schema = scope.spawn(|| Schema::from_definitions(&definition_json));
-            let terms =
-                MemoryTerminology::from_stored_scoped(&scoped, &stored, fhir_version.as_deref());
-            (schema.join().expect("schema build"), terms)
-        });
-        let mut types = BTreeMap::new();
-        for (definition, json) in definitions.iter().zip(&definition_json) {
-            if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
-                continue;
-            }
-            if definition.kind != "resource" || definition.is_abstract {
-                continue;
-            }
-            let model = types
-                .entry(definition.type_name.clone())
-                .or_insert_with(|| ResourceModel {
-                    name: definition.type_name.clone(),
-                    references: Vec::new(),
-                    params: Vec::new(),
-                });
-            for reference in references_from(&definition.type_name, json) {
-                if !model
-                    .references
-                    .iter()
-                    .any(|item| item.path == reference.path)
-                {
-                    model.references.push(reference);
-                }
-            }
+        drop(packages);
+        let terminology = CompiledTerminology::open(
+            store,
+            fhir_version.as_deref(),
+            source.clone().map(|source| source as Arc<dyn TermSource>),
+        )?;
+        let mut definitions =
+            DefinitionsCompiler::new(source.map(|source| source as Arc<dyn DefinitionSource>));
+        store.visit_structure_definitions(&mut |rows| definitions.add(&rows))?;
+        let mut definitions = definitions.finish();
+        add_parameters(&mut definitions.types, &store.load_search_parameters()?);
+        let mut catalog = Self::assemble(fhir_version, definitions, terminology);
+        if lazy {
+            // The base types are held, and so is what they bind: the value sets a code is checked
+            // against and the code systems behind them. A request of any common kind finds all of
+            // it in memory. What it uses beyond that (a profile, an extension, a table nothing
+            // binds) is read when it is first used.
+            let checked = catalog.schema.checked_value_sets();
+            catalog.terms.hold(&checked);
         }
-        let mut component_types = BTreeMap::new();
-        for parameter in parameters {
-            component_types
-                .entry(parameter.url.clone())
-                .or_insert_with(|| parameter.param_type.clone());
-        }
-        for parameter in parameters {
-            if parameter.status == ParamStatus::Unsupported {
-                continue;
-            }
-            let Some(model) = types.get_mut(&parameter.base) else {
-                continue;
-            };
-            let Ok(json) = serde_json::from_str::<Value>(&parameter.json) else {
-                continue;
-            };
-            let Some(mut extractor) = extract::compile_parameter(&json, &component_types) else {
-                continue;
-            };
-            // What the parameter can point at in this type, not in every type it is defined for.
-            extractor.narrow_targets(&parameter.base, |path| {
-                model
-                    .references
-                    .iter()
-                    .find(|element| element.path == path)
-                    .map(|element| element.targets.as_slice())
-            });
-            if model
-                .params
-                .iter()
-                .any(|param| param.name == parameter.code)
-            {
-                continue;
-            }
-            model.params.push(SearchParam {
-                name: parameter.code.clone(),
-                kind: extractor.kind(),
-                status: parameter.status,
-                extractor,
-            });
-        }
-        for model in types.values_mut() {
-            model
-                .params
-                .sort_by(|left, right| left.name.cmp(&right.name));
-        }
-        let model_json: Vec<Value> = definition_json
-            .iter()
-            .filter(|json| {
-                json.get("derivation").and_then(|value| value.as_str()) != Some("constraint")
-            })
-            .cloned()
-            .collect();
-        Ok(Self {
+        // The load parsed several times what the catalog keeps; do not let the process stay at
+        // that peak.
+        crate::memory::release_unused_memory();
+        Ok(catalog)
+    }
+
+    fn assemble(
+        fhir_version: Option<String>,
+        definitions: CompiledDefinitions,
+        terminology: CompiledTerminology,
+    ) -> Self {
+        Self {
             fhir_version,
-            types,
-            path_model: Model::from_definitions(&model_json),
-            schema,
-            terms,
+            types: definitions.types,
+            path_model: definitions.path_model,
+            schema: definitions.schema,
+            terms: terminology.terms,
             reference_policy: ReferencePolicy::Strict,
-            compartments: compartment::load(&term_json),
+            compartments: terminology.compartments,
             sdc_archiver: false,
             update_create: false,
-            stale_expansions: expansion_json
-                .iter()
-                .any(|document| !expansion_is_current(document)),
-        })
+            rebuild_in_place: false,
+            stale_expansions: terminology.stale_expansions,
+        }
+    }
+
+    /// What this catalog has read from the store lately and still keeps, which a catalog that
+    /// replaces it can be told to read at once (see [`Self::warm`]).
+    pub(crate) fn warmth(&self) -> Warmth {
+        Warmth {
+            structures: self.schema.resident(),
+            terminology: self.terms.resident(),
+        }
+    }
+
+    /// Read what `warmth` lists, so that a reload does not send the requests that were being
+    /// answered back to waiting for reads. It is done before the catalog is put in place, while
+    /// the one it replaces is still answering.
+    pub(crate) fn warm(&self, warmth: &Warmth) {
+        self.schema.warm(&warmth.structures);
+        self.terms.warm(&warmth.terminology);
     }
 
     /// Whether any stored expansion was made under other rules than the current ones. A database
@@ -382,6 +468,19 @@ impl Catalog {
     /// leaves it to the deployment, so it is a setting, and the capability statement reports it.
     pub fn update_create(&self) -> bool {
         self.update_create
+    }
+
+    /// Whether a rebuild of this catalog lets go of it first.
+    pub fn rebuild_in_place(&self) -> bool {
+        self.rebuild_in_place
+    }
+
+    /// Let a rebuild of this catalog release it before the new one is built, so that two are not
+    /// held at once (a whole catalog's memory, at the moment a starting server needs the most).
+    /// Only a server that is still starting may ask for it: until it serves, nothing reads the
+    /// catalog, so nothing can find it empty. A rebuild that then fails leaves it empty.
+    pub fn set_rebuild_in_place(&mut self, enabled: bool) {
+        self.rebuild_in_place = enabled;
     }
 
     pub fn set_update_create(&mut self, enabled: bool) {
@@ -576,6 +675,269 @@ fn target_name(profile: &str) -> String {
     }
 }
 
+/// Stored JSON is parsed this much text at a time. A parsed document is several times the size of
+/// its text and the catalog keeps a fraction of it, so the batch is what bounds the memory loading
+/// takes: about eight times this much. It is by size rather than by count because a code system
+/// can be thousands of times the size of another. A catalog that keeps only an index of what it
+/// loads keeps none of the parse, so its peak is this.
+const PARSE_BATCH_BYTES: usize = 1024 * 1024;
+
+/// `rows` in runs of about [`PARSE_BATCH_BYTES`] of text, at least one row each.
+fn batches<'a, T>(
+    rows: &'a [T],
+    text_len: impl Fn(&T) -> usize + 'a,
+) -> impl Iterator<Item = &'a [T]> + 'a {
+    let mut start = 0;
+    std::iter::from_fn(move || {
+        if start >= rows.len() {
+            return None;
+        }
+        let mut end = start;
+        let mut bytes = 0;
+        while end < rows.len() {
+            let next = text_len(&rows[end]);
+            if end > start && bytes + next > PARSE_BATCH_BYTES {
+                break;
+            }
+            bytes += next;
+            end += 1;
+        }
+        let batch = &rows[start..end];
+        start = end;
+        Some(batch)
+    })
+}
+
+struct CompiledDefinitions {
+    types: BTreeMap<String, ResourceModel>,
+    path_model: Model,
+    schema: Schema,
+}
+
+/// Compiles StructureDefinitions handed over a page at a time into the schema, the FHIRPath type
+/// model and the reference elements of each resource type. Only one batch of them is parsed at
+/// any moment.
+struct DefinitionsCompiler {
+    schema: SchemaBuilder,
+    path_model: ModelBuilder,
+    types: BTreeMap<String, ResourceModel>,
+}
+
+impl DefinitionsCompiler {
+    /// With a `source`, the schema keeps an index and reads each structure from it when used.
+    fn new(source: Option<Arc<dyn DefinitionSource>>) -> Self {
+        Self {
+            schema: match source {
+                Some(source) => SchemaBuilder::lazy(source),
+                None => SchemaBuilder::default(),
+            },
+            path_model: ModelBuilder::default(),
+            types: BTreeMap::new(),
+        }
+    }
+
+    fn add(&mut self, rows: &[StoredStructureDefinition]) -> Result<(), PersistError> {
+        for batch in batches(rows, |row| row.json.len()) {
+            let parsed = parse_all(batch, |row| &row.json, "structure definition json")?;
+            for (definition, json) in batch.iter().zip(&parsed) {
+                self.schema.add_stored(definition.package_id, json);
+                if json.get("derivation").and_then(|value| value.as_str()) == Some("constraint") {
+                    continue;
+                }
+                self.path_model.add(json);
+                if definition.kind != "resource" || definition.is_abstract {
+                    continue;
+                }
+                let model = self
+                    .types
+                    .entry(definition.type_name.clone())
+                    .or_insert_with(|| ResourceModel {
+                        name: definition.type_name.clone(),
+                        references: Vec::new(),
+                        params: Vec::new(),
+                    });
+                for reference in references_from(&definition.type_name, json) {
+                    if !model
+                        .references
+                        .iter()
+                        .any(|item| item.path == reference.path)
+                    {
+                        model.references.push(reference);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> CompiledDefinitions {
+        CompiledDefinitions {
+            types: self.types,
+            path_model: self.path_model.finish(),
+            schema: self.schema.finish(),
+        }
+    }
+}
+
+/// Attach the search parameters to the resource types they are defined for.
+fn add_parameters(
+    types: &mut BTreeMap<String, ResourceModel>,
+    parameters: &[StoredSearchParameter],
+) {
+    let mut component_types = BTreeMap::new();
+    for parameter in parameters {
+        component_types
+            .entry(parameter.url.clone())
+            .or_insert_with(|| parameter.param_type.clone());
+    }
+    for parameter in parameters {
+        if parameter.status == ParamStatus::Unsupported {
+            continue;
+        }
+        let Some(model) = types.get_mut(&parameter.base) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<Value>(&parameter.json) else {
+            continue;
+        };
+        let Some(mut extractor) = extract::compile_parameter(&json, &component_types) else {
+            continue;
+        };
+        // What the parameter can point at in this type, not in every type it is defined for.
+        extractor.narrow_targets(&parameter.base, |path| {
+            model
+                .references
+                .iter()
+                .find(|element| element.path == path)
+                .map(|element| element.targets.as_slice())
+        });
+        if model
+            .params
+            .iter()
+            .any(|param| param.name == parameter.code)
+        {
+            continue;
+        }
+        model.params.push(SearchParam {
+            name: parameter.code.clone(),
+            kind: extractor.kind(),
+            status: parameter.status,
+            extractor,
+        });
+    }
+    for model in types.values_mut() {
+        model
+            .params
+            .sort_by(|left, right| left.name.cmp(&right.name));
+    }
+}
+
+/// What a catalog derives from the terminology and expansion tables, and from nothing else.
+///
+/// A full load builds it with everything else, and a change to the terminology alone builds just
+/// this and swaps it in, so the two cannot disagree about what these tables mean.
+pub(crate) struct CompiledTerminology {
+    terms: MemoryTerminology,
+    compartments: BTreeMap<String, Compartment>,
+    stale_expansions: bool,
+}
+
+impl CompiledTerminology {
+    /// The tables read a page at a time and compiled, the code systems indexed and dropped as
+    /// they are parsed. With a `source`, what is not needed to answer a question is left in the
+    /// store.
+    fn open(
+        store: &dyn ConformanceStore,
+        fhir_version: Option<&str>,
+        source: Option<Arc<dyn TermSource>>,
+    ) -> Result<Self, PersistError> {
+        let mut compiler = TerminologyCompiler::new(fhir_version, source);
+        store.visit_terminology(&mut |rows| compiler.add_resources(&rows))?;
+        store.visit_expansions(&mut |rows| compiler.add_expansions(&rows))?;
+        Ok(compiler.finish())
+    }
+}
+
+/// Compiles terminology handed over a page at a time. Each resource goes in with the package it
+/// came from, so a value set reads the code systems of its own package first, as installing the
+/// package expanded it; each stored expansion goes in with the package that stored it, so that a
+/// value set more than one package defines is answered by the definition in use, not by the
+/// package installed last. Code systems are indexed and dropped as they are parsed; see
+/// [`TerminologyBuilder`]. Resources go in before expansions.
+struct TerminologyCompiler {
+    builder: TerminologyBuilder,
+    compartment_definitions: Vec<Value>,
+    stale_expansions: bool,
+    /// Set when terminology is to be read from the store when used: then the builder is told
+    /// what each row is stored under, and keeps no more than an index.
+    stored: bool,
+}
+
+impl TerminologyCompiler {
+    /// With a `source`, nothing of a code system, value set or expansion is kept but what answers
+    /// a question without reading it; the rest is read from the source when used.
+    fn new(fhir_version: Option<&str>, source: Option<Arc<dyn TermSource>>) -> Self {
+        Self {
+            stored: source.is_some(),
+            builder: match source {
+                Some(source) => TerminologyBuilder::for_source(fhir_version, source),
+                None => TerminologyBuilder::for_stored(fhir_version),
+            },
+            compartment_definitions: Vec::new(),
+            stale_expansions: false,
+        }
+    }
+
+    fn add_resources(
+        &mut self,
+        rows: &[refhir_persistence::StoredTerminology],
+    ) -> Result<(), PersistError> {
+        for batch in batches(rows, |row| row.json.len()) {
+            let parsed = parse_all(batch, |row| &row.json, "terminology json")?;
+            for (row, json) in batch.iter().zip(parsed) {
+                if json.get("resourceType").and_then(|value| value.as_str())
+                    == Some("CompartmentDefinition")
+                {
+                    self.compartment_definitions.push(json);
+                } else if self.stored {
+                    self.builder
+                        .add_stored_resource(row.package_id, &row.url, json);
+                } else {
+                    self.builder.add_resource(row.package_id, json);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn add_expansions(
+        &mut self,
+        rows: &[refhir_persistence::StoredExpansion],
+    ) -> Result<(), PersistError> {
+        for batch in batches(rows, |row| row.json.len()) {
+            let parsed = parse_all(batch, |row| &row.json, "value set expansion json")?;
+            for (row, document) in batch.iter().zip(&parsed) {
+                self.stale_expansions |= !expansion_is_current(document);
+                if self.stored {
+                    self.builder
+                        .add_stored_expansion(row.package_id, &row.url, document);
+                } else {
+                    self.builder.add_expansion(row.package_id, document);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> CompiledTerminology {
+        CompiledTerminology {
+            terms: self.builder.finish(),
+            compartments: compartment::load(&self.compartment_definitions),
+            stale_expansions: self.stale_expansions,
+        }
+    }
+}
+
 fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
     let Some(list) = json
         .pointer("/snapshot/element")
@@ -635,4 +997,81 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
         });
     }
     references
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn batched(sizes: &[usize]) -> Vec<Vec<usize>> {
+        batches(sizes, |size| *size)
+            .map(|batch| batch.to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn rows_are_batched_by_the_text_they_hold() {
+        assert!(batched(&[]).is_empty());
+        let budget = PARSE_BATCH_BYTES;
+        // Small rows share a batch, in order, until the next would pass the budget.
+        assert_eq!(
+            batched(&[budget / 2, budget / 2, 1, 1]),
+            vec![vec![budget / 2, budget / 2], vec![1, 1]]
+        );
+        // A row over the budget on its own is a batch of its own: never dropped, never split.
+        assert_eq!(
+            batched(&[1, budget * 3, 1]),
+            vec![vec![1], vec![budget * 3], vec![1]]
+        );
+        // Whatever the sizes, every row is in exactly one batch and the order is kept.
+        let sizes: Vec<usize> = (1..500).map(|n| n * 997).collect();
+        assert_eq!(batched(&sizes).concat(), sizes);
+    }
+
+    /// What a type's parameters come to, for comparing two catalogs.
+    fn parameters_of(catalog: &Catalog) -> BTreeMap<String, String> {
+        catalog
+            .types
+            .iter()
+            .map(|(name, model)| (name.clone(), format!("{:?}", model.params)))
+            .collect()
+    }
+
+    #[test]
+    fn the_parameters_of_a_catalog_are_what_a_fresh_load_gives_once_a_backfill_is_done() {
+        use std::sync::{Arc, RwLock};
+
+        use refhir_database::Database;
+        use refhir_sqlite::SqlitePersistence;
+
+        use crate::package::{
+            extra_dir, install_package_dir, minir4_dir, publish, run_backfills,
+            stage_package_deferred,
+        };
+
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let catalog = RwLock::new(Catalog::empty());
+        install_package_dir(&store, &db, &catalog, minir4_dir()).unwrap();
+        let pending = stage_package_deferred(&store, &db, &catalog, extra_dir())
+            .unwrap()
+            .expect("the package has pending search parameters");
+        publish(&store, &catalog).unwrap();
+        pending.create(&store, &db).unwrap();
+        assert!(catalog.read().unwrap().has_pending_parameters());
+
+        // The backfill refreshes the parameters in the catalog it is given.
+        run_backfills(&store, &db, &catalog).unwrap();
+        let kept = catalog.read().unwrap();
+        assert!(!kept.has_pending_parameters());
+        let fresh = Catalog::open(&store).unwrap();
+        assert_eq!(parameters_of(&kept), parameters_of(&fresh));
+        assert!(
+            kept.get("Patient")
+                .unwrap()
+                .ready_param("birthdate")
+                .is_some(),
+            "the parameter the package added is searchable"
+        );
+    }
 }

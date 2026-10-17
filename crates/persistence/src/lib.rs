@@ -10,6 +10,7 @@ pub mod migrate;
 
 pub use pool::{Pool, PoolGuard, PoolStats};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
@@ -47,6 +48,11 @@ pub enum PersistenceGlobalKey {
     /// pending. A standby watches this one: when it takes over it may have to finish a backfill,
     /// so it needs to know about parameters a replica must not see yet.
     CatalogRevision,
+    /// Moves when only the terminology changed (value sets, code systems, concept maps and the
+    /// expansions kept for them) and the process that made the change has already applied it to
+    /// its own catalog in place. A replica or a standby that sees only this one move reloads the
+    /// terminology and nothing else, so it never loads a search parameter on the way.
+    TerminologyVersion,
 }
 
 impl PersistenceGlobalKey {
@@ -57,6 +63,7 @@ impl PersistenceGlobalKey {
             PersistenceGlobalKey::PublishedTimestamp => "published_ts",
             PersistenceGlobalKey::CatalogVersion => "catalog_version",
             PersistenceGlobalKey::CatalogRevision => "catalog_revision",
+            PersistenceGlobalKey::TerminologyVersion => "terminology_version",
         }
     }
 }
@@ -400,7 +407,8 @@ pub trait Persistence: PersistenceReader {
 }
 
 /// Search parameter row state. `ready` is what search may use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ParamStatus {
     Pending,
     Ready,
@@ -471,7 +479,7 @@ pub struct StoredBackfill {
     pub claimed_epoch: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewStructureDefinition {
     pub url: String,
     pub type_name: String,
@@ -480,7 +488,7 @@ pub struct NewStructureDefinition {
     pub json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewSearchParameter {
     pub url: String,
     pub base: String,
@@ -601,6 +609,108 @@ pub fn plan_search_parameter(
     })
 }
 
+/// A stored search parameter row with the base and code it is looked up by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredParameterRow {
+    pub base: String,
+    pub code: String,
+    pub row: InstalledParam,
+}
+
+/// A stored row that installing a package replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParameterRemoval {
+    pub package_id: i64,
+    pub url: String,
+    pub base: String,
+    pub code: String,
+}
+
+/// What installing all the search parameters of one package comes to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageParameterPlan {
+    /// The parameters to store, as positions in the package's list, with the status each is
+    /// stored under, in the order they are stored.
+    pub inserts: Vec<(usize, ParamStatus)>,
+    /// Rows that were stored before the install and go away.
+    pub removals: Vec<ParameterRemoval>,
+    pub newly_pending: Vec<PendingParam>,
+}
+
+/// [`plan_search_parameter`] for every parameter of a package, in order, as if each one had been
+/// stored before the next was looked at: a package may carry two definitions of one parameter,
+/// and the later one then meets the earlier one. `stored` holds the rows that already exist for
+/// the bases and codes of `parameters`, so a store reads them in one query rather than one per
+/// parameter, then writes the result in a few statements.
+pub fn plan_package_parameters(
+    package_id: i64,
+    parameters: &[NewSearchParameter],
+    stored: Vec<StoredParameterRow>,
+) -> Result<PackageParameterPlan, InstallError> {
+    let mut by_key: HashMap<(String, String), Vec<InstalledParam>> = HashMap::new();
+    for stored in stored {
+        by_key
+            .entry((stored.base, stored.code))
+            .or_default()
+            .push(stored.row);
+    }
+    let mut plan = PackageParameterPlan::default();
+    for (position, param) in parameters.iter().enumerate() {
+        let key = (param.base.clone(), param.code.clone());
+        let installed = by_key.entry(key).or_default();
+        let (existing, remove) = match plan_search_parameter(param, installed)? {
+            ParamPlan::Conflict => {
+                return Err(InstallError::Expression {
+                    base: param.base.clone(),
+                    code: param.code.clone(),
+                });
+            }
+            ParamPlan::Skip => continue,
+            ParamPlan::Insert { status, remove } => (status, remove),
+        };
+        for (owner, url) in remove {
+            installed.retain(|row| !(row.package_id == owner && row.url == url));
+            // A row this package inserted earlier in the plan was never stored.
+            let earlier = (owner == package_id)
+                .then(|| {
+                    plan.inserts.iter().position(|(held, _)| {
+                        let held = &parameters[*held];
+                        held.url == url && held.base == param.base && held.code == param.code
+                    })
+                })
+                .flatten();
+            match earlier {
+                Some(index) => {
+                    plan.inserts.remove(index);
+                }
+                None => plan.removals.push(ParameterRemoval {
+                    package_id: owner,
+                    url,
+                    base: param.base.clone(),
+                    code: param.code.clone(),
+                }),
+            }
+        }
+        let is_new = existing.is_none();
+        let status = existing.unwrap_or(param.status);
+        if is_new && status == ParamStatus::Pending {
+            plan.newly_pending.push(PendingParam {
+                base: param.base.clone(),
+                code: param.code.clone(),
+            });
+        }
+        installed.push(InstalledParam {
+            package_id,
+            url: param.url.clone(),
+            expression: param.expression.clone().unwrap_or_default(),
+            status: status.as_str().to_string(),
+            json: param.json.clone(),
+        });
+        plan.inserts.push((position, status));
+    }
+    Ok(plan)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredTerminology {
     pub package_id: i64,
@@ -609,7 +719,7 @@ pub struct StoredTerminology {
     pub json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewTerminology {
     pub resource_type: String,
     pub url: String,
@@ -623,7 +733,7 @@ pub struct StoredExpansion {
     pub json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewExpansion {
     pub url: String,
     pub json: String,
@@ -638,7 +748,11 @@ pub struct ExpansionChange {
     pub json: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+/// A package as it is stored. The row types it holds are also what a prepared file of packages
+/// holds, in their serde form: adding, removing or renaming a field of one of them changes the
+/// bytes of every such file, so it needs a bump of `FORMAT` in `refhir-fhir`'s `prepared.rs`
+/// (a test there fails when the bytes change).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewPackage {
     pub name: String,
     pub version: String,
@@ -691,6 +805,57 @@ impl From<PersistError> for InstallError {
     }
 }
 
+/// Where the rows of a package go when they are handed over a few at a time, by
+/// [`ConformanceStore::install_package_in_pieces`]. They are stored as
+/// [`ConformanceStore::install_package`] stores the same rows given at once, in the order they
+/// are handed over: a package a store already has takes only terminology and expansions, as it does
+/// there.
+pub trait PackageRows {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError>;
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError>;
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError>;
+
+    /// The expansions replace those the package already had, once, whatever the number of calls:
+    /// a package with none is told so by never calling this.
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError>;
+}
+
+/// A package held whole is what [`ConformanceStore::install_package`] takes, so a store that does
+/// not store in pieces can be given the pieces one after another and then the whole.
+impl PackageRows for NewPackage {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        self.structure_definitions.extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        self.search_parameters.extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.terminology.extend_from_slice(rows);
+        Ok(())
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.expansions.extend_from_slice(rows);
+        Ok(())
+    }
+}
+
+/// How many rows a backend hands over at a time to [`ConformanceStore::visit_terminology`] and
+/// its siblings.
+pub const CONFORMANCE_PAGE_ROWS: usize = 128;
+
 /// Direct SQL for packages, structure definitions, and search parameters.
 /// Resource transactions do not use this trait.
 pub trait ConformanceStore: Send + Sync {
@@ -708,6 +873,14 @@ pub trait ConformanceStore: Send + Sync {
     /// Adds one to the catalog revision and returns the new value.
     fn bump_catalog_revision(&self) -> Result<u64, PersistError>;
 
+    /// The counter a change to the terminology alone bumps, when the process that made it has
+    /// already applied it to its own catalog. Whoever follows the version or the revision also
+    /// follows this one: if only it moved, only the terminology needs loading again.
+    fn terminology_version(&self) -> Result<u64, PersistError>;
+
+    /// Adds one to the terminology version and returns the new value.
+    fn bump_terminology_version(&self) -> Result<u64, PersistError>;
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError>;
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError>;
@@ -717,6 +890,86 @@ pub trait ConformanceStore: Send + Sync {
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError>;
 
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError>;
+
+    /// [`ConformanceStore::load_structure_definitions`], handed over a page at a time, in the
+    /// same order. A caller that compiles the definitions as they come never holds more than a
+    /// page of them, where the full load holds every installed package's JSON at once. The store
+    /// is not locked while `visit` runs. The default reads them all and hands them over in one
+    /// page; a backend that can read page by page should override it.
+    fn visit_structure_definitions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        visit(self.load_structure_definitions()?)
+    }
+
+    /// [`ConformanceStore::load_terminology`], a page at a time. See
+    /// [`ConformanceStore::visit_structure_definitions`].
+    fn visit_terminology(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        visit(self.load_terminology()?)
+    }
+
+    /// [`ConformanceStore::load_expansions`], a page at a time. See
+    /// [`ConformanceStore::visit_structure_definitions`].
+    fn visit_expansions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        visit(self.load_expansions()?)
+    }
+
+    /// The JSON of the structure definition stored under `url` for package `package_id`, or
+    /// `None` when there is no such row. A catalog that keeps an index of the definitions reads
+    /// the one a request needs with this, when it needs it. The default reads them all; a
+    /// backend should override it with a lookup by key.
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        Ok(self
+            .load_structure_definitions()?
+            .into_iter()
+            .find(|row| row.package_id == package_id && row.url == url)
+            .map(|row| row.json))
+    }
+
+    /// The JSON of the terminology row stored under `url` for package `package_id`. See
+    /// [`ConformanceStore::load_structure_definition_json`].
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        Ok(self
+            .load_terminology()?
+            .into_iter()
+            .find(|row| row.package_id == package_id && row.url == url)
+            .map(|row| row.json))
+    }
+
+    /// The JSON of the stored expansion under `url` for package `package_id`. See
+    /// [`ConformanceStore::load_structure_definition_json`].
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        Ok(self
+            .load_expansions()?
+            .into_iter()
+            .find(|row| row.package_id == package_id && row.url == url)
+            .map(|row| row.json))
+    }
+
+    /// A handle to this store that a catalog can keep, to read from it later. `None` for a store
+    /// that cannot give one, and a catalog then loads everything it needs when it is built.
+    fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
+        None
+    }
 
     /// The terminology rows of one package. The full load returns every installed package's
     /// JSON (the whole R4 core is thousands of resources); a caller that only wants the rows
@@ -777,6 +1030,33 @@ pub trait ConformanceStore: Send + Sync {
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
 
+    /// [`ConformanceStore::install_package`] for a package that is not held whole: `feed` is
+    /// given the place the rows go and hands them over a few at a time, and the package is
+    /// stored in one transaction, so it is there whole or not at all. Installing the largest R4
+    /// package this way takes the memory of a few rows, not of the package. If `feed` fails, so
+    /// does the install and nothing is stored. The default gathers the rows and stores them with
+    /// [`ConformanceStore::install_package`]. `feed` is `Send` because a store that talks to its
+    /// database from a thread of its own calls it there.
+    fn install_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        let mut package = NewPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            fhir_version: fhir_version.to_string(),
+            structure_definitions: Vec::new(),
+            search_parameters: Vec::new(),
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        feed(&mut package)?;
+        self.install_package(&package)
+    }
+
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError>;
 
     /// Marks the parameters snapshotted onto this backfill ready.
@@ -813,11 +1093,43 @@ pub trait ConformanceStore: Send + Sync {
         done: bool,
     ) -> Result<(), PersistError>;
 
+    /// [`ConformanceStore::insert_backfill`] for each of `tablets`, each snapshotting every
+    /// parameter of the package that is pending for it. A package that adds parameters to
+    /// a hundred resource types queues a hundred jobs; a store that makes this one step spares
+    /// a round trip and a commit each.
+    fn insert_backfills(
+        &self,
+        package_id: i64,
+        watermark_ts: i64,
+        tablets: &[String],
+    ) -> Result<(), PersistError> {
+        for tablet in tablets {
+            self.insert_backfill(package_id, watermark_ts, tablet, &[])?;
+        }
+        Ok(())
+    }
+
     /// Records that this writer is the one running backfill `id`, taking it over from an
     /// earlier writer that died with it half done. Returns false if the job is finished and
     /// there is nothing to run. Fails with `PersistError::Fenced` if a *newer* writer has
     /// already claimed it: this process is the stale one.
     fn claim_backfill(&self, id: i64) -> Result<bool, PersistError>;
+
+    /// Claims, completes and marks done each of `jobs`, which the caller found nothing to index
+    /// for: the resource type holds no document that is not already past the job's cursor. It
+    /// is [`ConformanceStore::claim_backfill`], [`ConformanceStore::complete_backfill`] and
+    /// [`ConformanceStore::update_backfill`] for each job in turn, except that a job that is
+    /// already finished is passed over, and a store may do all of it in one step.
+    fn complete_empty_backfills(&self, jobs: &[StoredBackfill]) -> Result<(), PersistError> {
+        for job in jobs {
+            if !self.claim_backfill(job.id)? {
+                continue;
+            }
+            self.complete_backfill(job.id, job.package_id, &job.tablet)?;
+            self.update_backfill(job.id, job.cursor_id.as_deref(), true)?;
+        }
+        Ok(())
+    }
 
     fn load_backfills(&self) -> Result<Vec<StoredBackfill>, PersistError>;
 }
@@ -916,6 +1228,157 @@ mod clash_tests {
             resolve_expression_clash("not json", real),
             ExpressionClash::Conflict
         );
+    }
+
+    fn incoming(url: &str, expression: &str, experimental: bool) -> NewSearchParameter {
+        NewSearchParameter {
+            url: url.into(),
+            ..param(expression, experimental)
+        }
+    }
+
+    type Rows = Vec<(i64, String, String)>;
+
+    /// The rows left after storing `parameters` one at a time, each looked up against what the
+    /// ones before it left: how a store that goes parameter by parameter ends up.
+    fn one_at_a_time(
+        package_id: i64,
+        parameters: &[NewSearchParameter],
+        mut rows: Vec<InstalledParam>,
+    ) -> Result<(Rows, Vec<PendingParam>), InstallError> {
+        let mut pending = Vec::new();
+        for param in parameters {
+            let (existing, remove) = match plan_search_parameter(param, &rows)? {
+                ParamPlan::Conflict => {
+                    return Err(InstallError::Expression {
+                        base: param.base.clone(),
+                        code: param.code.clone(),
+                    })
+                }
+                ParamPlan::Skip => continue,
+                ParamPlan::Insert { status, remove } => (status, remove),
+            };
+            for (owner, url) in remove {
+                rows.retain(|row| !(row.package_id == owner && row.url == url));
+            }
+            let status = existing.unwrap_or(param.status);
+            if existing.is_none() && status == ParamStatus::Pending {
+                pending.push(PendingParam {
+                    base: param.base.clone(),
+                    code: param.code.clone(),
+                });
+            }
+            rows.push(InstalledParam {
+                package_id,
+                url: param.url.clone(),
+                expression: param.expression.clone().unwrap_or_default(),
+                status: status.as_str().into(),
+                json: param.json.clone(),
+            });
+        }
+        let mut rows: Rows = rows
+            .into_iter()
+            .map(|row| (row.package_id, row.url, row.status))
+            .collect();
+        rows.sort();
+        Ok((rows, pending))
+    }
+
+    /// The same, from the plan a store gets for the whole package and applies in bulk.
+    fn all_at_once(
+        package_id: i64,
+        parameters: &[NewSearchParameter],
+        rows: Vec<InstalledParam>,
+    ) -> Result<(Rows, Vec<PendingParam>), InstallError> {
+        let stored = rows
+            .iter()
+            .cloned()
+            .map(|row| StoredParameterRow {
+                base: "Patient".into(),
+                code: "maiden".into(),
+                row,
+            })
+            .collect();
+        let plan = plan_package_parameters(package_id, parameters, stored)?;
+        let mut rows = rows;
+        for removal in &plan.removals {
+            rows.retain(|row| !(row.package_id == removal.package_id && row.url == removal.url));
+        }
+        for (position, status) in &plan.inserts {
+            let param = &parameters[*position];
+            rows.push(InstalledParam {
+                package_id,
+                url: param.url.clone(),
+                expression: param.expression.clone().unwrap_or_default(),
+                status: status.as_str().into(),
+                json: param.json.clone(),
+            });
+        }
+        let mut rows: Rows = rows
+            .into_iter()
+            .map(|row| (row.package_id, row.url, row.status))
+            .collect();
+        rows.sort();
+        Ok((rows, plan.newly_pending))
+    }
+
+    #[test]
+    fn a_package_is_planned_as_if_its_parameters_were_stored_one_by_one() {
+        // Rows of other packages that are already stored, and the definitions a package may
+        // carry for one parameter: drafts and real ones, one of them twice under another URL.
+        let stored: [Vec<InstalledParam>; 4] = [
+            Vec::new(),
+            vec![row(1, "Patient.draft", true)],
+            vec![row(1, "Patient.real", false)],
+            vec![
+                row(1, "Patient.draft", true),
+                row(2, "Patient.draft2", true),
+            ],
+        ];
+        let definitions = [
+            incoming("http://example.org/a", "Patient.draft", true),
+            incoming("http://example.org/b", "Patient.draft2", true),
+            incoming("http://example.org/c", "Patient.real", false),
+            incoming("http://example.org/d", "Patient.real", false),
+            incoming("http://example.org/e", "Patient.other", false),
+        ];
+        let mut compared = 0;
+        for rows in &stored {
+            for first in 0..definitions.len() {
+                for second in 0..definitions.len() {
+                    for third in 0..definitions.len() {
+                        let package = [
+                            definitions[first].clone(),
+                            definitions[second].clone(),
+                            definitions[third].clone(),
+                        ];
+                        let one = one_at_a_time(9, &package, rows.clone());
+                        let all = all_at_once(9, &package, rows.clone());
+                        match (one, all) {
+                            (Ok(one), Ok(all)) => assert_eq!(one, all, "{rows:?} {package:?}"),
+                            (Err(one), Err(all)) => {
+                                assert_eq!(one.to_string(), all.to_string())
+                            }
+                            (one, all) => panic!("{rows:?} {package:?}: {one:?} against {all:?}"),
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 4 * 5 * 5 * 5);
+    }
+
+    #[test]
+    fn a_definition_the_package_replaces_itself_is_never_stored() {
+        let package = [
+            incoming("http://example.org/draft", "Patient.draft", true),
+            incoming("http://example.org/real", "Patient.real", false),
+        ];
+        let plan = plan_package_parameters(9, &package, Vec::new()).unwrap();
+        assert_eq!(plan.inserts, [(1, ParamStatus::Pending)]);
+        assert!(plan.removals.is_empty(), "{plan:?}");
+        assert_eq!(plan.newly_pending.len(), 2);
     }
 }
 
@@ -1834,6 +2297,477 @@ pub mod jobs {
 pub mod conformance {
     use super::*;
 
+    /// Reading structure definitions, terminology and expansions a page at a time gives the rows
+    /// the full loads give, in the same order, in pages no larger than
+    /// [`CONFORMANCE_PAGE_ROWS`], and leaves the store free while the caller works on a page. A
+    /// row read by its key is the row the full load has, and a handle the store gives reads the
+    /// same rows. `tag` keeps this run's rows apart on a database that already holds earlier
+    /// runs.
+    pub fn exercise_paged_reads(store: &dyn ConformanceStore, tag: &str) {
+        let rows = CONFORMANCE_PAGE_ROWS * 2 + 5;
+        let url = |kind: &str, index: usize| format!("http://example.org/{tag}/{kind}/{index:05}");
+        let document =
+            |kind: &str, url: &str| format!(r#"{{"resourceType":"{kind}","url":"{url}"}}"#);
+        for name in ["paged-one", "paged-two"] {
+            let package = NewPackage {
+                name: format!("{name}.{tag}"),
+                version: "1.0.0".into(),
+                fhir_version: "4.0.1".into(),
+                structure_definitions: (0..rows)
+                    .map(|index| NewStructureDefinition {
+                        url: url("definition", index),
+                        type_name: "Thing".into(),
+                        kind: "complex-type".into(),
+                        is_abstract: index % 2 == 0,
+                        json: document("StructureDefinition", &url("definition", index)),
+                    })
+                    .collect(),
+                search_parameters: Vec::new(),
+                terminology: (0..rows)
+                    .map(|index| NewTerminology {
+                        resource_type: "CodeSystem".into(),
+                        url: url("system", index),
+                        json: document("CodeSystem", &url("system", index)),
+                    })
+                    .collect(),
+                expansions: (0..rows)
+                    .map(|index| NewExpansion {
+                        url: url("set", index),
+                        json: document("ValueSet", &url("set", index)),
+                    })
+                    .collect(),
+            };
+            assert!(store.install_package(&package).unwrap().inserted);
+        }
+        let mine = |url: &str| url.contains(&format!("/{tag}/"));
+
+        // One macro for the three tables, which differ only in their row type and loaders.
+        macro_rules! check {
+            ($load:ident, $visit:ident, $row:ident) => {{
+                let full: Vec<_> = store
+                    .$load()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|row| mine(&row.url))
+                    .collect();
+                assert_eq!(full.len(), rows * 2);
+                let mut paged = Vec::new();
+                let mut pages = 0;
+                store
+                    .$visit(&mut |page| {
+                        assert!(page.len() <= CONFORMANCE_PAGE_ROWS);
+                        // The store is not held while a page is worked on: another call goes
+                        // straight through.
+                        store.catalog_version().unwrap();
+                        pages += 1;
+                        paged.extend(page.into_iter().filter(|row| mine(&row.url)));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(paged, full, "{} pages of {}", pages, stringify!($visit));
+                assert!(pages >= (rows * 2).div_ceil(CONFORMANCE_PAGE_ROWS));
+                // What the caller says stops the read, and comes back as it was said.
+                let mut calls = 0;
+                let stopped = store.$visit(&mut |_| {
+                    calls += 1;
+                    Err(PersistError::Definite("stop".into()))
+                });
+                assert!(matches!(stopped, Err(PersistError::Definite(text)) if text == "stop"));
+                assert_eq!(calls, 1);
+                // A row by its key is the row the full load has, and a key that is not a row
+                // (a URL, or a package, that has none) is not found.
+                let reader = store.shared();
+                for row in [full.first().unwrap(), full.last().unwrap()] {
+                    let found = store.$row(row.package_id, &row.url).unwrap();
+                    assert_eq!(found.as_deref(), Some(row.json.as_str()));
+                    if let Some(reader) = &reader {
+                        let found = reader.$row(row.package_id, &row.url).unwrap();
+                        assert_eq!(found.as_deref(), Some(row.json.as_str()));
+                    }
+                    assert_eq!(store.$row(row.package_id, "http://example.org/none").unwrap(), None);
+                    assert_eq!(store.$row(i64::MAX, &row.url).unwrap(), None);
+                }
+            }};
+        }
+        check!(
+            load_structure_definitions,
+            visit_structure_definitions,
+            load_structure_definition_json
+        );
+        check!(load_terminology, visit_terminology, load_terminology_json);
+        check!(load_expansions, visit_expansions, load_expansion_json);
+    }
+
+    /// Installing a package a few rows at a time stores what installing it whole stores, is all
+    /// or nothing, and tops up a package that is already there as installing it again does. `tag`
+    /// keeps this run's URLs and package names apart on a database that already holds earlier
+    /// runs.
+    pub fn exercise_install_in_pieces(store: &dyn ConformanceStore, tag: &str) {
+        let url = |kind: &str, index: usize| format!("http://example.org/{tag}/{kind}/{index:03}");
+        let json = |kind: &str, url: &str| format!(r#"{{"resourceType":"{kind}","url":"{url}"}}"#);
+        let definitions = |from: usize, to: usize| -> Vec<NewStructureDefinition> {
+            (from..to)
+                .map(|index| NewStructureDefinition {
+                    url: url("definition", index),
+                    type_name: "Thing".into(),
+                    kind: "complex-type".into(),
+                    is_abstract: index % 2 == 0,
+                    json: json("StructureDefinition", &url("definition", index)),
+                })
+                .collect()
+        };
+        let parameters = |name: &str| -> Vec<NewSearchParameter> {
+            (0..4)
+                .map(|index| NewSearchParameter {
+                    url: format!("http://example.org/{tag}/{name}/param/{index}"),
+                    base: "Patient".into(),
+                    code: format!("{tag}-{name}-{index}"),
+                    param_type: "token".into(),
+                    expression: Some(format!("Patient.{tag}{name}{index}")),
+                    status: ParamStatus::Pending,
+                    json: "{}".into(),
+                })
+                .collect()
+        };
+        let terminology = |from: usize, to: usize| -> Vec<NewTerminology> {
+            (from..to)
+                .map(|index| NewTerminology {
+                    resource_type: "CodeSystem".into(),
+                    url: url("system", index),
+                    json: json("CodeSystem", &url("system", index)),
+                })
+                .collect()
+        };
+        let expansions = |from: usize, to: usize| -> Vec<NewExpansion> {
+            (from..to)
+                .map(|index| NewExpansion {
+                    url: url("set", index),
+                    json: json("ValueSet", &url("set", index)),
+                })
+                .collect()
+        };
+        let whole = |name: &str, definitions, terminology, expansions| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: definitions,
+            search_parameters: parameters(name),
+            terminology,
+            expansions,
+        };
+        // What a package holds, apart from its id.
+        let held = |name: &str| {
+            let id = store
+                .load_packages()
+                .unwrap()
+                .into_iter()
+                .find(|package| package.name == format!("{name}.{tag}"))
+                .map(|package| package.id)
+                .unwrap_or_else(|| panic!("{name} is not installed"));
+            let mut definitions: Vec<(String, String, bool)> = store
+                .load_structure_definitions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| (row.url, row.json, row.is_abstract))
+                .collect();
+            definitions.sort();
+            let mut terminology: Vec<(String, String)> = store
+                .load_terminology()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| (row.url, row.json))
+                .collect();
+            terminology.sort();
+            let mut expansions: Vec<(String, String)> = store
+                .load_expansions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| (row.url, row.json))
+                .collect();
+            expansions.sort();
+            let parameters = store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .count();
+            (definitions, terminology, expansions, parameters)
+        };
+
+        // Whole, and in pieces that cut each kind of row in two, give the same rows and the
+        // same search parameters to index.
+        let at_once = store
+            .install_package(&whole(
+                "whole",
+                definitions(0, 40),
+                terminology(0, 30),
+                expansions(0, 20),
+            ))
+            .unwrap();
+        let all_parameters = parameters("pieces");
+        let outcome = store
+            .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
+                rows.structure_definitions(&definitions(0, 17))?;
+                rows.structure_definitions(&definitions(17, 40))?;
+                rows.search_parameters(&all_parameters[..2])?;
+                rows.search_parameters(&all_parameters[2..])?;
+                rows.terminology(&terminology(0, 11))?;
+                rows.terminology(&terminology(11, 30))?;
+                rows.expansions(&expansions(0, 9))?;
+                rows.expansions(&expansions(9, 20))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(at_once.inserted && outcome.inserted);
+        assert_eq!(at_once.newly_pending.len(), outcome.newly_pending.len());
+        assert_eq!(held("whole"), held("pieces"));
+        assert_eq!(held("pieces").3, 4);
+
+        // All or nothing: a failure part of the way through leaves no package and no row.
+        let failed = store.install_package_in_pieces(
+            &format!("failed.{tag}"),
+            "1.0.0",
+            "4.0.1",
+            &mut |rows| {
+                rows.structure_definitions(&definitions(0, 5))?;
+                rows.terminology(&terminology(0, 5))?;
+                Err(InstallError::Persist(PersistError::Definite("stop".into())))
+            },
+        );
+        assert!(
+            matches!(failed, Err(InstallError::Persist(PersistError::Definite(text))) if text == "stop")
+        );
+        assert!(!store
+            .load_packages()
+            .unwrap()
+            .iter()
+            .any(|package| package.name == format!("failed.{tag}")));
+
+        // A package that is there takes terminology on top of what it has (a row it already
+        // has stays as it is) and its expansions replace the old ones, as installing it again
+        // does.
+        let again = whole(
+            "whole",
+            definitions(0, 3),
+            terminology(25, 40),
+            expansions(18, 26),
+        );
+        assert!(!store.install_package(&again).unwrap().inserted);
+        let topped = store
+            .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
+                rows.structure_definitions(&definitions(0, 3))?;
+                rows.search_parameters(&parameters("pieces"))?;
+                rows.terminology(&terminology(25, 33))?;
+                rows.terminology(&terminology(33, 40))?;
+                rows.expansions(&expansions(18, 22))?;
+                rows.expansions(&expansions(22, 26))?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!topped.inserted);
+        assert_eq!(held("whole"), held("pieces"));
+        assert_eq!(held("pieces").1.len(), 40);
+        assert_eq!(held("pieces").2.len(), 8);
+        // One that brings no expansions leaves it with none, as installing it again does.
+        assert!(
+            !store
+                .install_package(&whole("whole", Vec::new(), Vec::new(), Vec::new()))
+                .unwrap()
+                .inserted
+        );
+        assert!(
+            !store
+                .install_package_in_pieces(&format!("pieces.{tag}"), "1.0.0", "4.0.1", &mut |_| Ok(
+                    ()
+                ))
+                .unwrap()
+                .inserted
+        );
+        assert_eq!(held("whole"), held("pieces"));
+        assert!(held("pieces").2.is_empty());
+
+        // Search parameters that meet inside one package (a draft and the real definition that
+        // replaces it, a draft that yields to a real one stored before it, two spellings of one
+        // expression) end up as they do whole, wherever the pieces are cut, and report the same
+        // ones as waiting for a backfill.
+        let parameter = |name: &str, key: &str, code: &str, expression: Option<&str>, draft| {
+            NewSearchParameter {
+                url: format!("http://example.org/{tag}/{name}/param/{key}"),
+                base: "Patient".into(),
+                code: format!("{name}-{code}-{tag}"),
+                param_type: "string".into(),
+                expression: expression.map(str::to_string),
+                status: ParamStatus::Pending,
+                json: format!(r#"{{"experimental":{draft}}}"#),
+            }
+        };
+        let meeting = |name: &str| -> Vec<NewSearchParameter> {
+            vec![
+                parameter(name, "bare", "bare", None, false),
+                parameter(name, "draft", "replaced", Some("Patient.draft"), true),
+                parameter(name, "real", "replaced", Some("Patient.real"), false),
+                parameter(name, "plain", "plain", Some("Patient.plain"), false),
+                parameter(name, "kept", "kept", Some("Patient.kept"), false),
+                parameter(name, "sketch", "kept", Some("Patient.sketch"), true),
+                parameter(name, "again", "plain", Some("plain"), false),
+            ]
+        };
+        let pending = |name: &str, outcome: &InstallOutcome| -> Vec<String> {
+            let mut codes: Vec<String> = outcome
+                .newly_pending
+                .iter()
+                .map(|param| {
+                    param
+                        .code
+                        .strip_prefix(&format!("{name}-"))
+                        .and_then(|code| code.strip_suffix(&format!("-{tag}")))
+                        .unwrap_or_else(|| panic!("{} is not {name}'s", param.code))
+                        .to_string()
+                })
+                .collect();
+            codes.sort();
+            codes
+        };
+        let stored_parameters = |name: &str| -> Vec<(String, Option<String>, ParamStatus)> {
+            let id = store
+                .load_packages()
+                .unwrap()
+                .into_iter()
+                .find(|package| package.name == format!("{name}.{tag}"))
+                .map(|package| package.id)
+                .unwrap_or_else(|| panic!("{name} is not installed"));
+            let mut rows: Vec<(String, Option<String>, ParamStatus)> = store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.package_id == id)
+                .map(|row| {
+                    let key = row.url.rsplit('/').next().unwrap_or_default().to_string();
+                    (key, row.expression, row.status)
+                })
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        };
+        let package_of = |name: &str, parameters| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: parameters,
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        let reference = store
+            .install_package(&package_of("meetwhole", meeting("meetwhole")))
+            .unwrap();
+        let expected_pending = pending("meetwhole", &reference);
+        assert_eq!(
+            expected_pending,
+            ["bare", "kept", "plain", "replaced", "replaced"]
+        );
+        let expected_rows = stored_parameters("meetwhole");
+        let keys: Vec<&str> = expected_rows.iter().map(|row| row.0.as_str()).collect();
+        assert_eq!(keys, ["again", "bare", "kept", "plain", "real"]);
+        let count = meeting("shape").len();
+        let mut cut_sets: Vec<Vec<usize>> = (0..=count).map(|cut| vec![cut]).collect();
+        cut_sets.push((1..count).collect());
+        for (number, cuts) in cut_sets.iter().enumerate() {
+            let name = format!("meetpieces{number}");
+            let all = meeting(&name);
+            let outcome = store
+                .install_package_in_pieces(
+                    &format!("{name}.{tag}"),
+                    "1.0.0",
+                    "4.0.1",
+                    &mut |rows| {
+                        let mut from = 0;
+                        for &to in cuts.iter().chain(&[all.len()]) {
+                            rows.search_parameters(&all[from..to])?;
+                            from = to;
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                pending(&name, &outcome),
+                expected_pending,
+                "cut at {cuts:?}"
+            );
+            assert_eq!(stored_parameters(&name), expected_rows, "cut at {cuts:?}");
+        }
+
+        // Against a parameter another package has installed, in pieces: the same definition is
+        // found there and is not waiting for a backfill, and one that disagrees refuses the
+        // install after earlier pieces were stored, which leaves nothing behind.
+        let shared = |name: &str, key: &str, expression: &str| NewSearchParameter {
+            url: format!("http://example.org/{tag}/{name}/param/{key}"),
+            base: "Patient".into(),
+            code: format!("shared-{tag}"),
+            param_type: "string".into(),
+            expression: Some(format!("Patient.{expression}")),
+            status: ParamStatus::Pending,
+            json: r#"{"experimental":false}"#.into(),
+        };
+        let owner = store
+            .install_package(&package_of(
+                "owner",
+                vec![shared("owner", "owned", "owned")],
+            ))
+            .unwrap();
+        assert_eq!(owner.newly_pending.len(), 1);
+        let agreeing = store
+            .install_package_in_pieces(&format!("agreeing.{tag}"), "1.0.0", "4.0.1", &mut |rows| {
+                rows.search_parameters(&[parameter(
+                    "agreeing",
+                    "other",
+                    "other",
+                    Some("o"),
+                    false,
+                )])?;
+                rows.search_parameters(&[shared("agreeing", "owned", "owned")])?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(pending("agreeing", &agreeing), ["other"]);
+        assert_eq!(stored_parameters("agreeing").len(), 2);
+        let refused = store.install_package_in_pieces(
+            &format!("disagreeing.{tag}"),
+            "1.0.0",
+            "4.0.1",
+            &mut |rows| {
+                rows.structure_definitions(&definitions(0, 2))?;
+                rows.search_parameters(&[parameter(
+                    "disagreeing",
+                    "other",
+                    "other",
+                    Some("o"),
+                    false,
+                )])?;
+                rows.search_parameters(&[shared("disagreeing", "elsewhere", "elsewhere")])?;
+                Ok(())
+            },
+        );
+        assert!(
+            matches!(refused, Err(InstallError::Expression { .. })),
+            "{refused:?}"
+        );
+        assert!(!store
+            .load_packages()
+            .unwrap()
+            .iter()
+            .any(|package| package.name == format!("disagreeing.{tag}")));
+        assert!(!store
+            .load_search_parameters()
+            .unwrap()
+            .iter()
+            .any(|row| row.code == format!("disagreeing-other-{tag}")));
+    }
+
     /// Reading terminology by URL and changing one stored expansion at a time. `tag` keeps this
     /// run's URLs and package names apart on a database that already holds earlier runs.
     pub fn exercise_terminology_changes(store: &dyn ConformanceStore, tag: &str) {
@@ -1971,6 +2905,240 @@ pub mod conformance {
     /// Search parameters that meet in different packages: a draft yields to a real definition
     /// in either install order, and two real ones that disagree are refused. `tag` keeps
     /// package names unique on a database that already holds earlier runs.
+    /// A package that carries several search parameters, a definition and the draft it replaces,
+    /// a parameter with no expression, and two pieces of terminology for one URL goes in as the
+    /// same rows a one-by-one install would leave, and a second package with the same
+    /// parameters finds them there and inherits their status.
+    pub fn exercise_package_install(store: &dyn ConformanceStore, tag: &str) {
+        let parameter = |url: &str, code: &str, expression: Option<&str>, experimental: bool| {
+            NewSearchParameter {
+                url: format!("http://example.org/sp/{tag}/{url}"),
+                base: "Patient".into(),
+                code: format!("{code}-{tag}"),
+                param_type: "string".into(),
+                expression: expression.map(str::to_string),
+                status: ParamStatus::Pending,
+                json: format!(r#"{{"experimental":{experimental}}}"#),
+            }
+        };
+        let package = |name: &str| NewPackage {
+            name: format!("{name}.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: ["one", "two"]
+                .iter()
+                .map(|id| NewStructureDefinition {
+                    url: format!("http://example.org/sd/{tag}/{id}"),
+                    type_name: "Thing".into(),
+                    kind: "resource".into(),
+                    is_abstract: *id == "two",
+                    json: format!(r#"{{"id":"{id}"}}"#),
+                })
+                .collect(),
+            search_parameters: vec![
+                parameter("none", "bare", None, false),
+                parameter("draft", "replaced", Some("Patient.draft"), true),
+                parameter("real", "replaced", Some("Patient.real"), false),
+                parameter("plain", "plain", Some("Patient.plain"), false),
+            ],
+            terminology: ["first", "second"]
+                .iter()
+                .map(|which| NewTerminology {
+                    resource_type: "CodeSystem".into(),
+                    url: format!("http://example.org/cs/{tag}"),
+                    json: format!(r#"{{"which":"{which}"}}"#),
+                })
+                .collect(),
+            expansions: Vec::new(),
+        };
+        let mine = |row: &StoredSearchParameter| row.code.ends_with(&format!("-{tag}"));
+        let first = store.install_package(&package("bulk-one")).unwrap();
+        assert!(first.inserted);
+        let mut pending: Vec<String> = first
+            .newly_pending
+            .iter()
+            .map(|param| param.code.clone())
+            .collect();
+        pending.sort();
+        // The draft was new and pending when it went in, then the real one replaced it.
+        assert_eq!(
+            pending,
+            [
+                format!("bare-{tag}"),
+                format!("plain-{tag}"),
+                format!("replaced-{tag}"),
+                format!("replaced-{tag}"),
+            ]
+        );
+        let rows: Vec<StoredSearchParameter> = store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(mine)
+            .collect();
+        let mut stored: Vec<(&str, Option<&str>, ParamStatus)> = rows
+            .iter()
+            .map(|row| (row.code.as_str(), row.expression.as_deref(), row.status))
+            .collect();
+        stored.sort_by_key(|row| row.0);
+        let (bare, plain, replaced) = (
+            format!("bare-{tag}"),
+            format!("plain-{tag}"),
+            format!("replaced-{tag}"),
+        );
+        assert_eq!(
+            stored,
+            [
+                (bare.as_str(), None, ParamStatus::Pending),
+                (plain.as_str(), Some("Patient.plain"), ParamStatus::Pending),
+                (
+                    replaced.as_str(),
+                    Some("Patient.real"),
+                    ParamStatus::Pending
+                ),
+            ]
+        );
+        let definitions: Vec<StoredStructureDefinition> = store
+            .load_structure_definitions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.contains(&format!("/{tag}/")))
+            .collect();
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions.iter().any(|row| row.is_abstract));
+        assert!(definitions.iter().any(|row| !row.is_abstract));
+        let terminology: Vec<StoredTerminology> = store
+            .load_terminology()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.ends_with(&format!("/cs/{tag}")))
+            .collect();
+        assert_eq!(terminology.len(), 1);
+        assert_eq!(terminology[0].json, r#"{"which":"first"}"#);
+
+        // The package that follows carries the same parameters: they are found installed, keep
+        // their status, and nothing in it is waiting for a backfill that is not queued already.
+        let second = store.install_package(&package("bulk-two")).unwrap();
+        assert!(second.inserted);
+        assert!(
+            second.newly_pending.is_empty(),
+            "{:?}",
+            second.newly_pending
+        );
+        let rows: Vec<StoredSearchParameter> = store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(|row| mine(row) && row.package_id == second.package_id)
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert!(rows.iter().all(|row| row.status == ParamStatus::Pending));
+    }
+
+    /// Queueing and finishing backfill jobs in bulk does what doing it one at a time does: each
+    /// job is queued over the parameters pending for its type, finishing jobs that had nothing to
+    /// index marks exactly those parameters ready, a job that was limited to some parameters
+    /// leaves the others pending, and one that is already finished is passed over.
+    pub fn exercise_backfill_batches(store: &dyn ConformanceStore, tag: &str) {
+        let parameter = |base: &str, code: &str| NewSearchParameter {
+            url: format!("http://example.org/sp/{tag}/{base}-{code}"),
+            base: base.into(),
+            code: format!("{code}-{tag}"),
+            param_type: "string".into(),
+            expression: Some(format!("{base}.{code}")),
+            status: ParamStatus::Pending,
+            json: "{}".into(),
+        };
+        let package = NewPackage {
+            name: format!("backfills.{tag}"),
+            version: "1.0.0".into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: Vec::new(),
+            search_parameters: vec![
+                parameter("Patient", "a"),
+                parameter("Observation", "a"),
+                parameter("Encounter", "a"),
+                parameter("Encounter", "b"),
+                parameter("Group", "a"),
+                parameter("Group", "b"),
+            ],
+            terminology: Vec::new(),
+            expansions: Vec::new(),
+        };
+        let package_id = store.install_package(&package).unwrap().package_id;
+        let status_of = |base: &str, code: &str| -> ParamStatus {
+            store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .find(|row| {
+                    row.package_id == package_id && row.base == base && row.code.starts_with(code)
+                })
+                .unwrap()
+                .status
+        };
+        let mine = || -> Vec<StoredBackfill> {
+            store
+                .load_backfills()
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.package_id == package_id)
+                .collect()
+        };
+
+        let tablets: Vec<String> = ["Encounter", "Observation", "Patient"]
+            .iter()
+            .map(|tablet| tablet.to_string())
+            .collect();
+        store.insert_backfills(package_id, 7, &tablets).unwrap();
+        let queued = mine();
+        assert_eq!(
+            queued
+                .iter()
+                .map(|job| job.tablet.as_str())
+                .collect::<Vec<_>>(),
+            ["Encounter", "Observation", "Patient"],
+            "queued in the order given"
+        );
+        assert!(queued
+            .iter()
+            .all(|job| !job.done && job.cursor_id.is_none() && job.watermark_ts == 7));
+        assert!(queued.windows(2).all(|pair| pair[0].id < pair[1].id));
+
+        // The first two have nothing to index; the third is still to run.
+        store.complete_empty_backfills(&queued[..2]).unwrap();
+        let after = mine();
+        assert!(
+            after[0].done && after[1].done && !after[2].done,
+            "{after:?}"
+        );
+        assert!(after[0].claimed_epoch.is_some() && after[1].claimed_epoch.is_some());
+        assert_eq!(status_of("Encounter", "a"), ParamStatus::Ready);
+        assert_eq!(status_of("Encounter", "b"), ParamStatus::Ready);
+        assert_eq!(status_of("Observation", "a"), ParamStatus::Ready);
+        assert_eq!(status_of("Patient", "a"), ParamStatus::Pending);
+
+        // Finished jobs are passed over, so asking again for all three finishes only the last.
+        store.complete_empty_backfills(&queued).unwrap();
+        assert!(mine().iter().all(|job| job.done));
+        assert_eq!(status_of("Patient", "a"), ParamStatus::Ready);
+
+        // A job limited to one parameter of its type marks that one and no other.
+        let limited = store
+            .insert_backfill(
+                package_id,
+                7,
+                "Group",
+                &[format!("http://example.org/sp/{tag}/Group-a")],
+            )
+            .unwrap();
+        let job = mine().into_iter().find(|job| job.id == limited).unwrap();
+        store.complete_empty_backfills(&[job]).unwrap();
+        assert!(mine().iter().find(|job| job.id == limited).unwrap().done);
+        assert_eq!(status_of("Group", "a"), ParamStatus::Ready);
+        assert_eq!(status_of("Group", "b"), ParamStatus::Pending);
+    }
+
     pub fn exercise_parameter_clashes(store: &dyn ConformanceStore, tag: &str) {
         let package = |name: &str, expression: &str, experimental: bool| NewPackage {
             name: format!("{name}.{tag}"),

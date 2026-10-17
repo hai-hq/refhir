@@ -78,16 +78,18 @@ For a quick try you can skip the file and pass flags only (next step).
 
 **3. Run the server**
 
+A build from source has no prepared packages file, so these commands set `REFHIR_PACKAGE_DOWNLOAD=true`, which lets the first start download the R4 packages (nothing is downloaded without it). `refhir package-bundle` makes the file once, and then the setting is not needed; see [deploy/production.md](../deploy/production.md#preparing-the-packages).
+
 A SQLite file in the clone:
 
 ```bash
-cargo run -p refhir -- --sqlite refhir.sqlite
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --sqlite refhir.sqlite
 ```
 
 In memory (no file, good for trying things):
 
 ```bash
-cargo run -p refhir -- --memory
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory
 ```
 
 **4. Load demo data (optional)**
@@ -97,7 +99,7 @@ when it is started with `--update-as-create` (or `update_as_create = true` under
 start it that way:
 
 ```bash
-cargo run -p refhir -- --memory --update-as-create
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory --update-as-create
 ```
 
 Then, with Go 1.23+ installed:
@@ -108,7 +110,7 @@ cd clients/go && go run ./cmd/seed -url http://127.0.0.1:8080
 
 See [fixtures/mock-fhir/README.md](../fixtures/mock-fhir/README.md) and [clients/go/README.md](../clients/go/README.md#demo-data-seed-script).
 
-**Packages at runtime:** `[conformance].packages` or repeat `--package` to add IGs after the `[fhir].version` defaults. After startup, `POST /ImplementationGuide/$install` can install `name@version` from the registry when SMART is enabled (`system/*.write`). Override the package source with `REFHIR_PACKAGE_REGISTRY`: a registry or mirror URL, or `s3://bucket/prefix` for a bundle you host yourself, built with `scripts/package-bundle.py` (see [deploy/production.md](../deploy/production.md#package-source)). ReFHIR ships no packages, so a first start needs that source to be reachable.
+**Packages at runtime:** `[conformance].packages` or repeat `--package` to add IGs after the `[fhir].version` defaults. After startup, `POST /ImplementationGuide/$install` can install `name@version` from the registry when SMART is enabled (`system/*.write`). Override the package source with `REFHIR_PACKAGE_REGISTRY`: a registry or mirror URL, or `s3://bucket/prefix` for a bundle you host yourself, built with `scripts/package-bundle.py` (see [deploy/production.md](../deploy/production.md#package-source)). Release archives and container images carry the release defaults in a prepared file (`refhir-packages.bundle`, beside the binary), so their first start needs no network. The server downloads nothing unless `[conformance].package_download = true`: a binary you built yourself makes the file with `refhir package-bundle` (see [deploy/production.md](../deploy/production.md#preparing-the-packages)), or sets that and downloads the packages from the source above on its first start.
 
 ## Verify the server
 

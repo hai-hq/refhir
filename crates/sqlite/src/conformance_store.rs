@@ -1,14 +1,123 @@
 use refhir_persistence::{
     plan_search_parameter, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
-    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan,
-    ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
-    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
+    NewTerminology, PackageRows, ParamPlan, ParamStatus, PendingParam, PersistError,
+    PersistenceGlobalKey, StoredBackfill, StoredExpansion, StoredPackage, StoredSearchParameter,
+    StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{definite, SqlitePersistence};
 
+fn structure_definition_from(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredStructureDefinition> {
+    let abstract_flag: i64 = row.get(4)?;
+    Ok(StoredStructureDefinition {
+        package_id: row.get(0)?,
+        url: row.get(1)?,
+        type_name: row.get(2)?,
+        kind: row.get(3)?,
+        is_abstract: abstract_flag != 0,
+        json: row.get(5)?,
+    })
+}
+
+fn terminology_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTerminology> {
+    Ok(StoredTerminology {
+        package_id: row.get(0)?,
+        resource_type: row.get(1)?,
+        url: row.get(2)?,
+        json: row.get(3)?,
+    })
+}
+
+fn expansion_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredExpansion> {
+    Ok(StoredExpansion {
+        package_id: row.get(0)?,
+        url: row.get(1)?,
+        json: row.get(2)?,
+    })
+}
+
 impl SqlitePersistence {
+    /// Read `select` (a `SELECT` of a table keyed by `(package_id, url)`) a page at a time, in key
+    /// order, and hand each page to `visit`. The connection is locked for the query of each page
+    /// only, so nothing waits on what `visit` does with the rows, which for a catalog load is
+    /// seconds of work.
+    fn visit_pages<T>(
+        &self,
+        select: &str,
+        read: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        key: impl Fn(&T) -> (i64, String),
+        visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let next = format!(
+            "{select} WHERE (package_id, url) > (?1, ?2) \
+             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
+        );
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let page = {
+                let guard = self.inner.lock()?;
+                let rows = match &after {
+                    None => {
+                        let mut stmt = guard.connection.prepare(&first).map_err(definite)?;
+                        let rows = stmt
+                            .query_map([], |row| read(row))
+                            .map_err(definite)?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(definite)?;
+                        rows
+                    }
+                    Some((package_id, url)) => {
+                        let mut stmt = guard.connection.prepare(&next).map_err(definite)?;
+                        let rows = stmt
+                            .query_map(params![package_id, url], |row| read(row))
+                            .map_err(definite)?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(definite)?;
+                        rows
+                    }
+                };
+                rows
+            };
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = Some(key(last));
+            let done = page.len() < CONFORMANCE_PAGE_ROWS;
+            visit(page)?;
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The `json` of the row of `table` (a conformance table keyed by `(package_id, url)`) with
+    /// this key. It runs on a reader, so a request that reads a definition does not queue behind
+    /// a write.
+    fn row_json(
+        &self,
+        table: &str,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        let guard = self.read()?;
+        // The same three statements run again and again, so each is prepared once per connection.
+        let mut statement = guard
+            .connection
+            .prepare_cached(&format!(
+                "SELECT json FROM {table} WHERE package_id = ?1 AND url = ?2"
+            ))
+            .map_err(definite)?;
+        statement
+            .query_row(params![package_id, url], |row| row.get(0))
+            .optional()
+            .map_err(definite)
+    }
+
     fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
         let guard = self.read()?;
         let text: Option<String> = guard
@@ -85,6 +194,14 @@ impl ConformanceStore for SqlitePersistence {
         self.bump_counter(PersistenceGlobalKey::CatalogRevision)
     }
 
+    fn terminology_version(&self) -> Result<u64, PersistError> {
+        self.read_counter(PersistenceGlobalKey::TerminologyVersion)
+    }
+
+    fn bump_terminology_version(&self) -> Result<u64, PersistError> {
+        self.bump_counter(PersistenceGlobalKey::TerminologyVersion)
+    }
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         let guard = self.inner.lock()?;
         let mut stmt = guard
@@ -116,21 +233,51 @@ impl ConformanceStore for SqlitePersistence {
             )
             .map_err(definite)?;
         let rows = stmt
-            .query_map([], |row| {
-                let abstract_flag: i64 = row.get(4)?;
-                Ok(StoredStructureDefinition {
-                    package_id: row.get(0)?,
-                    url: row.get(1)?,
-                    type_name: row.get(2)?,
-                    kind: row.get(3)?,
-                    is_abstract: abstract_flag != 0,
-                    json: row.get(5)?,
-                })
-            })
+            .query_map([], structure_definition_from)
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn visit_structure_definitions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, type_name, kind, is_abstract, json FROM structure_definitions",
+            structure_definition_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
+    }
+
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("structure_definitions", package_id, url)
+    }
+
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("terminology", package_id, url)
+    }
+
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("value_set_expansion", package_id, url)
+    }
+
+    fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
+        Some(std::sync::Arc::new(self.clone()))
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
@@ -186,18 +333,23 @@ impl ConformanceStore for SqlitePersistence {
             )
             .map_err(definite)?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(StoredTerminology {
-                    package_id: row.get(0)?,
-                    resource_type: row.get(1)?,
-                    url: row.get(2)?,
-                    json: row.get(3)?,
-                })
-            })
+            .query_map([], terminology_from)
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn visit_terminology(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, resource_type, url, json FROM terminology",
+            terminology_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn load_terminology_for(
@@ -345,17 +497,23 @@ impl ConformanceStore for SqlitePersistence {
             )
             .map_err(definite)?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(StoredExpansion {
-                    package_id: row.get(0)?,
-                    url: row.get(1)?,
-                    json: row.get(2)?,
-                })
-            })
+            .query_map([], expansion_from)
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn visit_expansions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, json FROM value_set_expansion",
+            expansion_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -363,6 +521,23 @@ impl ConformanceStore for SqlitePersistence {
         let tx = guard.connection.unchecked_transaction().map_err(definite)?;
         self.check_fence(&tx)?;
         let outcome = install_in_tx(&tx, package)?;
+        tx.commit().map_err(definite)?;
+        Ok(outcome)
+    }
+
+    fn install_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        let guard = self.inner.lock()?;
+        let tx = guard.connection.unchecked_transaction().map_err(definite)?;
+        self.check_fence(&tx)?;
+        let mut installer = Installer::begin(&tx, name, version, fhir_version)?;
+        feed(&mut installer)?;
+        let outcome = installer.finish()?;
         tx.commit().map_err(definite)?;
         Ok(outcome)
     }
@@ -699,171 +874,236 @@ fn install_in_tx(
     tx: &Transaction<'_>,
     package: &NewPackage,
 ) -> Result<InstallOutcome, InstallError> {
-    let existing_id: Option<i64> = tx
-        .query_row(
-            "SELECT id FROM packages WHERE name = ?1 AND version = ?2",
-            params![package.name, package.version],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(definite)?;
-    if let Some(package_id) = existing_id {
-        insert_terminology(tx, package_id, package)?;
-        replace_expansions(tx, package_id, package)?;
-        return Ok(InstallOutcome {
-            package_id,
-            inserted: false,
-            newly_pending: Vec::new(),
-        });
-    }
-    let current: Option<String> = tx
-        .query_row("SELECT fhir_version FROM packages LIMIT 1", [], |row| {
-            row.get(0)
-        })
-        .optional()
-        .map_err(definite)?;
-    if let Some(existing) = current {
-        if existing != package.fhir_version {
-            return Err(InstallError::FhirVersion {
-                existing,
-                incoming: package.fhir_version.clone(),
+    let mut installer =
+        Installer::begin(tx, &package.name, &package.version, &package.fhir_version)?;
+    installer.structure_definitions(&package.structure_definitions)?;
+    installer.search_parameters(&package.search_parameters)?;
+    installer.terminology(&package.terminology)?;
+    installer.expansions(&package.expansions)?;
+    installer.finish()
+}
+
+/// A package being stored inside a transaction, a few rows at a time.
+///
+/// A package the store already has (same name and version) takes only terminology, which is
+/// added to what it has, and expansions, which replace what it has. A package it does not have
+/// gets its definitions and search parameters too, and the search parameters are checked against
+/// the ones installed.
+struct Installer<'a, 'c> {
+    tx: &'a Transaction<'c>,
+    package_id: i64,
+    /// Whether the package was there before this install.
+    existing: bool,
+    newly_pending: Vec<PendingParam>,
+    /// Whether the package's earlier expansions have been cleared for this install's.
+    expansions_cleared: bool,
+}
+
+impl<'a, 'c> Installer<'a, 'c> {
+    fn begin(
+        tx: &'a Transaction<'c>,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+    ) -> Result<Self, InstallError> {
+        let existing_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM packages WHERE name = ?1 AND version = ?2",
+                params![name, version],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(definite)?;
+        if let Some(package_id) = existing_id {
+            return Ok(Self {
+                tx,
+                package_id,
+                existing: true,
+                newly_pending: Vec::new(),
+                expansions_cleared: false,
             });
         }
-    }
-    tx.execute(
-        "INSERT INTO packages (name, version, fhir_version) VALUES (?1, ?2, ?3)",
-        params![package.name, package.version, package.fhir_version],
-    )
-    .map_err(definite)?;
-    let package_id = tx.last_insert_rowid();
-    for definition in &package.structure_definitions {
-        let abstract_flag: i64 = if definition.is_abstract { 1 } else { 0 };
+        let current: Option<String> = tx
+            .query_row("SELECT fhir_version FROM packages LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(definite)?;
+        if let Some(existing) = current {
+            if existing != fhir_version {
+                return Err(InstallError::FhirVersion {
+                    existing,
+                    incoming: fhir_version.to_string(),
+                });
+            }
+        }
         tx.execute(
-            "INSERT INTO structure_definitions \
-             (package_id, url, type_name, kind, is_abstract, json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                package_id,
-                definition.url,
-                definition.type_name,
-                definition.kind,
-                abstract_flag,
-                definition.json
-            ],
+            "INSERT INTO packages (name, version, fhir_version) VALUES (?1, ?2, ?3)",
+            params![name, version, fhir_version],
         )
         .map_err(definite)?;
+        Ok(Self {
+            tx,
+            package_id: tx.last_insert_rowid(),
+            existing: false,
+            newly_pending: Vec::new(),
+            expansions_cleared: false,
+        })
     }
-    let mut newly_pending = Vec::new();
-    for param in &package.search_parameters {
-        let installed = tx
-            .prepare(
-                "SELECT package_id, url, COALESCE(expression, ''), status, json \
-                 FROM search_parameters WHERE base = ?1 AND code = ?2",
-            )
-            .map_err(definite)?
-            .query_map(params![param.base, param.code], |row| {
-                Ok(InstalledParam {
-                    package_id: row.get(0)?,
-                    url: row.get(1)?,
-                    expression: row.get(2)?,
-                    status: row.get(3)?,
-                    json: row.get(4)?,
+
+    fn clear_expansions(&mut self) -> Result<(), InstallError> {
+        if !self.expansions_cleared {
+            self.tx
+                .execute(
+                    "DELETE FROM value_set_expansion WHERE package_id = ?1",
+                    params![self.package_id],
+                )
+                .map_err(definite)?;
+            self.expansions_cleared = true;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<InstallOutcome, InstallError> {
+        // A package that is installed again and brings no expansions has none afterwards.
+        self.clear_expansions()?;
+        Ok(InstallOutcome {
+            package_id: self.package_id,
+            inserted: !self.existing,
+            newly_pending: self.newly_pending,
+        })
+    }
+}
+
+impl PackageRows for Installer<'_, '_> {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        if self.existing {
+            return Ok(());
+        }
+        for definition in rows {
+            let abstract_flag: i64 = if definition.is_abstract { 1 } else { 0 };
+            self.tx
+                .execute(
+                    "INSERT INTO structure_definitions \
+                     (package_id, url, type_name, kind, is_abstract, json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        self.package_id,
+                        definition.url,
+                        definition.type_name,
+                        definition.kind,
+                        abstract_flag,
+                        definition.json
+                    ],
+                )
+                .map_err(definite)?;
+        }
+        Ok(())
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        if self.existing {
+            return Ok(());
+        }
+        let tx = self.tx;
+        for param in rows {
+            let installed = tx
+                .prepare(
+                    "SELECT package_id, url, COALESCE(expression, ''), status, json \
+                     FROM search_parameters WHERE base = ?1 AND code = ?2",
+                )
+                .map_err(definite)?
+                .query_map(params![param.base, param.code], |row| {
+                    Ok(InstalledParam {
+                        package_id: row.get(0)?,
+                        url: row.get(1)?,
+                        expression: row.get(2)?,
+                        status: row.get(3)?,
+                        json: row.get(4)?,
+                    })
                 })
-            })
-            .map_err(definite)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(definite)?;
-        let (existing, remove) = match plan_search_parameter(param, &installed)? {
-            ParamPlan::Conflict => {
-                return Err(InstallError::Expression {
+                .map_err(definite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(definite)?;
+            let (existing, remove) = match plan_search_parameter(param, &installed)? {
+                ParamPlan::Conflict => {
+                    return Err(InstallError::Expression {
+                        base: param.base.clone(),
+                        code: param.code.clone(),
+                    });
+                }
+                ParamPlan::Skip => continue,
+                ParamPlan::Insert { status, remove } => (status, remove),
+            };
+            for (owner, url) in remove {
+                tx.execute(
+                    "DELETE FROM search_parameters \
+                     WHERE package_id = ?1 AND url = ?2 AND base = ?3 AND code = ?4",
+                    params![owner, url, param.base, param.code],
+                )
+                .map_err(definite)?;
+            }
+            let is_new = existing.is_none();
+            let status = existing.unwrap_or(param.status);
+            if is_new && status == ParamStatus::Pending {
+                self.newly_pending.push(PendingParam {
                     base: param.base.clone(),
                     code: param.code.clone(),
                 });
             }
-            ParamPlan::Skip => continue,
-            ParamPlan::Insert { status, remove } => (status, remove),
-        };
-        for (owner, url) in remove {
             tx.execute(
-                "DELETE FROM search_parameters \
-                 WHERE package_id = ?1 AND url = ?2 AND base = ?3 AND code = ?4",
-                params![owner, url, param.base, param.code],
+                "INSERT INTO search_parameters \
+                 (package_id, url, base, code, param_type, expression, status, json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    self.package_id,
+                    param.url,
+                    param.base,
+                    param.code,
+                    param.param_type,
+                    param.expression,
+                    status.as_str(),
+                    param.json
+                ],
             )
             .map_err(definite)?;
         }
-        let is_new = existing.is_none();
-        let status = existing.unwrap_or(param.status);
-        if is_new && status == ParamStatus::Pending {
-            newly_pending.push(PendingParam {
-                base: param.base.clone(),
-                code: param.code.clone(),
-            });
+        Ok(())
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        for resource in rows {
+            self.tx
+                .execute(
+                    "INSERT OR IGNORE INTO terminology (package_id, resource_type, url, json) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        self.package_id,
+                        resource.resource_type,
+                        resource.url,
+                        resource.json
+                    ],
+                )
+                .map_err(definite)?;
         }
-        tx.execute(
-            "INSERT INTO search_parameters \
-             (package_id, url, base, code, param_type, expression, status, json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                package_id,
-                param.url,
-                param.base,
-                param.code,
-                param.param_type,
-                param.expression,
-                status.as_str(),
-                param.json
-            ],
-        )
-        .map_err(definite)?;
+        Ok(())
     }
-    insert_terminology(tx, package_id, package)?;
-    replace_expansions(tx, package_id, package)?;
-    Ok(InstallOutcome {
-        package_id,
-        inserted: true,
-        newly_pending,
-    })
-}
 
-fn insert_terminology(
-    tx: &Transaction<'_>,
-    package_id: i64,
-    package: &NewPackage,
-) -> Result<(), InstallError> {
-    for resource in &package.terminology {
-        tx.execute(
-            "INSERT OR IGNORE INTO terminology (package_id, resource_type, url, json) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                package_id,
-                resource.resource_type,
-                resource.url,
-                resource.json
-            ],
-        )
-        .map_err(definite)?;
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.clear_expansions()?;
+        for expansion in rows {
+            self.tx
+                .execute(
+                    "INSERT INTO value_set_expansion (package_id, url, json) VALUES (?1, ?2, ?3)",
+                    params![self.package_id, expansion.url, expansion.json],
+                )
+                .map_err(definite)?;
+        }
+        Ok(())
     }
-    Ok(())
-}
-
-fn replace_expansions(
-    tx: &Transaction<'_>,
-    package_id: i64,
-    package: &NewPackage,
-) -> Result<(), InstallError> {
-    tx.execute(
-        "DELETE FROM value_set_expansion WHERE package_id = ?1",
-        params![package_id],
-    )
-    .map_err(definite)?;
-    for expansion in &package.expansions {
-        tx.execute(
-            "INSERT INTO value_set_expansion (package_id, url, json) VALUES (?1, ?2, ?3)",
-            params![package_id, expansion.url, expansion.json],
-        )
-        .map_err(definite)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -874,6 +1114,30 @@ mod tests {
     fn terminology_is_read_by_url_and_expansions_change_one_at_a_time() {
         let store = SqlitePersistence::open_in_memory().unwrap();
         refhir_persistence::conformance::exercise_terminology_changes(&store, "sqlite");
+    }
+
+    #[test]
+    fn a_package_installed_in_pieces_is_stored_as_one_installed_whole() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_install_in_pieces(&store, "sqlite");
+    }
+
+    #[test]
+    fn conformance_rows_are_read_a_page_at_a_time() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_paged_reads(&store, "sqlite");
+    }
+
+    #[test]
+    fn a_package_goes_in_with_the_rows_a_one_by_one_install_would_leave() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_package_install(&store, "sqlite");
+    }
+
+    #[test]
+    fn backfill_jobs_are_queued_and_finished_in_bulk() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_backfill_batches(&store, "sqlite");
     }
 
     #[test]

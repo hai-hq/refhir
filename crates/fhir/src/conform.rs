@@ -47,8 +47,27 @@ pub fn commit_operation(
         // that did not; a failure that is about the request still goes back to the client.
         Err(err @ FhirError::Storage(_)) => {
             tracing::error!(error = %err, "conformance projection failed after commit; repairing");
-            match repair_conformance(store, db, catalog) {
-                Ok(()) => Ok(result),
+            let revision = store.catalog_revision().map_err(FhirError::from);
+            match repair_tables(store, db, catalog) {
+                Ok(()) => {
+                    // The failure may have been the announcement to the other processes, after
+                    // the projection had gone through, and a repair that finds nothing to fix
+                    // says nothing. So say it here, unless the repair published. The write is
+                    // committed and right on this process, so a failure to tell the others is
+                    // logged, not reported: a client that retried would write it twice, and any
+                    // later announcement brings them up to date.
+                    if let Err(announce) = revision
+                        .and_then(|before| announce_unless_published(store, catalog, before))
+                    {
+                        tracing::error!(
+                            error = %announce,
+                            "the write was committed and repaired, but telling the other \
+                             processes failed; replicas and standbys follow it when the catalog \
+                             next changes, or at their next start"
+                        );
+                    }
+                    Ok(result)
+                }
                 Err(repair) => Err(RunError::Fhir(FhirError::Storage(format!(
                     "the write was committed, but projecting it into the conformance tables \
                      failed ({err}) and so did the repair ({repair}); it is repaired from the \
@@ -60,7 +79,35 @@ pub fn commit_operation(
     }
 }
 
+/// Bring the conformance tables and the catalog in line with the stored resources, and make sure
+/// the other processes have been told. A repair that finds nothing to fix publishes nothing, and
+/// so says nothing, but whatever made it necessary may have been the announcement itself (a
+/// counter write that failed, or a process that stopped before it got to it). So unless the repair
+/// published, which announces, it announces: replicas and standbys load the whole catalog again.
 pub fn repair_conformance(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+) -> Result<(), FhirError> {
+    let revision = store.catalog_revision()?;
+    repair_tables(store, db, catalog)?;
+    announce_unless_published(store, catalog, revision)
+}
+
+/// Announce everything, unless the catalog revision has moved since `revision`, which only a
+/// publish (that announced) does.
+fn announce_unless_published(
+    store: &dyn ConformanceStore,
+    catalog: &std::sync::RwLock<crate::catalog::Catalog>,
+    revision: u64,
+) -> Result<(), FhirError> {
+    if store.catalog_revision()? == revision {
+        package::announce_all(store, catalog)?;
+    }
+    Ok(())
+}
+
+fn repair_tables(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &std::sync::RwLock<crate::catalog::Catalog>,
@@ -264,10 +311,16 @@ fn project_writes(
                 store, catalog, local_id, &written, &removed,
             ))
         };
-        if !matches!(applied, Some(Ok(()))) {
+        if matches!(applied, Some(Ok(()))) {
+            // Nothing was loaded again here, so nothing told the other processes: a replica and a
+            // standby follow counters, and only a publish moved them. This changed the
+            // terminology alone, so that is what they are told, and what they load.
+            package::announce_terminology(store)?;
+        } else {
             if let Some(Err(err)) = &applied {
                 tracing::warn!(error = %err, "incremental terminology update failed; rebuilding");
             }
+            // Publishing announces the change as well, so this is told once either way.
             sync_expansions(store)?;
             package::publish(store, catalog)?;
         }

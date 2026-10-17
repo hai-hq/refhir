@@ -1,14 +1,106 @@
 use postgres::Transaction;
 use refhir_persistence::{
-    plan_search_parameter, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
-    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan,
-    ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
-    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    plan_package_parameters, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
+    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
+    NewTerminology, PackageRows, ParamStatus, PendingParam, PersistError, PersistenceGlobalKey,
+    PoolGuard, StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow,
+    StoredSearchParameter, StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 
 use crate::{definite, PostgresPersistence};
 
+fn structure_definition_from(row: &postgres::Row) -> StoredStructureDefinition {
+    let abstract_flag: i32 = row.get(4);
+    StoredStructureDefinition {
+        package_id: row.get(0),
+        url: row.get(1),
+        type_name: row.get(2),
+        kind: row.get(3),
+        is_abstract: abstract_flag != 0,
+        json: row.get(5),
+    }
+}
+
+fn terminology_from(row: &postgres::Row) -> StoredTerminology {
+    StoredTerminology {
+        package_id: row.get(0),
+        resource_type: row.get(1),
+        url: row.get(2),
+        json: row.get(3),
+    }
+}
+
+fn expansion_from(row: &postgres::Row) -> StoredExpansion {
+    StoredExpansion {
+        package_id: row.get(0),
+        url: row.get(1),
+        json: row.get(2),
+    }
+}
+
 impl PostgresPersistence {
+    /// Read `select` (a `SELECT` of a table keyed by `(package_id, url)`) a page at a time, in key
+    /// order, and hand each page to `visit`. A connection is taken for the query of each page
+    /// only, so none is held while `visit` works on the rows, which for a catalog load is seconds
+    /// of work, and the client never holds more than a page of the wire data at once.
+    fn visit_pages<T: Send>(
+        &self,
+        select: &str,
+        read: impl Fn(&postgres::Row) -> T + Sync,
+        key: impl Fn(&T) -> (i64, String),
+        visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let next = format!(
+            "{select} WHERE (package_id, url) > ($1, $2) \
+             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
+        );
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let page: Vec<T> = crate::off_runtime(|| {
+                let mut guard = self.inner.lock()?;
+                let rows = match &after {
+                    None => guard.client.query(first.as_str(), &[]),
+                    Some((package_id, url)) => {
+                        guard.client.query(next.as_str(), &[package_id, url])
+                    }
+                }
+                .map_err(definite)?;
+                Ok::<_, PersistError>(rows.iter().map(&read).collect())
+            })?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = Some(key(last));
+            let done = page.len() < CONFORMANCE_PAGE_ROWS;
+            visit(page)?;
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The `json` of the row of `table` (a conformance table keyed by `(package_id, url)`) with
+    /// this key.
+    fn row_json(
+        &self,
+        table: &str,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let row = guard
+                .client
+                .query_opt(
+                    format!("SELECT json FROM {table} WHERE package_id = $1 AND url = $2").as_str(),
+                    &[&package_id, &url],
+                )
+                .map_err(definite)?;
+            Ok(row.map(|row| row.get(0)))
+        })
+    }
+
     fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
         let mut guard = self.inner.lock()?;
         let row = guard
@@ -73,6 +165,14 @@ impl ConformanceStore for PostgresPersistence {
         crate::off_runtime(|| self.bump_counter(PersistenceGlobalKey::CatalogRevision))
     }
 
+    fn terminology_version(&self) -> Result<u64, PersistError> {
+        crate::off_runtime(|| self.read_counter(PersistenceGlobalKey::TerminologyVersion))
+    }
+
+    fn bump_terminology_version(&self) -> Result<u64, PersistError> {
+        crate::off_runtime(|| self.bump_counter(PersistenceGlobalKey::TerminologyVersion))
+    }
+
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
@@ -93,6 +193,34 @@ impl ConformanceStore for PostgresPersistence {
                 })
                 .collect())
         })
+    }
+
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("structure_definitions", package_id, url)
+    }
+
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("terminology", package_id, url)
+    }
+
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        self.row_json("value_set_expansion", package_id, url)
+    }
+
+    fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
+        Some(std::sync::Arc::new(self.clone()))
     }
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
@@ -121,6 +249,18 @@ impl ConformanceStore for PostgresPersistence {
                 })
                 .collect())
         })
+    }
+
+    fn visit_structure_definitions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, type_name, kind, is_abstract, json FROM structure_definitions",
+            structure_definition_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
@@ -172,6 +312,18 @@ impl ConformanceStore for PostgresPersistence {
                 })
                 .collect())
         })
+    }
+
+    fn visit_terminology(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, resource_type, url, json FROM terminology",
+            terminology_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn load_terminology_for(
@@ -308,14 +460,48 @@ impl ConformanceStore for PostgresPersistence {
         })
     }
 
+    fn visit_expansions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, json FROM value_set_expansion",
+            expansion_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
+    }
+
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
         crate::off_runtime(|| {
             let _gate = self.gate();
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
-            let outcome = install_in_tx(&mut tx, package)?;
+            let (outcome, heaviest) = install_in_tx(&mut tx, package)?;
             tx.commit().map_err(definite)?;
+            retire_if_swollen(&mut guard, heaviest);
+            Ok(outcome)
+        })
+    }
+
+    fn install_package_in_pieces(
+        &self,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+        feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    ) -> Result<InstallOutcome, InstallError> {
+        crate::off_runtime(|| {
+            let _gate = self.gate();
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            self.fence(&mut tx)?;
+            let mut installer = Installer::begin(&mut tx, name, version, fhir_version)?;
+            feed(&mut installer)?;
+            let (outcome, heaviest) = installer.finish()?;
+            tx.commit().map_err(definite)?;
+            retire_if_swollen(&mut guard, heaviest);
             Ok(outcome)
         })
     }
@@ -619,6 +805,106 @@ impl ConformanceStore for PostgresPersistence {
         })
     }
 
+    fn insert_backfills(
+        &self,
+        package_id: i64,
+        watermark_ts: i64,
+        tablets: &[String],
+    ) -> Result<(), PersistError> {
+        if tablets.is_empty() {
+            return Ok(());
+        }
+        crate::off_runtime(|| {
+            let _gate = self.gate();
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            self.fence(&mut tx)?;
+            // The jobs are numbered in the order of `tablets`, which is the order they run in.
+            let ids: Vec<i64> = tx
+                .query(
+                    "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done) \
+                     SELECT $1, $2, tablet, NULL, 0 FROM UNNEST($3::text[]) AS tablets(tablet) \
+                     RETURNING id",
+                    &[&package_id, &watermark_ts, &tablets],
+                )
+                .map_err(definite)?
+                .iter()
+                .map(|row| row.get(0))
+                .collect();
+            tx.execute(
+                "INSERT INTO backfill_parameter (backfill_id, url) \
+                 SELECT job.id, parameter.url FROM index_backfills job \
+                 JOIN search_parameters parameter ON parameter.package_id = job.package_id \
+                  AND parameter.base = job.tablet AND parameter.status = 'pending' \
+                 WHERE job.id = ANY($1)",
+                &[&ids],
+            )
+            .map_err(definite)?;
+            tx.commit().map_err(definite)
+        })
+    }
+
+    fn complete_empty_backfills(&self, jobs: &[StoredBackfill]) -> Result<(), PersistError> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        crate::off_runtime(|| {
+            let _gate = self.gate();
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            self.fence(&mut tx)?;
+            let ours = self.lease.epoch().unwrap_or(0) as i64;
+            let ids: Vec<i64> = jobs.iter().map(|job| job.id).collect();
+            // The same checks as claiming each job, on all of them under one lock.
+            let rows = tx
+                .query(
+                    "SELECT id, done, claimed_epoch FROM index_backfills \
+                     WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+                    &[&ids],
+                )
+                .map_err(definite)?;
+            let mut open: Vec<i64> = Vec::new();
+            for row in &rows {
+                let id: i64 = row.get(0);
+                let done: i32 = row.get(1);
+                let held: Option<i64> = row.get(2);
+                if done != 0 {
+                    continue;
+                }
+                if let Some(held) = held.filter(|held| *held > ours) {
+                    return Err(PersistError::Fenced(format!(
+                        "backfill {id} is claimed by writer epoch {held}, this process holds {ours}"
+                    )));
+                }
+                open.push(id);
+            }
+            if open.is_empty() {
+                return Ok(());
+            }
+            // What `complete_backfill` does for each job: the parameters snapshotted onto it
+            // become ready, or every pending one of its package and type when it has no snapshot.
+            tx.execute(
+                "UPDATE search_parameters parameter SET status = 'ready' \
+                 FROM index_backfills job \
+                 WHERE job.id = ANY($1) AND parameter.package_id = job.package_id \
+                   AND parameter.base = job.tablet AND parameter.status = 'pending' \
+                   AND (NOT EXISTS (SELECT 1 FROM backfill_parameter snapshot \
+                                    WHERE snapshot.backfill_id = job.id) \
+                        OR EXISTS (SELECT 1 FROM backfill_parameter snapshot \
+                                   WHERE snapshot.backfill_id = job.id \
+                                     AND snapshot.url = parameter.url))",
+                &[&open],
+            )
+            .map_err(definite)?;
+            tx.execute(
+                "UPDATE index_backfills SET claimed_epoch = $1, done = 1 WHERE id = ANY($2)",
+                &[&ours, &open],
+            )
+            .map_err(definite)?;
+            tx.commit().map_err(definite)
+        })
+    }
+
     fn update_backfill(
         &self,
         id: i64,
@@ -710,166 +996,379 @@ impl ConformanceStore for PostgresPersistence {
 fn install_in_tx(
     tx: &mut Transaction<'_>,
     package: &NewPackage,
-) -> Result<InstallOutcome, InstallError> {
-    let existing = tx
-        .query_opt(
-            "SELECT id FROM packages WHERE name = $1 AND version = $2",
-            &[&package.name, &package.version],
-        )
-        .map_err(definite)?;
-    if let Some(row) = existing {
-        let package_id: i64 = row.get(0);
-        insert_terminology(tx, package_id, package)?;
-        replace_expansions(tx, package_id, package)?;
-        return Ok(InstallOutcome {
-            package_id,
-            inserted: false,
-            newly_pending: Vec::new(),
-        });
-    }
-    let current = tx
-        .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
-        .map_err(definite)?;
-    if let Some(row) = current {
-        let existing: String = row.get(0);
-        if existing != package.fhir_version {
-            return Err(InstallError::FhirVersion {
-                existing,
-                incoming: package.fhir_version.clone(),
+) -> Result<(InstallOutcome, usize), InstallError> {
+    let mut installer =
+        Installer::begin(tx, &package.name, &package.version, &package.fhir_version)?;
+    installer.structure_definitions(&package.structure_definitions)?;
+    installer.search_parameters(&package.search_parameters)?;
+    installer.terminology(&package.terminology)?;
+    installer.expansions(&package.expansions)?;
+    installer.finish()
+}
+
+/// A package being stored inside a transaction, a few rows at a time.
+///
+/// A package the store already has (same name and version) takes only terminology, which is added
+/// to what it has, and expansions, which replace what it has. A package it does not have gets its
+/// definitions and search parameters too, and the search parameters are checked against the ones
+/// installed. Each call stores the rows it is given in statements of its own, so what is held at
+/// once is the rows of one call, however large the package.
+struct Installer<'a, 'c> {
+    tx: &'a mut Transaction<'c>,
+    package_id: i64,
+    /// Whether the package was there before this install.
+    existing: bool,
+    newly_pending: Vec<PendingParam>,
+    /// Whether the package's earlier expansions have been cleared for this install's.
+    expansions_cleared: bool,
+    /// The most JSON text any one call was given.
+    heaviest: usize,
+}
+
+impl<'a, 'c> Installer<'a, 'c> {
+    fn begin(
+        tx: &'a mut Transaction<'c>,
+        name: &str,
+        version: &str,
+        fhir_version: &str,
+    ) -> Result<Self, InstallError> {
+        let existing = tx
+            .query_opt(
+                "SELECT id FROM packages WHERE name = $1 AND version = $2",
+                &[&name, &version],
+            )
+            .map_err(definite)?;
+        if let Some(row) = existing {
+            let package_id: i64 = row.get(0);
+            return Ok(Self {
+                tx,
+                package_id,
+                existing: true,
+                newly_pending: Vec::new(),
+                expansions_cleared: false,
+                heaviest: 0,
             });
         }
+        let current = tx
+            .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
+            .map_err(definite)?;
+        if let Some(row) = current {
+            let existing: String = row.get(0);
+            if existing != fhir_version {
+                return Err(InstallError::FhirVersion {
+                    existing,
+                    incoming: fhir_version.to_string(),
+                });
+            }
+        }
+        let inserted = tx
+            .query_one(
+                "INSERT INTO packages (name, version, fhir_version) VALUES ($1, $2, $3) \
+                 RETURNING id",
+                &[&name, &version, &fhir_version],
+            )
+            .map_err(definite)?;
+        let package_id: i64 = inserted.get(0);
+        Ok(Self {
+            tx,
+            package_id,
+            existing: false,
+            newly_pending: Vec::new(),
+            expansions_cleared: false,
+            heaviest: 0,
+        })
     }
-    let inserted = tx
-        .query_one(
-            "INSERT INTO packages (name, version, fhir_version) VALUES ($1, $2, $3) RETURNING id",
-            &[&package.name, &package.version, &package.fhir_version],
-        )
-        .map_err(definite)?;
-    let package_id: i64 = inserted.get(0);
-    for definition in &package.structure_definitions {
-        let abstract_flag: i32 = if definition.is_abstract { 1 } else { 0 };
+
+    fn note(&mut self, bytes: usize) {
+        self.heaviest = self.heaviest.max(bytes);
+    }
+
+    fn clear_expansions(&mut self) -> Result<(), InstallError> {
+        if !self.expansions_cleared {
+            self.tx
+                .execute(
+                    "DELETE FROM value_set_expansion WHERE package_id = $1",
+                    &[&self.package_id],
+                )
+                .map_err(definite)?;
+            self.expansions_cleared = true;
+        }
+        Ok(())
+    }
+
+    /// The outcome, and the most JSON text any one call was given.
+    fn finish(mut self) -> Result<(InstallOutcome, usize), InstallError> {
+        // A package that is installed again and brings no expansions has none afterwards.
+        self.clear_expansions()?;
+        Ok((
+            InstallOutcome {
+                package_id: self.package_id,
+                inserted: !self.existing,
+                newly_pending: self.newly_pending,
+            },
+            self.heaviest,
+        ))
+    }
+}
+
+impl PackageRows for Installer<'_, '_> {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        if self.existing {
+            return Ok(());
+        }
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_structure_definitions(self.tx, self.package_id, rows)
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        if self.existing {
+            return Ok(());
+        }
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        let pending = insert_search_parameters(self.tx, self.package_id, rows)?;
+        self.newly_pending.extend(pending);
+        Ok(())
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_terminology(self.tx, self.package_id, rows)
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.clear_expansions()?;
+        self.note(rows.iter().map(|row| row.json.len()).sum());
+        insert_expansions(self.tx, self.package_id, rows)
+    }
+}
+
+/// How much JSON text one call of an install may carry before the connection it went over is
+/// closed once the install is stored. A connection copies each statement into a buffer that it
+/// keeps at the size of the largest it has sent, for as long as it lives, so a connection that
+/// has stored a package of 100 MB in pieces of several megabytes keeps about 16 MB, which the
+/// server would then hold for as long as it ran. A small install is not worth a new connection.
+const RETIRE_AFTER_BYTES: usize = 1024 * 1024;
+
+/// Close the connection of an install that was large (see [`RETIRE_AFTER_BYTES`]); the pool
+/// opens another when it is next asked for one.
+fn retire_if_swollen(connection: &mut PoolGuard<'_, crate::Inner>, heaviest: usize) {
+    if heaviest > RETIRE_AFTER_BYTES {
+        connection.discard();
+    }
+}
+
+/// The most JSON text one statement carries. A package is thousands of rows and tens of
+/// megabytes, and every round trip to the server costs the same however small the row, so rows
+/// go in a statement at a time, as many as fit under this, and no more of them are copied into
+/// a statement than that.
+const INSERT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Split `rows` into runs whose `size` adds up to about [`INSERT_BYTES`]. A row larger than that
+/// is a run of its own.
+fn runs<T>(rows: &[T], size: impl Fn(&T) -> usize) -> Vec<&[T]> {
+    runs_within(rows, INSERT_BYTES, size)
+}
+
+fn runs_within<T>(rows: &[T], limit: usize, size: impl Fn(&T) -> usize) -> Vec<&[T]> {
+    let mut runs = Vec::new();
+    let (mut start, mut held) = (0, 0);
+    for (at, row) in rows.iter().enumerate() {
+        let bytes = size(row);
+        if at > start && held + bytes > limit {
+            runs.push(&rows[start..at]);
+            (start, held) = (at, 0);
+        }
+        held += bytes;
+    }
+    if start < rows.len() {
+        runs.push(&rows[start..]);
+    }
+    runs
+}
+
+fn insert_structure_definitions(
+    tx: &mut Transaction<'_>,
+    package_id: i64,
+    definitions: &[NewStructureDefinition],
+) -> Result<(), InstallError> {
+    for run in runs(definitions, |row| row.json.len() + row.url.len()) {
+        let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
+        let types: Vec<&str> = run.iter().map(|row| row.type_name.as_str()).collect();
+        let kinds: Vec<&str> = run.iter().map(|row| row.kind.as_str()).collect();
+        let flags: Vec<i32> = run.iter().map(|row| i32::from(row.is_abstract)).collect();
+        let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         tx.execute(
             "INSERT INTO structure_definitions \
              (package_id, url, type_name, kind, is_abstract, json) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             SELECT $1, url, type_name, kind, is_abstract, json \
+             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::int4[], $6::text[]) \
+                  AS rows(url, type_name, kind, is_abstract, json)",
+            &[&package_id, &urls, &types, &kinds, &flags, &documents],
+        )
+        .map_err(definite)?;
+    }
+    Ok(())
+}
+
+/// Store the search parameters of a package, and say which of them wait for a backfill. What the
+/// rows already stored decide about each one (see [`plan_package_parameters`]) is read in one
+/// query for all of them, not one per parameter.
+fn insert_search_parameters(
+    tx: &mut Transaction<'_>,
+    package_id: i64,
+    parameters: &[NewSearchParameter],
+) -> Result<Vec<refhir_persistence::PendingParam>, InstallError> {
+    if parameters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bases: Vec<&str> = parameters.iter().map(|row| row.base.as_str()).collect();
+    let codes: Vec<&str> = parameters.iter().map(|row| row.code.as_str()).collect();
+    let stored = tx
+        .query(
+            "SELECT base, code, package_id, url, COALESCE(expression, ''), status, json \
+             FROM search_parameters \
+             WHERE (base, code) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+            &[&bases, &codes],
+        )
+        .map_err(definite)?
+        .iter()
+        .map(|row| StoredParameterRow {
+            base: row.get(0),
+            code: row.get(1),
+            row: InstalledParam {
+                package_id: row.get(2),
+                url: row.get(3),
+                expression: row.get(4),
+                status: row.get(5),
+                json: row.get(6),
+            },
+        })
+        .collect();
+    let plan = plan_package_parameters(package_id, parameters, stored)?;
+    for removal in &plan.removals {
+        tx.execute(
+            "DELETE FROM search_parameters \
+             WHERE package_id = $1 AND url = $2 AND base = $3 AND code = $4",
             &[
-                &package_id,
-                &definition.url,
-                &definition.type_name,
-                &definition.kind,
-                &abstract_flag,
-                &definition.json,
+                &removal.package_id,
+                &removal.url,
+                &removal.base,
+                &removal.code,
             ],
         )
         .map_err(definite)?;
     }
-    let mut newly_pending = Vec::new();
-    for param in &package.search_parameters {
-        let installed = tx
-            .query(
-                "SELECT package_id, url, COALESCE(expression, ''), status, json \
-                 FROM search_parameters WHERE base = $1 AND code = $2",
-                &[&param.base, &param.code],
-            )
-            .map_err(definite)?
+    for run in runs(&plan.inserts, |(at, _)| {
+        parameters[*at].json.len() + parameters[*at].url.len()
+    }) {
+        let rows: Vec<(&NewSearchParameter, ParamStatus)> = run
             .iter()
-            .map(|row| InstalledParam {
-                package_id: row.get(0),
-                url: row.get(1),
-                expression: row.get(2),
-                status: row.get(3),
-                json: row.get(4),
-            })
-            .collect::<Vec<_>>();
-        let (existing, remove) = match plan_search_parameter(param, &installed)? {
-            ParamPlan::Conflict => {
-                return Err(InstallError::Expression {
-                    base: param.base.clone(),
-                    code: param.code.clone(),
-                });
-            }
-            ParamPlan::Skip => continue,
-            ParamPlan::Insert { status, remove } => (status, remove),
-        };
-        for (owner, url) in remove {
-            tx.execute(
-                "DELETE FROM search_parameters \
-                 WHERE package_id = $1 AND url = $2 AND base = $3 AND code = $4",
-                &[&owner, &url, &param.base, &param.code],
-            )
-            .map_err(definite)?;
-        }
-        let is_new = existing.is_none();
-        let status = existing.unwrap_or(param.status);
-        if is_new && status == ParamStatus::Pending {
-            newly_pending.push(PendingParam {
-                base: param.base.clone(),
-                code: param.code.clone(),
-            });
-        }
+            .map(|(at, status)| (&parameters[*at], *status))
+            .collect();
+        let urls: Vec<&str> = rows.iter().map(|(row, _)| row.url.as_str()).collect();
+        let bases: Vec<&str> = rows.iter().map(|(row, _)| row.base.as_str()).collect();
+        let codes: Vec<&str> = rows.iter().map(|(row, _)| row.code.as_str()).collect();
+        let types: Vec<&str> = rows
+            .iter()
+            .map(|(row, _)| row.param_type.as_str())
+            .collect();
+        let expressions: Vec<Option<&str>> = rows
+            .iter()
+            .map(|(row, _)| row.expression.as_deref())
+            .collect();
+        let statuses: Vec<&str> = rows.iter().map(|(_, status)| status.as_str()).collect();
+        let documents: Vec<&str> = rows.iter().map(|(row, _)| row.json.as_str()).collect();
         tx.execute(
             "INSERT INTO search_parameters \
              (package_id, url, base, code, param_type, expression, status, json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             SELECT $1, url, base, code, param_type, expression, status, json \
+             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], \
+                         $7::text[], $8::text[]) \
+                  AS rows(url, base, code, param_type, expression, status, json)",
             &[
                 &package_id,
-                &param.url,
-                &param.base,
-                &param.code,
-                &param.param_type,
-                &param.expression,
-                &status.as_str(),
-                &param.json,
+                &urls,
+                &bases,
+                &codes,
+                &types,
+                &expressions,
+                &statuses,
+                &documents,
             ],
         )
         .map_err(definite)?;
     }
-    insert_terminology(tx, package_id, package)?;
-    replace_expansions(tx, package_id, package)?;
-    Ok(InstallOutcome {
-        package_id,
-        inserted: true,
-        newly_pending,
-    })
+    Ok(plan.newly_pending)
 }
 
 fn insert_terminology(
     tx: &mut Transaction<'_>,
     package_id: i64,
-    package: &NewPackage,
+    rows: &[NewTerminology],
 ) -> Result<(), InstallError> {
-    for resource in &package.terminology {
+    for run in runs(rows, |row| row.json.len() + row.url.len()) {
+        let types: Vec<&str> = run.iter().map(|row| row.resource_type.as_str()).collect();
+        let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
+        let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
+        // The first of two rows for one URL stays, as it did when they went in one at a time.
         tx.execute(
             "INSERT INTO terminology (package_id, resource_type, url, json) \
-             VALUES ($1, $2, $3, $4) ON CONFLICT (package_id, url) DO NOTHING",
-            &[
-                &package_id,
-                &resource.resource_type,
-                &resource.url,
-                &resource.json,
-            ],
+             SELECT $1, resource_type, url, json \
+             FROM UNNEST($2::text[], $3::text[], $4::text[]) AS rows(resource_type, url, json) \
+             ON CONFLICT (package_id, url) DO NOTHING",
+            &[&package_id, &types, &urls, &documents],
         )
         .map_err(definite)?;
     }
     Ok(())
 }
 
-fn replace_expansions(
+fn insert_expansions(
     tx: &mut Transaction<'_>,
     package_id: i64,
-    package: &NewPackage,
+    rows: &[NewExpansion],
 ) -> Result<(), InstallError> {
-    tx.execute(
-        "DELETE FROM value_set_expansion WHERE package_id = $1",
-        &[&package_id],
-    )
-    .map_err(definite)?;
-    for expansion in &package.expansions {
+    for run in runs(rows, |row| row.json.len() + row.url.len()) {
+        let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
+        let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         tx.execute(
-            "INSERT INTO value_set_expansion (package_id, url, json) VALUES ($1, $2, $3)",
-            &[&package_id, &expansion.url, &expansion.json],
+            "INSERT INTO value_set_expansion (package_id, url, json) \
+             SELECT $1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)",
+            &[&package_id, &urls, &documents],
         )
         .map_err(definite)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runs_within;
+
+    #[test]
+    fn rows_go_in_runs_that_stay_under_the_limit_except_for_one_row_that_is_larger() {
+        let sizes = [4usize, 4, 4, 30, 1, 1, 9, 2];
+        let runs = runs_within(&sizes, 10, |size| *size);
+        let shape: Vec<&[usize]> = runs.to_vec();
+        assert_eq!(
+            shape,
+            [
+                &[4, 4][..],
+                &[4][..],
+                &[30][..],
+                &[1, 1][..],
+                &[9][..],
+                &[2][..]
+            ]
+        );
+        // Nothing is dropped or reordered, whatever the limit.
+        for limit in [1, 3, 10, 1000] {
+            let joined: Vec<usize> = runs_within(&sizes, limit, |size| *size).concat();
+            assert_eq!(joined, sizes);
+        }
+        assert!(runs_within::<usize>(&[], 10, |size| *size).is_empty());
+    }
 }

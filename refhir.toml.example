@@ -56,8 +56,16 @@ reference_policy = "strict" # strict | fhir
 # Build your own bundle with scripts/package-bundle.py.
 # package_registry = "https://packages.fhir.org"
 # package_cache = "/data/package-cache"
+# A file made by `refhir package-bundle`: the release's packages, prepared ahead of time, which a
+# first start installs instead of downloading them. Release archives and images have one beside the
+# binary, found without this setting; set it to use another file, or "off" to download instead.
+# package_bundle = "/usr/local/share/refhir/refhir-packages.bundle"
+# The server downloads packages only if this is true: the release defaults when there is no prepared
+# file, entries of `packages` below that are name@version, and `$install`. Off by default.
+# package_download = false
 
-# [fhir].version installs that release's defaults (r4 today). Optional IGs:
+# [fhir].version installs that release's defaults (r4 today). Optional IGs. A name@version entry is
+# downloaded, so it needs package_download = true above; a directory or a .tgz does not:
 # packages = ["hl7.fhir.us.core@6.1.0", "/ig/my-implementation-guide.tgz"]
 
 [smart]

@@ -1,10 +1,13 @@
 mod config;
 mod migrate;
+mod package_bundle;
 
 use std::env;
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use refhir_fhir::BUNDLE_FILE;
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 
@@ -39,6 +42,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("migrate") {
         return migrate::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("package-bundle") {
+        return package_bundle::run(&args[1..]);
     }
     match serve(args) {
         Ok(()) => ExitCode::SUCCESS,
@@ -523,6 +529,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             None => Arc::new(RwLock::new(Catalog::open(store.as_ref())?)),
         };
         let loaded = started.elapsed();
+        // Nothing serves from the catalog yet, so rebuilding it need not keep the old one alive.
+        catalog.write().expect("catalog").set_rebuild_in_place(true);
         check_release_matches_database(release_from_plan(&cfg.packages), store.as_ref())?;
         install_packages(store.as_ref(), &db, &catalog, &cfg.packages)?;
         let installed = started.elapsed();
@@ -531,6 +539,10 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         let backfilled = started.elapsed();
         refhir_fhir::repair_conformance(store.as_ref(), &db, &catalog)?;
         let repaired = started.elapsed();
+        catalog
+            .write()
+            .expect("catalog")
+            .set_rebuild_in_place(false);
         tracing::info!(
             "startup after the lease: {repaired:.1?} (database {opened:.1?}, catalog {:.1?}, \
              packages {:.1?}, backfills {:.1?}, repair {:.1?})",
@@ -776,6 +788,49 @@ fn env_flag(name: &str) -> bool {
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
+/// Where the prepared packages are.
+enum Prepared {
+    Found(PathBuf),
+    /// `REFHIR_PACKAGE_BUNDLE=off`: do not look.
+    Off,
+    Absent,
+}
+
+/// The file of prepared packages: where `REFHIR_PACKAGE_BUNDLE` (or `[conformance].package_bundle`)
+/// says, else beside the binary, else in `../share/refhir/` from it, which is where a container
+/// image or a system package puts it. A file that is named and is not there is an error.
+fn prepared_bundle() -> Result<Prepared, String> {
+    if let Ok(path) = env::var("REFHIR_PACKAGE_BUNDLE") {
+        match path.trim() {
+            "" => {}
+            "off" => return Ok(Prepared::Off),
+            path if Path::new(path).is_file() => return Ok(Prepared::Found(PathBuf::from(path))),
+            path => {
+                return Err(format!(
+                    "[conformance].package_bundle (REFHIR_PACKAGE_BUNDLE) names {path}, which is not a file"
+                ))
+            }
+        }
+    }
+    let Some(directory) = env::current_exe()
+        .ok()
+        .and_then(|binary| binary.parent().map(Path::to_path_buf))
+    else {
+        return Ok(Prepared::Absent);
+    };
+    let found = [
+        directory.join(BUNDLE_FILE),
+        directory
+            .join("..")
+            .join("share")
+            .join("refhir")
+            .join(BUNDLE_FILE),
+    ]
+    .into_iter()
+    .find(|path| path.is_file());
+    Ok(found.map_or(Prepared::Absent, Prepared::Found))
+}
+
 fn skip_release_defaults() -> bool {
     env_flag("REFHIR_SKIP_DEFAULT_PACKAGES")
 }
@@ -798,6 +853,60 @@ fn install_release_defaults(
             if refhir_fhir::packages_installed(store, &specs)? {
                 tracing::info!(target: "refhir", "FHIR R4 release packages already installed");
                 return Ok(());
+            }
+            // The release's packages come from the file prepared ahead of time: no registry to
+            // reach, and none of the work of reading them. A file that is there and cannot be
+            // used stops the start rather than being worked around, because a server that quietly
+            // fetched its packages from somewhere else would not be the one that was deployed.
+            // Only a server that was told it may download goes to the registry, and only when
+            // there is no file.
+            match prepared_bundle()? {
+                Prepared::Found(path) => {
+                    let installed = refhir_fhir::install_prepared(
+                        store, db, catalog, &path, &specs,
+                    )
+                    .map_err(|err| {
+                        format!("cannot install the packages in {}: {err}", path.display())
+                    })?;
+                    let Some(count) = installed else {
+                        return Err(format!(
+                            "{} does not hold {}: it was made for another release. Make one for \
+                             this release with `refhir package-bundle`, or name the right file in \
+                             [conformance].package_bundle (REFHIR_PACKAGE_BUNDLE)",
+                            path.display(),
+                            specs.join(" and ")
+                        )
+                        .into());
+                    };
+                    tracing::info!(
+                        target: "refhir",
+                        "installed {count} FHIR packages from {}",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+                Prepared::Off | Prepared::Absent if refhir_fhir::package_downloads_allowed() => {}
+                Prepared::Off => {
+                    return Err(format!(
+                        "REFHIR_PACKAGE_BUNDLE is off and this server does not download \
+                         packages, so there is nowhere to install {} from. Name a file made by \
+                         `refhir package-bundle`, or set [conformance].package_download = true",
+                        specs.join(" and ")
+                    )
+                    .into());
+                }
+                Prepared::Absent => {
+                    return Err(format!(
+                        "there is no prepared file of this release's FHIR packages \
+                         ({BUNDLE_FILE}, beside the binary or in ../share/refhir/ from it), and this \
+                         server does not download packages, so there is nowhere to install {} \
+                         from. A release archive or container image has the file; for a binary you \
+                         built, make one with `refhir package-bundle`, or set \
+                         [conformance].package_download = true to let this server download them",
+                        specs.join(" and ")
+                    )
+                    .into());
+                }
             }
             for spec in specs {
                 if let Err(err) = refhir_fhir::install_package(store, db, catalog, spec) {
@@ -860,17 +969,21 @@ fn print_help() {
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
          [--role primary|standby|replica] [--standby] [--primary-url url] [--db-pool n]\n\
          refhir migrate --status | --dry-run   (schema versions; see refhir migrate --help)\n\
+         refhir package-bundle [--out file]    (prepare the packages ahead of time; see --help)\n\
          refhir --version | -V                 (print the version and exit)\n\
          \n\
          Config file (optional): refhir.toml in the working directory, /etc/refhir/refhir.toml,\n\
          or REFHIR_CONFIG. CLI flags override the file. See refhir.toml.example.\n\
          \n\
-         Default database is refhir.sqlite. --memory uses SQLite in RAM and\n\
-         leaves no file. [fhir].version selects release defaults (r4: hl7.fhir.r4.core@4.0.1\n\
-         and hl7.fhir.uv.sdc@4.0.0) downloaded from [conformance].package_registry (default\n\
-         packages.fhir.org; a mirror URL or s3://bucket/prefix also works), cached and skipped\n\
-         when already in the database. The server ships no packages and does not start if\n\
-         that source is unreachable on a first start. --package may be repeated to add IGs (directory, .tgz,\n\
+         Default database is refhir.sqlite. --memory uses SQLite in RAM and leaves no file.\n\
+         [fhir].version selects release defaults (r4: hl7.fhir.r4.core@4.0.1, hl7.fhir.uv.sdc@4.0.0\n\
+         and what they depend on). A first start installs them from a file made by\n\
+         `refhir package-bundle`, found beside the binary or at [conformance].package_bundle, and\n\
+         reaches no registry; a file that is there and unusable stops the start. Nothing is\n\
+         downloaded unless [conformance].package_download is true (then from\n\
+         [conformance].package_registry: packages.fhir.org by default, or a mirror URL or\n\
+         s3://bucket/prefix). With no usable file and no download the server does not start.\n\
+         --package may be repeated to add IGs (directory, .tgz,\n\
          or name@version). --references defaults to strict.\n\
          --smart enables SMART App Launch 2.2. --public-url is required when\n\
          --smart is used with a non-loopback --bind. Generated DCR and confidential\n\

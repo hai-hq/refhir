@@ -842,6 +842,7 @@ mod tests {
         fenced(first.mark_base_ready(1, "Patient"));
         fenced(first.insert_backfill(1, 1, "Patient", &[]).map(drop));
         fenced(first.bump_catalog_version().map(drop));
+        fenced(first.bump_terminology_version().map(drop));
         let version = second
             .bump_catalog_version()
             .expect("the new holder announces changes");
@@ -973,19 +974,22 @@ mod tests {
     }
 
     #[test]
-    fn the_two_catalog_counters_count_separately() {
+    fn the_catalog_counters_count_separately() {
         let p = SqlitePersistence::open_in_memory().unwrap();
-        assert_eq!(
-            (p.catalog_version().unwrap(), p.catalog_revision().unwrap()),
-            (0, 0)
-        );
+        let counters = || {
+            (
+                p.catalog_version().unwrap(),
+                p.catalog_revision().unwrap(),
+                p.terminology_version().unwrap(),
+            )
+        };
+        assert_eq!(counters(), (0, 0, 0));
         assert_eq!(p.bump_catalog_revision().unwrap(), 1);
         assert_eq!(p.bump_catalog_revision().unwrap(), 2);
         assert_eq!(p.bump_catalog_version().unwrap(), 1);
-        assert_eq!(
-            (p.catalog_version().unwrap(), p.catalog_revision().unwrap()),
-            (1, 2)
-        );
+        assert_eq!(counters(), (1, 2, 0));
+        assert_eq!(p.bump_terminology_version().unwrap(), 1);
+        assert_eq!(counters(), (1, 2, 1));
     }
 
     #[test]

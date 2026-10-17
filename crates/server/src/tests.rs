@@ -5973,6 +5973,118 @@ mod cluster {
         );
     }
 
+    /// A package that only teaches the catalog the resource types terminology is written as: the
+    /// minimal R4 package has none of them.
+    fn conformance_types_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "refhir-cluster-types-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"example.conformance.types","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+        )
+        .unwrap();
+        for type_name in ["SearchParameter", "ValueSet", "CodeSystem", "ConceptMap"] {
+            std::fs::write(
+                dir.join(format!("StructureDefinition-{type_name}.json")),
+                format!(
+                    r#"{{"resourceType":"StructureDefinition","url":"http://hl7.org/fhir/StructureDefinition/{type_name}","name":"{type_name}","status":"active","kind":"resource","abstract":false,"type":"{type_name}","fhirVersion":"4.0.1","derivation":"specialization","snapshot":{{"element":[{{"path":"{type_name}","min":0,"max":"*"}}]}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_replica_follows_terminology_the_primary_is_given_through_the_api() {
+        use refhir_fhir::{reload_catalog, CatalogClock::Stable};
+        let cluster = pair(|_| {}).await;
+        let primary = cluster_primary_app(&cluster);
+        let replica_store = cluster.replica_store.as_ref();
+        let replica_follows = || Stable.stamp(replica_store).unwrap();
+
+        // The primary is given the resource types, which is an install: the replica is told, and
+        // loads everything.
+        let mut loaded_at = replica_follows();
+        let dir = conformance_types_dir();
+        let store = SqlitePersistence::open(&cluster.path).unwrap();
+        install_package_dir(&store, &cluster.primary_db, &cluster.primary_catalog, &dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        loaded_at =
+            reload_catalog(replica_store, &cluster.replica_catalog, loaded_at, Stable).unwrap();
+        assert_eq!(loaded_at, replica_follows());
+        assert!(loaded_at.clock > 0);
+
+        // A client writes a code system and a value set over it.
+        let system = call(
+            &primary,
+            "POST",
+            "/CodeSystem",
+            Some(json!({
+                "resourceType": "CodeSystem", "url": "http://example.org/animals",
+                "status": "active", "content": "complete",
+                "concept": [{"code": "dog"}, {"code": "cat"}]
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(system.status, StatusCode::CREATED, "{}", system.body);
+        let set = call(
+            &primary,
+            "POST",
+            "/ValueSet",
+            Some(json!({
+                "resourceType": "ValueSet", "url": "http://example.org/pets",
+                "status": "active",
+                "compose": {"include": [{"system": "http://example.org/animals"}]}
+            })),
+            &[],
+        )
+        .await;
+        assert_eq!(set.status, StatusCode::CREATED, "{}", set.body);
+
+        let expand = || {
+            call(
+                &cluster.replica_app,
+                "POST",
+                "/ValueSet/$expand",
+                Some(json!({"url": "http://example.org/pets"})),
+                &[],
+            )
+        };
+        // The replica has not looked yet, and answers from what it loaded.
+        assert_ne!(expand().await.status, StatusCode::OK);
+
+        // What a watcher does when it sees the counters move. They used to stand still: a
+        // terminology write moved none, so the replica went on answering from the old terminology
+        // until something else (a package, a search parameter) did. Only the terminology changed,
+        // so it is all the replica loads.
+        let now =
+            reload_catalog(replica_store, &cluster.replica_catalog, loaded_at, Stable).unwrap();
+        assert!(
+            now.terminology > loaded_at.terminology,
+            "the replica was not told of the write"
+        );
+        assert_eq!(now.clock, loaded_at.clock, "only the terminology changed");
+        let answered = expand().await;
+        assert_eq!(answered.status, StatusCode::OK, "{}", answered.body);
+        assert_eq!(header(&answered, "x-refhir-role"), "replica");
+        let codes: Vec<&str> = answered.body["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap())
+            .collect();
+        assert_eq!(codes, ["cat", "dog"]);
+    }
+
     #[tokio::test]
     async fn work_that_lives_on_the_primary_is_sent_there() {
         let cluster = pair(|_| {}).await;

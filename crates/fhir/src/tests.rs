@@ -18,7 +18,7 @@ use crate::extract::ReferenceId;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
     cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
-    minir4_dir, newer_terminology_dir, publish, r4_dir, run_backfills, sdc_dir,
+    minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir, run_backfills, sdc_dir,
     stage_package_deferred, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
@@ -820,6 +820,322 @@ fn dependency_versions_resolve_to_the_highest_one_installed_once() {
         ]
     );
     for dir in [app, mid, lib1, lib2, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A registry that counts what is fetched from it, and how many fetches are under way at once.
+struct CountingFetcher {
+    inner: MapFetcher,
+    fetched: std::sync::Mutex<BTreeMap<(String, String), usize>>,
+    running: std::sync::atomic::AtomicUsize,
+    most_at_once: std::sync::atomic::AtomicUsize,
+}
+
+impl PackageFetcher for CountingFetcher {
+    fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        *self
+            .fetched
+            .lock()
+            .unwrap()
+            .entry((name.to_string(), version.to_string()))
+            .or_default() += 1;
+        let now = self.running.fetch_add(1, SeqCst) + 1;
+        self.most_at_once.fetch_max(now, SeqCst);
+        // Long enough that fetches that are meant to overlap do.
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let result = self.inner.fetch(name, version, dest);
+        self.running.fetch_sub(1, SeqCst);
+        result
+    }
+}
+
+#[test]
+fn packages_that_do_not_need_each_other_are_fetched_side_by_side_and_once() {
+    let names = [
+        "example.a",
+        "example.b",
+        "example.c",
+        "example.d",
+        "example.e",
+    ];
+    let deps: Vec<(&str, &str)> = names.iter().map(|name| (*name, "1.0.0")).collect();
+    let app = dep_package("example.app", "1.0.0", &deps);
+    // The last one is needed by two of the others: still fetched once.
+    let libs: Vec<PathBuf> = names
+        .iter()
+        .map(|name| {
+            let needs: &[(&str, &str)] = if *name == "example.e" {
+                &[]
+            } else {
+                &[("example.shared", "1.0.0")]
+            };
+            dep_package(name, "1.0.0", needs)
+        })
+        .collect();
+    let shared = dep_package("example.shared", "1.0.0", &[]);
+    let mut listed: Vec<(&str, &str, &PathBuf)> = names
+        .iter()
+        .zip(&libs)
+        .map(|(name, dir)| (*name, "1.0.0", dir))
+        .collect();
+    listed.push(("example.shared", "1.0.0", &shared));
+    let fetcher = CountingFetcher {
+        inner: registry(&listed),
+        fetched: Default::default(),
+        running: Default::default(),
+        most_at_once: Default::default(),
+    };
+    let db = empty();
+    let cache = temp_dir("side-by-side-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    let mut expected: Vec<String> = names.iter().map(|name| format!("{name}@1.0.0")).collect();
+    expected.push("example.app@1.0.0".into());
+    expected.push("example.shared@1.0.0".into());
+    expected.sort();
+    assert_eq!(installed_packages(&db), expected);
+    let fetched = fetcher.fetched.lock().unwrap();
+    assert_eq!(fetched.len(), 6, "{fetched:?}");
+    assert!(fetched.values().all(|count| *count == 1), "{fetched:?}");
+    assert!(
+        fetcher
+            .most_at_once
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 1,
+        "the five that app needs were fetched one after another"
+    );
+    drop(fetched);
+    for dir in libs.into_iter().chain([app, shared, cache]) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_package_that_cannot_be_fetched_stops_the_install_before_anything_is_stored() {
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.a", "1.0.0"), ("example.missing", "1.0.0")],
+    );
+    let a = dep_package("example.a", "1.0.0", &[]);
+    let fetcher = registry(&[("example.a", "1.0.0", &a)]);
+    let db = empty();
+    let cache = temp_dir("missing-sibling-cache");
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, FhirError::NotFound(message) if message.contains("example.missing")),
+        "{err:?}"
+    );
+    assert!(installed_packages(&db).is_empty());
+    for dir in [app, a, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+const EXAMPLES: &str = "hl7.fhir.r4.examples";
+
+fn counting(packages: &[(&str, &str, &PathBuf)]) -> CountingFetcher {
+    CountingFetcher {
+        inner: registry(packages),
+        fetched: Default::default(),
+        running: Default::default(),
+        most_at_once: Default::default(),
+    }
+}
+
+#[test]
+fn the_r4_examples_package_is_not_installed_for_a_package_that_depends_on_it() {
+    // app needs lib, and mid, which needs the examples package (as sdc does, through its own
+    // dependencies in a deeper tree). The examples package needs a package of its own.
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("example.lib", "1.0.0"), ("example.mid", "1.0.0")],
+    );
+    let mid = dep_package("example.mid", "1.0.0", &[(EXAMPLES, "4.0.1")]);
+    let lib = dep_package("example.lib", "1.0.0", &[(EXAMPLES, "4.0.1")]);
+    let examples = dep_package(EXAMPLES, "4.0.1", &[("example.only-for-examples", "1.0.0")]);
+    let behind = dep_package("example.only-for-examples", "1.0.0", &[]);
+    let fetcher = counting(&[
+        ("example.mid", "1.0.0", &mid),
+        ("example.lib", "1.0.0", &lib),
+        (EXAMPLES, "4.0.1", &examples),
+        ("example.only-for-examples", "1.0.0", &behind),
+    ]);
+    let db = empty();
+    let cache = temp_dir("skip-examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        [
+            "example.app@1.0.0",
+            "example.lib@1.0.0",
+            "example.mid@1.0.0"
+        ]
+    );
+    // Neither it nor what only it needs was downloaded or unpacked.
+    let fetched: Vec<String> = fetcher
+        .fetched
+        .lock()
+        .unwrap()
+        .keys()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(fetched, ["example.lib", "example.mid"]);
+    assert!(!cache.join(EXAMPLES).exists());
+    for dir in [app, mid, lib, examples, behind, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn the_r4_examples_package_is_installed_when_it_is_asked_for() {
+    let examples = dep_package(EXAMPLES, "4.0.1", &[("example.lib", "1.0.0")]);
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let fetcher = counting(&[
+        (EXAMPLES, "4.0.1", &examples),
+        ("example.lib", "1.0.0", &lib),
+    ]);
+    let db = empty();
+    let cache = temp_dir("ask-examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        &format!("{EXAMPLES}@4.0.1"),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    // As any package: itself, and what it depends on.
+    assert_eq!(
+        installed_packages(&db),
+        ["example.lib@1.0.0".to_string(), format!("{EXAMPLES}@4.0.1")]
+    );
+    for dir in [examples, lib, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_copy_of_the_r4_examples_package_that_is_installed_stays_when_a_dependent_arrives() {
+    // A database an earlier version started, which installed the examples package for sdc.
+    let examples = dep_package(EXAMPLES, "4.0.1", &[]);
+    let app = dep_package("example.app", "1.0.0", &[(EXAMPLES, "4.0.1")]);
+    let db = empty();
+    install_package_dir(&db.store, &db.db, &db.catalog, &examples).unwrap();
+    let cache = temp_dir("kept-examples-cache");
+    // Nothing is fetched: the package is there and the dependency is skipped.
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &NoNetwork,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.app@1.0.0".to_string(), format!("{EXAMPLES}@4.0.1")]
+    );
+    for dir in [examples, app, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// The codes `url` expands to, sorted.
+fn expansion_codes(harness: &Harness, url: &str) -> Vec<String> {
+    let mut codes: Vec<String> = expansion_of(harness, url)
+        .iter()
+        .filter_map(|item| item["code"].as_str().map(str::to_string))
+        .collect();
+    codes.sort();
+    codes
+}
+
+#[test]
+fn leaving_the_r4_examples_package_out_changes_which_package_holds_a_value_set_but_not_its_codes() {
+    // R4 core, and a package that depends on the examples package, which carries core's
+    // `marital-status` value set and its code system again, with generated narrative. The value
+    // set in use is the last one at the release, so with the examples package installed it is
+    // the examples package's copy, and without it core's. Either way it expands to the same codes.
+    let marital = "http://hl7.org/fhir/ValueSet/marital-status";
+    let app = dep_package(
+        "example.sdc",
+        "1.0.0",
+        &[("hl7.fhir.r4.core", "4.0.1"), (EXAMPLES, "4.0.1")],
+    );
+
+    // As the server now installs it: the dependency is skipped.
+    let (without, _) = watched_r4();
+    let fetcher = counting(&[(EXAMPLES, "4.0.1", &r4_examples_dir().to_path_buf())]);
+    let cache = temp_dir("scope-without-cache");
+    install_with(
+        &without.store,
+        &without.db,
+        &without.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert!(fetcher.fetched.lock().unwrap().is_empty());
+    assert!(!installed_packages(&without)
+        .iter()
+        .any(|name| name.starts_with(EXAMPLES)));
+    let core = package_id(&without, "hl7.fhir.r4.core");
+    let rows = stored_rows(&without, marital);
+    assert_eq!(rows.len(), 1, "one expansion is stored for it");
+    assert_eq!(rows[0].package_id, core, "core holds the value set in use");
+
+    // As an earlier version, or someone who asked for the package, has it installed.
+    let (with, _) = watched_r4();
+    install_package_dir(&with.store, &with.db, &with.catalog, r4_examples_dir()).unwrap();
+    let examples = package_id(&with, EXAMPLES);
+    let owners: Vec<i64> = stored_rows(&with, marital)
+        .iter()
+        .map(|row| row.package_id)
+        .collect();
+    assert!(
+        owners.contains(&examples),
+        "the later copy is the one in use: {owners:?}"
+    );
+
+    // The codes are the same, and so is what a start reads from what was stored.
+    let codes = expansion_codes(&without, marital);
+    assert_eq!(codes.len(), 11, "ten statuses and UNK: {codes:?}");
+    assert_eq!(expansion_codes(&with, marital), codes);
+    publish(&without.store, &without.catalog).unwrap();
+    publish(&with.store, &with.catalog).unwrap();
+    assert_eq!(expansion_codes(&without, marital), codes, "after a restart");
+    assert_eq!(expansion_codes(&with, marital), codes, "after a restart");
+    for dir in [app, cache] {
         let _ = std::fs::remove_dir_all(dir);
     }
 }
@@ -1808,6 +2124,39 @@ fn label_parameter(expression: &str) -> Value {
         "type": "string",
         "expression": expression
     })
+}
+
+/// What a catalog says about its search parameters: a line for each parameter of each type, with
+/// its name, kind and status.
+fn parameter_summary(catalog: &Catalog) -> Vec<String> {
+    catalog
+        .resource_models()
+        .flat_map(|model| {
+            model.params.iter().map(|param| {
+                format!(
+                    "{}.{} {:?} {:?}",
+                    model.name, param.name, param.kind, param.status
+                )
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn compiling_the_parameters_in_place_gives_what_compiling_them_beside_the_catalog_gives() {
+    let harness = ready();
+    let parameters = harness.store.load_search_parameters().unwrap();
+    assert!(!parameters.is_empty());
+    let mut beside = harness.catalog.read().unwrap().clone();
+    let compiled = beside.compiled_parameters(&parameters);
+    beside.set_parameters(compiled);
+    let mut in_place = harness.catalog.read().unwrap().clone();
+    in_place.recompile_parameters(&parameters);
+    assert_eq!(parameter_summary(&in_place), parameter_summary(&beside));
+    assert_eq!(
+        parameter_summary(&in_place),
+        parameter_summary(&harness.catalog.read().unwrap())
+    );
 }
 
 #[test]
@@ -3419,6 +3768,12 @@ mod takeover {
         fn bump_catalog_revision(&self) -> Result<u64, rp::PersistError> {
             self.inner.bump_catalog_revision()
         }
+        fn terminology_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.terminology_version()
+        }
+        fn bump_terminology_version(&self) -> Result<u64, rp::PersistError> {
+            self.inner.bump_terminology_version()
+        }
         fn claim_backfill(&self, id: i64) -> Result<bool, rp::PersistError> {
             self.inner.claim_backfill(id)
         }
@@ -3704,7 +4059,7 @@ mod takeover {
             crate::CatalogClock::Latest,
         )
         .unwrap();
-        assert!(now > version);
+        assert!(now.clock > version.clock);
         assert_eq!(types(&warm), types(&primary.catalog));
 
         // When nothing changed there is nothing to do: the same version comes back and the
@@ -3735,7 +4090,7 @@ mod takeover {
         // What a replica loaded before the install: it follows the stable version.
         let (replica_catalog, replica_at) = Catalog::open_consistent(&db.store, Stable).unwrap();
         let replica_catalog = std::sync::RwLock::new(replica_catalog);
-        assert_eq!(replica_at, version_before);
+        assert_eq!(replica_at.clock, version_before);
 
         // The package is installed and published, but its backfill has not run.
         let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
@@ -3774,7 +4129,7 @@ mod takeover {
         );
         let now = crate::package::reload_catalog(&db.store, &replica_catalog, replica_at, Stable)
             .unwrap();
-        assert_eq!(now, version());
+        assert_eq!(now.clock, version());
         assert!(!replica_catalog.read().unwrap().has_pending_parameters());
         assert_eq!(
             search_total(
@@ -3798,6 +4153,534 @@ mod takeover {
         install_package_dir(&db.store, &db.db, &db.catalog, &plain).unwrap();
         assert!(db.store.catalog_version().unwrap() > before);
         assert!(db.store.catalog_revision().unwrap() > revision);
+    }
+
+    const PETS: &str = "http://example.org/pets";
+    const ANIMALS: &str = "http://example.org/animals";
+
+    /// What a follower had to do to catch up.
+    #[derive(Debug, PartialEq)]
+    enum Reload {
+        Nothing,
+        Terminology,
+        Everything,
+    }
+
+    /// A process that follows one of the clocks, as a replica (`Stable`) or a standby (`Latest`)
+    /// does: the catalog it serves from, and what it loaded it at.
+    struct Follower {
+        clock: crate::CatalogClock,
+        catalog: std::sync::RwLock<Catalog>,
+        at: crate::CatalogStamp,
+    }
+
+    impl Follower {
+        fn start(store: &dyn rp::ConformanceStore, clock: crate::CatalogClock) -> Self {
+            let (catalog, at) = Catalog::open_consistent(store, clock).unwrap();
+            Self {
+                clock,
+                catalog: std::sync::RwLock::new(catalog),
+                at,
+            }
+        }
+
+        /// What the watcher does when it sees the counters differ from the ones it loaded at.
+        /// The `Reload` is what the stamps say moved, not what was read: a test that cares counts
+        /// the reads with a `WatchedStore`.
+        fn catch_up(&mut self, store: &dyn rp::ConformanceStore) -> Reload {
+            let now =
+                crate::package::reload_catalog(store, &self.catalog, self.at, self.clock).unwrap();
+            let reload = if now == self.at {
+                Reload::Nothing
+            } else if now.clock == self.at.clock {
+                Reload::Terminology
+            } else {
+                Reload::Everything
+            };
+            self.at = now;
+            reload
+        }
+
+        fn pets(&self) -> Option<Vec<String>> {
+            codes_of_pets(&self.catalog)
+        }
+    }
+
+    /// The codes `catalog` expands the pets value set to, or `None` when it has no such value set.
+    fn codes_of_pets(catalog: &std::sync::RwLock<Catalog>) -> Option<Vec<String>> {
+        let expanded = catalog.read().unwrap().terms().expand(PETS, None)?;
+        let mut codes: Vec<String> = expanded["expansion"]["contains"]
+            .as_array()?
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect();
+        codes.sort();
+        Some(codes)
+    }
+
+    fn animals(codes: &[&str]) -> Value {
+        json!({
+            "resourceType": "CodeSystem", "url": ANIMALS, "status": "active",
+            "content": "complete",
+            "concept": codes.iter().map(|code| json!({"code": code})).collect::<Vec<_>>()
+        })
+    }
+
+    fn pets() -> Value {
+        json!({
+            "resourceType": "ValueSet", "url": PETS, "status": "active",
+            "compose": {"include": [{"system": ANIMALS}]}
+        })
+    }
+
+    /// Write a code system and a value set over it through the API, as a client would, on the
+    /// primary `db` and through `store`. Returns the ids they were given.
+    fn write_pets_through(
+        db: &Harness,
+        store: &dyn rp::ConformanceStore,
+        codes: &[&str],
+    ) -> Result<(String, String), RunError> {
+        let id = |value: Value| value["id"].as_str().unwrap().to_string();
+        let write = |path: &str, resource: Value| {
+            commit_operation(
+                store,
+                &db.db,
+                &db.catalog,
+                path,
+                &json!({"resource": resource}),
+            )
+            .map(|result| id(result.value))
+        };
+        Ok((
+            write("CodeSystem/create", animals(codes))?,
+            write("ValueSet/create", pets())?,
+        ))
+    }
+
+    fn write_pets(db: &Harness, codes: &[&str]) -> (String, String) {
+        write_pets_through(db, &db.store, codes).unwrap()
+    }
+
+    fn with_resource_types() -> Harness {
+        let db = ready();
+        install_resource_types(&db);
+        db
+    }
+
+    fn counters(db: &Harness) -> (u64, u64, u64) {
+        (
+            db.store.catalog_version().unwrap(),
+            db.store.catalog_revision().unwrap(),
+            db.store.terminology_version().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_replica_hears_of_terminology_written_through_the_api() {
+        let db = with_resource_types();
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        assert_eq!(replica.pets(), None);
+
+        write_pets(&db, &["dog", "cat"]);
+        assert_eq!(
+            codes_of_pets(&db.catalog),
+            Some(vec!["cat".into(), "dog".into()])
+        );
+
+        // The primary changed its own catalog in place and rewrote the expansions it touched, and
+        // that is all the replica could see of it: it follows counters, and nothing moved them.
+        // Only the terminology changed, so it loads only that.
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(replica.pets(), codes_of_pets(&db.catalog));
+        assert_eq!(replica.catch_up(&db.store), Reload::Nothing);
+    }
+
+    #[test]
+    fn a_standby_hears_of_terminology_written_through_the_api() {
+        let db = with_resource_types();
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        assert_eq!(standby.pets(), None);
+
+        write_pets(&db, &["dog", "cat"]);
+        assert_eq!(standby.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(standby.pets(), codes_of_pets(&db.catalog));
+    }
+
+    #[test]
+    fn an_edit_or_a_deletion_of_terminology_reaches_replicas_and_standbys_too() {
+        let db = with_resource_types();
+        let (system, set) = write_pets(&db, &["dog"]);
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+
+        // A code added to a code system changes the expansion of the value set over it.
+        let mut edited = animals(&["dog", "cat"]);
+        edited["id"] = json!(system);
+        commit(
+            &db,
+            "CodeSystem/update",
+            json!({"id": system, "resource": edited}),
+        )
+        .unwrap();
+        for follower in [&mut replica, &mut standby] {
+            assert_eq!(follower.catch_up(&db.store), Reload::Terminology);
+            assert_eq!(follower.pets(), Some(vec!["cat".into(), "dog".into()]));
+        }
+
+        // A value set that is deleted is gone from them too.
+        commit(&db, "ValueSet/delete", json!({"id": set})).unwrap();
+        assert_eq!(codes_of_pets(&db.catalog), None);
+        for follower in [&mut replica, &mut standby] {
+            assert_eq!(follower.catch_up(&db.store), Reload::Terminology);
+            assert_eq!(follower.pets(), None);
+        }
+    }
+
+    #[test]
+    fn a_terminology_write_moves_the_terminology_counter_and_a_rebuild_moves_the_catalog_ones() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let write = |resource: Value| {
+            watched_commit(
+                &db,
+                &watched,
+                "ValueSet/create",
+                json!({"resource": resource}),
+            )
+            .unwrap()
+        };
+        let colors = |id: &str| color_value_set(id, &["a"], "http://example.org/s");
+
+        // Only what the change touches is recomputed and the live catalog is changed in place, so
+        // the others are told the terminology changed, and nothing else.
+        let (version, revision, terminology) = counters(&db);
+        write(colors("incremental"));
+        assert_eq!(counters(&db), (version, revision, terminology + 1));
+
+        // If that fails the store is rebuilt and the catalog loaded again, which is a publish:
+        // everything is told, once.
+        watched.fail_apply_expansions.store(1, Ordering::SeqCst);
+        let (version, revision, terminology) = counters(&db);
+        write(colors("fallback"));
+        assert_eq!(counters(&db), (version + 1, revision + 1, terminology));
+    }
+
+    #[test]
+    fn a_terminology_reload_reads_the_terminology_and_nothing_else() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&watched, crate::CatalogClock::Stable);
+        let kept = replica.catalog.read().unwrap().capability_statement();
+
+        write_pets_through(&db, &watched, &["dog"]).unwrap();
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Terminology);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+        assert!(WatchedStore::count(&watched.full_terminology_loads) > 0);
+        assert!(WatchedStore::count(&watched.full_expansion_loads) > 0);
+        assert_eq!(
+            WatchedStore::count(&watched.definition_loads)
+                + WatchedStore::count(&watched.full_search_parameter_loads),
+            0,
+            "no structure definition or search parameter was read"
+        );
+        assert_eq!(replica.catalog.read().unwrap().capability_statement(), kept);
+
+        // A publish moves the clock, and then the whole catalog is read.
+        publish(&watched, &db.catalog).unwrap();
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Everything);
+        assert!(WatchedStore::count(&watched.definition_loads) > 0);
+        assert!(WatchedStore::count(&watched.full_search_parameter_loads) > 0);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+    }
+
+    #[test]
+    fn a_transaction_of_terminology_tells_replicas_and_standbys_once() {
+        let db = with_resource_types();
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        let (version, revision, terminology) = counters(&db);
+
+        // A code system and ten value sets in one request: one commit, so one announcement and
+        // one reload, however many resources it holds. Writing them one by one is eleven.
+        let mut entries = vec![json!({
+            "request": {"method": "POST", "url": "CodeSystem"},
+            "resource": animals(&["dog", "cat"])
+        })];
+        let mut set = pets();
+        for n in 0..10 {
+            set["url"] = json!(format!("{PETS}-{n}"));
+            entries.push(json!({
+                "request": {"method": "POST", "url": "ValueSet"},
+                "resource": set.clone()
+            }));
+        }
+        let bundle = json!({"resourceType": "Bundle", "type": "transaction", "entry": entries});
+        commit(&db, "Bundle/transaction", json!({"resource": bundle})).unwrap();
+
+        assert_eq!(counters(&db), (version, revision, terminology + 1));
+        for follower in [&mut replica, &mut standby] {
+            assert_eq!(follower.catch_up(&db.store), Reload::Terminology);
+            let expanded = follower
+                .catalog
+                .read()
+                .unwrap()
+                .terms()
+                .expand(&format!("{PETS}-9"), None);
+            assert!(
+                expanded.is_some(),
+                "{:?} has the last value set",
+                follower.clock
+            );
+        }
+    }
+
+    #[test]
+    fn a_terminology_write_while_a_backfill_is_pending_reaches_both_and_loads_no_parameter() {
+        let db = with_resource_types();
+        for n in 0..3 {
+            apply(
+                &db,
+                "Patient/create",
+                json!({"resource": with_birth_date(&format!("p{n}"))}),
+            );
+        }
+        // What a replica loaded before the install.
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let pending = stage_package_deferred(&db.store, &db.db, &db.catalog, extra_dir())
+            .unwrap()
+            .expect("the package has pending search parameters");
+        publish(&db.store, &db.catalog).unwrap();
+        pending.create(&db.store, &db.db).unwrap();
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        assert!(standby.catalog.read().unwrap().has_pending_parameters());
+        let (version, revision, _) = counters(&db);
+
+        write_pets(&db, &["dog"]);
+
+        // Nothing waits for the backfill, because nothing about a search parameter is loaded:
+        // both are told at once and load the terminology, and the replica still has no parameter
+        // whose index is incomplete.
+        assert_eq!(counters(&db).0, version);
+        assert_eq!(counters(&db).1, revision);
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+        assert!(!replica.catalog.read().unwrap().has_pending_parameters());
+        assert_eq!(standby.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(standby.pets(), Some(vec!["dog".into()]));
+        assert!(standby.catalog.read().unwrap().has_pending_parameters());
+
+        // Completing the backfill moves the version, and the replica loads the parameter.
+        run_backfills(&db.store, &db.db, &db.catalog).unwrap();
+        assert_eq!(replica.catch_up(&db.store), Reload::Everything);
+        assert!(!replica.catalog.read().unwrap().has_pending_parameters());
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+    }
+
+    #[test]
+    fn an_announcement_that_failed_is_made_again_when_the_write_is_repaired() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+
+        // The write and its projection go through and the counter write after them fails. The
+        // repair finds the tables in order and used to leave it there: the request succeeded and
+        // nobody was told.
+        watched.fail_bump_terminology.store(1, Ordering::SeqCst);
+        let (system, _) = write_pets_through(&db, &watched, &["dog"]).unwrap();
+        assert!(!system.is_empty());
+        assert_eq!(codes_of_pets(&db.catalog), Some(vec!["dog".into()]));
+        for follower in [&mut replica, &mut standby] {
+            assert_ne!(
+                follower.catch_up(&db.store),
+                Reload::Nothing,
+                "{:?} was never told",
+                follower.clock
+            );
+            assert_eq!(follower.pets(), Some(vec!["dog".into()]));
+        }
+
+        // The same when the write fell back to a rebuild and it was publishing that failed.
+        watched.fail_apply_expansions.store(1, Ordering::SeqCst);
+        watched.fail_bump_catalog.store(1, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": color_value_set("rebuilt", &["a"], "http://example.org/s")}),
+        )
+        .unwrap();
+        for follower in [&mut replica, &mut standby] {
+            assert_ne!(
+                follower.catch_up(&db.store),
+                Reload::Nothing,
+                "{:?} was never told",
+                follower.clock
+            );
+            let rebuilt = follower
+                .catalog
+                .read()
+                .unwrap()
+                .terms()
+                .expand("http://example.org/rebuilt", None);
+            assert!(rebuilt.is_some(), "{:?}", follower.clock);
+        }
+    }
+
+    #[test]
+    fn an_announcement_that_keeps_failing_does_not_fail_the_write() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+
+        commit(
+            &db,
+            "CodeSystem/create",
+            json!({"resource": animals(&["dog"])}),
+        )
+        .unwrap();
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+
+        // Nothing can be announced, not even by the repair. The write is committed and right on
+        // the primary, so the request succeeds: a client that retried a failed one would write
+        // it twice. Only the replica is not told.
+        watched.fail_bump_terminology.store(1, Ordering::SeqCst);
+        watched.fail_bump_catalog.store(100, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": pets()}),
+        )
+        .unwrap();
+        assert_eq!(codes_of_pets(&db.catalog), Some(vec!["dog".into()]));
+        assert_eq!(replica.catch_up(&db.store), Reload::Nothing);
+        assert_eq!(replica.pets(), None);
+
+        // Any later announcement brings the replica to everything written since.
+        watched.fail_bump_catalog.store(0, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": color_value_set("later", &["a"], "http://example.org/s")}),
+        )
+        .unwrap();
+        assert_eq!(replica.catch_up(&db.store), Reload::Terminology);
+        assert_eq!(replica.pets(), Some(vec!["dog".into()]));
+    }
+
+    #[test]
+    fn a_repair_that_publishes_announces_once() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let (version, revision, terminology) = counters(&db);
+
+        // The projection fails after the commit, so the repair finds a row missing, rebuilds and
+        // publishes. That is the announcement: the repair does not make a second one.
+        watched.fail_upsert_terminology.store(1, Ordering::SeqCst);
+        watched_commit(
+            &db,
+            &watched,
+            "ValueSet/create",
+            json!({"resource": color_value_set("repaired", &["a"], "http://example.org/s")}),
+        )
+        .unwrap();
+        assert_eq!(counters(&db), (version + 1, revision + 1, terminology));
+    }
+
+    #[test]
+    fn a_repair_that_finds_nothing_to_fix_still_announces() {
+        let db = with_resource_types();
+        write_pets(&db, &["dog"]);
+        let mut replica = Follower::start(&db.store, crate::CatalogClock::Stable);
+        let mut standby = Follower::start(&db.store, crate::CatalogClock::Latest);
+        let (version, revision, terminology) = counters(&db);
+
+        // What a primary does as it starts: the process before it may have stopped after writing
+        // and before telling anyone, and the tables alone cannot say whether it did.
+        repair_conformance(&db.store, &db.db, &db.catalog).unwrap();
+        assert_eq!(counters(&db), (version + 1, revision + 1, terminology));
+        for follower in [&mut replica, &mut standby] {
+            assert_eq!(follower.catch_up(&db.store), Reload::Everything);
+        }
+    }
+
+    #[test]
+    fn a_publish_that_lands_while_terminology_is_loading_is_loaded_afterwards() {
+        let db = with_resource_types();
+        let watched = WatchedStore::new(db.store.clone());
+        let mut replica = Follower::start(&watched, crate::CatalogClock::Stable);
+        write_pets(&db, &["dog"]);
+
+        // A publish lands while the replica reads the terminology: here only its version bump.
+        let store = db.store.clone();
+        *watched.on_terminology_load.lock().unwrap() = Some(Box::new(move || {
+            store.bump_catalog_version().unwrap();
+        }));
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Terminology);
+        assert_eq!(WatchedStore::count(&watched.definition_loads), 0);
+
+        // The clock that moved was not read into the catalog, so it is not recorded as loaded:
+        // the next call loads everything, and the one after finds nothing to do.
+        watched.reset();
+        assert_eq!(replica.catch_up(&watched), Reload::Everything);
+        assert!(WatchedStore::count(&watched.definition_loads) > 0);
+        assert_eq!(replica.catch_up(&watched), Reload::Nothing);
+    }
+
+    #[test]
+    fn the_watcher_loads_the_terminology_for_a_terminology_write_and_everything_for_a_package() {
+        let db = with_resource_types();
+        let watched = Arc::new(WatchedStore::new(db.store.clone()));
+        let (loaded, started) =
+            Catalog::open_consistent(watched.as_ref(), crate::CatalogClock::Stable).unwrap();
+        let catalog = Arc::new(std::sync::RwLock::new(loaded));
+        let store: Arc<dyn rp::ConformanceStore> = watched.clone();
+        let watcher = crate::package::watch_catalog(
+            store,
+            &catalog,
+            started,
+            std::time::Duration::from_millis(20),
+            crate::CatalogClock::Stable,
+        );
+        let resource_types = || {
+            catalog.read().unwrap().capability_statement()["rest"][0]["resource"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "never saw {what}");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+
+        // A terminology write: the watcher reads the terminology and nothing else.
+        watched.reset();
+        write_pets(&db, &["dog"]);
+        until("the terminology", &|| {
+            codes_of_pets(&catalog) == Some(vec!["dog".into()])
+        });
+        assert_eq!(WatchedStore::count(&watched.definition_loads), 0);
+        assert_eq!(WatchedStore::count(&watched.full_search_parameter_loads), 0);
+
+        // A package moves the clock: it reads everything.
+        let types = resource_types();
+        install_package_dir(&db.store, &db.db, &db.catalog, extra_dir()).unwrap();
+        until("the package", &|| resource_types() > types);
+        assert!(WatchedStore::count(&watched.definition_loads) > 0);
+
+        let stopped = watcher.stop();
+        assert_eq!(stopped.clock, db.store.catalog_version().unwrap());
+        assert_eq!(stopped.terminology, db.store.terminology_version().unwrap());
+        assert!(stopped.clock > started.clock && stopped.terminology > started.terminology);
     }
 }
 
@@ -5184,12 +6067,23 @@ struct WatchedStore {
     full_terminology_loads: AtomicUsize,
     full_expansion_loads: AtomicUsize,
     full_search_parameter_loads: AtomicUsize,
+    definition_loads: AtomicUsize,
+    /// Run once, as the next terminology read begins: a change another process makes meanwhile.
+    on_terminology_load: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Rewrites of a whole package's expansions.
     package_expansion_rewrites: AtomicUsize,
     expansion_changes: AtomicUsize,
     /// How many of the next calls to fail.
     fail_upsert_terminology: AtomicUsize,
     fail_apply_expansions: AtomicUsize,
+    /// How many of the next reads of every terminology row to fail.
+    fail_load_terminology: AtomicUsize,
+    /// Counter writes that announce a change to the other processes.
+    fail_bump_catalog: AtomicUsize,
+    fail_bump_terminology: AtomicUsize,
+    /// How many of the next reads of one stored row (a definition, a code system, an expansion)
+    /// to fail.
+    fail_row_reads: AtomicUsize,
 }
 
 impl WatchedStore {
@@ -5199,10 +6093,16 @@ impl WatchedStore {
             full_terminology_loads: AtomicUsize::new(0),
             full_expansion_loads: AtomicUsize::new(0),
             full_search_parameter_loads: AtomicUsize::new(0),
+            definition_loads: AtomicUsize::new(0),
+            on_terminology_load: std::sync::Mutex::new(None),
             package_expansion_rewrites: AtomicUsize::new(0),
             expansion_changes: AtomicUsize::new(0),
             fail_upsert_terminology: AtomicUsize::new(0),
             fail_apply_expansions: AtomicUsize::new(0),
+            fail_load_terminology: AtomicUsize::new(0),
+            fail_bump_catalog: AtomicUsize::new(0),
+            fail_bump_terminology: AtomicUsize::new(0),
+            fail_row_reads: AtomicUsize::new(0),
         }
     }
 
@@ -5211,6 +6111,7 @@ impl WatchedStore {
             &self.full_terminology_loads,
             &self.full_expansion_loads,
             &self.full_search_parameter_loads,
+            &self.definition_loads,
             &self.package_expansion_rewrites,
             &self.expansion_changes,
         ] {
@@ -5236,13 +6137,28 @@ impl ConformanceStore for WatchedStore {
         self.inner.catalog_version()
     }
     fn bump_catalog_version(&self) -> Result<u64, PersistError> {
+        if Self::should_fail(&self.fail_bump_catalog) {
+            return Err(PersistError::Definite("injected: catalog bump".into()));
+        }
         self.inner.bump_catalog_version()
     }
     fn catalog_revision(&self) -> Result<u64, PersistError> {
         self.inner.catalog_revision()
     }
     fn bump_catalog_revision(&self) -> Result<u64, PersistError> {
+        if Self::should_fail(&self.fail_bump_catalog) {
+            return Err(PersistError::Definite("injected: catalog bump".into()));
+        }
         self.inner.bump_catalog_revision()
+    }
+    fn terminology_version(&self) -> Result<u64, PersistError> {
+        self.inner.terminology_version()
+    }
+    fn bump_terminology_version(&self) -> Result<u64, PersistError> {
+        if Self::should_fail(&self.fail_bump_terminology) {
+            return Err(PersistError::Definite("injected: terminology bump".into()));
+        }
+        self.inner.bump_terminology_version()
     }
     fn claim_backfill(&self, id: i64) -> Result<bool, PersistError> {
         self.inner.claim_backfill(id)
@@ -5251,6 +6167,7 @@ impl ConformanceStore for WatchedStore {
         self.inner.load_packages()
     }
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
+        self.definition_loads.fetch_add(1, Ordering::SeqCst);
         self.inner.load_structure_definitions()
     }
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
@@ -5258,8 +6175,45 @@ impl ConformanceStore for WatchedStore {
             .fetch_add(1, Ordering::SeqCst);
         self.inner.load_search_parameters()
     }
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        if Self::should_fail(&self.fail_row_reads) {
+            return Err(PersistError::Definite("injected: row read".into()));
+        }
+        self.inner.load_structure_definition_json(package_id, url)
+    }
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        if Self::should_fail(&self.fail_row_reads) {
+            return Err(PersistError::Definite("injected: row read".into()));
+        }
+        self.inner.load_terminology_json(package_id, url)
+    }
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        if Self::should_fail(&self.fail_row_reads) {
+            return Err(PersistError::Definite("injected: row read".into()));
+        }
+        self.inner.load_expansion_json(package_id, url)
+    }
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
         self.full_terminology_loads.fetch_add(1, Ordering::SeqCst);
+        if Self::should_fail(&self.fail_load_terminology) {
+            return Err(PersistError::Definite("injected failure".into()));
+        }
+        let hook = self.on_terminology_load.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
         self.inner.load_terminology()
     }
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
@@ -5989,6 +6943,363 @@ fn a_run_of_terminology_writes_leaves_the_store_as_a_full_rebuild_would() {
             "{url}"
         );
     }
+}
+
+/// What a request of a common kind needs is in memory when the catalog is built: it reads nothing
+/// from the store, the first time or after. What is not common (a profile) is read once.
+#[test]
+fn a_request_of_a_common_kind_reads_nothing_from_the_store() {
+    use refhir_fhirpath::Host;
+    struct NoHost;
+    impl Host for NoHost {}
+
+    let harness = r4();
+    let source = Arc::new(crate::lazy::StoreSource::new(Arc::new(
+        harness.store.clone(),
+    )));
+    let catalog = Catalog::open_from(&harness.store, Some(source.clone())).unwrap();
+    let after_open = source.reads();
+    assert!(after_open > 0, "what a base type binds is read to be kept");
+    let validate = |resource: &Value| {
+        refhir_validate::validate_resource(resource, catalog.schema(), catalog.terms(), &NoHost)
+            .operation_outcome()
+    };
+    let common = [
+        json!({"resourceType": "Patient", "gender": "female", "birthDate": "1980-05-01",
+               "name": [{"family": "Okafor", "given": ["Ada"]}],
+               "maritalStatus": {"coding": [{
+                   "system": "http://terminology.hl7.org/CodeSystem/v3-MaritalStatus",
+                   "code": "M"}]},
+               "communication": [{"language": {"coding": [{
+                   "system": "urn:ietf:bcp:47", "code": "en"}]}}]}),
+        json!({"resourceType": "Observation", "status": "final",
+               "category": [{"coding": [{
+                   "system": "http://terminology.hl7.org/CodeSystem/observation-category",
+                   "code": "vital-signs"}]}],
+               "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]},
+               "valueQuantity": {"value": 120, "unit": "mmHg",
+                                 "system": "http://unitsofmeasure.org", "code": "mm[Hg]"}}),
+        json!({"resourceType": "Encounter", "status": "finished",
+               "class": {"system": "http://terminology.hl7.org/CodeSystem/v3-ActCode",
+                         "code": "AMB", "display": "ambulatory"}}),
+        json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+               "medicationCodeableConcept": {"text": "aspirin"}}),
+        json!({"resourceType": "Encounter", "status": "wrong"}),
+    ];
+    let answers: Vec<Value> = common.iter().map(&validate).collect();
+    for resource in &common {
+        validate(resource);
+    }
+    assert_eq!(source.reads(), after_open, "a common request reads nothing");
+
+    // A profile is not held: it is read the first time a request names it, and not again.
+    let profiled = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"profile": ["http://hl7.org/fhir/StructureDefinition/vitalsigns"]},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]}});
+    let first = validate(&profiled);
+    let read = source.reads();
+    assert!(read > after_open);
+    assert_eq!(validate(&profiled), first);
+    assert_eq!(source.reads(), read);
+
+    // Reading nothing is not answering differently.
+    let whole = Catalog::open_whole(&harness.store).unwrap();
+    for (resource, answer) in common.iter().zip(&answers) {
+        let held =
+            refhir_validate::validate_resource(resource, whole.schema(), whole.terms(), &NoHost)
+                .operation_outcome();
+        assert_eq!(&held, answer);
+    }
+}
+
+/// A definition that cannot be read from the store is not a definition that does not exist: the
+/// request that needed it fails, and a write is not committed on what was left to check it by.
+#[test]
+fn a_request_that_could_not_read_a_definition_fails_and_commits_nothing() {
+    let harness = r4();
+    let watched = Arc::new(WatchedStore::new(harness.store.clone()));
+    let source = Arc::new(crate::lazy::StoreSource::new(watched.clone()));
+    let catalog = Catalog::open_from(watched.as_ref(), Some(source)).unwrap();
+    let profile = "http://hl7.org/fhir/StructureDefinition/vitalsigns";
+    let observation = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"profile": [profile]},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]}});
+    let validate = || {
+        run(
+            &harness.db,
+            &catalog,
+            "Observation/$validate",
+            &json!({"resource": observation}),
+        )
+    };
+
+    // The profile is read when it is first used. If that read fails the request fails, and says
+    // what failed, where it would have been told the profile is unknown.
+    watched.fail_row_reads.store(usize::MAX, Ordering::SeqCst);
+    match validate() {
+        Err(RunError::Fhir(FhirError::Storage(message))) => {
+            assert!(
+                message.contains("could not read structure definition"),
+                "{message}"
+            );
+            assert!(message.contains(profile), "{message}");
+        }
+        other => panic!("expected a storage failure, got {other:?}"),
+    }
+    let create = run(
+        &harness.db,
+        &catalog,
+        "Observation/create",
+        &json!({"resource": observation}),
+    );
+    assert!(
+        matches!(create, Err(RunError::Fhir(FhirError::Storage(_)))),
+        "{create:?}"
+    );
+
+    // Nothing was kept of the failure: the same request, once the store answers, is answered.
+    watched.fail_row_reads.store(0, Ordering::SeqCst);
+    let outcome = validate().expect("the store answers now").value;
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    let created = run(
+        &harness.db,
+        &catalog,
+        "Observation/create",
+        &json!({"resource": observation}),
+    );
+    // Whatever the profile says of it, it is the profile that answered: no read failed.
+    assert!(!matches!(
+        created,
+        Err(RunError::Fhir(FhirError::Storage(_)))
+    ));
+}
+
+/// A catalog that takes the place of another has already read what the requests that were being
+/// answered used, so the swap does not send them back to waiting for the store.
+#[test]
+fn a_catalog_that_replaces_another_has_read_what_the_old_one_had() {
+    use refhir_fhirpath::Host;
+    struct NoHost;
+    impl Host for NoHost {}
+
+    let harness = r4();
+    let profile = "http://hl7.org/fhir/StructureDefinition/vitalsigns";
+    let observation = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"profile": [profile]},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]}});
+    let validate = |catalog: &std::sync::RwLock<Catalog>| {
+        let catalog = catalog.read().unwrap();
+        refhir_validate::validate_resource(&observation, catalog.schema(), catalog.terms(), &NoHost)
+            .operation_outcome()
+    };
+    let resident = |catalog: &std::sync::RwLock<Catalog>| {
+        catalog
+            .read()
+            .unwrap()
+            .schema()
+            .resident()
+            .contains(&profile.to_string())
+    };
+    let (replica, replica_at) =
+        Catalog::open_consistent(&harness.store, crate::CatalogClock::Stable).unwrap();
+    let replica = std::sync::RwLock::new(replica);
+    assert!(!resident(&harness.catalog) && !resident(&replica));
+    let answer = validate(&harness.catalog);
+    validate(&replica);
+    assert!(resident(&harness.catalog) && resident(&replica));
+
+    // A publish builds a new catalog, which has read the profile before it is put in place.
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(resident(&harness.catalog));
+    assert_eq!(validate(&harness.catalog), answer);
+
+    // So does a replica's reload when the version it follows has moved.
+    let now = crate::package::reload_catalog(
+        &harness.store,
+        &replica,
+        replica_at,
+        crate::CatalogClock::Stable,
+    )
+    .unwrap();
+    assert!(now.clock > replica_at.clock);
+    assert!(resident(&replica));
+    assert_eq!(validate(&replica), answer);
+}
+
+/// A catalog that reads definitions and terminology when they are first used, kept current by
+/// writes as it is by a rebuild, and by a reload on a replica.
+#[test]
+fn a_catalog_read_when_used_follows_terminology_writes_and_reloads() {
+    let harness = r4();
+    let store = &harness.store;
+    // Read before the writes: what a replica holds, and what it has read so far.
+    let (replica, replica_at) =
+        Catalog::open_consistent(store, crate::CatalogClock::Stable).unwrap();
+    let replica = std::sync::RwLock::new(replica);
+    let gender = "http://hl7.org/fhir/ValueSet/administrative-gender";
+    let genders = |catalog: &std::sync::RwLock<Catalog>| -> Vec<String> {
+        let expanded = catalog
+            .read()
+            .unwrap()
+            .terms()
+            .expand(gender, None)
+            .unwrap();
+        let mut codes: Vec<String> = expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect();
+        codes.sort();
+        codes
+    };
+    assert_eq!(genders(&replica), ["female", "male", "other", "unknown"]);
+
+    let write = |path: &str, resource: Value, id: Option<&str>| {
+        let mut args = json!({"resource": resource});
+        if let Some(id) = id {
+            args["id"] = json!(id);
+        }
+        commit_operation(store, &harness.db, &harness.catalog, path, &args)
+            .unwrap()
+            .value
+    };
+    let shapes = |codes: &[&str], id: Option<&str>| {
+        let mut system = json!({"resourceType": "CodeSystem", "url": "http://example.org/shapes",
+            "status": "active", "content": "complete",
+            "concept": codes.iter().map(|code| json!({"code": code})).collect::<Vec<_>>()});
+        if let Some(id) = id {
+            system["id"] = json!(id);
+        }
+        system
+    };
+    let first = write(
+        "ValueSet/create",
+        color_value_set("first", &["a"], "http://example.org/s"),
+        None,
+    );
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let system = write("CodeSystem/create", shapes(&["round", "flat"], None), None);
+    let system_id = system["id"].as_str().unwrap().to_string();
+    write(
+        "ValueSet/create",
+        json!({"resourceType": "ValueSet", "url": "http://example.org/over", "status": "active",
+               "compose": {"include": [
+                   {"valueSet": ["http://example.org/first"]},
+                   {"system": "http://example.org/shapes"},
+                   {"valueSet": [gender]}]}}),
+        None,
+    );
+    write(
+        "CodeSystem/update",
+        shapes(&["round", "flat", "tall"], Some(&system_id)),
+        Some(&system_id),
+    );
+    let mut edited = color_value_set("first", &["a", "b"], "http://example.org/s");
+    edited["id"] = json!(first_id);
+    write("ValueSet/update", edited, Some(&first_id));
+    assert_expansions_match(store, "after the writes");
+
+    // What the live catalog says is what one that holds everything, opened from the store, says.
+    let whole = Catalog::open_whole(store).unwrap();
+    let live = harness.catalog.read().unwrap();
+    for url in [
+        "http://example.org/over",
+        "http://example.org/first",
+        gender,
+    ] {
+        assert_eq!(
+            live.terms().expand(url, None),
+            whole.terms().expand(url, None),
+            "{url}"
+        );
+    }
+    let codes = |catalog: &Catalog| -> Vec<String> {
+        let expanded = catalog
+            .terms()
+            .expand("http://example.org/over", None)
+            .unwrap();
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for expected in ["a", "b", "round", "flat", "tall", "male"] {
+        assert!(codes(&live).contains(&expected.to_string()), "{expected}");
+    }
+    assert_eq!(
+        live.terms()
+            .lookup("http://example.org/shapes", None, "tall"),
+        whole
+            .terms()
+            .lookup("http://example.org/shapes", None, "tall")
+    );
+    assert!(live
+        .terms()
+        .lookup("http://example.org/shapes", None, "tall")
+        .is_some());
+    drop(live);
+
+    // The replica has not seen any of it. A change that publishes the catalog (a package, a
+    // search parameter) moves the version it follows, and it reloads: what it had read does not
+    // outlive the catalog it was read for.
+    assert!(replica
+        .read()
+        .unwrap()
+        .terms()
+        .expand("http://example.org/over", None)
+        .is_none());
+    publish(store, &harness.catalog).unwrap();
+    let now =
+        crate::package::reload_catalog(store, &replica, replica_at, crate::CatalogClock::Stable)
+            .unwrap();
+    assert!(now.clock > replica_at.clock);
+    assert_eq!(genders(&replica), ["female", "male", "other", "unknown"]);
+    let replicated = replica.read().unwrap();
+    assert_eq!(
+        replicated.terms().expand("http://example.org/over", None),
+        whole.terms().expand("http://example.org/over", None)
+    );
+    assert_eq!(
+        replicated
+            .terms()
+            .lookup("http://example.org/shapes", None, "tall"),
+        whole
+            .terms()
+            .lookup("http://example.org/shapes", None, "tall")
+    );
+    drop(replicated);
+
+    // Deleting a code system leaves what includes it unable to expand, in the live catalog and
+    // in one reloaded from the store.
+    write_delete(&harness, "CodeSystem/delete", &system_id);
+    let whole = Catalog::open_whole(store).unwrap();
+    let live = harness.catalog.read().unwrap();
+    assert_eq!(
+        live.terms().why_not_expanded("http://example.org/over"),
+        whole.terms().why_not_expanded("http://example.org/over")
+    );
+    assert!(live
+        .terms()
+        .why_not_expanded("http://example.org/over")
+        .is_some());
+    assert!(live
+        .terms()
+        .lookup("http://example.org/shapes", None, "tall")
+        .is_none());
+}
+
+fn write_delete(harness: &Harness, path: &str, id: &str) {
+    commit_operation(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        path,
+        &json!({"id": id}),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -7442,6 +8753,420 @@ mod or_and_iterate {
     }
 }
 
+#[test]
+fn an_examples_package_that_is_only_a_dependency_is_not_installed() {
+    // SDC lists `hl7.fhir.r4.examples`, which holds examples and a second copy of the core
+    // definitions. The registry below does not have it, so installing the app would fail if it
+    // were fetched.
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("hl7.fhir.r4.examples", "4.0.1"), ("example.lib", "1.0.0")],
+    );
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let fetcher = registry(&[("example.lib", "1.0.0", &lib)]);
+    let db = empty();
+    let cache = temp_dir("examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.app@1.0.0", "example.lib@1.0.0"]
+    );
+
+    // Asked for by name, it is installed like any other.
+    let examples = dep_package("hl7.fhir.r4.examples", "4.0.1", &[]);
+    let fetcher = registry(&[("hl7.fhir.r4.examples", "4.0.1", &examples)]);
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "hl7.fhir.r4.examples@4.0.1",
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert!(installed_packages(&db).contains(&"hl7.fhir.r4.examples@4.0.1".to_string()));
+    for dir in [app, lib, examples, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A prepared file of the two fixture packages, and the `name@version` of each.
+fn prepared_fixtures(scratch: &Path) -> (PathBuf, Vec<String>) {
+    let file = scratch.join("packages.bundle");
+    let specs = [minir4_dir(), extra_dir()].map(|dir| dir.to_str().unwrap().to_string());
+    let names = crate::write_prepared(&file, &specs, &NoNetwork, &scratch.join("cache")).unwrap();
+    (file, names)
+}
+
+fn as_strs(names: &[String]) -> Vec<&str> {
+    names.iter().map(String::as_str).collect()
+}
+
+/// Installing the packages in `file` stores every table as installing them from their directories
+/// does, and publishes the catalog.
+fn assert_a_prepared_file_installs_as_its_directories_do(file: &Path, names: &[String]) {
+    let from_directories = empty();
+    install_package_dir(
+        &from_directories.store,
+        &from_directories.db,
+        &from_directories.catalog,
+        minir4_dir(),
+    )
+    .unwrap();
+    install_package_dir(
+        &from_directories.store,
+        &from_directories.db,
+        &from_directories.catalog,
+        extra_dir(),
+    )
+    .unwrap();
+
+    let from_file = empty();
+    let installed = crate::install_prepared(
+        &from_file.store,
+        &from_file.db,
+        &from_file.catalog,
+        file,
+        &as_strs(names),
+    )
+    .unwrap();
+    assert_eq!(installed, Some(2));
+
+    // Every table holds what it holds when the packages are read from their directories.
+    let (a, b) = (&from_directories.store, &from_file.store);
+    assert_eq!(a.load_packages().unwrap(), b.load_packages().unwrap());
+    assert_eq!(
+        a.load_structure_definitions().unwrap(),
+        b.load_structure_definitions().unwrap()
+    );
+    assert_eq!(
+        a.load_search_parameters().unwrap(),
+        b.load_search_parameters().unwrap()
+    );
+    assert_eq!(a.load_terminology().unwrap(), b.load_terminology().unwrap());
+    assert_eq!(a.load_expansions().unwrap(), b.load_expansions().unwrap());
+    assert!(!b.load_search_parameters().unwrap().is_empty());
+    // And the catalog is published: the types and search parameters are there to use.
+    let catalog = from_file.catalog.read().expect("catalog");
+    assert!(catalog.contains("Patient"));
+    assert!(catalog.contains("Encounter"));
+}
+
+#[test]
+fn a_package_installed_from_a_prepared_file_is_stored_as_one_installed_from_its_directory() {
+    let scratch = temp_dir("prepared");
+    let (file, names) = prepared_fixtures(&scratch);
+    assert_eq!(names.len(), 2);
+    assert_a_prepared_file_installs_as_its_directories_do(&file, &names);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_package_cut_into_many_values_is_stored_as_one_installed_from_its_directory() {
+    let scratch = temp_dir("prepared-pieces");
+    let file = scratch.join("packages.bundle");
+    let specs = [minir4_dir(), extra_dir()].map(|dir| dir.to_str().unwrap().to_string());
+    // Values of a few hundred bytes: each kind of row is cut into several, and a row is larger
+    // than a value.
+    let names = crate::prepared::write_prepared_in_pieces(
+        &file,
+        &specs,
+        &NoNetwork,
+        &scratch.join("cache"),
+        700,
+    )
+    .unwrap();
+    assert_a_prepared_file_installs_as_its_directories_do(&file, &names);
+    // Read whole, each package is what its directory makes.
+    let mut bundle = crate::PreparedBundle::open(&file).unwrap();
+    let first = bundle.next().unwrap().unwrap();
+    let from_directory = crate::package::read_package(minir4_dir()).unwrap();
+    assert_eq!(first.name, from_directory.name);
+    assert_eq!(
+        first.structure_definitions.len(),
+        from_directory.structure_definitions.len()
+    );
+    assert_eq!(first.terminology.len(), from_directory.terminology.len());
+    assert_eq!(first.expansions.len(), from_directory.expansions.len());
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_prepared_file_leaves_alone_what_is_already_installed() {
+    let scratch = temp_dir("prepared-installed");
+    let (file, names) = prepared_fixtures(&scratch);
+    let db = empty();
+    install_package_dir(&db.store, &db.db, &db.catalog, minir4_dir()).unwrap();
+    let before = db.store.load_structure_definitions().unwrap();
+
+    let installed =
+        crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &as_strs(&names)).unwrap();
+    assert_eq!(installed, Some(1), "only the one that was missing");
+    assert_eq!(installed_packages(&db).len(), 2);
+    assert!(db
+        .store
+        .load_structure_definitions()
+        .unwrap()
+        .starts_with(&before));
+
+    // With every package there, nothing is done.
+    let again =
+        crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &as_strs(&names)).unwrap();
+    assert_eq!(again, Some(0));
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_prepared_file_that_lacks_a_package_asked_for_is_not_used() {
+    let scratch = temp_dir("prepared-lacks");
+    let (file, names) = prepared_fixtures(&scratch);
+    let db = empty();
+    let mut asked = as_strs(&names);
+    asked.push("example.missing@1.0.0");
+    let installed = crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &asked).unwrap();
+    assert_eq!(installed, None);
+    assert!(installed_packages(&db).is_empty());
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_damaged_prepared_file_installs_what_came_before_the_damage() {
+    let scratch = temp_dir("prepared-damaged");
+    let (file, names) = prepared_fixtures(&scratch);
+    let bytes = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &bytes[..bytes.len() - 40]).unwrap();
+
+    let db = empty();
+    let err = crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &as_strs(&names))
+        .unwrap_err();
+    assert!(err.to_string().contains("prepared packages"), "{err}");
+    // The first package was whole: it is installed and published.
+    assert_eq!(installed_packages(&db), [names[0].clone()]);
+    assert!(db.catalog.read().expect("catalog").contains("Patient"));
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_prepared_file_in_a_format_this_server_cannot_read_is_refused() {
+    use std::io::Write;
+    let scratch = temp_dir("prepared-format");
+    let file = scratch.join("packages.bundle");
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(&file).unwrap(),
+        flate2::Compression::default(),
+    );
+    encoder
+        .write_all(br#"{"format":99,"refhir":"9.9.9","packages":[]}"#)
+        .unwrap();
+    encoder.finish().unwrap();
+    let err = crate::PreparedBundle::open(&file).err().expect("refused");
+    assert!(err.to_string().contains("format 99"), "{err}");
+
+    // A file that is not a prepared file at all is refused as well, not mistaken for one.
+    std::fs::write(&file, b"not a bundle").unwrap();
+    assert!(crate::PreparedBundle::open(&file).is_err());
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_registry_that_may_not_download_downloads_nothing() {
+    let cache = temp_dir("no-download-cache");
+    let registry = crate::NpmRegistry::new("http://127.0.0.1:1", cache.clone())
+        .unwrap()
+        .allowing_download(false);
+    let dest = cache.join("example.lib").join("1.0.0");
+    std::fs::create_dir_all(&dest).unwrap();
+    let err = registry.fetch("example.lib", "1.0.0", &dest).unwrap_err();
+    assert!(matches!(err, FhirError::Forbidden(_)), "{err:?}");
+    assert!(err.to_string().contains("package_download = true"), "{err}");
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+
+    // Installing by name through it is refused and installs nothing.
+    let db = empty();
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "example.lib@1.0.0",
+        &registry,
+        &cache,
+    )
+    .unwrap_err();
+    assert!(matches!(err, FhirError::Forbidden(_)), "{err:?}");
+    assert!(installed_packages(&db).is_empty());
+
+    // A package already in the cache needs no download, so it installs.
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let _ = std::fs::remove_dir_all(&dest);
+    copy_tree(&lib, &dest).unwrap();
+    std::fs::write(dest.join(".complete"), "ok").unwrap();
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "example.lib@1.0.0",
+        &registry,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(installed_packages(&db), ["example.lib@1.0.0"]);
+    for dir in [lib, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_catalog_rebuilt_while_starting_does_not_keep_the_old_one_alive() {
+    let harness = ready();
+    let watched = WatchedStore::new(harness.store.clone());
+    assert!(harness.catalog.read().expect("catalog").contains("Patient"));
+
+    // Serving, which is the default: the old catalog stays until the new one is built, so a
+    // rebuild that fails leaves requests with the catalog they had.
+    watched.fail_load_terminology.store(1, Ordering::SeqCst);
+    assert!(publish(&watched, &harness.catalog).is_err());
+    assert!(harness.catalog.read().expect("catalog").contains("Patient"));
+
+    // Starting: nothing is served from it, so the old one is let go first, to build the new one
+    // in its place instead of beside it. A rebuild that fails leaves none. The setting belongs to
+    // this catalog alone, so no other catalog in the process is affected by it.
+    harness
+        .catalog
+        .write()
+        .expect("catalog")
+        .set_rebuild_in_place(true);
+    watched.fail_load_terminology.store(1, Ordering::SeqCst);
+    let failed = publish(&watched, &harness.catalog);
+    assert!(failed.is_err());
+    assert!(
+        !harness.catalog.read().expect("catalog").contains("Patient"),
+        "the old catalog was kept alive under the rebuild"
+    );
+
+    // And one that works gives the same catalog either way, and keeps the setting.
+    harness
+        .catalog
+        .write()
+        .expect("catalog")
+        .set_rebuild_in_place(true);
+    publish(&watched, &harness.catalog).unwrap();
+    let catalog = harness.catalog.read().expect("catalog");
+    assert!(catalog.contains("Patient"));
+    assert!(catalog.rebuild_in_place());
+}
+
+#[test]
+fn a_prepared_file_that_holds_fewer_packages_than_its_header_lists_is_refused() {
+    use std::io::Write;
+    let scratch = temp_dir("prepared-short");
+    let file = scratch.join("packages.bundle");
+    // A package with no rows is one value that names it.
+    let package = |name: &str| {
+        format!(r#"{{"Package":{{"name":"{name}","version":"1.0.0","fhir_version":"4.0.1"}}}}"#)
+    };
+    // The header promises two packages, and the stream ends cleanly after one: nothing says the
+    // second is missing except the count.
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(&file).unwrap(),
+        flate2::Compression::default(),
+    );
+    writeln!(
+        encoder,
+        r#"{{"format":2,"refhir":"0.0.1","packages":["example.a@1.0.0","example.b@1.0.0"]}}"#
+    )
+    .unwrap();
+    writeln!(encoder, "{}", package("example.a")).unwrap();
+    encoder.finish().unwrap();
+
+    let db = empty();
+    let err = crate::install_prepared(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        &file,
+        &["example.a@1.0.0", "example.b@1.0.0"],
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("lists 2 packages and it holds 1"),
+        "{err}"
+    );
+    // What was there was whole: it is installed.
+    assert_eq!(installed_packages(&db), ["example.a@1.0.0"]);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn an_implementation_guides_own_examples_package_is_installed_as_a_dependency() {
+    // Only the examples packages of the FHIR releases are left out; a guide's own may hold
+    // profiles it needs.
+    let guide = dep_package(
+        "example.guide",
+        "1.0.0",
+        &[("hl7.fhir.us.example.examples", "1.0.0")],
+    );
+    let examples = dep_package("hl7.fhir.us.example.examples", "1.0.0", &[]);
+    let fetcher = registry(&[("hl7.fhir.us.example.examples", "1.0.0", &examples)]);
+    let db = empty();
+    let cache = temp_dir("guide-examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        guide.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.guide@1.0.0", "hl7.fhir.us.example.examples@1.0.0"]
+    );
+    for dir in [guide, examples, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_prepared_file_that_could_not_be_written_leaves_nothing_behind() {
+    let scratch = temp_dir("prepared-failed");
+    let broken = scratch.join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        broken.join("package.json"),
+        r#"{"name":"example.broken","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(broken.join("StructureDefinition-bad.json"), "{ not json").unwrap();
+    let out = scratch.join("out").join("packages.bundle");
+    let err = crate::write_prepared(
+        &out,
+        &[broken.to_str().unwrap().to_string()],
+        &NoNetwork,
+        &scratch.join("cache"),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("StructureDefinition-bad.json"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    let left: Vec<_> = std::fs::read_dir(scratch.join("out"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    let _ = std::fs::remove_dir_all(scratch);
+}
 /// A page of sorted matches among thousands of Slots, the shape of a booking agent's question:
 /// `Slot?status=free&start=ge{now}&_sort=start&_count=3`.
 ///

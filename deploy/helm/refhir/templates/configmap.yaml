@@ -39,6 +39,9 @@ data:
     {{- if .Values.conformance.packageRegistry }}
     package_registry = "{{ .Values.conformance.packageRegistry }}"
     {{- end }}
+    {{- if .Values.conformance.packageDownload }}
+    package_download = true
+    {{- end }}
     {{- if .Values.conformance.packages }}
     packages = [
     {{- range .Values.conformance.packages }}

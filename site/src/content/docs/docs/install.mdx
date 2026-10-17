@@ -7,11 +7,13 @@ import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 Choose the way that suits where you will run it. They all start the same server.
 
-<Aside type="note" title="The first start needs the network">
-  ReFHIR ships no FHIR packages. On the first start it installs `hl7.fhir.r4.core` 4.0.1 and the
-  Structured Data Capture package from [packages.fhir.org](https://packages.fhir.org), and caches
-  them. If that source is unreachable on a first start, the server does not start. You can point it
-  at a mirror or at an `s3://` bundle you host yourself; see
+<Aside type="note" title="The first start installs the FHIR packages">
+  On the first start ReFHIR installs `hl7.fhir.r4.core` 4.0.1, the Structured Data Capture package
+  and what they depend on. The release archives and the Docker image carry them in a prepared file
+  beside the binary, so that start needs no network. The server downloads nothing unless you set
+  `[conformance].package_download = true`, so a binary you built yourself needs that, or the file
+  made with `refhir package-bundle`, and without either it stops with an error that says so. You can
+  point downloads at a mirror or at an `s3://` bundle you host yourself; see
   [Production deployment](/docs/operate/production/#package-source).
 </Aside>
 
@@ -56,17 +58,19 @@ Choose the way that suits where you will run it. They all start the same server.
     ```bash
     git clone https://github.com/hai-hq/refhir.git
     cd refhir
-    cargo run -p refhir -- --memory
+    REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory
     ```
 
     To install the binary instead of running it from the clone:
 
     ```bash
     cargo install --git https://github.com/hai-hq/refhir.git refhir
-    refhir --memory
+    REFHIR_PACKAGE_DOWNLOAD=true refhir --memory
     ```
 
-    The crate is not on crates.io, so install it from GitHub.
+    The crate is not on crates.io, so install it from GitHub. A build you made yourself has no
+    prepared packages file, so the first start downloads the FHIR packages, which
+    `REFHIR_PACKAGE_DOWNLOAD=true` allows; nothing is downloaded without it.
   </TabItem>
   <TabItem label="Kubernetes">
     The Helm chart is in the repository.

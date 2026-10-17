@@ -8,23 +8,24 @@ use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    same_expression, ConformanceStore, InstallError, NewExpansion, NewPackage, NewSearchParameter,
-    NewStructureDefinition, NewTerminology, ParamStatus,
+    same_expression, ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage,
+    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamStatus,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
-use refhir_validate::MemoryTerminology;
+use refhir_validate::TerminologyBuilder;
 use serde_json::Value;
 
-use crate::catalog::CatalogClock;
 use crate::catalog::{pending_index_keys, Catalog};
+use crate::catalog::{CatalogClock, CatalogStamp};
 use crate::error::FhirError;
 use crate::extract;
 use crate::run::MAX_OCC_FAILURES;
 
 const BATCH: usize = 16;
 
-// The `*_dir` fixtures below are for the test suites only. The server ships no packages: it
-// downloads the release defaults from `[conformance].package_registry` (see `npm.rs`).
+// The `*_dir` fixtures below are for the test suites only. The server binary carries no packages:
+// it installs the release defaults from a prepared file (see `prepared.rs`) or, without one,
+// downloads them from `[conformance].package_registry` (see `npm.rs`).
 
 pub fn minir4_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/minir4"))
@@ -71,6 +72,13 @@ pub fn extension_copies_dir() -> &'static Path {
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/extension-copies"
     ))
+}
+
+/// A package named `hl7.fhir.r4.examples` that holds two of `r4_dir`'s resources, a value set and
+/// the code system it includes, as the published package carries them: the same, with generated
+/// narrative text that core does not have.
+pub fn r4_examples_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/r4-examples"))
 }
 
 pub fn expression_clash_dir() -> &'static Path {
@@ -135,11 +143,10 @@ impl PendingBackfill {
             .latest_ts()
             .to_i64()
             .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
-        for base in &self.bases {
-            store
-                .insert_backfill(self.package_id, watermark, base, &[])
-                .map_err(FhirError::from)?;
-        }
+        let bases: Vec<String> = self.bases.iter().cloned().collect();
+        store
+            .insert_backfills(self.package_id, watermark, &bases)
+            .map_err(FhirError::from)?;
         Ok(())
     }
 }
@@ -176,9 +183,156 @@ fn stage_package(
     }
     let started = std::time::Instant::now();
     let package = read_package(path)?;
-    let read = started.elapsed();
+    stage_new_package(
+        store,
+        db,
+        catalog,
+        package,
+        started.elapsed(),
+        "read",
+        publish_now,
+    )
+}
+
+/// Store a package that has been read, and (unless `publish_now` is false) publish it.
+/// `read_time` and `read_label` are only for the log line: it says where the time went, whether
+/// the package was read from a directory or from a prepared bundle.
+pub(crate) fn stage_new_package(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    package: NewPackage,
+    read_time: std::time::Duration,
+    read_label: &str,
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
+    let started = std::time::Instant::now();
+    let name = package.name.clone();
+    let version = package.version.clone();
     let outcome = store.install_package(&package).map_err(install_error)?;
     let stored = started.elapsed();
+    let counts = (
+        package.structure_definitions.len(),
+        package.search_parameters.len(),
+        package.terminology.len(),
+    );
+    // The catalog rebuild below reads everything back from the store. The package's own copy of
+    // it, which is as large as the package, is not needed any more, so it is not kept alive
+    // under the rebuild.
+    drop(package);
+    crate::memory::release_unused_memory();
+    finish_staging(
+        store,
+        db,
+        catalog,
+        (&name, &version),
+        counts,
+        &format!("{read_label} {read_time:.1?}, store {stored:.1?}"),
+        (started, stored),
+        outcome,
+        publish_now,
+    )
+}
+
+/// The name and version a package is stored under, and the release it is for.
+pub(crate) struct PackageHead {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) fhir_version: String,
+}
+
+/// How many rows of each kind a package brought, counted as they pass.
+struct Counting<'a> {
+    rows: &'a mut dyn PackageRows,
+    definitions: usize,
+    parameters: usize,
+    terminology: usize,
+}
+
+impl PackageRows for Counting<'_> {
+    fn structure_definitions(
+        &mut self,
+        rows: &[NewStructureDefinition],
+    ) -> Result<(), InstallError> {
+        self.definitions += rows.len();
+        self.rows.structure_definitions(rows)
+    }
+
+    fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
+        self.parameters += rows.len();
+        self.rows.search_parameters(rows)
+    }
+
+    fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
+        self.terminology += rows.len();
+        self.rows.terminology(rows)
+    }
+
+    fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
+        self.rows.expansions(rows)
+    }
+}
+
+/// [`stage_new_package`] for a package that is not held whole: `feed` hands its rows over a few
+/// at a time as the store asks for them, so storing the largest package takes the memory of a few
+/// rows and not of the package. The package is stored in one transaction, as it is when it is held
+/// whole, so it is there whole or not at all.
+pub(crate) fn stage_package_in_pieces(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    head: &PackageHead,
+    feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
+    let started = std::time::Instant::now();
+    let mut counts = (0, 0, 0);
+    let outcome = store
+        .install_package_in_pieces(&head.name, &head.version, &head.fhir_version, &mut |rows| {
+            let mut counting = Counting {
+                rows,
+                definitions: 0,
+                parameters: 0,
+                terminology: 0,
+            };
+            let fed = feed(&mut counting);
+            counts = (
+                counting.definitions,
+                counting.parameters,
+                counting.terminology,
+            );
+            fed
+        })
+        .map_err(install_error)?;
+    let stored = started.elapsed();
+    crate::memory::release_unused_memory();
+    finish_staging(
+        store,
+        db,
+        catalog,
+        (&head.name, &head.version),
+        counts,
+        &format!("read and store {stored:.1?}"),
+        (started, stored),
+        outcome,
+        publish_now,
+    )
+}
+
+/// What follows storing a package, whichever way it was stored: publish it, say where the time
+/// went, and note the search parameters that still need their index built.
+#[allow(clippy::too_many_arguments)]
+fn finish_staging(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    (name, version): (&str, &str),
+    counts: (usize, usize, usize),
+    stored_note: &str,
+    (started, stored): (std::time::Instant, std::time::Duration),
+    outcome: InstallOutcome,
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
     if publish_now {
         publish(store, catalog)?;
     }
@@ -192,11 +346,10 @@ fn stage_package(
     };
     tracing::info!(
         target: "refhir_engine",
-        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; read {read:.1?}, store {:.1?}{catalog_time}",
-        package.structure_definitions.len(),
-        package.search_parameters.len(),
-        package.terminology.len(),
-        stored.saturating_sub(read),
+        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; {stored_note}{catalog_time}",
+        counts.0,
+        counts.1,
+        counts.2,
     );
     if !outcome.inserted {
         return Ok(None);
@@ -223,7 +376,28 @@ pub fn run_backfills(
 ) -> Result<(), FhirError> {
     let jobs = store.load_backfills().map_err(FhirError::from)?;
     let mut refreshed = false;
+    // A resource type with no document has nothing to index, and installing a package into a
+    // database that holds no resources yet leaves a job for every type it adds parameters to.
+    // Those are finished together. The documents that exist now are all the ones the backfill
+    // is for: one written after the job was queued is indexed by the writer, which already
+    // knows the parameter. A job that has begun is not looked at this way: its cursor says where
+    // it stands.
+    let mut empty = Vec::new();
+    let mut busy = Vec::new();
     for job in jobs.into_iter().filter(|job| !job.done) {
+        if job.cursor_id.is_none() && !holds_documents(db, &job.tablet)? {
+            empty.push(job);
+        } else {
+            busy.push(job);
+        }
+    }
+    if !empty.is_empty() {
+        store
+            .complete_empty_backfills(&empty)
+            .map_err(FhirError::from)?;
+        refreshed = true;
+    }
+    for job in busy {
         // This writer owns the job from here. If an earlier writer died with it half done, the
         // claim moves to this one and the cursor tells where to resume; if a newer writer has
         // already claimed it, this process is the stale one and is refused.
@@ -265,34 +439,33 @@ pub fn run_backfills(
         refreshed = true;
     }
     if refreshed {
-        publish(store, catalog)?;
+        publish_parameters(store, catalog)?;
     }
     Ok(())
 }
 
-pub(crate) fn publish(
+/// [`publish`] for a change that only moved search parameters from pending to ready, which is all
+/// a backfill changes: the parameters are read and compiled again, and the rest of the catalog,
+/// which is what takes the time to build, is kept.
+fn publish_parameters(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let (policy, archiver, update_create) = {
-        let current = catalog.read().expect("catalog");
-        (
-            current.reference_policy(),
-            current.sdc_archiver(),
-            current.update_create(),
-        )
+    let parameters = store.load_search_parameters()?;
+    let stable = if catalog.read().expect("catalog").rebuild_in_place() {
+        // Nothing is answering, so the old parameters need not stay while the new are built.
+        let mut current = catalog.write().expect("catalog");
+        current.recompile_parameters(&parameters);
+        !current.has_pending_parameters()
+    } else {
+        let compiled = catalog
+            .read()
+            .expect("catalog")
+            .compiled_parameters(&parameters);
+        let mut current = catalog.write().expect("catalog");
+        current.set_parameters(compiled);
+        !current.has_pending_parameters()
     };
-    let mut loaded = Catalog::open(store)?;
-    loaded.set_reference_policy(policy);
-    loaded.set_sdc_archiver(archiver);
-    let stable = !loaded.has_pending_parameters();
-    loaded.set_update_create(update_create);
-    *catalog.write().expect("catalog") = loaded;
-    // Tell the other processes the conformance tables changed. Every change moves the revision,
-    // which a standby follows. The version, which replicas follow, moves only when no search
-    // parameter is waiting for its backfill: while one is, this publish is skipped, and the one
-    // that follows the backfill's completion bumps it. So a replica never loads a parameter whose
-    // index is not complete.
     store.bump_catalog_revision()?;
     if stable {
         store.bump_catalog_version()?;
@@ -300,67 +473,199 @@ pub(crate) fn publish(
     Ok(())
 }
 
-/// Rebuild `catalog` from the store if its version moved since `loaded_version`, keeping the
-/// settings that are not stored (reference policy, archiver mode). Returns the version the
-/// catalog now reflects. A replica calls this when another process changed the catalog, and a
-/// standby calls it once more when it takes over.
+/// Publish what was stored, queue the backfills for it, and run them. `result` is how storing the
+/// packages went: what was stored reaches the catalog and gets its backfills even when a later
+/// package failed, or its search parameters stay pending until the next restart, and then the
+/// failure is returned. The backfill jobs are queued only after the publish, so the watermark they
+/// record is not older than the catalog writers use.
+pub(crate) fn finish_install(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    pending: &[PendingBackfill],
+    result: Result<(), FhirError>,
+) -> Result<(), FhirError> {
+    let finish = || -> Result<(), FhirError> {
+        let started = std::time::Instant::now();
+        publish(store, catalog)?;
+        tracing::info!(
+            target: "refhir_engine",
+            "rebuilt the catalog in {:.1?}",
+            started.elapsed()
+        );
+        for backfill in pending {
+            backfill.create(store, db)?;
+        }
+        run_backfills(store, db, catalog)
+    };
+    let finished = finish();
+    result?;
+    finished
+}
+
+pub(crate) fn publish(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+) -> Result<(), FhirError> {
+    let (policy, archiver, update_create, in_place, warmth) = {
+        let current = catalog.read().expect("catalog");
+        (
+            current.reference_policy(),
+            current.sdc_archiver(),
+            current.update_create(),
+            current.rebuild_in_place(),
+            // Nothing is being answered while a server starts, so there is nothing to keep warm.
+            (!current.rebuild_in_place()).then(|| current.warmth()),
+        )
+    };
+    if in_place {
+        *catalog.write().expect("catalog") = Catalog::empty();
+    }
+    // The tables are read a page at a time, so a write that lands in between would give a catalog
+    // that mixes two states; the revision is checked before and after, and the load repeated.
+    let (mut loaded, _) = Catalog::open_consistent(store, CatalogClock::Latest)?;
+    loaded.set_rebuild_in_place(in_place);
+    loaded.set_reference_policy(policy);
+    loaded.set_sdc_archiver(archiver);
+    let stable = !loaded.has_pending_parameters();
+    loaded.set_update_create(update_create);
+    // The requests that are being answered used definitions and terminology beyond what every
+    // catalog holds. The new catalog reads them before it takes the old one's place.
+    if let Some(warmth) = &warmth {
+        loaded.warm(warmth);
+    }
+    *catalog.write().expect("catalog") = loaded;
+    announce(store, stable)
+}
+
+/// Tell the other processes that the terminology changed in a way this one has already applied
+/// to its own catalog in place (a value set, code system or concept map written through the API),
+/// so a replica and a standby load the terminology again instead of answering from what they
+/// loaded before. Nothing else changed, so they load nothing else, and a search parameter that is
+/// still waiting for its backfill cannot reach a replica this way: there is no need to wait for
+/// the backfill, as a change to the version has to.
+///
+/// Call it once the change is fully in the store: a process that reloads on seeing the counter
+/// move must find all of it. A change that is applied by loading the catalog again goes through
+/// [`publish`] instead.
+pub(crate) fn announce_terminology(store: &dyn ConformanceStore) -> Result<(), FhirError> {
+    store.bump_terminology_version()?;
+    Ok(())
+}
+
+/// Tell the other processes that something may have changed that they have not been told of, so
+/// each loads the whole catalog again. For a repair that published nothing: what made it
+/// necessary may have been the announcement itself.
+pub(crate) fn announce_all(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+) -> Result<(), FhirError> {
+    let stable = !catalog.read().expect("catalog").has_pending_parameters();
+    announce(store, stable)
+}
+
+/// Every change that loads the catalog again moves the revision, which a standby follows. The
+/// version, which replicas follow, moves only when no search parameter is waiting for its
+/// backfill: while one is, the change is announced to standbys only, and the publish that follows
+/// the backfill's completion bumps the version. So a replica never loads a parameter whose index
+/// is not complete.
+fn announce(store: &dyn ConformanceStore, stable: bool) -> Result<(), FhirError> {
+    store.bump_catalog_revision()?;
+    if stable {
+        store.bump_catalog_version()?;
+    }
+    Ok(())
+}
+
+/// Bring `catalog` up to date with the store if what the process follows moved since it was
+/// loaded at `loaded`, keeping the settings that are not stored (reference policy, archiver mode).
+/// Returns what the catalog now reflects. A replica calls this when another process changed the
+/// catalog, and a standby calls it once more when it takes over.
+///
+/// If the clock moved, the whole catalog is loaded again. If only the terminology counter moved,
+/// a change was made to the terminology alone, and only that is loaded again: the structure
+/// definitions and search parameters are neither read nor compiled, so it takes a fraction of the
+/// time, and it cannot bring in a search parameter whose index is incomplete.
 pub fn reload_catalog(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
-    loaded_version: u64,
+    loaded: CatalogStamp,
     clock: CatalogClock,
-) -> Result<u64, FhirError> {
-    // Nothing to do, and nothing worth the seconds a full load takes, if the clock stands.
-    if clock.read(store)? == loaded_version {
-        return Ok(loaded_version);
+) -> Result<CatalogStamp, FhirError> {
+    // Nothing to do, and nothing worth the seconds a full load takes, if both stand.
+    let now = clock.stamp(store)?;
+    if now == loaded {
+        return Ok(loaded);
     }
-    let (fresh, version) = Catalog::open_consistent(store, clock)?;
+    if now.clock == loaded.clock {
+        let mut terminology = Catalog::open_terminology(store)?;
+        // Read what a request would otherwise wait for now, while the catalog being replaced is
+        // still answering. The definitions it holds are the ones these hold terminology for.
+        catalog
+            .read()
+            .expect("catalog")
+            .prepare_terminology(&mut terminology);
+        catalog
+            .write()
+            .expect("catalog")
+            .replace_terminology(terminology);
+        // `now` was read before the load, and it is what is recorded: a write that lands during
+        // the load moves a counter past it, so the next call loads again. A publish that lands
+        // during it is found the same way, not recorded as loaded when only terminology was read.
+        return Ok(now);
+    }
+    let (fresh, stamp) = Catalog::open_consistent(store, clock)?;
     let mut fresh = fresh;
     {
         let current = catalog.read().expect("catalog");
         fresh.set_reference_policy(current.reference_policy());
         fresh.set_sdc_archiver(current.sdc_archiver());
         fresh.set_update_create(current.update_create());
+        fresh.set_rebuild_in_place(current.rebuild_in_place());
+        // What the requests being answered use beyond what every catalog holds is read now, while
+        // the old catalog is still answering them, and not by the first request after the swap.
+        fresh.warm(&current.warmth());
     }
     *catalog.write().expect("catalog") = fresh;
-    Ok(version)
+    Ok(stamp)
 }
 
 /// The thread that keeps a catalog in step with another process. See [`watch_catalog`].
 pub struct CatalogWatcher {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    loaded: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    loaded: std::sync::Arc<std::sync::Mutex<CatalogStamp>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl CatalogWatcher {
-    /// Stops watching and returns the catalog version the catalog was last loaded at. A standby
-    /// that is about to become the primary does this, then reloads once, so from then on only
-    /// its own changes touch the catalog.
-    pub fn stop(mut self) -> u64 {
+    /// Stops watching and returns what the catalog was last loaded at. A standby that is about to
+    /// become the primary does this, then reloads once, so from then on only its own changes
+    /// touch the catalog.
+    pub fn stop(mut self) -> CatalogStamp {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        self.loaded.load(std::sync::atomic::Ordering::SeqCst)
+        *self.loaded.lock().expect("catalog stamp")
     }
 }
 
-/// Keep `catalog` in step with changes another process makes: poll the catalog version and
-/// reload in the background when it moves. The thread stops when the catalog is dropped or the
-/// returned watcher is stopped.
+/// Keep `catalog` in step with changes another process makes: poll the counters and reload in the
+/// background when they move (the whole catalog, or only the terminology if that is all that
+/// changed; see [`reload_catalog`]). The thread stops when the catalog is dropped or the returned
+/// watcher is stopped.
 pub fn watch_catalog(
     store: std::sync::Arc<dyn ConformanceStore>,
     catalog: &std::sync::Arc<RwLock<Catalog>>,
-    loaded_version: u64,
+    loaded: CatalogStamp,
     interval: std::time::Duration,
     clock: CatalogClock,
 ) -> CatalogWatcher {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
     let weak = Arc::downgrade(catalog);
     let stop = Arc::new(AtomicBool::new(false));
-    let loaded = Arc::new(AtomicU64::new(loaded_version));
+    let loaded = Arc::new(Mutex::new(loaded));
     let (stopped, tracked) = (stop.clone(), loaded.clone());
     let spawned = std::thread::Builder::new()
         .name("refhir-catalog".into())
@@ -378,16 +683,27 @@ pub fn watch_catalog(
             let Some(catalog) = weak.upgrade() else {
                 return;
             };
-            let known = tracked.load(Ordering::SeqCst);
-            match clock.read(store.as_ref()) {
-                Ok(version) if version != known => {
+            let known = *tracked.lock().expect("catalog stamp");
+            match clock.stamp(store.as_ref()) {
+                Ok(stamp) if stamp != known => {
                     match reload_catalog(store.as_ref(), &catalog, known, clock) {
                         Ok(now) => {
-                            tracing::info!(
-                                target: "refhir",
-                                "catalog reloaded at version {now} (was {known})"
-                            );
-                            tracked.store(now, Ordering::SeqCst);
+                            if now.clock == known.clock {
+                                tracing::info!(
+                                    target: "refhir",
+                                    "terminology reloaded at terminology version {} (was {})",
+                                    now.terminology,
+                                    known.terminology
+                                );
+                            } else {
+                                tracing::info!(
+                                    target: "refhir",
+                                    "catalog reloaded at version {} (was {})",
+                                    now.clock,
+                                    known.clock
+                                );
+                            }
+                            *tracked.lock().expect("catalog stamp") = now;
                         }
                         Err(err) => {
                             tracing::warn!(target: "refhir", "catalog reload failed: {err}")
@@ -412,6 +728,20 @@ pub fn watch_catalog(
         loaded,
         thread,
     }
+}
+
+/// Whether any document of `type_name` is live: the first row of its id index, read without the
+/// documents.
+fn holds_documents(db: &Database, type_name: &str) -> Result<bool, FhirError> {
+    let index = IndexId::new(format!("{type_name}/by_id"));
+    let first = db.reader().index_scan_ids(
+        &index,
+        db.latest_ts(),
+        &Interval::all(),
+        Order::Asc,
+        Some(1),
+    )?;
+    Ok(!first.is_empty())
 }
 
 pub(crate) fn live_ids(db: &Database, type_name: &str) -> Result<Vec<String>, FhirError> {
@@ -595,7 +925,7 @@ struct ResourceKind {
     resource_type: Option<Value>,
 }
 
-fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
+pub(crate) fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     let root = package_root(path)?;
     let manifest = read_manifest(&root)?;
     let name = manifest
@@ -608,9 +938,18 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         .and_then(|value| value.as_str())
         .ok_or_else(|| FhirError::Invalid("package.json version is required".into()))?
         .to_string();
-    let mut definitions = Vec::new();
+    // A parsed file is several times the size of its text and a package holds thousands, so each
+    // StructureDefinition and each piece of terminology is reduced to its row, and to what is read
+    // from it later, as soon as it is parsed. Search parameters are kept parsed: they are small,
+    // and read together below.
+    let mut structure_definitions = Vec::new();
+    let mut scope = SearchScope::default();
+    let mut definition_version = None;
+    let mut definition_error = None;
     let mut parameters = Vec::new();
-    let mut terminology = Vec::new();
+    let mut terminology_rows = Vec::new();
+    let mut terminology_error = None;
+    let mut expanded = TerminologyBuilder::for_package(None);
     for entry in fs::read_dir(&root).map_err(|err| FhirError::Invalid(err.to_string()))? {
         let entry = entry.map_err(|err| FhirError::Invalid(err.to_string()))?;
         let file = entry.path();
@@ -646,22 +985,47 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
             }
         };
         let bucket = match value.get("resourceType").and_then(Value::as_str) {
-            Some("StructureDefinition") => &mut definitions,
+            Some("StructureDefinition") => {
+                scope.note_definition(&value);
+                if definition_version.is_none() {
+                    definition_version = value
+                        .get("fhirVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                match structure_row(&value) {
+                    Ok(row) => structure_definitions.push(row),
+                    Err(err) => {
+                        definition_error.get_or_insert(err);
+                    }
+                }
+                continue;
+            }
             Some("SearchParameter") => &mut parameters,
             Some("CodeSystem")
             | Some("ValueSet")
             | Some("ConceptMap")
-            | Some("CompartmentDefinition") => &mut terminology,
+            | Some("CompartmentDefinition") => {
+                match terminology_row(&value) {
+                    Ok(row) => terminology_rows.push(row),
+                    Err(err) => {
+                        terminology_error.get_or_insert(err);
+                    }
+                }
+                expanded.add_resource(0, value);
+                continue;
+            }
             _ => continue,
         };
         bucket.push(value);
     }
-    let fhir_version = fhir_version(&manifest, &definitions)?;
-    let mut structure_definitions = Vec::new();
-    for definition in &definitions {
-        structure_definitions.push(structure_row(definition)?);
+    let fhir_version = fhir_version(&manifest, definition_version)?;
+    if let Some(err) = definition_error {
+        return Err(err);
     }
-    let scope = SearchScope::from_documents(&definitions, &parameters);
+    for parameter in &parameters {
+        scope.note_parameter(parameter);
+    }
     let mut search_parameters = Vec::new();
     // Non-experimental parameters go first and win: the R4 core package ships a sample
     // `_id` parameter (`SearchParameter/example`) that disagrees with the real `Resource-id`.
@@ -696,24 +1060,22 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
             search_parameters.push(row);
         }
     }
-    let mut terminology_rows = Vec::new();
-    for resource in &terminology {
-        terminology_rows.push(terminology_row(resource)?);
+    if let Some(err) = terminology_error {
+        return Err(err);
     }
     // Read for the release the package is for, as the catalog and a rebuild read it, so that what a
     // rebuild gives is what is stored here.
-    let tagged: Vec<(i64, &Value)> = terminology.iter().map(|resource| (0, resource)).collect();
-    let expansions =
-        MemoryTerminology::expansion_documents_scoped(&tagged, Some(fhir_version.as_str()))
-            .into_iter()
-            .filter_map(|document| {
-                let url = document.get("url")?.as_str()?.to_string();
-                Some(NewExpansion {
-                    url,
-                    json: document.to_string(),
-                })
+    expanded.set_release(Some(fhir_version.as_str()));
+    let expansions = expanded
+        .expansion_documents()
+        .filter_map(|document| {
+            let url = document.get("url")?.as_str()?.to_string();
+            Some(NewExpansion {
+                url,
+                json: document.to_string(),
             })
-            .collect();
+        })
+        .collect();
     Ok(NewPackage {
         name,
         version,
@@ -739,7 +1101,9 @@ pub(crate) fn package_root(path: &Path) -> Result<PathBuf, FhirError> {
     )))
 }
 
-fn fhir_version(manifest: &Value, definitions: &[Value]) -> Result<String, FhirError> {
+/// The release a package is for: what its manifest says, or else what its first definition that
+/// says (`definition_version`) does.
+fn fhir_version(manifest: &Value, definition_version: Option<String>) -> Result<String, FhirError> {
     if let Some(version) = manifest.get("fhirVersion").and_then(|value| value.as_str()) {
         return Ok(version.to_string());
     }
@@ -751,15 +1115,7 @@ fn fhir_version(manifest: &Value, definitions: &[Value]) -> Result<String, FhirE
     {
         return Ok(version.to_string());
     }
-    for definition in definitions {
-        if let Some(version) = definition
-            .get("fhirVersion")
-            .and_then(|value| value.as_str())
-        {
-            return Ok(version.to_string());
-        }
-    }
-    Err(FhirError::Invalid("package fhirVersion is required".into()))
+    definition_version.ok_or_else(|| FhirError::Invalid("package fhirVersion is required".into()))
 }
 
 fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
@@ -839,17 +1195,6 @@ pub(crate) struct SearchScope {
 }
 
 impl SearchScope {
-    pub(crate) fn from_documents(definitions: &[Value], parameters: &[Value]) -> Self {
-        let mut scope = Self::default();
-        for definition in definitions {
-            scope.note_definition(definition);
-        }
-        for parameter in parameters {
-            scope.note_parameter(parameter);
-        }
-        scope
-    }
-
     pub(crate) fn from_store(store: &dyn ConformanceStore) -> Result<Self, FhirError> {
         let mut scope = Self::default();
         for definition in store

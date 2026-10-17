@@ -110,7 +110,7 @@ and neither may change what a query returns without a code change that says so.
 
 ## Regenerating fixtures
 
-The server ships no FHIR packages, so the test suites use a copy of `hl7.fhir.r4.core` under
+The server binary carries no FHIR packages (a release adds them as a prepared file, made with `refhir package-bundle`), so the test suites use a copy of `hl7.fhir.r4.core` under
 `crates/fhir/fixtures/r4`. To rebuild it from the published package:
 
 ```bash

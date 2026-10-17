@@ -20,10 +20,11 @@ You need Node 20 or newer, and Rust or Docker to run a server.
    ```bash
    git clone https://github.com/hai-hq/refhir.git
    cd refhir
-   cargo run -p refhir -- --memory
+   REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory
    ```
 
-   The first start installs the FHIR core package, so give it a moment. It is ready when
+   The first start downloads the FHIR core package (that is what `REFHIR_PACKAGE_DOWNLOAD=true`
+   allows; the Docker image already has it), so give it a moment. It is ready when
    `curl -s http://127.0.0.1:8080/readyz` prints `{"status":"ok"}`. Other ways to run it are on the
    [Install](/docs/install/) page. Leave the server running.
 

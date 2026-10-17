@@ -117,11 +117,19 @@ jobs:
           want="refhir ${{ needs.verify.outputs.version }}"
           [[ "${got}" == "${want}" ]] || { echo "::error::binary says '${got}', expected '${want}'"; exit 1; }
 
+      # The release's FHIR packages, read and expanded once here, so that a first start stores
+      # them instead of downloading and reading them. The server finds the file beside itself.
+      # This downloads from packages.fhir.org (set REFHIR_PACKAGE_REGISTRY to use a mirror), so the
+      # release needs it reachable. The log records the SHA-256 of every tarball downloaded, and
+      # the file's header keeps them, so what a release shipped can be checked afterwards.
+      - name: Prepare the FHIR packages
+        run: target/release/refhir package-bundle --out refhir-packages.bundle
+
       - name: Package
         run: |
           name="refhir-${{ needs.verify.outputs.version }}-${{ matrix.name }}"
           mkdir -p "dist/${name}"
-          cp target/release/refhir LICENSE NOTICE README.md CHANGELOG.md "dist/${name}/"
+          cp target/release/refhir refhir-packages.bundle LICENSE NOTICE README.md CHANGELOG.md "dist/${name}/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
           (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
 

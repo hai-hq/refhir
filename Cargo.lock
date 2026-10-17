@@ -1579,9 +1579,12 @@ version = "0.0.1"
 dependencies = [
  "flate2",
  "hmac 0.12.1",
+ "libc",
+ "postgres",
  "refhir-database",
  "refhir-fhirpath",
  "refhir-persistence",
+ "refhir-postgres",
  "refhir-sdc",
  "refhir-sqlite",
  "refhir-types",
@@ -1620,6 +1623,7 @@ version = "0.0.1"
 dependencies = [
  "hmac 0.12.1",
  "refhir-types",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
 ]

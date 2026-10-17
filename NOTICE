@@ -12,6 +12,15 @@ HL7 FHIR R4 core package (crates/fhir/fixtures/r4)
   HL7 International publishes the package under CC0-1.0, as its package.json declares.
   https://hl7.org/fhir/
 
+Prepared FHIR packages (refhir-packages.bundle, in release archives and container images)
+  Made by `refhir package-bundle` when a release is built, from hl7.fhir.r4.core 4.0.1,
+  hl7.fhir.uv.sdc 4.0.0 and the packages they depend on (hl7.terminology.r4 7.1.0,
+  hl7.fhir.uv.extensions.r4 5.3.0-ballot-tc1, hl7.fhir.uv.tools.r4 1.1.2 and
+  hl7.fhir.uv.xver-r5.r4 0.1.0): the StructureDefinition, SearchParameter, CodeSystem, ValueSet,
+  ConceptMap and CompartmentDefinition resources they hold, and the value set expansions worked
+  out from them. HL7 International publishes each package under CC0-1.0, as its package.json
+  declares. https://hl7.org/fhir/
+
 Other test packages (crates/fhir/fixtures/*)
   The remaining directories are small packages written for the test suites. Several are
   named after HL7 packages (hl7.fhir.uv.sdc, hl7.fhir.uv.extensions.r4, hl7.terminology.r4,

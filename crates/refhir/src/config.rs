@@ -124,6 +124,12 @@ pub struct ConformanceSection {
     pub update_as_create: Option<bool>,
     pub package_registry: Option<String>,
     pub package_cache: Option<String>,
+    /// A file made by `refhir package-bundle`: the release's packages, prepared ahead of time, for
+    /// a first start to install instead of downloading them. Found beside the binary when unset.
+    pub package_bundle: Option<String>,
+    /// Whether the server may download packages (from `package_registry`). Off unless set: the
+    /// release's packages come from the prepared file.
+    pub package_download: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -448,6 +454,16 @@ impl ResolvedConfig {
         if let Some(v) = &file.conformance.package_cache {
             if env_value("REFHIR_PACKAGE_CACHE").is_none() {
                 std::env::set_var("REFHIR_PACKAGE_CACHE", v);
+            }
+        }
+        if file.conformance.package_download == Some(true)
+            && env_value("REFHIR_PACKAGE_DOWNLOAD").is_none()
+        {
+            std::env::set_var("REFHIR_PACKAGE_DOWNLOAD", "true");
+        }
+        if let Some(v) = &file.conformance.package_bundle {
+            if env_value("REFHIR_PACKAGE_BUNDLE").is_none() {
+                std::env::set_var("REFHIR_PACKAGE_BUNDLE", v);
             }
         }
 

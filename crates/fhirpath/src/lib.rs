@@ -15,7 +15,7 @@ pub use ast::Expr;
 pub use error::{Error, ErrorKind};
 pub use eval::{days_in_month, member_values};
 pub use host::{days_from_civil, EmptyHost, Host};
-pub use model::Model;
+pub use model::{Model, ModelBuilder};
 pub use parse::parse;
 pub use value::{Temporal, Value};
 

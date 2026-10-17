@@ -12,6 +12,16 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **A first start installs prepared packages, with no registry and little memory.** Release archives
+  and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
+  in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
+  downloaded, read and expanded once, there. A server finds the file beside its binary (or in
+  `../share/refhir/` from it, or at `[conformance].package_bundle` / `REFHIR_PACKAGE_BUNDLE`; `off`
+  says not to look) and stores what is in it, so the first start needs no network and no package
+  cache, and a first start peaks at a small fraction of the memory it did. A file that is there and
+  cannot be used (damaged, or made for another release) stops the start with an error that says so.
+  `refhir package-bundle` makes the file for a binary you built yourself, or for other packages
+  (`--spec`). See [Preparing the packages](deploy/production.md#preparing-the-packages).
 - **A repeated search parameter in a live query.** A `/sync` query's arguments are a JSON object, so
   a parameter that a URL would give twice (AND) had no way to be written. It is now an array of
   strings: `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}` finds the Slots whose
@@ -42,6 +52,61 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **A running server holds what every request needs and an index of the rest, and reads the rest
+  the first time a request uses it.** It used to hold every StructureDefinition, code system,
+  value set expansion and concept map of the installed packages in memory: about 100 MB for R4
+  core, SDC and what they depend on, nearly all of what the process used. It now holds the base
+  types (every resource, data type and primitive), the value sets their bindings check a code
+  against and the code systems behind those, which is what a request of any common kind is
+  validated with, and an index of everything else, about 27 MB in all. A profile, an extension, a
+  concept map or a table nothing binds is read from the database the first time a request uses it,
+  and kept, up to about 8 MB of each kind, until other reads push it out; a server that has been
+  asked about every value set the packages define holds about 48 MB. On macOS the running
+  server's private memory went from about 90 MB to about 27 MB. A request of a common kind reads
+  nothing from the database, the first time or after (a test checks it); the first request that
+  names a profile waits for a read of a few milliseconds, and the next does not. What a request is
+  answered does not change, and a catalog loaded this way is checked against one that holds
+  everything, for every definition and expansion of R4 core. Validating a resource is about a
+  third faster, because a definition is shared and no longer copied for each request. A restart
+  reads what is held, which can take up to half a second longer. When the catalog is rebuilt (a
+  package, a change to a search parameter) or a replica or standby reloads it after the primary
+  changed it, the new catalog reads what the old one had in use before it takes its place, while
+  the old one is still answering, so requests are not sent back to waiting. A replica that lags the
+  primary can read a row the primary has just written that its index does not describe yet.
+- **A request that cannot read a definition or a code system from the database fails.** With the
+  reads above, a database error while reading a profile, an extension or a code system used to be
+  logged and the request answered as if it did not exist: a write refused as invalid, or one
+  accepted because nothing was left to check it by. It is now a `500` (`exception`) that names what
+  could not be read, nothing is committed, and the same request is answered once the database is.
+- **A first start stores each package as it reads it.** The prepared file (see below) holds a
+  package as values of about 4 MB of rows, and the database takes them one at a time inside one
+  transaction, so a package is stored whole or not at all, as before. The largest default package
+  is over 120 MB of JSON, and a first start used to hold all of it; it now holds a few megabytes
+  of it at a time, on SQLite and on Postgres. On SQLite the heap peaks at about 42 MB where it
+  peaked at about 129 MB (resident memory 120 MB where it was 300 MB); on Postgres at about
+  51 MB where it peaked at about 164 MB. Postgres keeps a buffer as large as the biggest
+  statement a connection has sent for as long as the connection lives, which after storing the
+  default packages would be about 16 MB for the life of the server, so a connection that stored
+  a large package is closed afterwards and the pool opens another. A prepared file made by an
+  earlier build of this version has another format and is refused with an error that says so:
+  make it again with `refhir package-bundle`.
+- **The server downloads packages only if it is told it may.** It used to fetch the release's
+  packages from packages.fhir.org on a first start, and anything named in `[conformance].packages`
+  or `$install`. Now nothing is downloaded unless `[conformance].package_download = true` (or
+  `REFHIR_PACKAGE_DOWNLOAD=true`; the Helm chart has `conformance.packageDownload`). Without it a
+  package that is not installed and not in the package cache is refused: a first start with no
+  prepared file stops with an error that says what to do, and `$install` answers `403`. Release
+  archives and images are not affected, because they carry their packages. **If you build ReFHIR
+  yourself and relied on the first-start download, set `package_download = true`, or make a file
+  with `refhir package-bundle`.** Packages from a directory or a `.tgz` need no setting.
+- **A package that is only a dependency and holds examples is not installed.** SDC lists
+  `hl7.fhir.r4.examples`, which holds the example resources of R4 and a second copy of every core
+  definition, none of which a server uses; it was downloaded, read, stored and loaded for
+  nothing. It is left out when a package only depends on it, with a line in the log. Name it in
+  `[conformance].packages` (or give it to `$install`) to install it, and a database that has it keeps
+  it. The one visible difference is which package holds the value sets that core and the examples
+  package both define: core, where it was the examples package, with the same codes in each
+  expansion.
 - **A search `GET` that names no `_count` returns a page of 100 matches with a `next` link.** It
   used to return every match in one response (1,520 Slots in one 0.3 s answer, which a client then
   handed on whole). FHIR leaves the page size to the server. The `self` link shows the `_count` that
@@ -127,9 +192,31 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   populating from nothing. Each alternative of a comma list, and each occurrence of a parameter
   given twice, is read on its own. A client that relied on the empty result can send
   `Prefer: handling=lenient`.
-
-### Fixed
-
+- **A first start installs the default packages more than twice as fast on PostgreSQL.** The
+  time went to round trips and commits, not to work: every definition, search parameter and
+  piece of terminology was a statement of its own, every resource type a package adds search
+  parameters to cost four committed transactions of bookkeeping (even with no resource stored to
+  index), the catalog was rebuilt a second time only to mark those parameters ready, and the
+  packages one install needs were downloaded and unpacked one after another. A package now goes
+  in a few statements per table, the bookkeeping is queued and finished in one step per package
+  (a type with no stored resources is not scanned), only the search parameters are recompiled
+  after it, and the packages a dependency walk needs at the same time are fetched side by side.
+  The log has a new line, `fetched N package(s) to install in …`, for the part before the first
+  package is stored. With the default R4 packages from a local mirror (so no download time) the
+  start after the lease took about 70 s on PostgreSQL and about 25 s now, and on SQLite about
+  26 s and about 24 s; peak memory did not rise. A database whose packages are already installed
+  starts as before.
+- **A first start needed several gigabytes of memory.** Installing the default packages (R4 core,
+  SDC and the seven packages SDC depends on) peaked at over 2 GiB, so a container given 512 MiB or
+  2 GiB was killed (exit status 137) while it was still installing, and a server that started
+  fine kept that memory for as long as it ran. Loading the conformance tables and reading a
+  package now work through them a page at a time instead of parsing every document and holding
+  all of it, and what they keep is shared: the R4 packages hold about 66,000 constraints of
+  which 299 differ, and each is now kept once. A first start with the default packages peaks at
+  about a quarter of what it did, and a restart on a database that already has them takes about a
+  tenth of the memory it did and starts faster. On Linux the memory a load frees is now handed
+  back to the system, so a running server does not stay at its start-up peak. See
+  [Memory](deploy/production.md#fhir-version-and-implementation-guides).
 - **A comma between the values of one search parameter is OR.** `Slot?status=free,busy` and
   `HealthcareService?_id=a,b` matched nothing, because the whole value was compared as one. This
   holds for ids and every parameter type, with `\,` for a literal comma, and a value lists at most
@@ -142,6 +229,38 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   type the search parameter can point at, so `subject=123` finds a `Patient/123` or a `Group/123`.
   Live queries over `/sync` read ids the same way, and are woken only by writes that reference
   that id.
+- **A replica and a standby now follow terminology written through the API.** Creating, updating
+  or deleting a CodeSystem, ValueSet or ConceptMap changed the catalog of the process that took
+  the write and told no other. A replica went on validating and expanding against the
+  terminology it loaded at start, and a standby took over with it, until something else (a package
+  install, a SearchParameter write) happened to make them reload; a restart also fixed it. The
+  write now tells them, and each reloads the terminology within a moment of it.
+  - **What a replica does now.** It reloads only the terminology (the value sets, code systems and
+    concept maps and the expansions kept for them) in the background, and answers from the old
+    one until the new one is ready. It does not read the structure definitions or the search
+    parameters, so it takes a fraction of a full reload: about a third of the time on the R4
+    package alone, and less saved where a lot of terminology is installed. A package install or a
+    SearchParameter write still reloads everything. A script that writes many code systems or
+    value sets one by one keeps every replica reloading until it stops; send them in one
+    `transaction` Bundle, or install them as a package, to have each reload once.
+  - **A running backfill does not hold it back.** A replica still never loads a search parameter
+    whose index is incomplete, and a terminology reload loads none, so the replica hears of a
+    terminology write at once even while a backfill is running.
+  - **Upgrading.** There is no migration: the change is a new counter, `terminology_version`, in
+    the `persistence_globals` table, created by the first write. It takes effect when the
+    primary, the replicas and the standbys all run this version: an older replica or standby does
+    not follow it, and an older primary does not move it, so those behave as before.
+- **A write whose announcement failed is announced again, and a primary announces when it
+  starts.** When the server has committed a CodeSystem, ValueSet, ConceptMap or SearchParameter
+  and then fails to tell the other processes (the counter write after the tables were in order),
+  the repair that follows used to find nothing to fix and say nothing, so replicas and standbys
+  stayed on the old catalog until the next change. The repair now tells them again, and they
+  reload everything, unless it published, which tells them. The request succeeds either way,
+  because the write is committed and right: a failure to tell the others is logged, and they
+  catch up at the next change to the catalog or at their next start. The repair that runs as a
+  primary starts does the same, so a primary that stopped between writing and telling is made up
+  for. The cost is that every replica and standby loads the whole catalog (a few seconds of one
+  thread each) when a primary starts or a standby takes over.
 
 ## [0.0.1] - 2026-10-15
 
