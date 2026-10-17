@@ -12,7 +12,7 @@ use refhir_persistence::{
     NewSearchParameter, NewStructureDefinition, NewTerminology, ParamStatus, PersistError,
 };
 
-use crate::tenancy_tests::{client, open, shared};
+use crate::tenancy_tests::{client, digests, open, shared};
 use crate::tests::test_url;
 use crate::{delete_tenant, PostgresPersistence};
 
@@ -589,4 +589,191 @@ fn a_package_for_another_release_is_refused_as_it_is_without_tenants() {
         "{refused:?}"
     );
     assert_eq!(a.load_packages().unwrap().len(), 1);
+}
+
+/// Two tenants given the same shared package, so each holds its own copy of the package's search
+/// parameters under one package id. A statement that is keyed by package, url and base and forgets
+/// the tenant would change both copies at once.
+struct SamePackage {
+    url: String,
+    a: PostgresPersistence,
+    b: PostgresPersistence,
+    package_id: i64,
+    package: NewPackage,
+}
+
+fn same_package(tag: &str) -> Option<SamePackage> {
+    let admin = test_url("tenants holding one shared package")?;
+    let url = shared(&admin, tag, &["a", "b"]);
+    let (a, b) = (open(&url, "a"), open(&url, "b"));
+    let package = demo("same", "4.0.1");
+    let (first, _) = install(&a, &package, "sha-same").unwrap();
+    let (second, _) = install(&b, &package, "sha-same").unwrap();
+    assert_eq!(first.package_id, second.package_id);
+    Some(SamePackage {
+        url,
+        a,
+        b,
+        package_id: first.package_id,
+        package,
+    })
+}
+
+/// (url, status, json) of the tenant's copy of the package's search parameters, by url.
+fn parameters(store: &PostgresPersistence, package_id: i64) -> Vec<(String, String, String)> {
+    let mut rows: Vec<_> = store
+        .load_search_parameters_of(package_id)
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.url, row.status.as_str().to_string(), row.json))
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn statuses(rows: &[(String, String, String)]) -> Vec<&str> {
+    rows.iter().map(|row| row.1.as_str()).collect()
+}
+
+#[test]
+fn a_tenant_changing_a_shared_packages_parameter_leaves_the_other_tenants_copy_alone() {
+    let Some(same) = same_package("tsamepar") else {
+        return;
+    };
+    let SamePackage {
+        url,
+        a,
+        b,
+        package_id,
+        package,
+    } = same;
+    let (dropped, unsupported, rewritten) = (
+        &package.search_parameters[0],
+        &package.search_parameters[2].url,
+        &package.search_parameters[1],
+    );
+    // Both tenants hold the third parameter as unsupported, as indexing can leave it.
+    client(&url)
+        .batch_execute(&format!(
+            "UPDATE search_parameters SET status = 'unsupported' \
+             WHERE instance_id <> 0 AND url = '{unsupported}'"
+        ))
+        .unwrap();
+    let before = digests(&url, "b");
+    assert_eq!(statuses(&parameters(&b, package_id))[2], "unsupported");
+
+    // One tenant's indexing finds it supported: only its copy changes.
+    a.set_search_parameter_status(package_id, unsupported, "Patient", ParamStatus::Pending)
+        .unwrap();
+    assert_eq!(
+        statuses(&parameters(&a, package_id)),
+        ["pending", "pending", "pending"]
+    );
+    assert_eq!(
+        statuses(&parameters(&b, package_id)),
+        ["pending", "pending", "unsupported"]
+    );
+    assert_eq!(digests(&url, "b"), before);
+
+    // A definition that says the same with other json is rewritten in place, in its copy only.
+    let mut again = rewritten.clone();
+    again.json = r#"{"resourceType":"SearchParameter","rewritten":true}"#.into();
+    assert!(
+        !a.upsert_search_parameter(package_id, &again).unwrap(),
+        "the same definition is a rewrite, not a new parameter"
+    );
+    let ours = parameters(&a, package_id);
+    assert_eq!(ours[1].2, again.json);
+    assert_eq!(digests(&url, "b"), before);
+
+    // One dropped from a tenant's copy stays in the other's.
+    a.delete_search_parameter(package_id, &dropped.url).unwrap();
+    assert_eq!(parameters(&a, package_id).len(), 2);
+    assert_eq!(parameters(&b, package_id).len(), 3);
+    assert_eq!(digests(&url, "b"), before);
+}
+
+#[test]
+fn backfills_of_tenants_on_one_package_snapshot_and_finish_apart() {
+    let Some(same) = same_package("tsamejob") else {
+        return;
+    };
+    let SamePackage {
+        url,
+        a,
+        b,
+        package_id,
+        ..
+    } = same;
+    // Each tenant's job snapshots the parameters waiting in its own copy, three each.
+    let b_job = b.insert_backfill(package_id, 5, "Patient", &[]).unwrap();
+    let a_job = a.insert_backfill(package_id, 5, "Patient", &[]).unwrap();
+    assert_ne!(a_job, b_job);
+    for tenant in ["a", "b"] {
+        let id = crate::tenancy_tests::tenant_id(&url, tenant);
+        assert_eq!(
+            count(
+                &url,
+                &format!("SELECT count(*) FROM backfill_parameter WHERE instance_id = {id}")
+            ),
+            3,
+            "tenant {tenant}'s snapshot"
+        );
+    }
+    let before = digests(&url, "b");
+
+    // One tenant finishing its job makes its parameters ready, and not the other's.
+    a.complete_backfill(a_job, package_id, "Patient").unwrap();
+    assert_eq!(
+        statuses(&parameters(&a, package_id)),
+        ["ready", "ready", "ready"]
+    );
+    assert_eq!(
+        statuses(&parameters(&b, package_id)),
+        ["pending", "pending", "pending"]
+    );
+    assert_eq!(digests(&url, "b"), before);
+
+    // And the base of a package, by itself, the same way.
+    b.mark_base_ready(package_id, "Patient").unwrap();
+    assert_eq!(
+        statuses(&parameters(&b, package_id)),
+        ["ready", "ready", "ready"]
+    );
+    assert_eq!(
+        statuses(&parameters(&a, package_id)),
+        ["ready", "ready", "ready"]
+    );
+}
+
+#[test]
+fn a_tenant_does_not_read_another_tenants_snapshot_of_a_job() {
+    let Some(same) = same_package("tsamesnap") else {
+        return;
+    };
+    let SamePackage {
+        url,
+        a,
+        b,
+        package_id,
+        package,
+    } = same;
+    // Tenant b's job names one parameter. Tenant a has no snapshot under that job id, so for it the
+    // job covers whatever is waiting for the package, as any job without a snapshot does: it must
+    // not take b's one-parameter snapshot for its own.
+    let b_job = b
+        .insert_backfill(
+            package_id,
+            5,
+            "Patient",
+            &[package.search_parameters[0].url.clone()],
+        )
+        .unwrap();
+    let before = digests(&url, "b");
+    a.complete_backfill(b_job, package_id, "Patient").unwrap();
+    assert_eq!(
+        statuses(&parameters(&a, package_id)),
+        ["ready", "ready", "ready"]
+    );
+    assert_eq!(digests(&url, "b"), before);
 }

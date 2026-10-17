@@ -270,6 +270,9 @@ impl PostgresPersistence {
     /// order, and hand each page to `visit`. A connection is taken for the query of each page
     /// only, so none is held while `visit` works on the rows, which for a catalog load is seconds
     /// of work, and the client never holds more than a page of the wire data at once.
+    ///
+    /// For the classic layout, where every row of the table is the database's own. A tenant pages
+    /// through its packages with [`PostgresPersistence::visit_tenant_pages`].
     fn visit_pages<T: Send>(
         &self,
         select: &str,
@@ -277,14 +280,11 @@ impl PostgresPersistence {
         key: impl Fn(&T) -> (i64, String),
         visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
-        let first = format!(
-            "{select}{} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}",
-            self.scope.where_only()
-        );
+        debug_assert!(matches!(self.scope, Scope::Classic));
+        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
         let next = format!(
-            "{select} WHERE {}(package_id, url) > ($1, $2) \
-             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}",
-            self.scope.and()
+            "{select} WHERE (package_id, url) > ($1, $2) \
+             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
         );
         let mut after: Option<(i64, String)> = None;
         loop {

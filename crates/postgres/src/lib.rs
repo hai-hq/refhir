@@ -1097,6 +1097,9 @@ mod tenancy_store_tests;
 mod tenancy_catalog_tests;
 
 #[cfg(test)]
+mod tenancy_foreign_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use refhir_persistence::conformance;
