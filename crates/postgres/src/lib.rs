@@ -1089,6 +1089,9 @@ mod job_store;
 mod tenancy_tests;
 
 #[cfg(test)]
+mod tenancy_store_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use refhir_persistence::conformance;

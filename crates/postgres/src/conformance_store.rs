@@ -7,6 +7,7 @@ use refhir_persistence::{
     StoredSearchParameter, StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 
+use crate::scope::Scope;
 use crate::{definite, PostgresPersistence};
 
 fn structure_definition_from(row: &postgres::Row) -> StoredStructureDefinition {
@@ -50,10 +51,14 @@ impl PostgresPersistence {
         key: impl Fn(&T) -> (i64, String),
         visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
-        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let first = format!(
+            "{select}{} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}",
+            self.scope.where_only()
+        );
         let next = format!(
-            "{select} WHERE (package_id, url) > ($1, $2) \
-             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
+            "{select} WHERE {}(package_id, url) > ($1, $2) \
+             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}",
+            self.scope.and()
         );
         let mut after: Option<(i64, String)> = None;
         loop {
@@ -93,7 +98,11 @@ impl PostgresPersistence {
             let row = guard
                 .client
                 .query_opt(
-                    format!("SELECT json FROM {table} WHERE package_id = $1 AND url = $2").as_str(),
+                    format!(
+                        "SELECT json FROM {table} WHERE {}package_id = $1 AND url = $2",
+                        self.scope.and()
+                    )
+                    .as_str(),
                     &[&package_id, &url],
                 )
                 .map_err(definite)?;
@@ -106,7 +115,10 @@ impl PostgresPersistence {
         let row = guard
             .client
             .query_opt(
-                "SELECT json_value FROM persistence_globals WHERE key = $1",
+                &format!(
+                    "SELECT json_value FROM persistence_globals WHERE {}key = $1",
+                    self.scope.and()
+                ),
                 &[&key.as_str()],
             )
             .map_err(definite)?;
@@ -122,10 +134,15 @@ impl PostgresPersistence {
         self.fence(&mut tx)?;
         let text: String = tx
             .query_one(
-                "INSERT INTO persistence_globals (key, json_value) VALUES ($1, '1')
-                 ON CONFLICT (key) DO UPDATE
-                 SET json_value = (persistence_globals.json_value::bigint + 1)::text
-                 RETURNING json_value",
+                &format!(
+                    "INSERT INTO persistence_globals ({}key, json_value) VALUES ({}$1, '1')
+                     ON CONFLICT {} DO UPDATE
+                     SET json_value = (persistence_globals.json_value::bigint + 1)::text
+                     RETURNING json_value",
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.conflict("key")
+                ),
                 &[&key.as_str()],
             )
             .map_err(definite)?
@@ -179,7 +196,10 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT id, name, version, fhir_version FROM packages ORDER BY id",
+                    &format!(
+                        "SELECT id, name, version, fhir_version FROM packages{} ORDER BY id",
+                        self.scope.where_only()
+                    ),
                     &[],
                 )
                 .map_err(definite)?;
@@ -229,8 +249,11 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT package_id, url, type_name, kind, is_abstract, json \
-                 FROM structure_definitions ORDER BY package_id, url",
+                    &format!(
+                        "SELECT package_id, url, type_name, kind, is_abstract, json \
+                         FROM structure_definitions{} ORDER BY package_id, url",
+                        self.scope.where_only()
+                    ),
                     &[],
                 )
                 .map_err(definite)?;
@@ -269,8 +292,11 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT package_id, url, base, code, param_type, expression, status, json \
-                 FROM search_parameters ORDER BY package_id, base, code",
+                    &format!(
+                        "SELECT package_id, url, base, code, param_type, expression, status, json \
+                         FROM search_parameters{} ORDER BY package_id, base, code",
+                        self.scope.where_only()
+                    ),
                     &[],
                 )
                 .map_err(definite)?;
@@ -296,12 +322,16 @@ impl ConformanceStore for PostgresPersistence {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
             let rows = guard
-            .client
-            .query(
-                "SELECT package_id, resource_type, url, json FROM terminology ORDER BY package_id, url",
-                &[],
-            )
-            .map_err(definite)?;
+                .client
+                .query(
+                    &format!(
+                        "SELECT package_id, resource_type, url, json FROM terminology{} \
+                     ORDER BY package_id, url",
+                        self.scope.where_only()
+                    ),
+                    &[],
+                )
+                .map_err(definite)?;
             Ok(rows
                 .iter()
                 .map(|row| StoredTerminology {
@@ -338,9 +368,12 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT package_id, resource_type, url, json FROM terminology \
-                 WHERE url = ANY($1) OR split_part(url, '|', 1) = ANY($1) \
-                 ORDER BY package_id, url",
+                    &format!(
+                        "SELECT package_id, resource_type, url, json FROM terminology \
+                         WHERE {}(url = ANY($1) OR split_part(url, '|', 1) = ANY($1)) \
+                         ORDER BY package_id, url",
+                        self.scope.and()
+                    ),
                     &[&urls],
                 )
                 .map_err(definite)?;
@@ -367,17 +400,26 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             for change in changes {
                 match &change.json {
-                Some(json) => tx.execute(
-                    "INSERT INTO value_set_expansion (package_id, url, json) VALUES ($1, $2, $3) \
-                     ON CONFLICT (package_id, url) DO UPDATE SET json = excluded.json",
-                    &[&change.package_id, &change.url, json],
-                ),
-                None => tx.execute(
-                    "DELETE FROM value_set_expansion WHERE package_id = $1 AND url = $2",
-                    &[&change.package_id, &change.url],
-                ),
-            }
-            .map_err(definite)?;
+                    Some(json) => tx.execute(
+                        &format!(
+                            "INSERT INTO value_set_expansion ({}package_id, url, json) \
+                         VALUES ({}$1, $2, $3) \
+                         ON CONFLICT {} DO UPDATE SET json = excluded.json",
+                            self.scope.cols(),
+                            self.scope.vals(),
+                            self.scope.conflict("package_id, url")
+                        ),
+                        &[&change.package_id, &change.url, json],
+                    ),
+                    None => tx.execute(
+                        &format!(
+                            "DELETE FROM value_set_expansion WHERE {}package_id = $1 AND url = $2",
+                            self.scope.and()
+                        ),
+                        &[&change.package_id, &change.url],
+                    ),
+                }
+                .map_err(definite)?;
             }
             tx.commit().map_err(definite)?;
             Ok(())
@@ -390,8 +432,11 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT package_id, resource_type, url, json FROM terminology \
-                 WHERE package_id = $1 ORDER BY url",
+                    &format!(
+                        "SELECT package_id, resource_type, url, json FROM terminology \
+                         WHERE {}package_id = $1 ORDER BY url",
+                        self.scope.and()
+                    ),
                     &[&package_id],
                 )
                 .map_err(definite)?;
@@ -416,8 +461,11 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT package_id, url, base, code, param_type, expression, status, json \
-                 FROM search_parameters WHERE package_id = $1 ORDER BY base, code",
+                    &format!(
+                        "SELECT package_id, url, base, code, param_type, expression, status, json \
+                         FROM search_parameters WHERE {}package_id = $1 ORDER BY base, code",
+                        self.scope.and()
+                    ),
                     &[&package_id],
                 )
                 .map_err(definite)?;
@@ -443,12 +491,16 @@ impl ConformanceStore for PostgresPersistence {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
             let rows = guard
-            .client
-            .query(
-                "SELECT package_id, url, json FROM value_set_expansion ORDER BY package_id, url",
-                &[],
-            )
-            .map_err(definite)?;
+                .client
+                .query(
+                    &format!(
+                        "SELECT package_id, url, json FROM value_set_expansion{} \
+                     ORDER BY package_id, url",
+                        self.scope.where_only()
+                    ),
+                    &[],
+                )
+                .map_err(definite)?;
             Ok(rows
                 .iter()
                 .map(|row| StoredExpansion {
@@ -478,7 +530,7 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
-            let (outcome, heaviest) = install_in_tx(&mut tx, package)?;
+            let (outcome, heaviest) = install_in_tx(&mut tx, self.scope, package)?;
             tx.commit().map_err(definite)?;
             retire_if_swollen(&mut guard, heaviest);
             Ok(outcome)
@@ -497,7 +549,7 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
-            let mut installer = Installer::begin(&mut tx, name, version, fhir_version)?;
+            let mut installer = Installer::begin(&mut tx, self.scope, name, version, fhir_version)?;
             feed(&mut installer)?;
             let (outcome, heaviest) = installer.finish()?;
             tx.commit().map_err(definite)?;
@@ -522,8 +574,11 @@ impl ConformanceStore for PostgresPersistence {
             let url = url.to_string();
             let base = base.to_string();
             tx.execute(
-                "UPDATE search_parameters SET status = $1 \
-             WHERE package_id = $2 AND url = $3 AND base = $4 AND status = 'unsupported'",
+                &format!(
+                    "UPDATE search_parameters SET status = $1 \
+                     WHERE {}package_id = $2 AND url = $3 AND base = $4 AND status = 'unsupported'",
+                    self.scope.and()
+                ),
                 &[&status, &package_id, &url, &base],
             )
             .map_err(definite)?;
@@ -539,7 +594,10 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             let existing = tx
                 .query_opt(
-                    "SELECT id FROM packages WHERE name = 'refhir.local' AND version = '0'",
+                    &format!(
+                        "SELECT id FROM packages WHERE {}name = 'refhir.local' AND version = '0'",
+                        self.scope.and()
+                    ),
                     &[],
                 )
                 .map_err(definite)?;
@@ -547,15 +605,25 @@ impl ConformanceStore for PostgresPersistence {
                 return Ok(row.get(0));
             }
             let current = tx
-                .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
+                .query_opt(
+                    &format!(
+                        "SELECT fhir_version FROM packages{} LIMIT 1",
+                        self.scope.where_only()
+                    ),
+                    &[],
+                )
                 .map_err(definite)?;
             let version = current
                 .map(|row| row.get::<_, String>(0))
                 .unwrap_or_else(|| fhir_version.to_string());
             let inserted = tx
                 .query_one(
-                    "INSERT INTO packages (name, version, fhir_version) \
-                 VALUES ('refhir.local', '0', $1) RETURNING id",
+                    &format!(
+                        "INSERT INTO packages ({}name, version, fhir_version) \
+                         VALUES ({}'refhir.local', '0', $1) RETURNING id",
+                        self.scope.cols(),
+                        self.scope.vals()
+                    ),
                     &[&version],
                 )
                 .map_err(definite)?;
@@ -577,8 +645,11 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             let prior = tx
             .query_opt(
-                "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
-                 WHERE package_id = $1 AND url = $2 AND base = $3",
+                &format!(
+                    "SELECT code, param_type, COALESCE(expression, ''), status FROM search_parameters \
+                     WHERE {}package_id = $1 AND url = $2 AND base = $3",
+                    self.scope.and()
+                ),
                 &[&package_id, &param.url, &param.base],
             )
             .map_err(definite)?;
@@ -589,8 +660,11 @@ impl ConformanceStore for PostgresPersistence {
                 let expression: String = row.get(2);
                 if code == param.code && param_type == param.param_type && expression == incoming {
                     tx.execute(
-                        "UPDATE search_parameters SET json = $1 \
-                     WHERE package_id = $2 AND url = $3 AND base = $4",
+                        &format!(
+                            "UPDATE search_parameters SET json = $1 \
+                             WHERE {}package_id = $2 AND url = $3 AND base = $4",
+                            self.scope.and()
+                        ),
                         &[&param.json, &package_id, &param.url, &param.base],
                     )
                     .map_err(definite)?;
@@ -600,12 +674,18 @@ impl ConformanceStore for PostgresPersistence {
             }
             let status = param.status.as_str();
             tx.execute(
-                "INSERT INTO search_parameters \
-             (package_id, url, base, code, param_type, expression, status, json) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
-             ON CONFLICT (package_id, url, base) DO UPDATE SET \
-             code = EXCLUDED.code, param_type = EXCLUDED.param_type, \
-             expression = EXCLUDED.expression, status = EXCLUDED.status, json = EXCLUDED.json",
+                &format!(
+                    "INSERT INTO search_parameters \
+                     ({}package_id, url, base, code, param_type, expression, status, json) \
+                     VALUES ({}$1, $2, $3, $4, $5, $6, $7, $8) \
+                     ON CONFLICT {} DO UPDATE SET \
+                     code = EXCLUDED.code, param_type = EXCLUDED.param_type, \
+                     expression = EXCLUDED.expression, status = EXCLUDED.status, \
+                     json = EXCLUDED.json",
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.conflict("package_id, url, base")
+                ),
                 &[
                     &package_id,
                     &param.url,
@@ -631,7 +711,10 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             let url = url.to_string();
             tx.execute(
-                "DELETE FROM search_parameters WHERE package_id = $1 AND url = $2",
+                &format!(
+                    "DELETE FROM search_parameters WHERE {}package_id = $1 AND url = $2",
+                    self.scope.and()
+                ),
                 &[&package_id, &url],
             )
             .map_err(definite)?;
@@ -650,10 +733,15 @@ impl ConformanceStore for PostgresPersistence {
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
             tx.execute(
-                "INSERT INTO terminology (package_id, resource_type, url, json) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (package_id, url) DO UPDATE SET \
-             resource_type = EXCLUDED.resource_type, json = EXCLUDED.json",
+                &format!(
+                    "INSERT INTO terminology ({}package_id, resource_type, url, json) \
+                     VALUES ({}$1, $2, $3, $4) \
+                     ON CONFLICT {} DO UPDATE SET \
+                     resource_type = EXCLUDED.resource_type, json = EXCLUDED.json",
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.conflict("package_id, url")
+                ),
                 &[&package_id, &row.resource_type, &row.url, &row.json],
             )
             .map_err(definite)?;
@@ -669,7 +757,10 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             let url = url.to_string();
             tx.execute(
-                "DELETE FROM terminology WHERE package_id = $1 AND url = $2",
+                &format!(
+                    "DELETE FROM terminology WHERE {}package_id = $1 AND url = $2",
+                    self.scope.and()
+                ),
                 &[&package_id, &url],
             )
             .map_err(definite)?;
@@ -688,16 +779,21 @@ impl ConformanceStore for PostgresPersistence {
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
             tx.execute(
-                "DELETE FROM value_set_expansion WHERE package_id = $1",
+                &format!(
+                    "DELETE FROM value_set_expansion WHERE {}package_id = $1",
+                    self.scope.and()
+                ),
                 &[&package_id],
             )
             .map_err(definite)?;
+            let insert = format!(
+                "INSERT INTO value_set_expansion ({}package_id, url, json) VALUES ({}$1, $2, $3)",
+                self.scope.cols(),
+                self.scope.vals()
+            );
             for expansion in expansions {
-                tx.execute(
-                    "INSERT INTO value_set_expansion (package_id, url, json) VALUES ($1, $2, $3)",
-                    &[&package_id, &expansion.url, &expansion.json],
-                )
-                .map_err(definite)?;
+                tx.execute(&insert, &[&package_id, &expansion.url, &expansion.json])
+                    .map_err(definite)?;
             }
             tx.commit().map_err(definite)?;
             Ok(())
@@ -719,7 +815,10 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             let urls: Vec<String> = tx
                 .query(
-                    "SELECT url FROM backfill_parameter WHERE backfill_id = $1",
+                    &format!(
+                        "SELECT url FROM backfill_parameter WHERE {}backfill_id = $1",
+                        self.scope.and()
+                    ),
                     &[&backfill_id],
                 )
                 .map_err(definite)?
@@ -728,16 +827,22 @@ impl ConformanceStore for PostgresPersistence {
                 .collect();
             if urls.is_empty() {
                 tx.execute(
-                    "UPDATE search_parameters SET status = 'ready' \
-                 WHERE package_id = $1 AND base = $2 AND status = 'pending'",
+                    &format!(
+                        "UPDATE search_parameters SET status = 'ready' \
+                         WHERE {}package_id = $1 AND base = $2 AND status = 'pending'",
+                        self.scope.and()
+                    ),
                     &[&package_id, &base],
                 )
                 .map_err(definite)?;
             }
             for url in urls {
                 tx.execute(
-                    "UPDATE search_parameters SET status = 'ready' \
-                 WHERE package_id = $1 AND base = $2 AND url = $3 AND status = 'pending'",
+                    &format!(
+                        "UPDATE search_parameters SET status = 'ready' \
+                         WHERE {}package_id = $1 AND base = $2 AND url = $3 AND status = 'pending'",
+                        self.scope.and()
+                    ),
                     &[&package_id, &base, &url],
                 )
                 .map_err(definite)?;
@@ -753,8 +858,11 @@ impl ConformanceStore for PostgresPersistence {
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
             tx.execute(
-                "UPDATE search_parameters SET status = 'ready' \
-             WHERE package_id = $1 AND base = $2 AND status = 'pending'",
+                &format!(
+                    "UPDATE search_parameters SET status = 'ready' \
+                     WHERE {}package_id = $1 AND base = $2 AND status = 'pending'",
+                    self.scope.and()
+                ),
                 &[&package_id, &base],
             )
             .map_err(definite)?;
@@ -775,29 +883,42 @@ impl ConformanceStore for PostgresPersistence {
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
             let row = tx
-            .query_one(
-                "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done) \
-                 VALUES ($1, $2, $3, NULL, 0) RETURNING id",
-                &[&package_id, &watermark_ts, &tablet],
-            )
-            .map_err(definite)?;
+                .query_one(
+                    &format!(
+                        "INSERT INTO index_backfills \
+                     ({}package_id, watermark_ts, tablet, cursor_id, done) \
+                     VALUES ({}$1, $2, $3, NULL, 0) RETURNING id",
+                        self.scope.cols(),
+                        self.scope.vals()
+                    ),
+                    &[&package_id, &watermark_ts, &tablet],
+                )
+                .map_err(definite)?;
             let backfill_id: i64 = row.get(0);
             if urls.is_empty() {
                 tx.execute(
-                    "INSERT INTO backfill_parameter (backfill_id, url) \
-                 SELECT $1, url FROM search_parameters \
-                 WHERE package_id = $2 AND base = $3 AND status = 'pending'",
+                    &format!(
+                        "INSERT INTO backfill_parameter ({}backfill_id, url) \
+                         SELECT {}$1, url FROM search_parameters \
+                         WHERE {}package_id = $2 AND base = $3 AND status = 'pending'",
+                        self.scope.cols(),
+                        self.scope.vals(),
+                        self.scope.and()
+                    ),
                     &[&backfill_id, &package_id, &tablet],
                 )
                 .map_err(definite)?;
             } else {
+                let insert = format!(
+                    "INSERT INTO backfill_parameter ({}backfill_id, url) VALUES ({}$1, $2) \
+                     ON CONFLICT {} DO NOTHING",
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.conflict("backfill_id, url")
+                );
                 for url in urls {
-                    tx.execute(
-                        "INSERT INTO backfill_parameter (backfill_id, url) VALUES ($1, $2) \
-                     ON CONFLICT (backfill_id, url) DO NOTHING",
-                        &[&backfill_id, url],
-                    )
-                    .map_err(definite)?;
+                    tx.execute(&insert, &[&backfill_id, url])
+                        .map_err(definite)?;
                 }
             }
             tx.commit().map_err(definite)?;
@@ -822,9 +943,14 @@ impl ConformanceStore for PostgresPersistence {
             // The jobs are numbered in the order of `tablets`, which is the order they run in.
             let ids: Vec<i64> = tx
                 .query(
-                    "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done) \
-                     SELECT $1, $2, tablet, NULL, 0 FROM UNNEST($3::text[]) AS tablets(tablet) \
-                     RETURNING id",
+                    &format!(
+                        "INSERT INTO index_backfills \
+                         ({}package_id, watermark_ts, tablet, cursor_id, done) \
+                         SELECT {}$1, $2, tablet, NULL, 0 FROM UNNEST($3::text[]) AS tablets(tablet) \
+                         RETURNING id",
+                        self.scope.cols(),
+                        self.scope.vals()
+                    ),
                     &[&package_id, &watermark_ts, &tablets],
                 )
                 .map_err(definite)?
@@ -832,11 +958,18 @@ impl ConformanceStore for PostgresPersistence {
                 .map(|row| row.get(0))
                 .collect();
             tx.execute(
-                "INSERT INTO backfill_parameter (backfill_id, url) \
-                 SELECT job.id, parameter.url FROM index_backfills job \
-                 JOIN search_parameters parameter ON parameter.package_id = job.package_id \
-                  AND parameter.base = job.tablet AND parameter.status = 'pending' \
-                 WHERE job.id = ANY($1)",
+                &format!(
+                    "INSERT INTO backfill_parameter ({}backfill_id, url) \
+                     SELECT {}job.id, parameter.url FROM index_backfills job \
+                     JOIN search_parameters parameter \
+                       ON {}parameter.package_id = job.package_id \
+                      AND parameter.base = job.tablet AND parameter.status = 'pending' \
+                     WHERE {}job.id = ANY($1)",
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.and_in("parameter"),
+                    self.scope.and_in("job")
+                ),
                 &[&ids],
             )
             .map_err(definite)?;
@@ -858,8 +991,11 @@ impl ConformanceStore for PostgresPersistence {
             // The same checks as claiming each job, on all of them under one lock.
             let rows = tx
                 .query(
-                    "SELECT id, done, claimed_epoch FROM index_backfills \
-                     WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+                    &format!(
+                        "SELECT id, done, claimed_epoch FROM index_backfills \
+                         WHERE {}id = ANY($1) ORDER BY id FOR UPDATE",
+                        self.scope.and()
+                    ),
                     &[&ids],
                 )
                 .map_err(definite)?;
@@ -884,20 +1020,29 @@ impl ConformanceStore for PostgresPersistence {
             // What `complete_backfill` does for each job: the parameters snapshotted onto it
             // become ready, or every pending one of its package and type when it has no snapshot.
             tx.execute(
-                "UPDATE search_parameters parameter SET status = 'ready' \
-                 FROM index_backfills job \
-                 WHERE job.id = ANY($1) AND parameter.package_id = job.package_id \
-                   AND parameter.base = job.tablet AND parameter.status = 'pending' \
-                   AND (NOT EXISTS (SELECT 1 FROM backfill_parameter snapshot \
-                                    WHERE snapshot.backfill_id = job.id) \
-                        OR EXISTS (SELECT 1 FROM backfill_parameter snapshot \
-                                   WHERE snapshot.backfill_id = job.id \
-                                     AND snapshot.url = parameter.url))",
+                &format!(
+                    "UPDATE search_parameters parameter SET status = 'ready' \
+                     FROM index_backfills job \
+                     WHERE {job}job.id = ANY($1) AND {parameter}parameter.package_id = job.package_id \
+                       AND parameter.base = job.tablet AND parameter.status = 'pending' \
+                       AND (NOT EXISTS (SELECT 1 FROM backfill_parameter snapshot \
+                                        WHERE {snapshot}snapshot.backfill_id = job.id) \
+                            OR EXISTS (SELECT 1 FROM backfill_parameter snapshot \
+                                       WHERE {snapshot}snapshot.backfill_id = job.id \
+                                         AND snapshot.url = parameter.url))",
+                    job = self.scope.and_in("job"),
+                    parameter = self.scope.and_in("parameter"),
+                    snapshot = self.scope.and_in("snapshot"),
+                ),
                 &[&open],
             )
             .map_err(definite)?;
             tx.execute(
-                "UPDATE index_backfills SET claimed_epoch = $1, done = 1 WHERE id = ANY($2)",
+                &format!(
+                    "UPDATE index_backfills SET claimed_epoch = $1, done = 1 \
+                     WHERE {}id = ANY($2)",
+                    self.scope.and()
+                ),
                 &[&ours, &open],
             )
             .map_err(definite)?;
@@ -919,7 +1064,10 @@ impl ConformanceStore for PostgresPersistence {
             self.fence(&mut tx)?;
             let done_flag: i32 = if done { 1 } else { 0 };
             tx.execute(
-                "UPDATE index_backfills SET cursor_id = $1, done = $2 WHERE id = $3",
+                &format!(
+                    "UPDATE index_backfills SET cursor_id = $1, done = $2 WHERE {}id = $3",
+                    self.scope.and()
+                ),
                 &[&cursor_id, &done_flag, &id],
             )
             .map_err(definite)?;
@@ -933,8 +1081,11 @@ impl ConformanceStore for PostgresPersistence {
             let rows = guard
                 .client
                 .query(
-                    "SELECT id, package_id, watermark_ts, tablet, cursor_id, done, claimed_epoch \
-                 FROM index_backfills ORDER BY id",
+                    &format!(
+                        "SELECT id, package_id, watermark_ts, tablet, cursor_id, done, \
+                         claimed_epoch FROM index_backfills{} ORDER BY id",
+                        self.scope.where_only()
+                    ),
                     &[],
                 )
                 .map_err(definite)?;
@@ -965,7 +1116,11 @@ impl ConformanceStore for PostgresPersistence {
             let ours = self.lease.epoch().unwrap_or(0) as i64;
             let row = tx
                 .query_opt(
-                    "SELECT done, claimed_epoch FROM index_backfills WHERE id = $1 FOR UPDATE",
+                    &format!(
+                        "SELECT done, claimed_epoch FROM index_backfills \
+                         WHERE {}id = $1 FOR UPDATE",
+                        self.scope.and()
+                    ),
                     &[&id],
                 )
                 .map_err(definite)?;
@@ -983,7 +1138,10 @@ impl ConformanceStore for PostgresPersistence {
                 )));
             }
             tx.execute(
-                "UPDATE index_backfills SET claimed_epoch = $1 WHERE id = $2",
+                &format!(
+                    "UPDATE index_backfills SET claimed_epoch = $1 WHERE {}id = $2",
+                    self.scope.and()
+                ),
                 &[&ours, &id],
             )
             .map_err(definite)?;
@@ -995,10 +1153,16 @@ impl ConformanceStore for PostgresPersistence {
 
 fn install_in_tx(
     tx: &mut Transaction<'_>,
+    scope: Scope,
     package: &NewPackage,
 ) -> Result<(InstallOutcome, usize), InstallError> {
-    let mut installer =
-        Installer::begin(tx, &package.name, &package.version, &package.fhir_version)?;
+    let mut installer = Installer::begin(
+        tx,
+        scope,
+        &package.name,
+        &package.version,
+        &package.fhir_version,
+    )?;
     installer.structure_definitions(&package.structure_definitions)?;
     installer.search_parameters(&package.search_parameters)?;
     installer.terminology(&package.terminology)?;
@@ -1015,6 +1179,7 @@ fn install_in_tx(
 /// once is the rows of one call, however large the package.
 struct Installer<'a, 'c> {
     tx: &'a mut Transaction<'c>,
+    scope: Scope,
     package_id: i64,
     /// Whether the package was there before this install.
     existing: bool,
@@ -1028,13 +1193,17 @@ struct Installer<'a, 'c> {
 impl<'a, 'c> Installer<'a, 'c> {
     fn begin(
         tx: &'a mut Transaction<'c>,
+        scope: Scope,
         name: &str,
         version: &str,
         fhir_version: &str,
     ) -> Result<Self, InstallError> {
         let existing = tx
             .query_opt(
-                "SELECT id FROM packages WHERE name = $1 AND version = $2",
+                &format!(
+                    "SELECT id FROM packages WHERE {}name = $1 AND version = $2",
+                    scope.and()
+                ),
                 &[&name, &version],
             )
             .map_err(definite)?;
@@ -1042,6 +1211,7 @@ impl<'a, 'c> Installer<'a, 'c> {
             let package_id: i64 = row.get(0);
             return Ok(Self {
                 tx,
+                scope,
                 package_id,
                 existing: true,
                 newly_pending: Vec::new(),
@@ -1050,7 +1220,13 @@ impl<'a, 'c> Installer<'a, 'c> {
             });
         }
         let current = tx
-            .query_opt("SELECT fhir_version FROM packages LIMIT 1", &[])
+            .query_opt(
+                &format!(
+                    "SELECT fhir_version FROM packages{} LIMIT 1",
+                    scope.where_only()
+                ),
+                &[],
+            )
             .map_err(definite)?;
         if let Some(row) = current {
             let existing: String = row.get(0);
@@ -1063,14 +1239,19 @@ impl<'a, 'c> Installer<'a, 'c> {
         }
         let inserted = tx
             .query_one(
-                "INSERT INTO packages (name, version, fhir_version) VALUES ($1, $2, $3) \
-                 RETURNING id",
+                &format!(
+                    "INSERT INTO packages ({}name, version, fhir_version) VALUES ({}$1, $2, $3) \
+                     RETURNING id",
+                    scope.cols(),
+                    scope.vals()
+                ),
                 &[&name, &version, &fhir_version],
             )
             .map_err(definite)?;
         let package_id: i64 = inserted.get(0);
         Ok(Self {
             tx,
+            scope,
             package_id,
             existing: false,
             newly_pending: Vec::new(),
@@ -1087,7 +1268,10 @@ impl<'a, 'c> Installer<'a, 'c> {
         if !self.expansions_cleared {
             self.tx
                 .execute(
-                    "DELETE FROM value_set_expansion WHERE package_id = $1",
+                    &format!(
+                        "DELETE FROM value_set_expansion WHERE {}package_id = $1",
+                        self.scope.and()
+                    ),
                     &[&self.package_id],
                 )
                 .map_err(definite)?;
@@ -1120,7 +1304,7 @@ impl PackageRows for Installer<'_, '_> {
             return Ok(());
         }
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        insert_structure_definitions(self.tx, self.package_id, rows)
+        insert_structure_definitions(self.tx, self.scope, self.package_id, rows)
     }
 
     fn search_parameters(&mut self, rows: &[NewSearchParameter]) -> Result<(), InstallError> {
@@ -1128,20 +1312,20 @@ impl PackageRows for Installer<'_, '_> {
             return Ok(());
         }
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        let pending = insert_search_parameters(self.tx, self.package_id, rows)?;
+        let pending = insert_search_parameters(self.tx, self.scope, self.package_id, rows)?;
         self.newly_pending.extend(pending);
         Ok(())
     }
 
     fn terminology(&mut self, rows: &[NewTerminology]) -> Result<(), InstallError> {
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        insert_terminology(self.tx, self.package_id, rows)
+        insert_terminology(self.tx, self.scope, self.package_id, rows)
     }
 
     fn expansions(&mut self, rows: &[NewExpansion]) -> Result<(), InstallError> {
         self.clear_expansions()?;
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        insert_expansions(self.tx, self.package_id, rows)
+        insert_expansions(self.tx, self.scope, self.package_id, rows)
     }
 }
 
@@ -1191,9 +1375,19 @@ fn runs_within<T>(rows: &[T], limit: usize, size: impl Fn(&T) -> usize) -> Vec<&
 
 fn insert_structure_definitions(
     tx: &mut Transaction<'_>,
+    scope: Scope,
     package_id: i64,
     definitions: &[NewStructureDefinition],
 ) -> Result<(), InstallError> {
+    let insert = format!(
+        "INSERT INTO structure_definitions \
+         ({}package_id, url, type_name, kind, is_abstract, json) \
+         SELECT {}$1, url, type_name, kind, is_abstract, json \
+         FROM UNNEST($2::text[], $3::text[], $4::text[], $5::int4[], $6::text[]) \
+              AS rows(url, type_name, kind, is_abstract, json)",
+        scope.cols(),
+        scope.vals()
+    );
     for run in runs(definitions, |row| row.json.len() + row.url.len()) {
         let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
         let types: Vec<&str> = run.iter().map(|row| row.type_name.as_str()).collect();
@@ -1201,11 +1395,7 @@ fn insert_structure_definitions(
         let flags: Vec<i32> = run.iter().map(|row| i32::from(row.is_abstract)).collect();
         let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         tx.execute(
-            "INSERT INTO structure_definitions \
-             (package_id, url, type_name, kind, is_abstract, json) \
-             SELECT $1, url, type_name, kind, is_abstract, json \
-             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::int4[], $6::text[]) \
-                  AS rows(url, type_name, kind, is_abstract, json)",
+            &insert,
             &[&package_id, &urls, &types, &kinds, &flags, &documents],
         )
         .map_err(definite)?;
@@ -1218,6 +1408,7 @@ fn insert_structure_definitions(
 /// query for all of them, not one per parameter.
 fn insert_search_parameters(
     tx: &mut Transaction<'_>,
+    scope: Scope,
     package_id: i64,
     parameters: &[NewSearchParameter],
 ) -> Result<Vec<refhir_persistence::PendingParam>, InstallError> {
@@ -1228,9 +1419,12 @@ fn insert_search_parameters(
     let codes: Vec<&str> = parameters.iter().map(|row| row.code.as_str()).collect();
     let stored = tx
         .query(
-            "SELECT base, code, package_id, url, COALESCE(expression, ''), status, json \
-             FROM search_parameters \
-             WHERE (base, code) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+            &format!(
+                "SELECT base, code, package_id, url, COALESCE(expression, ''), status, json \
+                 FROM search_parameters \
+                 WHERE {}(base, code) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+                scope.and()
+            ),
             &[&bases, &codes],
         )
         .map_err(definite)?
@@ -1250,8 +1444,11 @@ fn insert_search_parameters(
     let plan = plan_package_parameters(package_id, parameters, stored)?;
     for removal in &plan.removals {
         tx.execute(
-            "DELETE FROM search_parameters \
-             WHERE package_id = $1 AND url = $2 AND base = $3 AND code = $4",
+            &format!(
+                "DELETE FROM search_parameters \
+                 WHERE {}package_id = $1 AND url = $2 AND base = $3 AND code = $4",
+                scope.and()
+            ),
             &[
                 &removal.package_id,
                 &removal.url,
@@ -1282,12 +1479,16 @@ fn insert_search_parameters(
         let statuses: Vec<&str> = rows.iter().map(|(_, status)| status.as_str()).collect();
         let documents: Vec<&str> = rows.iter().map(|(row, _)| row.json.as_str()).collect();
         tx.execute(
-            "INSERT INTO search_parameters \
-             (package_id, url, base, code, param_type, expression, status, json) \
-             SELECT $1, url, base, code, param_type, expression, status, json \
-             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], \
-                         $7::text[], $8::text[]) \
-                  AS rows(url, base, code, param_type, expression, status, json)",
+            &format!(
+                "INSERT INTO search_parameters \
+                 ({}package_id, url, base, code, param_type, expression, status, json) \
+                 SELECT {}$1, url, base, code, param_type, expression, status, json \
+                 FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], \
+                             $7::text[], $8::text[]) \
+                      AS rows(url, base, code, param_type, expression, status, json)",
+                scope.cols(),
+                scope.vals()
+            ),
             &[
                 &package_id,
                 &urls,
@@ -1306,6 +1507,7 @@ fn insert_search_parameters(
 
 fn insert_terminology(
     tx: &mut Transaction<'_>,
+    scope: Scope,
     package_id: i64,
     rows: &[NewTerminology],
 ) -> Result<(), InstallError> {
@@ -1315,10 +1517,15 @@ fn insert_terminology(
         let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         // The first of two rows for one URL stays, as it did when they went in one at a time.
         tx.execute(
-            "INSERT INTO terminology (package_id, resource_type, url, json) \
-             SELECT $1, resource_type, url, json \
-             FROM UNNEST($2::text[], $3::text[], $4::text[]) AS rows(resource_type, url, json) \
-             ON CONFLICT (package_id, url) DO NOTHING",
+            &format!(
+                "INSERT INTO terminology ({}package_id, resource_type, url, json) \
+                 SELECT {}$1, resource_type, url, json \
+                 FROM UNNEST($2::text[], $3::text[], $4::text[]) AS rows(resource_type, url, json) \
+                 ON CONFLICT {} DO NOTHING",
+                scope.cols(),
+                scope.vals(),
+                scope.conflict("package_id, url")
+            ),
             &[&package_id, &types, &urls, &documents],
         )
         .map_err(definite)?;
@@ -1328,6 +1535,7 @@ fn insert_terminology(
 
 fn insert_expansions(
     tx: &mut Transaction<'_>,
+    scope: Scope,
     package_id: i64,
     rows: &[NewExpansion],
 ) -> Result<(), InstallError> {
@@ -1335,8 +1543,12 @@ fn insert_expansions(
         let urls: Vec<&str> = run.iter().map(|row| row.url.as_str()).collect();
         let documents: Vec<&str> = run.iter().map(|row| row.json.as_str()).collect();
         tx.execute(
-            "INSERT INTO value_set_expansion (package_id, url, json) \
-             SELECT $1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)",
+            &format!(
+                "INSERT INTO value_set_expansion ({}package_id, url, json) \
+                 SELECT {}$1, url, json FROM UNNEST($2::text[], $3::text[]) AS rows(url, json)",
+                scope.cols(),
+                scope.vals()
+            ),
             &[&package_id, &urls, &documents],
         )
         .map_err(definite)?;

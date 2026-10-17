@@ -19,11 +19,11 @@ use crate::tenant::TENANT_TABLES;
 use crate::tests::{fresh_database, test_url};
 use crate::{create_tenant, list_tenants, ConnectOptions, PostgresPersistence, Scope};
 
-fn client(url: &str) -> Client {
+pub(crate) fn client(url: &str) -> Client {
     Client::connect(url, NoTls).expect("connect")
 }
 
-fn open(url: &str, tenant: &str) -> PostgresPersistence {
+pub(crate) fn open(url: &str, tenant: &str) -> PostgresPersistence {
     PostgresPersistence::connect_with(
         url,
         &ConnectOptions {
@@ -45,7 +45,7 @@ fn refusal(result: Result<PostgresPersistence, PersistError>) -> String {
 }
 
 /// A new database in the shared layout holding these tenants.
-fn shared(admin: &str, tag: &str, tenants: &[&str]) -> String {
+pub(crate) fn shared(admin: &str, tag: &str, tenants: &[&str]) -> String {
     let url = fresh_database(admin, tag);
     for name in tenants {
         create_tenant(&url, name).unwrap_or_else(|err| panic!("create {name}: {err}"));
@@ -53,7 +53,7 @@ fn shared(admin: &str, tag: &str, tenants: &[&str]) -> String {
     url
 }
 
-fn tenant_id(url: &str, name: &str) -> i32 {
+pub(crate) fn tenant_id(url: &str, name: &str) -> i32 {
     client(url)
         .query_one("SELECT id FROM refhir_tenants WHERE name = $1", &[&name])
         .expect("tenant")
@@ -62,7 +62,7 @@ fn tenant_id(url: &str, name: &str) -> i32 {
 
 /// One digest per table of everything a tenant holds, with the tenant column left out so that two
 /// tenants that did the same thing digest the same (for tables whose ids come from no sequence).
-fn digests(url: &str, tenant: &str) -> Vec<(&'static str, String)> {
+pub(crate) fn digests(url: &str, tenant: &str) -> Vec<(&'static str, String)> {
     let id = tenant_id(url, tenant);
     let mut client = client(url);
     TENANT_TABLES
@@ -84,7 +84,7 @@ fn digests(url: &str, tenant: &str) -> Vec<(&'static str, String)> {
         .collect()
 }
 
-fn rows_of(url: &str, tenant: &str, table: &str) -> i64 {
+pub(crate) fn rows_of(url: &str, tenant: &str, table: &str) -> i64 {
     client(url)
         .query_one(
             &format!(
@@ -97,7 +97,7 @@ fn rows_of(url: &str, tenant: &str, table: &str) -> i64 {
         .get(0)
 }
 
-fn suite(p: &PostgresPersistence) {
+pub(crate) fn suite(p: &PostgresPersistence) {
     conformance::exercise(p);
     conformance::exercise_index_scan_ids(p);
 }
@@ -107,7 +107,7 @@ fn suite(p: &PostgresPersistence) {
 /// suite's own data, which a statement that forgot its tenant would mostly still get right by luck)
 /// a newer row wherever another tenant looks. Any read that reaches across tenants returns a decoy,
 /// or the wrong newest timestamp, and a suite that asserts exact results fails.
-fn decoy(url: &str, tenant: &str) {
+pub(crate) fn decoy(url: &str, tenant: &str) {
     let id = tenant_id(url, tenant);
     client(url)
         .batch_execute(&format!(

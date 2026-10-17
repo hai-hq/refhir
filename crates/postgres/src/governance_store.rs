@@ -10,7 +10,36 @@ use refhir_persistence::{
 /// at the same time take turns and make one chain. (The schema is migrated under 7428310.)
 const CHAIN_LOCK: i64 = 7428312;
 
+use crate::scope::Scope;
 use crate::{definite, PostgresPersistence};
+
+/// Takes the lock that serializes extending (or pruning) an audit chain, for the rest of the
+/// transaction. A tenant has a chain of its own, so it takes a lock of its own: the two-part key
+/// `(CHAIN_LOCK, tenant id)`, a different space from the single key the classic layout uses.
+fn lock_chain(tx: &mut postgres::Transaction<'_>, scope: Scope) -> Result<(), PersistError> {
+    match scope {
+        Scope::Classic => tx.execute("SELECT pg_advisory_xact_lock($1)", &[&CHAIN_LOCK]),
+        Scope::Tenant(id) => tx.execute(
+            "SELECT pg_advisory_xact_lock($1, $2)",
+            &[&(CHAIN_LOCK as i32), &id],
+        ),
+    }
+    .map(drop)
+    .map_err(definite)
+}
+
+/// A filter's ` WHERE`, with the tenant's condition in front of it (or alone when the filter has
+/// none).
+fn filtered(scope: Scope, clause: &Where) -> String {
+    let rest = clause.sql(true, 1);
+    match (scope, rest.strip_prefix(" WHERE ")) {
+        (Scope::Classic, _) => rest,
+        (Scope::Tenant(id), None) => format!(" WHERE instance_id = {id}"),
+        (Scope::Tenant(id), Some(conditions)) => {
+            format!(" WHERE instance_id = {id} AND {conditions}")
+        }
+    }
+}
 
 const AUDIT_COLUMNS: &str = "id, ts, request_id, source, action, subtype, outcome, status, \
      principal, client_id, user_id, fhir_user, remote_ip, resource_type, resource_id, patient, \
@@ -107,11 +136,11 @@ impl GovernanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             let stmt = tx
-                .prepare(
-                    "INSERT INTO usage_daily (period_day, principal, request_class, requests, \
+                .prepare(&format!(
+                    "INSERT INTO usage_daily ({}period_day, principal, request_class, requests, \
                      client_errors, server_errors, throttled, bytes_in, bytes_out, duration_ms) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-                     ON CONFLICT (period_day, principal, request_class) DO UPDATE SET \
+                     VALUES ({}$1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+                     ON CONFLICT {} DO UPDATE SET \
                      requests = usage_daily.requests + EXCLUDED.requests, \
                      client_errors = usage_daily.client_errors + EXCLUDED.client_errors, \
                      server_errors = usage_daily.server_errors + EXCLUDED.server_errors, \
@@ -119,7 +148,10 @@ impl GovernanceStore for PostgresPersistence {
                      bytes_in = usage_daily.bytes_in + EXCLUDED.bytes_in, \
                      bytes_out = usage_daily.bytes_out + EXCLUDED.bytes_out, \
                      duration_ms = usage_daily.duration_ms + EXCLUDED.duration_ms",
-                )
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.conflict("period_day, principal, request_class")
+                ))
                 .map_err(definite)?;
             for row in rows {
                 tx.execute(
@@ -149,7 +181,7 @@ impl GovernanceStore for PostgresPersistence {
             let sql = format!(
                 "SELECT {USAGE_COLUMNS} FROM usage_daily{} \
                  ORDER BY period_day DESC, principal, request_class LIMIT {}",
-                clause.sql(true, 1),
+                filtered(self.scope, &clause),
                 filter.limit.clamp(1, 10_000)
             );
             let values = bind(&clause);
@@ -167,11 +199,13 @@ impl GovernanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             let stmt = tx
-                .prepare(
-                    "INSERT INTO request_log (ts, request_id, principal, remote_ip, method, \
+                .prepare(&format!(
+                    "INSERT INTO request_log ({}ts, request_id, principal, remote_ip, method, \
                      path, params, request_class, status, duration_ms, bytes_in, bytes_out) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
-                )
+                     VALUES ({}$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    self.scope.cols(),
+                    self.scope.vals()
+                ))
                 .map_err(definite)?;
             for row in rows {
                 tx.execute(
@@ -205,7 +239,7 @@ impl GovernanceStore for PostgresPersistence {
             let clause = filter.to_where();
             let sql = format!(
                 "SELECT {REQUEST_COLUMNS} FROM request_log{} ORDER BY id DESC LIMIT {}",
-                clause.sql(true, 1),
+                filtered(self.scope, &clause),
                 filter.limit.clamp(1, 10_000)
             );
             let values = bind(&clause);
@@ -224,21 +258,28 @@ impl GovernanceStore for PostgresPersistence {
             let mut tx = guard.client.transaction().map_err(definite)?;
             // Every server that extends the chain takes this first, so the hash read below is
             // still the last one when the rows that follow it are inserted.
-            tx.execute("SELECT pg_advisory_xact_lock($1)", &[&CHAIN_LOCK])
-                .map_err(definite)?;
+            lock_chain(&mut tx, self.scope)?;
             let mut previous: Vec<u8> = tx
-                .query_opt("SELECT hash FROM audit_log ORDER BY id DESC LIMIT 1", &[])
+                .query_opt(
+                    &format!(
+                        "SELECT hash FROM audit_log{} ORDER BY id DESC LIMIT 1",
+                        self.scope.where_only()
+                    ),
+                    &[],
+                )
                 .map_err(definite)?
                 .and_then(|row| row.get::<_, Option<Vec<u8>>>(0))
                 .unwrap_or_else(|| CHAIN_GENESIS.to_vec());
             let stmt = tx
-                .prepare(
-                    "INSERT INTO audit_log (ts, request_id, source, action, subtype, outcome, \
+                .prepare(&format!(
+                    "INSERT INTO audit_log ({}ts, request_id, source, action, subtype, outcome, \
                      status, principal, client_id, user_id, fhir_user, remote_ip, resource_type, \
                      resource_id, patient, query, detail, prev_hash, hash) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
+                     VALUES ({}$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, \
                      $16, $17, $18, $19)",
-                )
+                    self.scope.cols(),
+                    self.scope.vals()
+                ))
                 .map_err(definite)?;
             for row in rows {
                 let hash = audit_digest(key, &previous, row).to_vec();
@@ -278,7 +319,7 @@ impl GovernanceStore for PostgresPersistence {
             let clause = filter.to_where();
             let sql = format!(
                 "SELECT {AUDIT_COLUMNS} FROM audit_log{} ORDER BY id DESC LIMIT {}",
-                clause.sql(true, 1),
+                filtered(self.scope, &clause),
                 filter.limit.clamp(1, 10_000)
             );
             let values = bind(&clause);
@@ -295,8 +336,9 @@ impl GovernanceStore for PostgresPersistence {
                 .client
                 .query(
                     &format!(
-                        "SELECT {AUDIT_COLUMNS}, prev_hash, hash FROM audit_log WHERE id > $1 \
-                         ORDER BY id ASC LIMIT $2"
+                        "SELECT {AUDIT_COLUMNS}, prev_hash, hash FROM audit_log \
+                         WHERE {}id > $1 ORDER BY id ASC LIMIT $2",
+                        self.scope.and()
                     ),
                     &[&sql_int(after_id), &i64::from(limit)],
                 )
@@ -318,7 +360,11 @@ impl GovernanceStore for PostgresPersistence {
             let row = guard
                 .client
                 .query_opt(
-                    "SELECT id, hash FROM audit_log WHERE hash IS NOT NULL ORDER BY id DESC LIMIT 1",
+                    &format!(
+                        "SELECT id, hash FROM audit_log WHERE {}hash IS NOT NULL \
+                         ORDER BY id DESC LIMIT 1",
+                        self.scope.and()
+                    ),
                     &[],
                 )
                 .map_err(definite)?;
@@ -335,19 +381,31 @@ impl GovernanceStore for PostgresPersistence {
             let mut tx = guard.client.transaction().map_err(definite)?;
             tx.execute(
                 &format!(
-                    "INSERT INTO governance_members (owner, seen_ms) VALUES ($1, {NOW}) \
-                     ON CONFLICT (owner) DO UPDATE SET seen_ms = EXCLUDED.seen_ms"
+                    "INSERT INTO governance_members ({}owner, seen_ms) VALUES ({}$1, {NOW}) \
+                     ON CONFLICT {} DO UPDATE SET seen_ms = EXCLUDED.seen_ms",
+                    self.scope.cols(),
+                    self.scope.vals(),
+                    self.scope.conflict("owner")
                 ),
                 &[&owner],
             )
             .map_err(definite)?;
             tx.execute(
-                &format!("DELETE FROM governance_members WHERE seen_ms < {NOW} - $1"),
+                &format!(
+                    "DELETE FROM governance_members WHERE {}seen_ms < {NOW} - $1",
+                    self.scope.and()
+                ),
                 &[&sql_int(ttl_ms)],
             )
             .map_err(definite)?;
             let count: i64 = tx
-                .query_one("SELECT count(*) FROM governance_members", &[])
+                .query_one(
+                    &format!(
+                        "SELECT count(*) FROM governance_members{}",
+                        self.scope.where_only()
+                    ),
+                    &[],
+                )
                 .map_err(definite)?
                 .get(0);
             tx.commit().map_err(definite)?;
@@ -360,7 +418,13 @@ impl GovernanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             guard
                 .client
-                .execute("DELETE FROM governance_members WHERE owner = $1", &[&owner])
+                .execute(
+                    &format!(
+                        "DELETE FROM governance_members WHERE {}owner = $1",
+                        self.scope.and()
+                    ),
+                    &[&owner],
+                )
                 .map_err(definite)?;
             Ok(())
         })
@@ -377,20 +441,28 @@ impl GovernanceStore for PostgresPersistence {
             let mut pruned = Pruned::default();
             if let Some(before) = request_log_before_ms {
                 pruned.request_log = tx
-                    .execute("DELETE FROM request_log WHERE ts < $1", &[&sql_int(before)])
+                    .execute(
+                        &format!("DELETE FROM request_log WHERE {}ts < $1", self.scope.and()),
+                        &[&sql_int(before)],
+                    )
                     .map_err(definite)?;
             }
             if let Some(before) = audit_before_ms {
                 // From the start of the trail only, so that no gap is left in the chain: see
                 // `GovernanceStore::prune`. Under the chain lock, so that nothing is appended
                 // between the deletion's reads and its writes.
-                tx.execute("SELECT pg_advisory_xact_lock($1)", &[&CHAIN_LOCK])
-                    .map_err(definite)?;
+                lock_chain(&mut tx, self.scope)?;
+                // The tenant is in the deletion and in the subselect that finds the first row to
+                // keep: scoped only outside, another tenant's newer rows would hold that row
+                // back; scoped only inside, the deletion would take other tenants' rows.
+                let scoped = self.scope.and();
                 pruned.audit = tx
                     .execute(
-                        "DELETE FROM audit_log WHERE ts < $1 AND id < \
-                         COALESCE((SELECT min(id) FROM audit_log WHERE ts >= $1), \
-                                  9223372036854775807)",
+                        &format!(
+                            "DELETE FROM audit_log WHERE {scoped}ts < $1 AND id < \
+                             COALESCE((SELECT min(id) FROM audit_log WHERE {scoped}ts >= $1), \
+                                      9223372036854775807)"
+                        ),
                         &[&sql_int(before)],
                     )
                     .map_err(definite)?;
