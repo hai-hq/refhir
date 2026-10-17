@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::package::{
-    package_identity, package_root, publish, read_manifest, run_backfills, stage_package_deferred,
+    finish_install, package_identity, package_root, read_manifest, run_backfills,
+    stage_package_deferred,
 };
 use crate::run::RunResult;
 use crate::s3::S3Source;
@@ -53,10 +54,36 @@ pub struct NpmRegistry {
     pub base_url: String,
     pub cache_dir: PathBuf,
     s3: Option<S3Source>,
+    /// Whether this registry may be reached at all. A server does not download packages unless
+    /// it was told it may (see [`package_downloads_allowed`]).
+    allow_download: bool,
+}
+
+/// The environment variable that lets a server download packages. `[conformance].package_download`
+/// sets it.
+pub const DOWNLOAD_VARIABLE: &str = "REFHIR_PACKAGE_DOWNLOAD";
+
+/// Whether this server was told it may download packages. It may not unless it was: packages come
+/// from a file prepared ahead of time (see `prepared.rs`), or from a directory or a `.tgz`.
+pub fn package_downloads_allowed() -> bool {
+    std::env::var(DOWNLOAD_VARIABLE)
+        .ok()
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// What is said when a package would have to be downloaded and the server may not.
+fn download_refused(name: &str, version: &str) -> FhirError {
+    FhirError::Forbidden(format!(
+        "{name}@{version} is not installed, and this server does not download packages. \
+         Set [conformance].package_download = true (or {DOWNLOAD_VARIABLE}=true) to let it, \
+         or install the package from a directory or a .tgz"
+    ))
 }
 
 impl NpmRegistry {
-    /// `REFHIR_PACKAGE_REGISTRY` (default packages.fhir.org) and `REFHIR_PACKAGE_CACHE`.
+    /// `REFHIR_PACKAGE_REGISTRY` (default packages.fhir.org) and `REFHIR_PACKAGE_CACHE`. It
+    /// downloads only if the server may (see [`package_downloads_allowed`]); a package that is
+    /// already in the cache is used either way.
     pub fn from_env() -> Result<Self, FhirError> {
         let base_url = std::env::var("REFHIR_PACKAGE_REGISTRY")
             .ok()
@@ -67,21 +94,31 @@ impl NpmRegistry {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".refhir/packages"));
-        Self::new(&base_url, cache_dir)
+        Ok(Self::new(&base_url, cache_dir)?.allowing_download(package_downloads_allowed()))
     }
 
+    /// A registry that downloads: building one says the caller wants to reach it.
     pub fn new(location: &str, cache_dir: PathBuf) -> Result<Self, FhirError> {
         let s3 = S3Source::from_location(location).transpose()?;
         Ok(Self {
             base_url: location.trim_end_matches('/').to_string(),
             cache_dir,
             s3,
+            allow_download: true,
         })
+    }
+
+    pub fn allowing_download(mut self, allow: bool) -> Self {
+        self.allow_download = allow;
+        self
     }
 }
 
 impl PackageFetcher for NpmRegistry {
     fn fetch(&self, name: &str, version: &str, dest: &Path) -> Result<(), FhirError> {
+        if !self.allow_download {
+            return Err(download_refused(name, version));
+        }
         let bytes = match &self.s3 {
             Some(s3) => {
                 let object = s3.object(name, version);
@@ -281,7 +318,12 @@ fn install_tree(
     if already_installed(store, &name, &version)? {
         return run_backfills(store, db, catalog);
     }
-    let order = Resolver::new(store, fetcher, cache)?.resolve(root, name, version)?;
+    let installed = store
+        .load_packages()
+        .map_err(FhirError::from)?
+        .into_iter()
+        .map(|package| (package.name, package.version));
+    let order = Resolver::new(installed, fetcher, cache).resolve(root, name, version)?;
     // Store every package first and rebuild the catalog once at the end: the rebuild grows
     // with the catalog, so doing it after each package of a large tree costs minutes.
     let mut staged = false;
@@ -304,29 +346,14 @@ fn install_tree(
         // Nothing new, but an earlier attempt may have left backfills behind.
         return run_backfills(store, db, catalog);
     }
-    // Packages already stored must reach the catalog and get their backfills even when a later
-    // one failed; otherwise their search parameters stay pending until the next restart. The
-    // backfill jobs are queued only after the publish, so the watermark they record is not
-    // older than the catalog writers use.
-    let finish = || -> Result<(), FhirError> {
-        let started = std::time::Instant::now();
-        publish(store, catalog)?;
-        tracing::info!(target: ENGINE, "rebuilt the catalog in {:.1?}", started.elapsed());
-        for backfill in &pending {
-            backfill.create(store, db)?;
-        }
-        run_backfills(store, db, catalog)
-    };
-    let finished = finish();
-    result?;
-    finished
+    finish_install(store, db, catalog, &pending, result)
 }
 
 /// A package that was downloaded (or read from the cache) during resolution.
-struct Node {
-    name: String,
-    version: String,
-    staged: Staged,
+pub(crate) struct Node {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) staged: Staged,
     deps: Vec<(String, String)>,
 }
 
@@ -343,7 +370,7 @@ const MAX_ROUNDS: usize = 64;
 /// - An installed version at least as new as the request is used as is. A newer request is
 ///   installed next to it, since there is no way to remove the old one.
 /// - Versions that are not `major.minor.patch` still order (see [`compare_versions`]).
-struct Resolver<'a> {
+pub(crate) struct Resolver<'a> {
     fetcher: &'a dyn PackageFetcher,
     cache: &'a Path,
     chosen: BTreeMap<String, String>,
@@ -354,26 +381,46 @@ struct Resolver<'a> {
     /// Names the caller asked for.
     requested: BTreeSet<String>,
     nodes: BTreeMap<(String, String), Node>,
+    /// Dependencies that are not installed, because they add nothing a server uses (see
+    /// [`is_examples_package`]).
+    skipped: BTreeSet<String>,
+}
+
+/// The examples packages of the FHIR releases: each holds the example resources of a release
+/// (`hl7.fhir.r4.examples`) and, because it is built from the same source, a second copy of every
+/// definition the core package has. A server loads neither, and a package such as SDC lists one as
+/// a dependency, so it is left out when it is only a dependency. Asking for one by name still
+/// installs it. The names are listed rather than matched by pattern, so that an implementation
+/// guide's own package of examples, which may hold profiles it needs, is never dropped.
+const EXAMPLES_PACKAGES: [&str; 3] = [
+    "hl7.fhir.r4.examples",
+    "hl7.fhir.r4b.examples",
+    "hl7.fhir.r5.examples",
+];
+
+fn is_examples_package(name: &str) -> bool {
+    EXAMPLES_PACKAGES.contains(&name)
 }
 
 impl<'a> Resolver<'a> {
-    fn new(
-        store: &dyn ConformanceStore,
+    /// A resolver for what is already installed, as (name, version) pairs.
+    pub(crate) fn new(
+        installed_packages: impl IntoIterator<Item = (String, String)>,
         fetcher: &'a dyn PackageFetcher,
         cache: &'a Path,
-    ) -> Result<Self, FhirError> {
+    ) -> Self {
         let mut installed_latest: BTreeMap<String, String> = BTreeMap::new();
         let mut installed = BTreeSet::new();
-        for package in store.load_packages().map_err(FhirError::from)? {
-            installed.insert((package.name.clone(), package.version.clone()));
-            let newer = installed_latest.get(&package.name).is_none_or(|current| {
-                compare_versions(&package.version, current) == Ordering::Greater
-            });
+        for (name, version) in installed_packages {
+            installed.insert((name.clone(), version.clone()));
+            let newer = installed_latest
+                .get(&name)
+                .is_none_or(|current| compare_versions(&version, current) == Ordering::Greater);
             if newer {
-                installed_latest.insert(package.name, package.version);
+                installed_latest.insert(name, version);
             }
         }
-        Ok(Self {
+        Self {
             fetcher,
             cache,
             chosen: BTreeMap::new(),
@@ -381,10 +428,11 @@ impl<'a> Resolver<'a> {
             installed,
             requested: BTreeSet::new(),
             nodes: BTreeMap::new(),
-        })
+            skipped: BTreeSet::new(),
+        }
     }
 
-    fn resolve(
+    pub(crate) fn resolve(
         mut self,
         root: Staged,
         name: String,
@@ -472,6 +520,14 @@ impl<'a> Resolver<'a> {
             }
         }
         self.chosen.insert(name.to_string(), target.clone());
+        if !self.requested.contains(name) && is_examples_package(name) {
+            tracing::info!(
+                target: ENGINE,
+                "not installing {name}@{target}, which {requester} lists: it holds examples and a copy of the core definitions"
+            );
+            self.skipped.insert(name.to_string());
+            return Ok(true);
+        }
         let key = (name.to_string(), target.clone());
         if !self.installed.contains(&key) && !self.nodes.contains_key(&key) {
             let staged = materialize(
@@ -530,6 +586,10 @@ impl<'a> Resolver<'a> {
         if done.contains(name) {
             return Ok(());
         }
+        if self.skipped.contains(name) {
+            done.insert(name.to_string());
+            return Ok(());
+        }
         let version = self.chosen[name].clone();
         let key = (name.to_string(), version.clone());
         if self.installed.contains(&key) {
@@ -562,7 +622,7 @@ impl<'a> Resolver<'a> {
 /// Order two package versions: `major.minor.patch` (missing parts count as 0), then
 /// pre-release (`5.3.0-ballot` sorts before `5.3.0` and after `5.2.0`). A version that is not
 /// numeric, like `current` or `dev`, means "the newest" and sorts after every numeric one.
-fn compare_versions(left: &str, right: &str) -> Ordering {
+pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
     let parse = |text: &str| -> Option<([u64; 3], Option<String>)> {
         let text = text.split('+').next().unwrap_or(text);
         let (core, pre) = match text.split_once('-') {
@@ -617,8 +677,8 @@ fn compare_prerelease(left: &str, right: &str) -> Ordering {
     }
 }
 
-struct Staged {
-    dir: PathBuf,
+pub(crate) struct Staged {
+    pub(crate) dir: PathBuf,
     _scratch: Option<PathBuf>,
 }
 
@@ -630,7 +690,7 @@ impl Drop for Staged {
     }
 }
 
-fn materialize(
+pub(crate) fn materialize(
     spec: &PackageSpec,
     fetcher: &dyn PackageFetcher,
     cache: &Path,
@@ -733,6 +793,15 @@ fn scratch_dir() -> Result<PathBuf, FhirError> {
 
 fn cache_complete(dest: &Path) -> bool {
     dest.join(COMPLETE).is_file() && package_root(dest).is_ok()
+}
+
+/// The SHA-256 of the tarball a package in the cache was downloaded from, when the cache recorded
+/// it: a package from a directory, or one cached without a digest, has none.
+pub(crate) fn source_digest(dir: &Path) -> Option<String> {
+    let token = fs::read_to_string(dir.join(COMPLETE)).ok()?;
+    let token = token.trim();
+    (token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| token.to_string())
 }
 
 fn write_complete(dest: &Path, token: &str) -> Result<(), FhirError> {
@@ -1138,6 +1207,7 @@ mod tests {
             base_url: "s3://packages/fhir".into(),
             cache_dir: dest.clone(),
             s3: Some(S3Source::for_test(&base)),
+            allow_download: true,
         };
         registry.fetch("example.pkg", "1.0.0", &dest).unwrap();
         assert!(dest.join("package/package.json").is_file());

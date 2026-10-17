@@ -29,7 +29,7 @@ with a `409`.
 the `udfPath` field.
 
 **Package.** A FHIR package, such as `hl7.fhir.r4.core`, that supplies the resource types, search
-parameters and profiles a server knows. ReFHIR ships none and installs them on the first start.
+parameters and profiles a server knows. ReFHIR installs them on the first start, from a file prepared when it was built, and downloads packages only if it is told it may.
 
 **Primary, standby, replica.** The roles of several processes sharing one database. The _primary_
 writes and holds the lease. A _standby_ waits for the lease and takes over when the primary is gone.

@@ -45,7 +45,7 @@ claim below has a source.
 | Queries, not events | An event says something changed; a live query says what the answer is now | `docs/design.md`, `README.md` ("Queries, not events") |
 | Queries, not events | The grid: a plain query receives one answer; a Subscription sends a ping per matching record created or updated, nothing when a record stops matching, one per record in a transaction; a live query sends the whole answer each time and a transaction as one step. The rows are the tutorial's scenario | `docs/concepts/vs-subscriptions` (side-by-side table), `site/src/content/docs/docs/tutorial.mdx`, checked against a running server |
 | How it works | A write commits; only queries that read what it changed wake; each gets the whole new answer. The figure uses example queries | `docs/design.md` ("How a write becomes a live-query update"), `docs/sync-protocol.md` |
-| Run it, watch it | `git clone`, `docker compose up --build`; first start needs network for the FHIR packages; the printed lines | `README.md` ("Quick start", read at build time), `docs/tutorial` run against a live server |
+| Run it, watch it | `git clone`, `docker compose up --build`; the image build downloads and prepares the FHIR packages, so the first start needs no network; the printed lines | `README.md` ("Quick start", read at build time), `docs/tutorial` run against a live server |
 
 | Run it, watch it | TypeScript, React, Go and raw `/sync` examples, read at build time | `README.md`, `clients/ts/README.md`, `clients/go/README.md` |
 | AI agents | The four-step loop, and that a write is refused if the record moved; the printed lines | `docs/concepts/agents` (run against a live server) |

@@ -1711,6 +1711,16 @@ mod tests {
     }
 
     #[test]
+    fn postgres_conformance_rows_are_read_a_page_at_a_time_when_configured() {
+        let Some(url) = test_url("postgres paged conformance reads") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let tag = format!("pgpaged{}", std::process::id());
+        refhir_persistence::conformance::exercise_paged_reads(&persistence, &tag);
+    }
+
+    #[test]
     fn postgres_parameter_clashes_when_configured() {
         let Some(url) = test_url("postgres parameter clashes") else {
             return;

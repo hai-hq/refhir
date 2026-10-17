@@ -42,11 +42,13 @@ docker compose up --build
 Or with Rust 1.88 (installed by `rustup` from `rust-toolchain.toml`):
 
 ```bash
-cargo run -p refhir -- --memory      # a throwaway server; use --sqlite refhir.sqlite to keep data
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory      # a throwaway server; use --sqlite refhir.sqlite to keep data
 ```
 
-The first start installs `hl7.fhir.r4.core` and the SDC package from
-[packages.fhir.org](https://packages.fhir.org), so it needs network access. Then:
+A build from source has no prepared packages file, so `REFHIR_PACKAGE_DOWNLOAD=true` lets its first
+start download `hl7.fhir.r4.core`, the SDC package and what they depend on from
+[packages.fhir.org](https://packages.fhir.org); nothing is downloaded without it. The Docker image
+carries them and needs neither the setting nor the network. Then:
 
 ```bash
 curl -s http://127.0.0.1:8080/metadata | head -c 300

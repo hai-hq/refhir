@@ -2,7 +2,7 @@
 
 ## Configuration file
 
-Set `[fhir].version = "r4"` (default) to install that release’s defaults (**hl7.fhir.r4.core@4.0.1**, **hl7.fhir.uv.sdc@4.0.0**) from [packages.fhir.org](https://packages.fhir.org) on first startup (cached on disk; skipped when already in the database). Add other IGs with `[conformance].packages` (`name@version`, a `.tgz`, or a local folder). See [refhir.toml.example](../refhir.toml.example).
+Set `[fhir].version = "r4"` (default) to install that release’s defaults (**hl7.fhir.r4.core@4.0.1**, **hl7.fhir.uv.sdc@4.0.0**) from [packages.fhir.org](https://packages.fhir.org) on first startup (skipped when already in the database). Release archives and container images install them from a prepared file beside the binary and reach no registry; a binary you built yourself has none, and the server downloads nothing unless `[conformance].package_download = true`. `[conformance].package_bundle` names another prepared file, or `"off"` to ignore any file. A file that is there but unusable stops the start. Add other IGs with `[conformance].packages` (`name@version`, a `.tgz`, or a local folder). See [refhir.toml.example](../refhir.toml.example).
 
 **Production:** [deploy/refhir.production.toml](../deploy/refhir.production.toml) and [deploy/production.md](../deploy/production.md) (Postgres, SMART secrets via env, Helm, `cargo install --git …`).
 
@@ -36,4 +36,5 @@ Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or 
 | `--standby` | Same as `--role standby` |
 | `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
 | `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
+| `refhir package-bundle [--out file]` | Prepare the release's FHIR packages ahead of time into one file that a first start installs instead of downloading them. See [Preparing the packages](../deploy/production.md#preparing-the-packages) |
 | `refhir migrate --status\|--dry-run` | Report the database's schema version and what startup would do to it, without changing anything. See [Schema migrations](migrations.md) |

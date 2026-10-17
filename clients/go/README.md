@@ -26,7 +26,7 @@ go get github.com/hai-hq/refhir/clients/go
 Loads `.json` files from a directory (single resources or Synthea-style Bundles) and commits them in transaction batches over `/sync`.
 
 ```bash
-cargo run -p refhir -- --memory --update-as-create
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory --update-as-create
 cd clients/go
 go run ./cmd/seed -url http://127.0.0.1:8080
 ```
@@ -96,7 +96,7 @@ func main() {
 Run the server without a database file:
 
 ```bash
-cargo run -p refhir -- --memory
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory
 ```
 
 The server assigns the id of every resource it creates and ignores one in the body (see [Resource ids](../../docs/fhir-api.md#resource-ids)). Later examples use `p1` as a stand-in for an id you already have.

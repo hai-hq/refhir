@@ -12,6 +12,16 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **A first start installs prepared packages, with no registry and little memory.** Release
+  archives and container images now carry the release's FHIR packages (R4 core, SDC and what they
+  depend on) in a file, `refhir-packages.bundle`, that is made when they are built: the packages
+  are downloaded, read and expanded once, there. A server finds the file beside its binary (or in
+  `../share/refhir/` from it, or at `[conformance].package_bundle` / `REFHIR_PACKAGE_BUNDLE`; `off`
+  says not to look) and stores what is in it, so the first start needs no network and no package
+  cache, and a first start peaks at a small fraction of the memory it did. A file that is there and cannot be used (damaged, or made for another release) stops the
+  start with an error that says so. `refhir package-bundle` makes the file for a binary you built
+  yourself, or for other packages (`--spec`). See [Preparing the
+  packages](deploy/production.md#preparing-the-packages).
 - **Subscriptions send `channel.header`.** Each entry (R4 says `Name: value`, for example
   `Authorization: Bearer …`) is added to the `rest-hook` request, so a receiver that needs a
   token can be served. A name can be given once. An entry that is not a valid header, that
@@ -35,6 +45,20 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **The server downloads packages only if it is told it may.** It used to fetch the release's
+  packages from packages.fhir.org on a first start, and anything named in `[conformance].packages`
+  or `$install`. Now nothing is downloaded unless `[conformance].package_download = true` (or
+  `REFHIR_PACKAGE_DOWNLOAD=true`; the Helm chart has `conformance.packageDownload`). Without it a
+  package that is not installed and not in the package cache is refused: a first start with no
+  prepared file stops with an error that says what to do, and `$install` answers `403`. Release
+  archives and images are not affected, because they carry their packages. **If you build ReFHIR
+  yourself and relied on the first-start download, set `package_download = true`, or make a file
+  with `refhir package-bundle`.** Packages from a directory or a `.tgz` need no setting.
+- **A package that is only a dependency and holds examples is not installed.** SDC lists
+  `hl7.fhir.r4.examples`, which holds the example resources of R4 and a second copy of every core
+  definition, none of which a server uses; it was downloaded, read, stored and loaded for
+  nothing. It is left out when a package only depends on it. Name it in `[conformance].packages`
+  (or give it to `$install`) to install it.
 - **Naming more than one database on the command line is now an error.** `--sqlite`, `--memory`
   and `--postgres` are alternatives, but ReFHIR used to start without complaint and use one of
   them: `refhir --memory --sqlite x.db` ran in memory and never created `x.db`. It now exits with
@@ -103,6 +127,17 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Fixed
 
+- **A first start needed several gigabytes of memory.** Installing the default packages (R4 core,
+  SDC and the seven packages SDC depends on) peaked at over 2 GiB, so a container given 512 MiB or
+  2 GiB was killed (exit status 137) while it was still installing, and a server that started
+  fine kept that memory for as long as it ran. Loading the conformance tables and reading a
+  package now work through them a page at a time instead of parsing every document and holding
+  all of it, and what they keep is shared: the R4 packages hold about 66,000 constraints of
+  which 299 differ, and each is now kept once. A first start with the default packages peaks at
+  about a quarter of what it did, and a restart on a database that already has them takes about a
+  tenth of the memory it did and starts faster. On Linux the memory a load frees is now handed
+  back to the system, so a running server does not stay at its start-up peak. See
+  [Memory](deploy/production.md#fhir-version-and-implementation-guides).
 - **A comma between the values of one search parameter is OR.** `Slot?status=free,busy` and
   `HealthcareService?_id=a,b` matched nothing, because the whole value was compared as one. This
   holds for ids and every parameter type, with `\,` for a literal comma, and a value lists at most

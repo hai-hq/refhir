@@ -5190,6 +5190,8 @@ struct WatchedStore {
     /// How many of the next calls to fail.
     fail_upsert_terminology: AtomicUsize,
     fail_apply_expansions: AtomicUsize,
+    /// How many of the next reads of every terminology row to fail.
+    fail_load_terminology: AtomicUsize,
 }
 
 impl WatchedStore {
@@ -5203,6 +5205,7 @@ impl WatchedStore {
             expansion_changes: AtomicUsize::new(0),
             fail_upsert_terminology: AtomicUsize::new(0),
             fail_apply_expansions: AtomicUsize::new(0),
+            fail_load_terminology: AtomicUsize::new(0),
         }
     }
 
@@ -5260,6 +5263,9 @@ impl ConformanceStore for WatchedStore {
     }
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
         self.full_terminology_loads.fetch_add(1, Ordering::SeqCst);
+        if Self::should_fail(&self.fail_load_terminology) {
+            return Err(PersistError::Definite("injected failure".into()));
+        }
         self.inner.load_terminology()
     }
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
@@ -7341,4 +7347,394 @@ mod or_and_iterate {
         );
         assert_eq!(with_mode(&found, "include"), ["Patient/p1"]);
     }
+}
+
+#[test]
+fn an_examples_package_that_is_only_a_dependency_is_not_installed() {
+    // SDC lists `hl7.fhir.r4.examples`, which holds examples and a second copy of the core
+    // definitions. The registry below does not have it, so installing the app would fail if it
+    // were fetched.
+    let app = dep_package(
+        "example.app",
+        "1.0.0",
+        &[("hl7.fhir.r4.examples", "4.0.1"), ("example.lib", "1.0.0")],
+    );
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let fetcher = registry(&[("example.lib", "1.0.0", &lib)]);
+    let db = empty();
+    let cache = temp_dir("examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        app.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.app@1.0.0", "example.lib@1.0.0"]
+    );
+
+    // Asked for by name, it is installed like any other.
+    let examples = dep_package("hl7.fhir.r4.examples", "4.0.1", &[]);
+    let fetcher = registry(&[("hl7.fhir.r4.examples", "4.0.1", &examples)]);
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "hl7.fhir.r4.examples@4.0.1",
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert!(installed_packages(&db).contains(&"hl7.fhir.r4.examples@4.0.1".to_string()));
+    for dir in [app, lib, examples, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A prepared file of the two fixture packages, and the `name@version` of each.
+fn prepared_fixtures(scratch: &Path) -> (PathBuf, Vec<String>) {
+    let file = scratch.join("packages.bundle");
+    let specs = [minir4_dir(), extra_dir()].map(|dir| dir.to_str().unwrap().to_string());
+    let names = crate::write_prepared(&file, &specs, &NoNetwork, &scratch.join("cache")).unwrap();
+    (file, names)
+}
+
+fn as_strs(names: &[String]) -> Vec<&str> {
+    names.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn a_package_installed_from_a_prepared_file_is_stored_as_one_installed_from_its_directory() {
+    let scratch = temp_dir("prepared");
+    let (file, names) = prepared_fixtures(&scratch);
+    assert_eq!(names.len(), 2);
+
+    let from_directories = empty();
+    install_package_dir(
+        &from_directories.store,
+        &from_directories.db,
+        &from_directories.catalog,
+        minir4_dir(),
+    )
+    .unwrap();
+    install_package_dir(
+        &from_directories.store,
+        &from_directories.db,
+        &from_directories.catalog,
+        extra_dir(),
+    )
+    .unwrap();
+
+    let from_file = empty();
+    let installed = crate::install_prepared(
+        &from_file.store,
+        &from_file.db,
+        &from_file.catalog,
+        &file,
+        &as_strs(&names),
+    )
+    .unwrap();
+    assert_eq!(installed, Some(2));
+
+    // Every table holds what it holds when the packages are read from their directories.
+    let (a, b) = (&from_directories.store, &from_file.store);
+    assert_eq!(a.load_packages().unwrap(), b.load_packages().unwrap());
+    assert_eq!(
+        a.load_structure_definitions().unwrap(),
+        b.load_structure_definitions().unwrap()
+    );
+    assert_eq!(
+        a.load_search_parameters().unwrap(),
+        b.load_search_parameters().unwrap()
+    );
+    assert_eq!(a.load_terminology().unwrap(), b.load_terminology().unwrap());
+    assert_eq!(a.load_expansions().unwrap(), b.load_expansions().unwrap());
+    assert!(!b.load_search_parameters().unwrap().is_empty());
+    // And the catalog is published: the types and search parameters are there to use.
+    let catalog = from_file.catalog.read().expect("catalog");
+    assert!(catalog.contains("Patient"));
+    assert!(catalog.contains("Encounter"));
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_prepared_file_leaves_alone_what_is_already_installed() {
+    let scratch = temp_dir("prepared-installed");
+    let (file, names) = prepared_fixtures(&scratch);
+    let db = empty();
+    install_package_dir(&db.store, &db.db, &db.catalog, minir4_dir()).unwrap();
+    let before = db.store.load_structure_definitions().unwrap();
+
+    let installed =
+        crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &as_strs(&names)).unwrap();
+    assert_eq!(installed, Some(1), "only the one that was missing");
+    assert_eq!(installed_packages(&db).len(), 2);
+    assert!(db
+        .store
+        .load_structure_definitions()
+        .unwrap()
+        .starts_with(&before));
+
+    // With every package there, nothing is done.
+    let again =
+        crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &as_strs(&names)).unwrap();
+    assert_eq!(again, Some(0));
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_prepared_file_that_lacks_a_package_asked_for_is_not_used() {
+    let scratch = temp_dir("prepared-lacks");
+    let (file, names) = prepared_fixtures(&scratch);
+    let db = empty();
+    let mut asked = as_strs(&names);
+    asked.push("example.missing@1.0.0");
+    let installed = crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &asked).unwrap();
+    assert_eq!(installed, None);
+    assert!(installed_packages(&db).is_empty());
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_damaged_prepared_file_installs_what_came_before_the_damage() {
+    let scratch = temp_dir("prepared-damaged");
+    let (file, names) = prepared_fixtures(&scratch);
+    let bytes = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &bytes[..bytes.len() - 40]).unwrap();
+
+    let db = empty();
+    let err = crate::install_prepared(&db.store, &db.db, &db.catalog, &file, &as_strs(&names))
+        .unwrap_err();
+    assert!(err.to_string().contains("prepared packages"), "{err}");
+    // The first package was whole: it is installed and published.
+    assert_eq!(installed_packages(&db), [names[0].clone()]);
+    assert!(db.catalog.read().expect("catalog").contains("Patient"));
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_prepared_file_in_a_format_this_server_cannot_read_is_refused() {
+    use std::io::Write;
+    let scratch = temp_dir("prepared-format");
+    let file = scratch.join("packages.bundle");
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(&file).unwrap(),
+        flate2::Compression::default(),
+    );
+    encoder
+        .write_all(br#"{"format":99,"refhir":"9.9.9","packages":[]}"#)
+        .unwrap();
+    encoder.finish().unwrap();
+    let err = crate::PreparedBundle::open(&file).err().expect("refused");
+    assert!(err.to_string().contains("format 99"), "{err}");
+
+    // A file that is not a prepared file at all is refused as well, not mistaken for one.
+    std::fs::write(&file, b"not a bundle").unwrap();
+    assert!(crate::PreparedBundle::open(&file).is_err());
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn a_registry_that_may_not_download_downloads_nothing() {
+    let cache = temp_dir("no-download-cache");
+    let registry = crate::NpmRegistry::new("http://127.0.0.1:1", cache.clone())
+        .unwrap()
+        .allowing_download(false);
+    let dest = cache.join("example.lib").join("1.0.0");
+    std::fs::create_dir_all(&dest).unwrap();
+    let err = registry.fetch("example.lib", "1.0.0", &dest).unwrap_err();
+    assert!(matches!(err, FhirError::Forbidden(_)), "{err:?}");
+    assert!(err.to_string().contains("package_download = true"), "{err}");
+    assert_eq!(std::fs::read_dir(&dest).unwrap().count(), 0);
+
+    // Installing by name through it is refused and installs nothing.
+    let db = empty();
+    let err = install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "example.lib@1.0.0",
+        &registry,
+        &cache,
+    )
+    .unwrap_err();
+    assert!(matches!(err, FhirError::Forbidden(_)), "{err:?}");
+    assert!(installed_packages(&db).is_empty());
+
+    // A package already in the cache needs no download, so it installs.
+    let lib = dep_package("example.lib", "1.0.0", &[]);
+    let _ = std::fs::remove_dir_all(&dest);
+    copy_tree(&lib, &dest).unwrap();
+    std::fs::write(dest.join(".complete"), "ok").unwrap();
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        "example.lib@1.0.0",
+        &registry,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(installed_packages(&db), ["example.lib@1.0.0"]);
+    for dir in [lib, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_catalog_rebuilt_while_starting_does_not_keep_the_old_one_alive() {
+    let harness = ready();
+    let watched = WatchedStore::new(harness.store.clone());
+    assert!(harness.catalog.read().expect("catalog").contains("Patient"));
+
+    // Serving, which is the default: the old catalog stays until the new one is built, so a
+    // rebuild that fails leaves requests with the catalog they had.
+    watched.fail_load_terminology.store(1, Ordering::SeqCst);
+    assert!(publish(&watched, &harness.catalog).is_err());
+    assert!(harness.catalog.read().expect("catalog").contains("Patient"));
+
+    // Starting: nothing is served from it, so the old one is let go first, to build the new one
+    // in its place instead of beside it. A rebuild that fails leaves none. The setting belongs to
+    // this catalog alone, so no other catalog in the process is affected by it.
+    harness
+        .catalog
+        .write()
+        .expect("catalog")
+        .set_rebuild_in_place(true);
+    watched.fail_load_terminology.store(1, Ordering::SeqCst);
+    let failed = publish(&watched, &harness.catalog);
+    assert!(failed.is_err());
+    assert!(
+        !harness.catalog.read().expect("catalog").contains("Patient"),
+        "the old catalog was kept alive under the rebuild"
+    );
+
+    // And one that works gives the same catalog either way, and keeps the setting.
+    harness
+        .catalog
+        .write()
+        .expect("catalog")
+        .set_rebuild_in_place(true);
+    publish(&watched, &harness.catalog).unwrap();
+    let catalog = harness.catalog.read().expect("catalog");
+    assert!(catalog.contains("Patient"));
+    assert!(catalog.rebuild_in_place());
+}
+
+#[test]
+fn a_prepared_file_that_holds_fewer_packages_than_its_header_lists_is_refused() {
+    use std::io::Write;
+    let scratch = temp_dir("prepared-short");
+    let file = scratch.join("packages.bundle");
+    let package = |name: &str| NewPackage {
+        name: name.into(),
+        version: "1.0.0".into(),
+        fhir_version: "4.0.1".into(),
+        structure_definitions: Vec::new(),
+        search_parameters: Vec::new(),
+        terminology: Vec::new(),
+        expansions: Vec::new(),
+    };
+    // The header promises two packages, and the stream ends cleanly after one: nothing says the
+    // second is missing except the count.
+    let mut encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(&file).unwrap(),
+        flate2::Compression::default(),
+    );
+    writeln!(
+        encoder,
+        r#"{{"format":1,"refhir":"0.0.1","packages":["example.a@1.0.0","example.b@1.0.0"]}}"#
+    )
+    .unwrap();
+    writeln!(
+        encoder,
+        "{}",
+        serde_json::to_string(&package("example.a")).unwrap()
+    )
+    .unwrap();
+    encoder.finish().unwrap();
+
+    let db = empty();
+    let err = crate::install_prepared(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        &file,
+        &["example.a@1.0.0", "example.b@1.0.0"],
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("lists 2 packages and it holds 1"),
+        "{err}"
+    );
+    // What was there was whole: it is installed.
+    assert_eq!(installed_packages(&db), ["example.a@1.0.0"]);
+    let _ = std::fs::remove_dir_all(scratch);
+}
+
+#[test]
+fn an_implementation_guides_own_examples_package_is_installed_as_a_dependency() {
+    // Only the examples packages of the FHIR releases are left out; a guide's own may hold
+    // profiles it needs.
+    let guide = dep_package(
+        "example.guide",
+        "1.0.0",
+        &[("hl7.fhir.us.example.examples", "1.0.0")],
+    );
+    let examples = dep_package("hl7.fhir.us.example.examples", "1.0.0", &[]);
+    let fetcher = registry(&[("hl7.fhir.us.example.examples", "1.0.0", &examples)]);
+    let db = empty();
+    let cache = temp_dir("guide-examples-cache");
+    install_with(
+        &db.store,
+        &db.db,
+        &db.catalog,
+        guide.to_str().unwrap(),
+        &fetcher,
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(
+        installed_packages(&db),
+        ["example.guide@1.0.0", "hl7.fhir.us.example.examples@1.0.0"]
+    );
+    for dir in [guide, examples, cache] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[test]
+fn a_prepared_file_that_could_not_be_written_leaves_nothing_behind() {
+    let scratch = temp_dir("prepared-failed");
+    let broken = scratch.join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(
+        broken.join("package.json"),
+        r#"{"name":"example.broken","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(broken.join("StructureDefinition-bad.json"), "{ not json").unwrap();
+    let out = scratch.join("out").join("packages.bundle");
+    let err = crate::write_prepared(
+        &out,
+        &[broken.to_str().unwrap().to_string()],
+        &NoNetwork,
+        &scratch.join("cache"),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("StructureDefinition-bad.json"),
+        "{err}"
+    );
+    assert!(!out.exists());
+    let left: Vec<_> = std::fs::read_dir(scratch.join("out"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    let _ = std::fs::remove_dir_all(scratch);
 }

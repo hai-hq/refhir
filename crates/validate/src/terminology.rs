@@ -302,10 +302,267 @@ pub struct MemoryTerminology {
     uses: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// An expansion on offer for a value set: the one inside its definition, or a stored document.
-enum Offer<'a> {
-    Inline(&'a [Json]),
-    Stored(&'a Json),
+/// Builds a [`MemoryTerminology`] from resources handed over one at a time, so that a caller that
+/// reads them one by one does not have to keep them all parsed at once. A parsed code system is
+/// several times the size of its text and the index keeps a fraction of it: each code system and
+/// concept map is indexed as it comes and can be dropped by the caller, and each value set is
+/// moved in (not copied) because it has to wait for every code system before it can be expanded.
+///
+/// There are two ways to finish, chosen by the constructor: [`Self::for_stored`] for terminology
+/// loaded as stored, where the expansions already made are on offer, and [`Self::for_package`]
+/// for the resources of a package being installed, where every value set is expanded.
+pub struct TerminologyBuilder {
+    index: Index,
+    /// For each value set, the expansions on offer, with the package each came from: those inside
+    /// the value sets, then the stored ones. A package has one per value set, the last it offered,
+    /// because that is the only one of its own that is ever chosen. `None` when value sets are to
+    /// be expanded instead.
+    offered: Option<BTreeMap<String, Vec<(Scope, Expansion)>>>,
+    /// The value sets of terminology that is loaded as stored, in the form that holds them
+    /// cheaply (see [`Held`]). Value sets to be expanded are held by `index`, parsed.
+    held: BTreeMap<String, Vec<(Scope, Held)>>,
+}
+
+/// A value set definition held by terminology that is loaded as stored. Nothing is expanded
+/// there: the expansions are already made, so a definition is read for three things only. Which
+/// of its package's definitions is in use, which says its `version`; what it draws on, which
+/// is kept as `references`; and, for one that has no expansion, its `compose`, to say why. A
+/// parsed tree is several times the size of its text, and there are thousands of value sets, so
+/// the definition is held as text, and only the few that cannot be expanded are parsed again.
+struct Held {
+    version: Option<String>,
+    references: BTreeSet<String>,
+    /// The definition, without the expansion inside it: that is on offer, or absent.
+    text: String,
+}
+
+impl TerminologyBuilder {
+    /// Terminology as stored: value sets are answered by the expansions already made.
+    ///
+    /// A value set that several packages define, and expand, is answered by the expansion of the
+    /// definition in use (see [`winning_scope`]), or of the next one that has one: not by
+    /// whichever package was installed last.
+    pub fn for_stored(release: Option<&str>) -> Self {
+        Self {
+            index: Index::new(release),
+            offered: Some(BTreeMap::new()),
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// The resources of a package: every value set is expanded from its definition, each with the
+    /// code system versions its own package holds.
+    pub fn for_package(release: Option<&str>) -> Self {
+        Self {
+            index: Index::new(release),
+            offered: None,
+            held: BTreeMap::new(),
+        }
+    }
+
+    /// Set the FHIR release the terminology is read for, when it is learned after the first
+    /// resources were added.
+    pub fn set_release(&mut self, release: Option<&str>) {
+        self.index.set_release(release);
+    }
+
+    /// Add a resource of package `scope`. Only code systems, concept maps and value sets count.
+    pub fn add_resource(&mut self, scope: Scope, resource: Json) {
+        if resource_type(&resource) == Some("ValueSet") {
+            self.offer_inline(scope, &resource);
+            self.add_value_set(scope, slim_value_set(resource));
+        } else {
+            self.index.add_indexed(scope, &resource);
+        }
+    }
+
+    /// [`Self::add_resource`] for a resource the caller keeps: only what is held of a value set
+    /// is copied.
+    pub fn add_resource_ref(&mut self, scope: Scope, resource: &Json) {
+        if resource_type(resource) == Some("ValueSet") {
+            self.offer_inline(scope, resource);
+            self.add_value_set(scope, slim_value_set_copy(resource));
+        } else {
+            self.index.add_indexed(scope, resource);
+        }
+    }
+
+    fn add_value_set(&mut self, scope: Scope, mut value_set: Json) {
+        if self.offered.is_none() {
+            self.index.add_value_set(scope, value_set);
+            return;
+        }
+        let Some(url) = value_set
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(|url| canonical(url).to_string())
+        else {
+            return;
+        };
+        if let Json::Object(fields) = &mut value_set {
+            fields.remove("expansion");
+        }
+        let held = Held {
+            version: value_set
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            references: compose_references(&value_set),
+            text: value_set.to_string(),
+        };
+        // What this package defined before is replaced; the definition loaded last stays last.
+        let definitions = self.held.entry(url).or_default();
+        definitions.retain(|(owner, _)| *owner != scope);
+        definitions.push((scope, held));
+    }
+
+    /// Add a stored expansion document of package `scope`. It is read now, so the caller can
+    /// drop the document.
+    pub fn add_expansion(&mut self, scope: Scope, document: &Json) {
+        let Some(offered) = self.offered.as_mut() else {
+            return;
+        };
+        let Some((url, mut expansion)) = expansion_from_document(document) else {
+            return;
+        };
+        expansion.scope = Some(scope);
+        offer(offered, url, scope, expansion);
+    }
+
+    /// The expansion inside a value set's own definition.
+    fn offer_inline(&mut self, scope: Scope, resource: &Json) {
+        let Some(offered) = self.offered.as_mut() else {
+            return;
+        };
+        let Some(contains) = resource
+            .pointer("/expansion/contains")
+            .and_then(|value| value.as_array())
+        else {
+            return;
+        };
+        let Some(url) = resource
+            .get("url")
+            .and_then(|value| value.as_str())
+            .filter(|url| !url.is_empty())
+        else {
+            return;
+        };
+        let mut expansion = expansion_from_contains(contains);
+        expansion.scope = Some(scope);
+        offer(offered, canonical(url).to_string(), scope, expansion);
+    }
+
+    pub fn finish(self) -> MemoryTerminology {
+        let Self {
+            index,
+            offered,
+            mut held,
+        } = self;
+        let release = index.release.clone();
+        let (mut terms, value_sets) = index.finish();
+        match offered {
+            None => {
+                terms.expand_every_value_set(&value_sets);
+                terms.keep_unexpanded(value_sets);
+            }
+            Some(offered) => {
+                let owners = order_held(&mut held, release.as_deref());
+                terms.choose_offered(&owners, offered);
+                terms.keep_unexpanded_held(held);
+            }
+        }
+        terms
+    }
+
+    /// The expansion document of every value set that has an expansion, ordered by URL, made one
+    /// at a time as the iterator is read, so a caller that stores each as it comes never holds
+    /// them all. What is only needed to answer questions about the terminology afterwards (which
+    /// value sets cannot be expanded, and why) is not worked out.
+    pub fn expansion_documents(self) -> impl Iterator<Item = Json> {
+        let Self {
+            index,
+            offered,
+            mut held,
+        } = self;
+        let release = index.release.clone();
+        let (mut terms, value_sets) = index.finish();
+        match offered {
+            None => terms.expand_every_value_set(&value_sets),
+            Some(offered) => {
+                let owners = order_held(&mut held, release.as_deref());
+                terms.choose_offered(&owners, offered);
+            }
+        }
+        drop((value_sets, held));
+        let MemoryTerminology { expansions, .. } = terms;
+        expansions
+            .into_iter()
+            .map(|(url, expansion)| expansion_document(&url, &expansion))
+    }
+}
+
+/// Order the held definitions of each value set for use (see `order_for_use`), and say which
+/// packages they are from, the one in use last.
+fn order_held(
+    held: &mut BTreeMap<String, Vec<(Scope, Held)>>,
+    release: Option<&str>,
+) -> BTreeMap<String, Vec<Scope>> {
+    held.iter_mut()
+        .map(|(url, definitions)| {
+            order_for_use(definitions, |definition| {
+                release.is_some() && definition.version.as_deref() == release
+            });
+            (
+                url.clone(),
+                definitions.iter().map(|(scope, _)| *scope).collect(),
+            )
+        })
+        .collect()
+}
+
+/// What expanding a value set, ordering its definitions and tracking what it draws on read from
+/// it. A value set is held until every code system is in, and for good when it cannot be
+/// expanded, so everything else (the narrative, the descriptions, contacts and usage notes) is
+/// left out of what is held: the narrative alone is more than half the text of the value sets in
+/// the R4 packages.
+const VALUE_SET_FIELDS: [&str; 5] = ["resourceType", "url", "version", "compose", "expansion"];
+
+fn slim_value_set(mut value_set: Json) -> Json {
+    if let Json::Object(fields) = &mut value_set {
+        fields.retain(|name, _| VALUE_SET_FIELDS.contains(&name.as_str()));
+    }
+    value_set
+}
+
+fn slim_value_set_copy(value_set: &Json) -> Json {
+    match value_set {
+        Json::Object(fields) => Json::Object(
+            fields
+                .iter()
+                .filter(|(name, _)| VALUE_SET_FIELDS.contains(&name.as_str()))
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Record `expansion` as what package `scope` offers for `url`, in place of any it offered before.
+fn offer(
+    offered: &mut BTreeMap<String, Vec<(Scope, Expansion)>>,
+    url: String,
+    scope: Scope,
+    expansion: Expansion,
+) {
+    let candidates = offered.entry(url).or_default();
+    candidates.retain(|(owner, _)| *owner != scope);
+    candidates.push((scope, expansion));
+}
+
+fn resource_type(resource: &Json) -> Option<&str> {
+    resource
+        .get("resourceType")
+        .and_then(|value| value.as_str())
 }
 
 /// Every definition of each value set URL, with the package it came from, ordered for use (see
@@ -324,11 +581,19 @@ impl MemoryTerminology {
     /// its own package holds; only a system it does not hold is read from the others. With no
     /// version named, the release's version comes first.
     pub fn from_resources_scoped(resources: &[(Scope, &Json)], release: Option<&str>) -> Self {
-        let (mut terms, value_sets) = index_resources(resources, release);
+        let mut builder = TerminologyBuilder::for_package(release);
+        for (scope, resource) in resources {
+            builder.add_resource_ref(*scope, resource);
+        }
+        builder.finish()
+    }
+
+    /// Expand each value set from its definition.
+    fn expand_every_value_set(&mut self, value_sets: &Definitions) {
         let known = BTreeMap::new();
         let mut expander = Expander {
-            systems: &terms.systems,
-            value_sets: &value_sets,
+            systems: &self.systems,
+            value_sets,
             scope: None,
             strict: false,
             known: &known,
@@ -337,11 +602,65 @@ impl MemoryTerminology {
         };
         for url in value_sets.keys() {
             if let Ok(expansion) = expander.expand_in_use(url) {
-                terms.expansions.insert(url.clone(), expansion);
+                self.expansions.insert(url.clone(), expansion);
             }
         }
-        terms.keep_unexpanded(value_sets);
-        terms
+    }
+
+    /// Answer each value set with the expansion of the definition in use, or of the next one that
+    /// has one. `owners` are the packages that define each value set, the one in use last.
+    fn choose_offered(
+        &mut self,
+        owners: &BTreeMap<String, Vec<Scope>>,
+        offered: BTreeMap<String, Vec<(Scope, Expansion)>>,
+    ) {
+        for (url, mut candidates) in offered {
+            let chosen = owners
+                .get(&url)
+                .and_then(|owners| {
+                    owners
+                        .iter()
+                        .rev()
+                        .find_map(|owner| candidates.iter().rposition(|(scope, _)| scope == owner))
+                })
+                .unwrap_or(candidates.len() - 1);
+            let (_, expansion) = candidates.swap_remove(chosen);
+            self.expansions.insert(url, expansion);
+        }
+    }
+
+    /// [`Self::keep_unexpanded`] for value sets that were held as text. Only the ones that have
+    /// no expansion are parsed again.
+    fn keep_unexpanded_held(&mut self, held: BTreeMap<String, Vec<(Scope, Held)>>) {
+        self.uses = held
+            .iter()
+            .map(|(url, definitions)| {
+                let references = definitions
+                    .iter()
+                    .flat_map(|(_, definition)| definition.references.iter().cloned())
+                    .collect();
+                (url.clone(), references)
+            })
+            .collect();
+        self.unexpanded = held
+            .into_iter()
+            .filter(|(url, _)| !self.expansions.contains_key(url))
+            .map(|(url, definitions)| {
+                let parsed = definitions
+                    .into_iter()
+                    .filter_map(|(scope, definition)| {
+                        Some((scope, serde_json::from_str(&definition.text).ok()?))
+                    })
+                    .collect();
+                (url, parsed)
+            })
+            .collect();
+        let reasons = self
+            .unexpanded
+            .keys()
+            .map(|url| (url.clone(), self.explain(url)))
+            .collect();
+        self.reasons = reasons;
     }
 
     fn keep_unexpanded(&mut self, value_sets: Definitions) {
@@ -391,67 +710,14 @@ impl MemoryTerminology {
         expansions: &[(Scope, &Json)],
         release: Option<&str>,
     ) -> Self {
-        let (mut terms, value_sets) = index_resources(resources, release);
-        // Every expansion on offer for each value set, with the package it came from, in the
-        // order loaded: those inside the value sets, then the stored ones. They are only borrowed
-        // here; the one that is chosen is read once.
-        let mut offered: BTreeMap<String, Vec<(Scope, Offer<'_>)>> = BTreeMap::new();
+        let mut builder = TerminologyBuilder::for_stored(release);
         for (scope, resource) in resources {
-            if resource
-                .get("resourceType")
-                .and_then(|value| value.as_str())
-                != Some("ValueSet")
-            {
-                continue;
-            }
-            let Some(contains) = resource
-                .pointer("/expansion/contains")
-                .and_then(|value| value.as_array())
-            else {
-                continue;
-            };
-            let Some(url) = resource
-                .get("url")
-                .and_then(|value| value.as_str())
-                .filter(|url| !url.is_empty())
-            else {
-                continue;
-            };
-            offered
-                .entry(canonical(url).to_string())
-                .or_default()
-                .push((*scope, Offer::Inline(contains)));
+            builder.add_resource_ref(*scope, resource);
         }
         for (scope, document) in expansions {
-            if let Some(url) = document.get("url").and_then(|value| value.as_str()) {
-                offered
-                    .entry(canonical(url).to_string())
-                    .or_default()
-                    .push((*scope, Offer::Stored(document)));
-            }
+            builder.add_expansion(*scope, document);
         }
-        for (url, candidates) in offered {
-            let chosen = value_sets
-                .get(&url)
-                .and_then(|definitions| {
-                    definitions.iter().rev().find_map(|(owner, _)| {
-                        candidates.iter().rposition(|(scope, _)| scope == owner)
-                    })
-                })
-                .unwrap_or(candidates.len() - 1);
-            let (scope, offer) = &candidates[chosen];
-            let mut expansion = match offer {
-                Offer::Inline(contains) => expansion_from_contains(contains),
-                Offer::Stored(document) => match expansion_from_document(document) {
-                    Some((_, expansion)) => expansion,
-                    None => continue,
-                },
-            };
-            expansion.scope = Some(*scope);
-            terms.expansions.insert(url, expansion);
-        }
-        terms.keep_unexpanded(value_sets);
-        terms
+        builder.finish()
     }
 
     /// Why `url` has no expansion, or `None` when it has one. A value set that cannot be
@@ -495,7 +761,11 @@ impl MemoryTerminology {
         resources: &[(Scope, &Json)],
         release: Option<&str>,
     ) -> Vec<Json> {
-        Self::from_resources_scoped(resources, release).documents()
+        let mut builder = TerminologyBuilder::for_package(release);
+        for (scope, resource) in resources {
+            builder.add_resource_ref(*scope, resource);
+        }
+        builder.expansion_documents().collect()
     }
 
     /// The FHIR release this terminology is read for, when it was told.
@@ -512,6 +782,7 @@ impl MemoryTerminology {
     }
 
     /// The expansion document of every value set that has an expansion, ordered by URL.
+    #[cfg(test)]
     fn documents(&self) -> Vec<Json> {
         self.expansions
             .iter()
@@ -1861,36 +2132,59 @@ pub fn winning_scopes(
         .collect()
 }
 
-fn index_resources(
-    resources: &[(Scope, &Json)],
-    release: Option<&str>,
-) -> (MemoryTerminology, Definitions) {
-    let mut terms = MemoryTerminology::default();
-    terms.set_release(release);
-    let mut value_sets = Definitions::new();
-    for (scope, resource) in resources {
-        match resource
-            .get("resourceType")
-            .and_then(|value| value.as_str())
-        {
-            Some("CodeSystem") => terms.add_system(resource, *scope),
-            Some("ConceptMap") => terms.add_map(resource),
-            Some("ValueSet") => {
-                if let Some(url) = resource.get("url").and_then(|value| value.as_str()) {
-                    // What this package defined before is replaced; the definition loaded last
-                    // stays last.
-                    let definitions = value_sets.entry(canonical(url).to_string()).or_default();
-                    definitions.retain(|(owner, _)| owner != scope);
-                    definitions.push((*scope, (*resource).clone()));
-                }
-            }
+/// What indexing resources builds up: code systems and concept maps are indexed as they are
+/// handed over, and value sets are kept, to be expanded once every code system is in.
+struct Index {
+    terms: MemoryTerminology,
+    value_sets: Definitions,
+    release: Option<String>,
+}
+
+impl Index {
+    fn new(release: Option<&str>) -> Self {
+        let mut terms = MemoryTerminology::default();
+        terms.set_release(release);
+        Self {
+            terms,
+            value_sets: Definitions::new(),
+            release: release.map(str::to_string),
+        }
+    }
+
+    fn set_release(&mut self, release: Option<&str>) {
+        self.terms.set_release(release);
+        self.release = release.map(str::to_string);
+    }
+
+    /// A code system or concept map: indexed, nothing of it is kept. Anything else is ignored.
+    fn add_indexed(&mut self, scope: Scope, resource: &Json) {
+        match resource_type(resource) {
+            Some("CodeSystem") => self.terms.add_system(resource, scope),
+            Some("ConceptMap") => self.terms.add_map(resource),
             _ => {}
         }
     }
-    for definitions in value_sets.values_mut() {
-        prefer_release(definitions, release);
+
+    fn add_value_set(&mut self, scope: Scope, resource: Json) {
+        let Some(url) = resource
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(|url| canonical(url).to_string())
+        else {
+            return;
+        };
+        // What this package defined before is replaced; the definition loaded last stays last.
+        let definitions = self.value_sets.entry(url).or_default();
+        definitions.retain(|(owner, _)| *owner != scope);
+        definitions.push((scope, resource));
     }
-    (terms, value_sets)
+
+    fn finish(mut self) -> (MemoryTerminology, Definitions) {
+        for definitions in self.value_sets.values_mut() {
+            prefer_release(definitions, self.release.as_deref());
+        }
+        (self.terms, self.value_sets)
+    }
 }
 
 impl MemoryTerminology {
@@ -4031,6 +4325,117 @@ mod tests {
                 "fish"
             ),
             TermAnswer::No
+        );
+    }
+
+    #[test]
+    fn a_value_set_is_held_without_what_expanding_it_never_reads() {
+        let full = json!({
+            "resourceType": "ValueSet", "id": "x", "url": SET, "version": "1",
+            "text": {"status": "generated", "div": "<div>a long narrative</div>"},
+            "description": "words", "contact": [{"name": "someone"}],
+            "compose": {"include": [{"system": SYS}]},
+            "expansion": {"contains": [{"system": SYS, "code": "a"}]}
+        });
+        let slim = json!({
+            "resourceType": "ValueSet", "url": SET, "version": "1",
+            "compose": {"include": [{"system": SYS}]},
+            "expansion": {"contains": [{"system": SYS, "code": "a"}]}
+        });
+        assert_eq!(super::slim_value_set(full.clone()), slim);
+        assert_eq!(super::slim_value_set_copy(&full), slim);
+
+        // What is held is enough to expand it: from its definition, or from the expansion inside
+        // it, which comes first, and to say why one cannot be.
+        let system = json!({"resourceType": "CodeSystem", "url": SYS, "content": "complete",
+                            "concept": [{"code": "a"}, {"code": "b"}]});
+        let terms = MemoryTerminology::from_resources(&[system.clone(), full.clone()]);
+        assert_eq!(terms.contains(SET, Some(SYS), "a"), TermAnswer::Yes);
+        assert_eq!(terms.contains(SET, Some(SYS), "b"), TermAnswer::No);
+        let mut composed = full.clone();
+        composed.as_object_mut().unwrap().remove("expansion");
+        let terms = MemoryTerminology::from_resources(&[system.clone(), composed]);
+        assert_eq!(terms.contains(SET, Some(SYS), "b"), TermAnswer::Yes);
+        let missing = json!({"resourceType": "ValueSet", "url": "http://example.org/gone",
+                             "description": "words",
+                             "compose": {"include": [{"system": "http://example.org/nowhere"}]}});
+        let terms = MemoryTerminology::from_resources(&[system, missing]);
+        let reasons = terms.why_not_expanded("http://example.org/gone");
+        assert!(reasons.is_some_and(|reasons| !reasons.is_empty()));
+    }
+
+    /// The codes of the expansion a terminology answers `url` with.
+    fn expansion_codes(terms: &MemoryTerminology, url: &str) -> Vec<String> {
+        terms
+            .expand(url, None)
+            .map(|expansion| {
+                expansion["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["code"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_expansion_a_stored_terminology_answers_with_is_the_definition_in_uses() {
+        let defined = |inline: Option<&str>| {
+            let mut set = json!({"resourceType": "ValueSet", "url": SET});
+            if let Some(code) = inline {
+                set["expansion"] = json!({"contains": [{"code": code}]});
+            }
+            set
+        };
+        let stored = |codes: &[&str]| {
+            json!({"url": SET, "systems": [],
+                   "contains": codes.iter().map(|code| json!({"code": code})).collect::<Vec<_>>()})
+        };
+        let read = |resources: &[(super::Scope, serde_json::Value)],
+                    expansions: &[(super::Scope, serde_json::Value)]| {
+            let resources: Vec<(super::Scope, &serde_json::Value)> = resources
+                .iter()
+                .map(|(scope, json)| (*scope, json))
+                .collect();
+            let expansions: Vec<(super::Scope, &serde_json::Value)> = expansions
+                .iter()
+                .map(|(scope, json)| (*scope, json))
+                .collect();
+            expansion_codes(
+                &MemoryTerminology::from_stored_scoped(&resources, &expansions, None),
+                SET,
+            )
+        };
+
+        // A package's own stored expansion is the later of what it offered: it replaces the one
+        // inside its definition.
+        assert_eq!(
+            read(&[(1, defined(Some("a")))], &[(1, stored(&["b"]))]),
+            ["b"]
+        );
+        // The definition in use is the one loaded last, and its package's expansion answers,
+        // whatever another package stored.
+        assert_eq!(
+            read(
+                &[(1, defined(Some("a"))), (2, defined(Some("c")))],
+                &[(1, stored(&["b"]))]
+            ),
+            ["c"]
+        );
+        // A package that does not define the value set does not answer for it, even when it was
+        // installed last: the definition in use is package 1's.
+        assert_eq!(
+            read(
+                &[(1, defined(None))],
+                &[(1, stored(&["b"])), (2, stored(&["c"]))]
+            ),
+            ["b"]
+        );
+        // With no definition at all, the expansion stored last is what there is.
+        assert_eq!(
+            read(&[], &[(1, stored(&["b"])), (2, stored(&["c"]))]),
+            ["c"]
         );
     }
 }

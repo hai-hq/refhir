@@ -232,15 +232,35 @@ curl -s https://fhir.example.com/oauth/introspect \
 
 ## FHIR version and Implementation Guides
 
-`[fhir].version = "r4"` (default) installs **`hl7.fhir.r4.core@4.0.1`** and **`hl7.fhir.uv.sdc@4.0.0`** from [packages.fhir.org](https://packages.fhir.org) on first startup. Downloads are cached under `[conformance].package_cache` (or `REFHIR_PACKAGE_CACHE`); packages already in the conformance database are not reinstalled. ReFHIR ships no FHIR packages: if the package source cannot be reached on a first start, the server does not start and says where it looked.
+`[fhir].version = "r4"` (default) installs **`hl7.fhir.r4.core@4.0.1`** and **`hl7.fhir.uv.sdc@4.0.0`**, and the packages they depend on (`hl7.terminology.r4`, `hl7.fhir.uv.extensions.r4`, `hl7.fhir.uv.tools.r4` and `hl7.fhir.uv.xver-r5.r4`), on first startup. SDC also lists `hl7.fhir.r4.examples`, which holds example resources and a second copy of the core definitions, so a package that is only a dependency and holds examples is left out; name it in `[conformance].packages` if you want it. Packages already in the conformance database are not reinstalled.
+
+**Release archives and container images carry these packages already**, prepared when they were built, in a file called `refhir-packages.bundle` beside the `refhir` binary (in the image, in `/usr/local/share/refhir/`). A first start stores what is in the file: it reaches no registry and needs no network and no package cache. **The server does not download packages unless you set `[conformance].package_download = true`.** Without that setting, a first start that has no prepared file, or has one it cannot use (it is damaged, or was made for another release), stops with an error that says which, and nothing is fetched from anywhere. A binary you built yourself has no such file: make one with `refhir package-bundle` (see [Preparing the packages](#preparing-the-packages)), or turn downloading on (see [Package source](#package-source)).
 
 Add other implementation guides with `[conformance].packages` (`name@version`, `.tgz`, or directory), or repeat `--package` on the CLI.
 
-**First container start** needs to reach the package source (below) to install release defaults; use a persistent `package_cache` volume so later restarts do not re-download.
+**Memory.** Storing the default packages is the most memory the server ever asks for, so it is what sets the limit for a container: a first start needs more than a running server, and a restart on a database that already has its packages needs less than the first start. Start from 512 MiB, and watch your own first start before you tighten it; give it more if you add large implementation guides with `[conformance].packages`. A container with less than a start needs is killed (exit status 137) before the server is ready, and starts again with the same result.
+
+### Preparing the packages
+
+`refhir package-bundle` downloads the release defaults and everything they depend on, reads and expands them the way a first start would, and writes the result to one file:
+
+```bash
+refhir package-bundle --out refhir-packages.bundle
+```
+
+`--spec name@version` (a `.tgz` or a directory also works) prepares other packages, and may be repeated; naming any replaces the defaults. `--registry` and `--cache` say where to download from and where to keep the downloads, like `REFHIR_PACKAGE_REGISTRY` and `REFHIR_PACKAGE_CACHE`. The file does not depend on the machine it was made on.
+
+A server uses the file when it holds the packages the release asks for, and installs from it what its database does not have. It looks beside the `refhir` binary, then in `../share/refhir/` from it, or where `[conformance].package_bundle` (or `REFHIR_PACKAGE_BUNDLE`) says; a file named there that is not a file is an error, and `off` there says not to look. A file that is there but does not hold the release's packages, or is damaged, stops the start with an error: the server does not go to a registry instead, because a server that quietly fetched its packages from somewhere else would not be the one that was deployed. To put one in your own image:
+
+```dockerfile
+RUN refhir package-bundle --out /usr/local/share/refhir/refhir-packages.bundle
+```
 
 ### Package source
 
-`[conformance].package_registry` (or `REFHIR_PACKAGE_REGISTRY`) says where packages are downloaded from. It is used for the release defaults, their dependencies, `[conformance].packages` and `$install`:
+A server downloads packages only if `[conformance].package_download = true` (or `REFHIR_PACKAGE_DOWNLOAD=true`) says it may. It is off by default, and with it off nothing here is reached: a package that is not installed and not in the package cache is refused, whether it is a release default with no prepared file, an entry of `[conformance].packages`, or the one a `$install` asks for (that answers `403`). Packages that come from a directory or a `.tgz` need no download.
+
+`[conformance].package_registry` (or `REFHIR_PACKAGE_REGISTRY`) says where packages are downloaded from once downloading is on. It is used for the release defaults when there is no prepared file, their dependencies, `[conformance].packages` and `$install`:
 
 | Value | Meaning |
 |-------|---------|

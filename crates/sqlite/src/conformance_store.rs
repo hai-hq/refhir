@@ -3,12 +3,98 @@ use refhir_persistence::{
     InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan,
     ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
     StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    CONFORMANCE_PAGE_ROWS,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::{definite, SqlitePersistence};
 
+fn structure_definition_from(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredStructureDefinition> {
+    let abstract_flag: i64 = row.get(4)?;
+    Ok(StoredStructureDefinition {
+        package_id: row.get(0)?,
+        url: row.get(1)?,
+        type_name: row.get(2)?,
+        kind: row.get(3)?,
+        is_abstract: abstract_flag != 0,
+        json: row.get(5)?,
+    })
+}
+
+fn terminology_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredTerminology> {
+    Ok(StoredTerminology {
+        package_id: row.get(0)?,
+        resource_type: row.get(1)?,
+        url: row.get(2)?,
+        json: row.get(3)?,
+    })
+}
+
+fn expansion_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredExpansion> {
+    Ok(StoredExpansion {
+        package_id: row.get(0)?,
+        url: row.get(1)?,
+        json: row.get(2)?,
+    })
+}
+
 impl SqlitePersistence {
+    /// Read `select` (a `SELECT` of a table keyed by `(package_id, url)`) a page at a time, in key
+    /// order, and hand each page to `visit`. The connection is locked for the query of each page
+    /// only, so nothing waits on what `visit` does with the rows, which for a catalog load is
+    /// seconds of work.
+    fn visit_pages<T>(
+        &self,
+        select: &str,
+        read: impl Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        key: impl Fn(&T) -> (i64, String),
+        visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let next = format!(
+            "{select} WHERE (package_id, url) > (?1, ?2) \
+             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
+        );
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let page = {
+                let guard = self.inner.lock()?;
+                let rows = match &after {
+                    None => {
+                        let mut stmt = guard.connection.prepare(&first).map_err(definite)?;
+                        let rows = stmt
+                            .query_map([], |row| read(row))
+                            .map_err(definite)?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(definite)?;
+                        rows
+                    }
+                    Some((package_id, url)) => {
+                        let mut stmt = guard.connection.prepare(&next).map_err(definite)?;
+                        let rows = stmt
+                            .query_map(params![package_id, url], |row| read(row))
+                            .map_err(definite)?
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(definite)?;
+                        rows
+                    }
+                };
+                rows
+            };
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = Some(key(last));
+            let done = page.len() < CONFORMANCE_PAGE_ROWS;
+            visit(page)?;
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
     fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
         let guard = self.read()?;
         let text: Option<String> = guard
@@ -116,21 +202,23 @@ impl ConformanceStore for SqlitePersistence {
             )
             .map_err(definite)?;
         let rows = stmt
-            .query_map([], |row| {
-                let abstract_flag: i64 = row.get(4)?;
-                Ok(StoredStructureDefinition {
-                    package_id: row.get(0)?,
-                    url: row.get(1)?,
-                    type_name: row.get(2)?,
-                    kind: row.get(3)?,
-                    is_abstract: abstract_flag != 0,
-                    json: row.get(5)?,
-                })
-            })
+            .query_map([], structure_definition_from)
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn visit_structure_definitions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, type_name, kind, is_abstract, json FROM structure_definitions",
+            structure_definition_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
@@ -186,18 +274,23 @@ impl ConformanceStore for SqlitePersistence {
             )
             .map_err(definite)?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(StoredTerminology {
-                    package_id: row.get(0)?,
-                    resource_type: row.get(1)?,
-                    url: row.get(2)?,
-                    json: row.get(3)?,
-                })
-            })
+            .query_map([], terminology_from)
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn visit_terminology(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, resource_type, url, json FROM terminology",
+            terminology_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn load_terminology_for(
@@ -345,17 +438,23 @@ impl ConformanceStore for SqlitePersistence {
             )
             .map_err(definite)?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(StoredExpansion {
-                    package_id: row.get(0)?,
-                    url: row.get(1)?,
-                    json: row.get(2)?,
-                })
-            })
+            .query_map([], expansion_from)
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?;
         Ok(rows)
+    }
+
+    fn visit_expansions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, json FROM value_set_expansion",
+            expansion_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -874,6 +973,12 @@ mod tests {
     fn terminology_is_read_by_url_and_expansions_change_one_at_a_time() {
         let store = SqlitePersistence::open_in_memory().unwrap();
         refhir_persistence::conformance::exercise_terminology_changes(&store, "sqlite");
+    }
+
+    #[test]
+    fn conformance_rows_are_read_a_page_at_a_time() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_paged_reads(&store, "sqlite");
     }
 
     #[test]

@@ -1,6 +1,8 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
+use std::sync::Arc;
 
-use refhir_fhirpath::{parse, Expr, Model};
+use refhir_fhirpath::{parse, Expr, Model, ModelBuilder};
 use serde_json::Value as Json;
 
 use crate::outcome::Severity;
@@ -37,14 +39,14 @@ impl Cardinality {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SliceRules {
     Open,
     Closed,
     OpenAtEnd,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DiscriminatorKind {
     Value,
     Exists,
@@ -53,27 +55,27 @@ pub enum DiscriminatorKind {
     Profile,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Discriminator {
     pub kind: DiscriminatorKind,
     pub path: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Slicing {
     pub discriminators: Vec<Discriminator>,
     pub rules: SliceRules,
     pub ordered: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TypeRef {
     pub code: String,
     pub target_profiles: Vec<String>,
     pub profiles: Vec<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Binding {
     pub strength: String,
     pub value_set: String,
@@ -94,14 +96,14 @@ pub struct ElementDef {
     pub slice_name: Option<String>,
     pub min: u32,
     pub max: Cardinality,
-    pub types: Vec<TypeRef>,
-    pub constraints: Vec<Constraint>,
-    pub binding: Option<Binding>,
+    pub types: Vec<Arc<TypeRef>>,
+    pub constraints: Vec<Arc<Constraint>>,
+    pub binding: Option<Arc<Binding>>,
     pub fixed: Option<Json>,
     pub pattern: Option<Json>,
     pub min_value: Option<Json>,
     pub max_value: Option<Json>,
-    pub slicing: Option<Slicing>,
+    pub slicing: Option<Arc<Slicing>>,
     /// Element id this node reuses (`contentReference` without the leading `#`).
     pub content_reference: Option<String>,
     pub must_support: bool,
@@ -219,45 +221,92 @@ impl Default for Schema {
     }
 }
 
-impl Schema {
-    pub fn from_definitions(definitions: &[Json]) -> Self {
-        let model = Model::from_definitions(definitions);
-        let mut by_url = BTreeMap::new();
-        let mut type_url = BTreeMap::new();
-        let mut primitive_regex = BTreeMap::new();
-        for definition in definitions {
-            let Some(structure) = compile_structure(definition) else {
-                continue;
-            };
-            if structure.kind == "primitive-type" {
-                if let Some(pattern) = regex_from(definition) {
-                    if compiled_regex_ok(&pattern) {
-                        primitive_regex.insert(structure.type_name.clone(), pattern);
-                    }
+/// The constraints, types, bindings and slicings the elements of a schema have, each kept once.
+///
+/// Elements repeat them again and again: the R4 packages hold about 66,000 constraints of which
+/// 299 differ (`ele-1` is on every element of every definition), and about 91,000 type references
+/// of which 2,100 differ. Giving every element its own copy, with its own parsed FHIRPath tree,
+/// made them most of what a schema takes.
+#[derive(Default)]
+struct Shared {
+    /// By key, severity, human text and expression, so that one that is already held is not
+    /// parsed again.
+    constraints: HashMap<(String, String, String, String), Arc<Constraint>>,
+    types: HashSet<Arc<TypeRef>>,
+    bindings: HashSet<Arc<Binding>>,
+    slicings: HashSet<Arc<Slicing>>,
+}
+
+/// The shared copy of `value`: the one already held when there is one.
+fn share<T: Hash + Eq>(held: &mut HashSet<Arc<T>>, value: T) -> Arc<T> {
+    if let Some(existing) = held.get(&value) {
+        return existing.clone();
+    }
+    let shared = Arc::new(value);
+    held.insert(shared.clone());
+    shared
+}
+
+/// Builds a [`Schema`] from StructureDefinitions handed over one at a time, so a caller that
+/// reads its definitions one by one does not have to keep them all parsed at once.
+#[derive(Default)]
+pub struct SchemaBuilder {
+    model: ModelBuilder,
+    by_url: BTreeMap<String, Structure>,
+    type_url: BTreeMap<String, String>,
+    primitive_regex: BTreeMap<String, String>,
+    shared: Shared,
+}
+
+impl SchemaBuilder {
+    pub fn add(&mut self, definition: &Json) {
+        self.model.add(definition);
+        let Some(structure) = compile_structure(definition, &mut self.shared) else {
+            return;
+        };
+        if structure.kind == "primitive-type" {
+            if let Some(pattern) = regex_from(definition) {
+                if compiled_regex_ok(&pattern) {
+                    self.primitive_regex
+                        .insert(structure.type_name.clone(), pattern);
                 }
             }
-            if structure.derivation != "constraint" {
-                type_url
-                    .entry(structure.type_name.clone())
-                    .or_insert_with(|| structure.url.clone());
-            }
-            // A later package may repeat a core URL with a root-only snapshot.
-            // Keep the definition that actually describes the type.
-            let keep_existing = by_url
-                .get(&structure.url)
-                .is_some_and(|existing: &Structure| {
-                    existing.elements.len() >= structure.elements.len()
-                });
-            if !keep_existing {
-                by_url.insert(structure.url.clone(), structure);
-            }
         }
-        Self {
-            by_url,
-            type_url,
-            model,
-            primitive_regex,
+        if structure.derivation != "constraint" {
+            self.type_url
+                .entry(structure.type_name.clone())
+                .or_insert_with(|| structure.url.clone());
         }
+        // A later package may repeat a core URL with a root-only snapshot.
+        // Keep the definition that actually describes the type.
+        let keep_existing = self
+            .by_url
+            .get(&structure.url)
+            .is_some_and(|existing: &Structure| {
+                existing.elements.len() >= structure.elements.len()
+            });
+        if !keep_existing {
+            self.by_url.insert(structure.url.clone(), structure);
+        }
+    }
+
+    pub fn finish(self) -> Schema {
+        Schema {
+            by_url: self.by_url,
+            type_url: self.type_url,
+            model: self.model.finish(),
+            primitive_regex: self.primitive_regex,
+        }
+    }
+}
+
+impl Schema {
+    pub fn from_definitions(definitions: &[Json]) -> Self {
+        let mut builder = SchemaBuilder::default();
+        for definition in definitions {
+            builder.add(definition);
+        }
+        builder.finish()
     }
 
     pub fn model(&self) -> &Model {
@@ -282,7 +331,7 @@ fn canonical(url: &str) -> &str {
     url.split('|').next().unwrap_or(url)
 }
 
-fn compile_structure(definition: &Json) -> Option<Structure> {
+fn compile_structure(definition: &Json, shared: &mut Shared) -> Option<Structure> {
     let url = definition.get("url")?.as_str()?.to_string();
     let type_name = definition
         .get("type")
@@ -292,7 +341,12 @@ fn compile_structure(definition: &Json) -> Option<Structure> {
     let elements = definition
         .pointer("/snapshot/element")
         .and_then(|value| value.as_array())
-        .map(|elements| elements.iter().filter_map(compile_element).collect())
+        .map(|elements| {
+            elements
+                .iter()
+                .filter_map(|element| compile_element(element, shared))
+                .collect()
+        })
         .unwrap_or_default();
     Some(Structure {
         url,
@@ -311,7 +365,7 @@ fn compile_structure(definition: &Json) -> Option<Structure> {
     })
 }
 
-fn compile_element(element: &Json) -> Option<ElementDef> {
+fn compile_element(element: &Json, shared: &mut Shared) -> Option<ElementDef> {
     let path = element.get("path")?.as_str()?.to_string();
     let id = element
         .get("id")
@@ -335,14 +389,28 @@ fn compile_element(element: &Json) -> Option<ElementDef> {
     let types = element
         .get("type")
         .and_then(|value| value.as_array())
-        .map(|types| types.iter().filter_map(compile_type).collect())
+        .map(|types| {
+            types
+                .iter()
+                .filter_map(compile_type)
+                .map(|type_ref| share(&mut shared.types, type_ref))
+                .collect()
+        })
         .unwrap_or_default();
     let constraints = element
         .get("constraint")
         .and_then(|value| value.as_array())
-        .map(|items| items.iter().filter_map(compile_constraint).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| shared_constraint(item, &mut shared.constraints))
+                .collect()
+        })
         .unwrap_or_default();
-    let binding = element.get("binding").and_then(compile_binding);
+    let binding = element
+        .get("binding")
+        .and_then(compile_binding)
+        .map(|binding| share(&mut shared.bindings, binding));
     let content_reference = element
         .get("contentReference")
         .and_then(|value| value.as_str())
@@ -360,7 +428,10 @@ fn compile_element(element: &Json) -> Option<ElementDef> {
         pattern: prefixed(element, "pattern"),
         min_value: prefixed(element, "minValue"),
         max_value: prefixed(element, "maxValue"),
-        slicing: element.get("slicing").and_then(compile_slicing),
+        slicing: element
+            .get("slicing")
+            .and_then(compile_slicing)
+            .map(|slicing| share(&mut shared.slicings, slicing)),
         content_reference,
         must_support: element
             .get("mustSupport")
@@ -389,6 +460,32 @@ fn canonical_list(value: Option<&Json>) -> Vec<String> {
         Some(Json::String(url)) => vec![canonical(url).to_string()],
         _ => Vec::new(),
     }
+}
+
+/// The constraint `value` describes, compiled the first time it is seen and shared after.
+fn shared_constraint(
+    value: &Json,
+    held: &mut HashMap<(String, String, String, String), Arc<Constraint>>,
+) -> Option<Arc<Constraint>> {
+    let text = |name: &str| {
+        value
+            .get(name)
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let key = (
+        text("key"),
+        text("severity"),
+        text("human"),
+        text("expression"),
+    );
+    if let Some(existing) = held.get(&key) {
+        return Some(existing.clone());
+    }
+    let constraint = Arc::new(compile_constraint(value)?);
+    held.insert(key, constraint.clone());
+    Some(constraint)
 }
 
 fn compile_constraint(value: &Json) -> Option<Constraint> {

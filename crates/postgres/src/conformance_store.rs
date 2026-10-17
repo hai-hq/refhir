@@ -4,11 +4,82 @@ use refhir_persistence::{
     InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewTerminology, ParamPlan,
     ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, StoredBackfill, StoredExpansion,
     StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    CONFORMANCE_PAGE_ROWS,
 };
 
 use crate::{definite, PostgresPersistence};
 
+fn structure_definition_from(row: &postgres::Row) -> StoredStructureDefinition {
+    let abstract_flag: i32 = row.get(4);
+    StoredStructureDefinition {
+        package_id: row.get(0),
+        url: row.get(1),
+        type_name: row.get(2),
+        kind: row.get(3),
+        is_abstract: abstract_flag != 0,
+        json: row.get(5),
+    }
+}
+
+fn terminology_from(row: &postgres::Row) -> StoredTerminology {
+    StoredTerminology {
+        package_id: row.get(0),
+        resource_type: row.get(1),
+        url: row.get(2),
+        json: row.get(3),
+    }
+}
+
+fn expansion_from(row: &postgres::Row) -> StoredExpansion {
+    StoredExpansion {
+        package_id: row.get(0),
+        url: row.get(1),
+        json: row.get(2),
+    }
+}
+
 impl PostgresPersistence {
+    /// Read `select` (a `SELECT` of a table keyed by `(package_id, url)`) a page at a time, in key
+    /// order, and hand each page to `visit`. A connection is taken for the query of each page
+    /// only, so none is held while `visit` works on the rows, which for a catalog load is seconds
+    /// of work, and the client never holds more than a page of the wire data at once.
+    fn visit_pages<T: Send>(
+        &self,
+        select: &str,
+        read: impl Fn(&postgres::Row) -> T + Sync,
+        key: impl Fn(&T) -> (i64, String),
+        visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let next = format!(
+            "{select} WHERE (package_id, url) > ($1, $2) \
+             ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
+        );
+        let mut after: Option<(i64, String)> = None;
+        loop {
+            let page: Vec<T> = crate::off_runtime(|| {
+                let mut guard = self.inner.lock()?;
+                let rows = match &after {
+                    None => guard.client.query(first.as_str(), &[]),
+                    Some((package_id, url)) => {
+                        guard.client.query(next.as_str(), &[package_id, url])
+                    }
+                }
+                .map_err(definite)?;
+                Ok::<_, PersistError>(rows.iter().map(&read).collect())
+            })?;
+            let Some(last) = page.last() else {
+                return Ok(());
+            };
+            after = Some(key(last));
+            let done = page.len() < CONFORMANCE_PAGE_ROWS;
+            visit(page)?;
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
     fn read_counter(&self, key: PersistenceGlobalKey) -> Result<u64, PersistError> {
         let mut guard = self.inner.lock()?;
         let row = guard
@@ -123,6 +194,18 @@ impl ConformanceStore for PostgresPersistence {
         })
     }
 
+    fn visit_structure_definitions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, type_name, kind, is_abstract, json FROM structure_definitions",
+            structure_definition_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
+    }
+
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
         crate::off_runtime(|| {
             let mut guard = self.inner.lock()?;
@@ -172,6 +255,18 @@ impl ConformanceStore for PostgresPersistence {
                 })
                 .collect())
         })
+    }
+
+    fn visit_terminology(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, resource_type, url, json FROM terminology",
+            terminology_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn load_terminology_for(
@@ -306,6 +401,18 @@ impl ConformanceStore for PostgresPersistence {
                 })
                 .collect())
         })
+    }
+
+    fn visit_expansions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        self.visit_pages(
+            "SELECT package_id, url, json FROM value_set_expansion",
+            expansion_from,
+            |row| (row.package_id, row.url.clone()),
+            visit,
+        )
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {

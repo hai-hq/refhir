@@ -9,11 +9,13 @@ mod conform;
 mod error;
 mod extract;
 mod history;
+mod memory;
 mod meta;
 mod npm;
 mod ops;
 mod package;
 mod patch;
+mod prepared;
 mod resolve;
 mod run;
 mod s3;
@@ -28,9 +30,11 @@ pub use bundle::transaction;
 pub use catalog::{Catalog, CatalogClock, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
+pub use memory::release_unused_memory;
 pub use npm::{
-    install_package, install_with, packages_installed, parse_package_spec, unexpandable_value_sets,
-    NpmRegistry, PackageFetcher, PackageSpec,
+    install_package, install_with, package_downloads_allowed, packages_installed,
+    parse_package_spec, unexpandable_value_sets, NpmRegistry, PackageFetcher, PackageSpec,
+    DOWNLOAD_VARIABLE,
 };
 pub use package::{
     cross_version_dir, default_r4_registry_specs, expression_clash_dir, extension_copies_dir,
@@ -38,6 +42,7 @@ pub use package::{
     run_backfills, sdc_dir, stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher,
     R4_CORE_PACKAGE, SDC_PACKAGE,
 };
+pub use prepared::{install_prepared, write_prepared, PreparedBundle, BUNDLE_FILE};
 pub use refhir_persistence::ConformanceStore;
 pub use run::{
     dispatch, import_resource, run, stamp_stored_json, RunError, RunResult, CONTROL_ARGS,

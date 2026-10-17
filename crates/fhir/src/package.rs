@@ -12,7 +12,7 @@ use refhir_persistence::{
     NewStructureDefinition, NewTerminology, ParamStatus,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
-use refhir_validate::MemoryTerminology;
+use refhir_validate::TerminologyBuilder;
 use serde_json::Value;
 
 use crate::catalog::CatalogClock;
@@ -23,8 +23,9 @@ use crate::run::MAX_OCC_FAILURES;
 
 const BATCH: usize = 16;
 
-// The `*_dir` fixtures below are for the test suites only. The server ships no packages: it
-// downloads the release defaults from `[conformance].package_registry` (see `npm.rs`).
+// The `*_dir` fixtures below are for the test suites only. The server binary carries no packages:
+// it installs the release defaults from a prepared file (see `prepared.rs`) or, without one,
+// downloads them from `[conformance].package_registry` (see `npm.rs`).
 
 pub fn minir4_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/minir4"))
@@ -176,9 +177,44 @@ fn stage_package(
     }
     let started = std::time::Instant::now();
     let package = read_package(path)?;
-    let read = started.elapsed();
+    stage_new_package(
+        store,
+        db,
+        catalog,
+        package,
+        started.elapsed(),
+        "read",
+        publish_now,
+    )
+}
+
+/// Store a package that has been read, and (unless `publish_now` is false) publish it.
+/// `read_time` and `read_label` are only for the log line: it says where the time went, whether
+/// the package was read from a directory or from a prepared bundle.
+pub(crate) fn stage_new_package(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    package: NewPackage,
+    read_time: std::time::Duration,
+    read_label: &str,
+    publish_now: bool,
+) -> Result<Option<PendingBackfill>, FhirError> {
+    let started = std::time::Instant::now();
+    let name = package.name.clone();
+    let version = package.version.clone();
     let outcome = store.install_package(&package).map_err(install_error)?;
     let stored = started.elapsed();
+    let counts = (
+        package.structure_definitions.len(),
+        package.search_parameters.len(),
+        package.terminology.len(),
+    );
+    // The catalog rebuild below reads everything back from the store. The package's own copy of
+    // it, which is as large as the package, is not needed any more, so it is not kept alive
+    // under the rebuild.
+    drop(package);
+    crate::memory::release_unused_memory();
     if publish_now {
         publish(store, catalog)?;
     }
@@ -192,11 +228,10 @@ fn stage_package(
     };
     tracing::info!(
         target: "refhir_engine",
-        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; read {read:.1?}, store {:.1?}{catalog_time}",
-        package.structure_definitions.len(),
-        package.search_parameters.len(),
-        package.terminology.len(),
-        stored.saturating_sub(read),
+        "installed {name}@{version}: {} definitions, {} search parameters, {} terminology resources; {read_label} {read_time:.1?}, store {stored:.1?}{catalog_time}",
+        counts.0,
+        counts.1,
+        counts.2,
     );
     if !outcome.inserted {
         return Ok(None);
@@ -270,19 +305,56 @@ pub fn run_backfills(
     Ok(())
 }
 
+/// Publish what was stored, queue the backfills for it, and run them. `result` is how storing the
+/// packages went: what was stored reaches the catalog and gets its backfills even when a later
+/// package failed, or its search parameters stay pending until the next restart, and then the
+/// failure is returned. The backfill jobs are queued only after the publish, so the watermark they
+/// record is not older than the catalog writers use.
+pub(crate) fn finish_install(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    pending: &[PendingBackfill],
+    result: Result<(), FhirError>,
+) -> Result<(), FhirError> {
+    let finish = || -> Result<(), FhirError> {
+        let started = std::time::Instant::now();
+        publish(store, catalog)?;
+        tracing::info!(
+            target: "refhir_engine",
+            "rebuilt the catalog in {:.1?}",
+            started.elapsed()
+        );
+        for backfill in pending {
+            backfill.create(store, db)?;
+        }
+        run_backfills(store, db, catalog)
+    };
+    let finished = finish();
+    result?;
+    finished
+}
+
 pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let (policy, archiver, update_create) = {
+    let (policy, archiver, update_create, in_place) = {
         let current = catalog.read().expect("catalog");
         (
             current.reference_policy(),
             current.sdc_archiver(),
             current.update_create(),
+            current.rebuild_in_place(),
         )
     };
-    let mut loaded = Catalog::open(store)?;
+    if in_place {
+        *catalog.write().expect("catalog") = Catalog::empty();
+    }
+    // The tables are read a page at a time, so a write that lands in between would give a catalog
+    // that mixes two states; the revision is checked before and after, and the load repeated.
+    let (mut loaded, _) = Catalog::open_consistent(store, CatalogClock::Latest)?;
+    loaded.set_rebuild_in_place(in_place);
     loaded.set_reference_policy(policy);
     loaded.set_sdc_archiver(archiver);
     let stable = !loaded.has_pending_parameters();
@@ -321,6 +393,7 @@ pub fn reload_catalog(
         fresh.set_reference_policy(current.reference_policy());
         fresh.set_sdc_archiver(current.sdc_archiver());
         fresh.set_update_create(current.update_create());
+        fresh.set_rebuild_in_place(current.rebuild_in_place());
     }
     *catalog.write().expect("catalog") = fresh;
     Ok(version)
@@ -595,7 +668,7 @@ struct ResourceKind {
     resource_type: Option<Value>,
 }
 
-fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
+pub(crate) fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     let root = package_root(path)?;
     let manifest = read_manifest(&root)?;
     let name = manifest
@@ -608,9 +681,18 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         .and_then(|value| value.as_str())
         .ok_or_else(|| FhirError::Invalid("package.json version is required".into()))?
         .to_string();
-    let mut definitions = Vec::new();
+    // A parsed file is several times the size of its text and a package holds thousands, so each
+    // StructureDefinition and each piece of terminology is reduced to its row, and to what is read
+    // from it later, as soon as it is parsed. Search parameters are kept parsed: they are small,
+    // and read together below.
+    let mut structure_definitions = Vec::new();
+    let mut scope = SearchScope::default();
+    let mut definition_version = None;
+    let mut definition_error = None;
     let mut parameters = Vec::new();
-    let mut terminology = Vec::new();
+    let mut terminology_rows = Vec::new();
+    let mut terminology_error = None;
+    let mut expanded = TerminologyBuilder::for_package(None);
     for entry in fs::read_dir(&root).map_err(|err| FhirError::Invalid(err.to_string()))? {
         let entry = entry.map_err(|err| FhirError::Invalid(err.to_string()))?;
         let file = entry.path();
@@ -646,22 +728,47 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
             }
         };
         let bucket = match value.get("resourceType").and_then(Value::as_str) {
-            Some("StructureDefinition") => &mut definitions,
+            Some("StructureDefinition") => {
+                scope.note_definition(&value);
+                if definition_version.is_none() {
+                    definition_version = value
+                        .get("fhirVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                match structure_row(&value) {
+                    Ok(row) => structure_definitions.push(row),
+                    Err(err) => {
+                        definition_error.get_or_insert(err);
+                    }
+                }
+                continue;
+            }
             Some("SearchParameter") => &mut parameters,
             Some("CodeSystem")
             | Some("ValueSet")
             | Some("ConceptMap")
-            | Some("CompartmentDefinition") => &mut terminology,
+            | Some("CompartmentDefinition") => {
+                match terminology_row(&value) {
+                    Ok(row) => terminology_rows.push(row),
+                    Err(err) => {
+                        terminology_error.get_or_insert(err);
+                    }
+                }
+                expanded.add_resource(0, value);
+                continue;
+            }
             _ => continue,
         };
         bucket.push(value);
     }
-    let fhir_version = fhir_version(&manifest, &definitions)?;
-    let mut structure_definitions = Vec::new();
-    for definition in &definitions {
-        structure_definitions.push(structure_row(definition)?);
+    let fhir_version = fhir_version(&manifest, definition_version)?;
+    if let Some(err) = definition_error {
+        return Err(err);
     }
-    let scope = SearchScope::from_documents(&definitions, &parameters);
+    for parameter in &parameters {
+        scope.note_parameter(parameter);
+    }
     let mut search_parameters = Vec::new();
     // Non-experimental parameters go first and win: the R4 core package ships a sample
     // `_id` parameter (`SearchParameter/example`) that disagrees with the real `Resource-id`.
@@ -696,24 +803,22 @@ fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
             search_parameters.push(row);
         }
     }
-    let mut terminology_rows = Vec::new();
-    for resource in &terminology {
-        terminology_rows.push(terminology_row(resource)?);
+    if let Some(err) = terminology_error {
+        return Err(err);
     }
     // Read for the release the package is for, as the catalog and a rebuild read it, so that what a
     // rebuild gives is what is stored here.
-    let tagged: Vec<(i64, &Value)> = terminology.iter().map(|resource| (0, resource)).collect();
-    let expansions =
-        MemoryTerminology::expansion_documents_scoped(&tagged, Some(fhir_version.as_str()))
-            .into_iter()
-            .filter_map(|document| {
-                let url = document.get("url")?.as_str()?.to_string();
-                Some(NewExpansion {
-                    url,
-                    json: document.to_string(),
-                })
+    expanded.set_release(Some(fhir_version.as_str()));
+    let expansions = expanded
+        .expansion_documents()
+        .filter_map(|document| {
+            let url = document.get("url")?.as_str()?.to_string();
+            Some(NewExpansion {
+                url,
+                json: document.to_string(),
             })
-            .collect();
+        })
+        .collect();
     Ok(NewPackage {
         name,
         version,
@@ -739,7 +844,9 @@ pub(crate) fn package_root(path: &Path) -> Result<PathBuf, FhirError> {
     )))
 }
 
-fn fhir_version(manifest: &Value, definitions: &[Value]) -> Result<String, FhirError> {
+/// The release a package is for: what its manifest says, or else what its first definition that
+/// says (`definition_version`) does.
+fn fhir_version(manifest: &Value, definition_version: Option<String>) -> Result<String, FhirError> {
     if let Some(version) = manifest.get("fhirVersion").and_then(|value| value.as_str()) {
         return Ok(version.to_string());
     }
@@ -751,15 +858,7 @@ fn fhir_version(manifest: &Value, definitions: &[Value]) -> Result<String, FhirE
     {
         return Ok(version.to_string());
     }
-    for definition in definitions {
-        if let Some(version) = definition
-            .get("fhirVersion")
-            .and_then(|value| value.as_str())
-        {
-            return Ok(version.to_string());
-        }
-    }
-    Err(FhirError::Invalid("package fhirVersion is required".into()))
+    definition_version.ok_or_else(|| FhirError::Invalid("package fhirVersion is required".into()))
 }
 
 fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
@@ -839,17 +938,6 @@ pub(crate) struct SearchScope {
 }
 
 impl SearchScope {
-    pub(crate) fn from_documents(definitions: &[Value], parameters: &[Value]) -> Self {
-        let mut scope = Self::default();
-        for definition in definitions {
-            scope.note_definition(definition);
-        }
-        for parameter in parameters {
-            scope.note_parameter(parameter);
-        }
-        scope
-    }
-
     pub(crate) fn from_store(store: &dyn ConformanceStore) -> Result<Self, FhirError> {
         let mut scope = Self::default();
         for definition in store

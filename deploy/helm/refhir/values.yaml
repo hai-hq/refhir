@@ -59,6 +59,9 @@ conformance:
   # secretEnv (REFHIR_S3_ACCESS_KEY_ID, REFHIR_S3_SECRET_ACCESS_KEY) and, for a non-AWS store,
   # REFHIR_S3_ENDPOINT / REFHIR_S3_REGION.
   packageRegistry: ""
+  # The server downloads packages only if this is true. The image carries the release's packages,
+  # so the default needs no download; turn it on to install other packages by name or version.
+  packageDownload: false
 
 smart:
   enabled: false

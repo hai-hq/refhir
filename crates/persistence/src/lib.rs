@@ -400,7 +400,8 @@ pub trait Persistence: PersistenceReader {
 }
 
 /// Search parameter row state. `ready` is what search may use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ParamStatus {
     Pending,
     Ready,
@@ -471,7 +472,7 @@ pub struct StoredBackfill {
     pub claimed_epoch: Option<i64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewStructureDefinition {
     pub url: String,
     pub type_name: String,
@@ -480,7 +481,7 @@ pub struct NewStructureDefinition {
     pub json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewSearchParameter {
     pub url: String,
     pub base: String,
@@ -609,7 +610,7 @@ pub struct StoredTerminology {
     pub json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewTerminology {
     pub resource_type: String,
     pub url: String,
@@ -623,7 +624,7 @@ pub struct StoredExpansion {
     pub json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewExpansion {
     pub url: String,
     pub json: String,
@@ -638,7 +639,11 @@ pub struct ExpansionChange {
     pub json: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+/// A package as it is stored. It is also what a prepared file of packages holds, in its serde
+/// form: adding, removing or renaming a field here, or in the row types it holds, changes the
+/// bytes of every such file, so it needs a bump of `FORMAT` in `refhir-fhir`'s `prepared.rs`
+/// (a test there fails when the bytes change).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NewPackage {
     pub name: String,
     pub version: String,
@@ -691,6 +696,10 @@ impl From<PersistError> for InstallError {
     }
 }
 
+/// How many rows a backend hands over at a time to [`ConformanceStore::visit_terminology`] and
+/// its siblings.
+pub const CONFORMANCE_PAGE_ROWS: usize = 128;
+
 /// Direct SQL for packages, structure definitions, and search parameters.
 /// Resource transactions do not use this trait.
 pub trait ConformanceStore: Send + Sync {
@@ -717,6 +726,36 @@ pub trait ConformanceStore: Send + Sync {
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError>;
 
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError>;
+
+    /// [`ConformanceStore::load_structure_definitions`], handed over a page at a time, in the
+    /// same order. A caller that compiles the definitions as they come never holds more than a
+    /// page of them, where the full load holds every installed package's JSON at once. The store
+    /// is not locked while `visit` runs. The default reads them all and hands them over in one
+    /// page; a backend that can read page by page should override it.
+    fn visit_structure_definitions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredStructureDefinition>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        visit(self.load_structure_definitions()?)
+    }
+
+    /// [`ConformanceStore::load_terminology`], a page at a time. See
+    /// [`ConformanceStore::visit_structure_definitions`].
+    fn visit_terminology(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredTerminology>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        visit(self.load_terminology()?)
+    }
+
+    /// [`ConformanceStore::load_expansions`], a page at a time. See
+    /// [`ConformanceStore::visit_structure_definitions`].
+    fn visit_expansions(
+        &self,
+        visit: &mut dyn FnMut(Vec<StoredExpansion>) -> Result<(), PersistError>,
+    ) -> Result<(), PersistError> {
+        visit(self.load_expansions()?)
+    }
 
     /// The terminology rows of one package. The full load returns every installed package's
     /// JSON (the whole R4 core is thousands of resources); a caller that only wants the rows
@@ -1833,6 +1872,88 @@ pub mod jobs {
 
 pub mod conformance {
     use super::*;
+
+    /// Reading structure definitions, terminology and expansions a page at a time gives the rows
+    /// the full loads give, in the same order, in pages no larger than
+    /// [`CONFORMANCE_PAGE_ROWS`], and leaves the store free while the caller works on a page.
+    /// `tag` keeps this run's rows apart on a database that already holds earlier runs.
+    pub fn exercise_paged_reads(store: &dyn ConformanceStore, tag: &str) {
+        let rows = CONFORMANCE_PAGE_ROWS * 2 + 5;
+        let url = |kind: &str, index: usize| format!("http://example.org/{tag}/{kind}/{index:05}");
+        let document =
+            |kind: &str, url: &str| format!(r#"{{"resourceType":"{kind}","url":"{url}"}}"#);
+        for name in ["paged-one", "paged-two"] {
+            let package = NewPackage {
+                name: format!("{name}.{tag}"),
+                version: "1.0.0".into(),
+                fhir_version: "4.0.1".into(),
+                structure_definitions: (0..rows)
+                    .map(|index| NewStructureDefinition {
+                        url: url("definition", index),
+                        type_name: "Thing".into(),
+                        kind: "complex-type".into(),
+                        is_abstract: index % 2 == 0,
+                        json: document("StructureDefinition", &url("definition", index)),
+                    })
+                    .collect(),
+                search_parameters: Vec::new(),
+                terminology: (0..rows)
+                    .map(|index| NewTerminology {
+                        resource_type: "CodeSystem".into(),
+                        url: url("system", index),
+                        json: document("CodeSystem", &url("system", index)),
+                    })
+                    .collect(),
+                expansions: (0..rows)
+                    .map(|index| NewExpansion {
+                        url: url("set", index),
+                        json: document("ValueSet", &url("set", index)),
+                    })
+                    .collect(),
+            };
+            assert!(store.install_package(&package).unwrap().inserted);
+        }
+        let mine = |url: &str| url.contains(&format!("/{tag}/"));
+
+        // One macro for the three tables, which differ only in their row type and loaders.
+        macro_rules! check {
+            ($load:ident, $visit:ident) => {{
+                let full: Vec<_> = store
+                    .$load()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|row| mine(&row.url))
+                    .collect();
+                assert_eq!(full.len(), rows * 2);
+                let mut paged = Vec::new();
+                let mut pages = 0;
+                store
+                    .$visit(&mut |page| {
+                        assert!(page.len() <= CONFORMANCE_PAGE_ROWS);
+                        // The store is not held while a page is worked on: another call goes
+                        // straight through.
+                        store.catalog_version().unwrap();
+                        pages += 1;
+                        paged.extend(page.into_iter().filter(|row| mine(&row.url)));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(paged, full, "{} pages of {}", pages, stringify!($visit));
+                assert!(pages >= (rows * 2).div_ceil(CONFORMANCE_PAGE_ROWS));
+                // What the caller says stops the read, and comes back as it was said.
+                let mut calls = 0;
+                let stopped = store.$visit(&mut |_| {
+                    calls += 1;
+                    Err(PersistError::Definite("stop".into()))
+                });
+                assert!(matches!(stopped, Err(PersistError::Definite(text)) if text == "stop"));
+                assert_eq!(calls, 1);
+            }};
+        }
+        check!(load_structure_definitions, visit_structure_definitions);
+        check!(load_terminology, visit_terminology);
+        check!(load_expansions, visit_expansions);
+    }
 
     /// Reading terminology by URL and changing one stored expansion at a time. `tag` keeps this
     /// run's URLs and package names apart on a database that already holds earlier runs.

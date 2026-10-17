@@ -12,7 +12,7 @@ Files can live in subfolders (`Patient/alice.json`, `Organization/org.json`, …
 The files name their own ids and refer to each other by `Type/id`, so they are loaded with `PUT [type]/[id]`. A server assigns the id of a resource it creates, unless it is started with `--update-as-create` (or `update_as_create = true` under `[conformance]`), so start it that way:
 
 ```bash
-cargo run -p refhir -- --memory --update-as-create
+REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory --update-as-create
 
 cd clients/go
 go run ./cmd/seed -url http://127.0.0.1:8080

@@ -25,5 +25,8 @@ tar = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 refhir-sqlite = { path = "../sqlite" }

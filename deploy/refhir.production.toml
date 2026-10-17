@@ -26,6 +26,9 @@ postgres_url = "postgresql://refhir:CHANGE_ME@postgres:5432/refhir?sslmode=verif
 [conformance]
 reference_policy = "strict"
 package_cache = "/data/package-cache"
+# A name@version entry is downloaded, so it also needs package_download = true (the server
+# downloads nothing otherwise); a directory or a .tgz needs no download.
+# package_download = true
 packages = [
   # "hl7.fhir.us.core@6.1.0",
 ]

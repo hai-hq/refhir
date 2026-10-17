@@ -22,72 +22,95 @@ struct ModelInner {
     types: BTreeSet<String>,
 }
 
-impl Model {
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Builds a [`Model`] from StructureDefinitions handed over one at a time, so a caller that
+/// reads its definitions one by one does not have to keep them all parsed at once.
+#[derive(Default)]
+pub struct ModelBuilder {
+    inner: ModelInner,
+    references: Vec<(String, String)>,
+}
 
-    pub fn from_definitions(definitions: &[Value]) -> Self {
-        let mut inner = ModelInner::default();
-        let mut references = Vec::new();
-        for definition in definitions {
-            let Some(name) = definition.get("name").and_then(|value| value.as_str()) else {
-                continue;
-            };
-            inner.types.insert(name.to_string());
-            if let Some(parent) = definition
-                .get("baseDefinition")
-                .and_then(|value| value.as_str())
-                .and_then(|url| url.rsplit('/').next())
-            {
-                if parent != name {
-                    inner.parents.insert(name.to_string(), parent.to_string());
-                    inner.types.insert(parent.to_string());
-                }
-            }
-            let Some(elements) = definition
-                .pointer("/snapshot/element")
-                .and_then(|value| value.as_array())
-            else {
-                continue;
-            };
-            for element in elements {
-                let Some(path) = element.get("path").and_then(|value| value.as_str()) else {
-                    continue;
-                };
-                let codes = element
-                    .get("type")
-                    .and_then(|value| value.as_array())
-                    .map(|types| {
-                        types
-                            .iter()
-                            .filter_map(|item| item.get("code").and_then(|code| code.as_str()))
-                            .map(|code| code.to_string())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                if !codes.is_empty() {
-                    inner.elements.insert(path.to_string(), codes);
-                } else if let Some(reference) = element
-                    .get("contentReference")
-                    .and_then(|value| value.as_str())
-                {
-                    references.push((
-                        path.to_string(),
-                        reference.trim_start_matches('#').to_string(),
-                    ));
-                }
+impl ModelBuilder {
+    pub fn add(&mut self, definition: &Value) {
+        let Some(name) = definition.get("name").and_then(|value| value.as_str()) else {
+            return;
+        };
+        self.inner.types.insert(name.to_string());
+        if let Some(parent) = definition
+            .get("baseDefinition")
+            .and_then(|value| value.as_str())
+            .and_then(|url| url.rsplit('/').next())
+        {
+            if parent != name {
+                self.inner
+                    .parents
+                    .insert(name.to_string(), parent.to_string());
+                self.inner.types.insert(parent.to_string());
             }
         }
+        let Some(elements) = definition
+            .pointer("/snapshot/element")
+            .and_then(|value| value.as_array())
+        else {
+            return;
+        };
+        for element in elements {
+            let Some(path) = element.get("path").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let codes = element
+                .get("type")
+                .and_then(|value| value.as_array())
+                .map(|types| {
+                    types
+                        .iter()
+                        .filter_map(|item| item.get("code").and_then(|code| code.as_str()))
+                        .map(|code| code.to_string())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !codes.is_empty() {
+                self.inner.elements.insert(path.to_string(), codes);
+            } else if let Some(reference) = element
+                .get("contentReference")
+                .and_then(|value| value.as_str())
+            {
+                self.references.push((
+                    path.to_string(),
+                    reference.trim_start_matches('#').to_string(),
+                ));
+            }
+        }
+    }
+
+    pub fn finish(self) -> Model {
+        let Self {
+            mut inner,
+            references,
+        } = self;
         for (path, target) in references {
             if let Some(types) = inner.elements.get(&target).cloned() {
                 inner.elements.insert(path.clone(), types);
             }
             inner.references.insert(path, target);
         }
-        Self {
+        Model {
             inner: Arc::new(inner),
         }
+    }
+}
+
+impl Model {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_definitions(definitions: &[Value]) -> Self {
+        let mut builder = ModelBuilder::default();
+        for definition in definitions {
+            builder.add(definition);
+        }
+        builder.finish()
     }
 
     /// Follow `contentReference` so a repeated backbone keeps the original element's children.

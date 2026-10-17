@@ -24,7 +24,9 @@ between deployments, so they stay out of the config file.
 
 | Variable | What it does |
 |---|---|
-| `REFHIR_PACKAGE_REGISTRY` | Where FHIR packages are downloaded from on a first start: a registry or mirror URL, or `s3://bucket/prefix`. The default is `https://packages.fhir.org`. |
+| `REFHIR_PACKAGE_DOWNLOAD` | `true` lets the server download FHIR packages: the release defaults when there is no prepared file, `name@version` entries of `[conformance].packages`, and `$install`. Off by default, so nothing is downloaded unless it is set. |
+| `REFHIR_PACKAGE_REGISTRY` | Where FHIR packages are downloaded from once downloading is on: a registry or mirror URL, or `s3://bucket/prefix`. The default is `https://packages.fhir.org`. |
+| `REFHIR_PACKAGE_BUNDLE` | The file of prepared packages (made by `refhir package-bundle`) that a first start installs. Found beside the binary when unset; `off` says not to look. A file that is named and is not there, or that is there and unusable, stops the start. |
 | `REFHIR_PACKAGE_CACHE` | The on-disk cache for downloaded packages. Without it the cache is `package-cache` next to the SQLite file, or `.refhir/packages` for an in-memory or Postgres database. |
 | `REFHIR_SKIP_DEFAULT_PACKAGES` | Skips installing the release's default packages, so the server knows no resource types until you add a package with `--package`. Not for production. |
 | `REFHIR_S3_ACCESS_KEY_ID` | The access key for an `s3://` package source. |
