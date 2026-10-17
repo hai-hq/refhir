@@ -70,6 +70,7 @@ const TEST_ONLY = new Set([
   'REFHIR_TLS_POSTGRES_ADDR',
   'REFHIR_TLS_POSTGRES_DIR',
   'REFHIR_REQUIRE_POSTGRES_TLS',
+  'REFHIR_MEASURE_BUNDLE',
 ]);
 test('every REFHIR_ variable the code reads is on the environment variables page', () => {
   const page = fs.readFileSync(path.join(siteRoot, 'src/content/docs/docs/reference/environment-variables.md'), 'utf8');
