@@ -21,6 +21,10 @@ bind = "0.0.0.0:8080"
 # from one of them; without this a client that reaches the server directly (a node port, a pod
 # address) can write the header itself and choose, or frame, an address.
 # trusted_proxy_peers = ["10.0.0.0/8", "fd00::/8"]
+# How many matches a search returns when it names no _count; the rest follow behind the `next`
+# link of the Bundle. A client that asks for _count gets what it asked for. 0 returns every match
+# in one response. REFHIR_DEFAULT_PAGE_SIZE.
+# default_page_size = 100
 
 [database]
 kind = "sqlite" # sqlite | memory | postgres

@@ -12,16 +12,23 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
-- **A first start installs prepared packages, with no registry and little memory.** Release
-  archives and container images now carry the release's FHIR packages (R4 core, SDC and what they
-  depend on) in a file, `refhir-packages.bundle`, that is made when they are built: the packages
-  are downloaded, read and expanded once, there. A server finds the file beside its binary (or in
+- **A first start installs prepared packages, with no registry and little memory.** Release archives
+  and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
+  in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
+  downloaded, read and expanded once, there. A server finds the file beside its binary (or in
   `../share/refhir/` from it, or at `[conformance].package_bundle` / `REFHIR_PACKAGE_BUNDLE`; `off`
   says not to look) and stores what is in it, so the first start needs no network and no package
-  cache, and a first start peaks at a small fraction of the memory it did. A file that is there and cannot be used (damaged, or made for another release) stops the
-  start with an error that says so. `refhir package-bundle` makes the file for a binary you built
-  yourself, or for other packages (`--spec`). See [Preparing the
-  packages](deploy/production.md#preparing-the-packages).
+  cache, and a first start peaks at a small fraction of the memory it did. A file that is there and
+  cannot be used (damaged, or made for another release) stops the start with an error that says so.
+  `refhir package-bundle` makes the file for a binary you built yourself, or for other packages
+  (`--spec`). See [Preparing the packages](deploy/production.md#preparing-the-packages).
+- **A repeated search parameter in a live query.** A `/sync` query's arguments are a JSON object, so
+  a parameter that a URL would give twice (AND) had no way to be written. It is now an array of
+  strings: `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}` finds the Slots whose
+  Schedule has both as actors, as `schedule.actor=…&schedule.actor=…` does over REST. An empty
+  array, or one with anything but strings in it, is refused (`QueryFailed`). The Go and TypeScript
+  clients carry an array through `Watch`, `Query` and `search`.
+- **`[server].default_page_size`** (or `REFHIR_DEFAULT_PAGE_SIZE`). See Changed.
 - **Subscriptions send `channel.header`.** Each entry (R4 says `Name: value`, for example
   `Authorization: Bearer …`) is added to the `rest-hook` request, so a receiver that needs a
   token can be served. A name can be given once. An entry that is not a valid header, that
@@ -95,6 +102,26 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   it. The one visible difference is which package holds the value sets that core and the examples
   package both define: core, where it was the examples package, with the same codes in each
   expansion.
+- **A search `GET` that names no `_count` returns a page of 100 matches with a `next` link.** It
+  used to return every match in one response (1,520 Slots in one 0.3 s answer, which a client then
+  handed on whole). FHIR leaves the page size to the server. The `self` link shows the `_count` that
+  applied, `total` still counts every match, and a `_count` in the request is used as sent
+  (`_count=0` is the total alone). A client that read every match from one response must now follow
+  `next`, or ask for a `_count` large enough. **A page without `_sort` is in index order**, which is
+  not an order to rely on: send `_sort`. This covers `GET [type]` and a compartment search. Live
+  queries, GraphQL, the entries of a Bundle, conditional update and delete and the searches behind
+  a chain, `_has` or `_include` are not paged. Set `[server].default_page_size` or
+  `REFHIR_DEFAULT_PAGE_SIZE` to change the page, or to `0` to return every match as before.
+- **`_sort` with a small `_count` no longer costs a millisecond for every match.** On a server with
+  1,520 free Slots, `Slot?status=free&start=ge…&_sort=start&_count=3` took 0.9 s (5.2 s with 6,080),
+  because the search worked out both sort keys again for every comparison of the sort, and kept
+  every match until it was done. Each match now gets its sort key once, only the `offset + count`
+  that sort first are held, and the order and the bundle are unchanged. Reading a plain path such as
+  `Slot.start`, `Schedule.actor` or `Appointment.participant.actor` out of a document no longer
+  copies the whole document first, which cuts what it costs to check a row and to index a write.
+  The same search takes 20 ms (78 ms with 6,080 Slots), and about what the search takes without
+  `_sort`. The time still grows with the number of Slots the filters leave to be read, by about
+  13 µs each; narrowing by a parameter the index decides (`status`, `schedule`) keeps it small.
 - **Naming more than one database on the command line is now an error.** `--sqlite`, `--memory`
   and `--postgres` are alternatives, but ReFHIR used to start without complaint and use one of
   them: `refhir --memory --sqlite x.db` ran in memory and never created `x.db`. It now exits with

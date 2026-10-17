@@ -8,6 +8,8 @@ Set `[fhir].version = "r4"` (default) to install that release’s defaults (**hl
 
 Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or `REFHIR_CONFIG`. CLI flags override the file. In containers, set `REFHIR_CONFIG=/etc/refhir/refhir.toml` and mount the file there.
 
+`[server].default_page_size` (or `REFHIR_DEFAULT_PAGE_SIZE`, and it has no CLI flag) is how many matches a search `GET` returns on a page when it names no `_count`: 100 by default, and `0` returns every match in one response. See [FHIR API](fhir-api.md#search).
+
 ## CLI reference
 
 | Flag | Purpose |

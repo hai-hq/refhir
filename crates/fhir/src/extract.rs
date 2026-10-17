@@ -884,6 +884,26 @@ fn path_strings(
     ) {
         return Vec::new();
     }
+    // A plain path of members is read straight from the JSON: evaluating it copies the resource,
+    // which is most of what checking a row, or working out its sort key, costs.
+    if let Some(found) = refhir_fhirpath::member_values(expr, resource, path_model) {
+        return found
+            .into_iter()
+            .flat_map(|json| encode_json(kind, json))
+            .collect();
+    }
+    path_strings_by_evaluating(kind, expr, resource, path_model, host)
+}
+
+/// `path_strings` for any expression, found by evaluating it. What `path_strings` gives for a
+/// plain path of members has to be what this gives.
+fn path_strings_by_evaluating(
+    kind: SearchKind,
+    expr: &Expr,
+    resource: &Value,
+    path_model: &Model,
+    host: &dyn Host,
+) -> Vec<String> {
     eval_items(expr, resource, path_model, host)
         .iter()
         .flat_map(|item| encode_value(kind, item))
@@ -901,28 +921,21 @@ fn path_match<S: AsRef<str>>(
     path_model: &Model,
     host: &dyn Host,
 ) -> bool {
-    let items = eval_items(expr, resource, path_model, host);
-    let encoded = |kind| {
-        items
-            .iter()
-            .flat_map(|item| encode_value(kind, item))
-            .collect::<Vec<_>>()
-    };
     match kind {
         SearchKind::Token | SearchKind::Reference => {
-            let values = encoded(kind);
+            let values = path_strings(kind, expr, resource, path_model, host);
             expected
                 .iter()
                 .any(|wanted| token_match(op, &values, wanted.as_ref()))
         }
         SearchKind::Uri => {
-            let values = encoded(kind);
+            let values = path_strings(kind, expr, resource, path_model, host);
             expected
                 .iter()
                 .any(|wanted| uri_match(op, &values, wanted.as_ref()))
         }
         SearchKind::String => {
-            let values = encoded(kind);
+            let values = path_strings(kind, expr, resource, path_model, host);
             expected.iter().any(|wanted| {
                 values
                     .iter()
@@ -930,7 +943,7 @@ fn path_match<S: AsRef<str>>(
             })
         }
         SearchKind::Date => {
-            let values = encoded(kind);
+            let values = path_strings(kind, expr, resource, path_model, host);
             expected.iter().any(|wanted| {
                 values
                     .iter()
@@ -938,12 +951,14 @@ fn path_match<S: AsRef<str>>(
             })
         }
         SearchKind::Number => {
+            let items = eval_items(expr, resource, path_model, host);
             let numbers = numbers_of(&items);
             expected
                 .iter()
                 .any(|wanted| number_match(op, &numbers, wanted.as_ref()))
         }
         SearchKind::Quantity => {
+            let items = eval_items(expr, resource, path_model, host);
             let quantities = quantities_of(&items);
             expected
                 .iter()
@@ -1002,15 +1017,19 @@ fn composite_match(
 }
 
 fn encode_value(kind: SearchKind, item: &refhir_fhirpath::Value) -> Vec<String> {
-    let json = match item {
-        refhir_fhirpath::Value::Node { json, .. } => json,
-        refhir_fhirpath::Value::String(text) => return vec![text.clone()],
-        refhir_fhirpath::Value::Boolean { value, .. } => return vec![value.to_string()],
+    match item {
+        refhir_fhirpath::Value::Node { json, .. } => encode_json(kind, json),
+        refhir_fhirpath::Value::String(text) => vec![text.clone()],
+        refhir_fhirpath::Value::Boolean { value, .. } => vec![value.to_string()],
         refhir_fhirpath::Value::Date(_) | refhir_fhirpath::Value::DateTime(_) => {
-            return vec![item.render().trim_start_matches('@').to_string()];
+            vec![item.render().trim_start_matches('@').to_string()]
         }
-        _ => return Vec::new(),
-    };
+        _ => Vec::new(),
+    }
+}
+
+/// What a node of the resource is as the values of a parameter of this kind.
+fn encode_json(kind: SearchKind, json: &Value) -> Vec<String> {
     match kind {
         SearchKind::Token => token_json(json),
         SearchKind::String => string_json(json),
@@ -1937,11 +1956,27 @@ fn nodes_at<'a>(root: &'a Value, path: &[String]) -> Vec<&'a Value> {
     flat
 }
 
+/// The JSON files of the R4 package in `fixtures/r4` whose names start with `prefix`.
+#[cfg(test)]
+fn r4_fixtures(prefix: &str) -> Vec<Value> {
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/r4"));
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if name.starts_with(prefix) && name.ends_with(".json") {
+            found.push(serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap());
+        }
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::fs;
-    use std::path::Path;
 
     use refhir_fhirpath::{EmptyHost, Model};
     use serde_json::{json, Value};
@@ -1952,20 +1987,7 @@ mod tests {
 
     #[test]
     fn every_r4_search_parameter_compiles() {
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/r4"));
-        let mut parameters = Vec::new();
-        for entry in fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            let name = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("");
-            if !name.starts_with("SearchParameter-") || !name.ends_with(".json") {
-                continue;
-            }
-            let text = fs::read_to_string(&path).unwrap();
-            parameters.push(serde_json::from_str::<Value>(&text).unwrap());
-        }
+        let parameters = super::r4_fixtures("SearchParameter-");
         assert!(parameters.len() > 1000);
         let mut kinds = BTreeMap::new();
         for parameter in &parameters {
@@ -2577,5 +2599,351 @@ mod tests {
         assert!(covered(&group));
         assert!(!covered(&device));
         assert!(!covered(&other));
+    }
+}
+
+/// A plain path of members is read straight from the JSON instead of evaluated. The two have to
+/// give the same values for every search parameter of every resource type, whatever shape the
+/// resource has, because the keys of the index and every match are made from them.
+#[cfg(test)]
+mod direct_reads {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use refhir_fhirpath::{EmptyHost, Model};
+    use serde_json::{json, Map, Value};
+
+    use super::{compile_parameter, path_strings, path_strings_by_evaluating, Source};
+
+    /// What the StructureDefinitions say of one element.
+    struct Element {
+        types: Vec<String>,
+        repeats: bool,
+        content_reference: Option<String>,
+    }
+
+    struct Shapes {
+        elements: BTreeMap<String, Element>,
+        definitions: Vec<Value>,
+    }
+
+    /// How a generated resource is filled in.
+    #[derive(Clone, Copy)]
+    struct Variant {
+        /// Every element, with two of each that repeats; otherwise every other element, and one.
+        full: bool,
+        /// Booleans and numbers written as strings, which the evaluator reads as what they should be.
+        stringly: bool,
+    }
+
+    fn load() -> Shapes {
+        let definitions = super::r4_fixtures("StructureDefinition-");
+        let mut elements = BTreeMap::new();
+        for definition in &definitions {
+            for element in definition
+                .pointer("/snapshot/element")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(path) = element["path"].as_str() else {
+                    continue;
+                };
+                elements.insert(
+                    path.to_string(),
+                    Element {
+                        types: element["type"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|item| item["code"].as_str().map(str::to_string))
+                            .collect(),
+                        repeats: element["max"].as_str() == Some("*"),
+                        content_reference: element["contentReference"]
+                            .as_str()
+                            .map(|reference| reference.trim_start_matches('#').to_string()),
+                    },
+                );
+            }
+        }
+        Shapes {
+            elements,
+            definitions,
+        }
+    }
+
+    impl Shapes {
+        /// The names directly below `path`, and the paths they are at.
+        fn children(&self, path: &str) -> Vec<(String, String)> {
+            let prefix = format!("{path}.");
+            self.elements
+                .range(prefix.clone()..)
+                .take_while(|(key, _)| key.starts_with(&prefix))
+                .filter(|(key, _)| !key[prefix.len()..].contains('.'))
+                .map(|(key, _)| (key[prefix.len()..].to_string(), key.clone()))
+                .collect()
+        }
+
+        fn primitive(code: &str, salt: usize, variant: Variant) -> Option<Value> {
+            Some(match code {
+                "boolean" if variant.stringly => json!("true"),
+                "boolean" => json!(salt % 2 == 0),
+                "integer" | "unsignedInt" | "positiveInt" if variant.stringly => {
+                    json!(format!("{}", salt + 1))
+                }
+                "integer" | "unsignedInt" | "positiveInt" => json!(salt + 1),
+                "decimal" if variant.stringly => json!("1.5"),
+                "decimal" => json!(1.5),
+                "date" => json!("2030-01-02"),
+                "dateTime" | "instant" => json!(format!("2030-01-02T03:04:0{}Z", salt % 10)),
+                "time" => json!("03:04:05"),
+                "base64Binary" => json!("AAAA"),
+                "string"
+                | "code"
+                | "id"
+                | "markdown"
+                | "oid"
+                | "uuid"
+                | "xhtml"
+                | "http://hl7.org/fhirpath/System.String" => json!(format!("v{salt}")),
+                "uri" | "url" | "canonical" => json!(format!("http://example.org/{salt}")),
+                _ => return None,
+            })
+        }
+
+        /// A value of `code` for the element at `path`.
+        fn value(
+            &self,
+            path: &str,
+            code: &str,
+            salt: usize,
+            depth: usize,
+            variant: Variant,
+        ) -> Value {
+            if let Some(value) = Self::primitive(code, salt, variant) {
+                return value;
+            }
+            if code == "Reference" {
+                return json!({"reference": format!("Patient/p{salt}"), "display": "d"});
+            }
+            if depth > 4 {
+                return json!({});
+            }
+            // A complex type's elements are under its own name; a backbone's, under its path.
+            let base = if matches!(code, "BackboneElement" | "Element") {
+                path.to_string()
+            } else {
+                code.to_string()
+            };
+            self.object(&base, salt, depth + 1, variant)
+        }
+
+        fn object(&self, path: &str, salt: usize, depth: usize, variant: Variant) -> Value {
+            let mut object = Map::new();
+            for (position, (name, child)) in self.children(path).into_iter().enumerate() {
+                if matches!(
+                    name.as_str(),
+                    "extension" | "modifierExtension" | "contained"
+                ) {
+                    continue;
+                }
+                if !variant.full && position % 2 == 1 {
+                    continue;
+                }
+                let element = &self.elements[&child];
+                // A repeated backbone points at the element it repeats.
+                let (source, element) = match &element.content_reference {
+                    Some(target) if self.elements.contains_key(target) => {
+                        (target.as_str(), &self.elements[target])
+                    }
+                    _ => (child.as_str(), element),
+                };
+                // A choice is given two of its types; an element with none is a backbone.
+                let wanted = if name.ends_with("[x]") { 2 } else { 1 };
+                let mut types: Vec<String> = element.types.iter().take(wanted).cloned().collect();
+                if types.is_empty() {
+                    types.push("BackboneElement".to_string());
+                }
+                for code in types {
+                    let key = match name.strip_suffix("[x]") {
+                        Some(stem) => format!("{stem}{}{}", code[..1].to_uppercase(), &code[1..]),
+                        None => name.clone(),
+                    };
+                    let count = if element.repeats && variant.full {
+                        2
+                    } else {
+                        1
+                    };
+                    let values: Vec<Value> = (0..count)
+                        .map(|n| self.value(source, &code, salt + n + position, depth, variant))
+                        .collect();
+                    object.insert(
+                        key,
+                        if element.repeats {
+                            Value::Array(values)
+                        } else {
+                            values.into_iter().next().unwrap()
+                        },
+                    );
+                }
+            }
+            Value::Object(object)
+        }
+
+        fn resource(&self, type_name: &str, variant: Variant) -> Value {
+            let mut resource = self.object(type_name, 0, 0, variant);
+            let object = resource.as_object_mut().unwrap();
+            object.insert("resourceType".into(), json!(type_name));
+            object.insert("id".into(), json!("r1"));
+            resource
+        }
+    }
+
+    #[test]
+    fn a_plain_path_reads_the_same_whether_walked_or_evaluated() {
+        let shapes = load();
+        let model = Model::from_definitions(&shapes.definitions);
+        let unloaded = Model::new();
+        let parameters = super::r4_fixtures("SearchParameter-");
+        let kinds: BTreeMap<String, String> = parameters
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter["url"].as_str().unwrap().to_string(),
+                    parameter["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let variants = [
+            Variant {
+                full: true,
+                stringly: false,
+            },
+            Variant {
+                full: false,
+                stringly: false,
+            },
+            Variant {
+                full: true,
+                stringly: true,
+            },
+        ];
+        let mut resources: BTreeMap<(String, usize), Value> = BTreeMap::new();
+        let (mut compared, mut walked, mut absent) = (0, 0, 0);
+        let mut walked_codes = BTreeSet::new();
+        for parameter in &parameters {
+            let Some(extractor) = compile_parameter(parameter, &kinds) else {
+                continue;
+            };
+            let Source::Path(expr) = &extractor.source else {
+                continue;
+            };
+            for base in parameter["base"].as_array().into_iter().flatten() {
+                let Some(base) = base.as_str() else { continue };
+                for (number, variant) in variants.iter().enumerate() {
+                    let resource = resources
+                        .entry((base.to_string(), number))
+                        .or_insert_with(|| shapes.resource(base, *variant));
+                    for model in [&model, &unloaded] {
+                        let walked_values =
+                            path_strings(extractor.kind, expr, resource, model, &EmptyHost);
+                        let evaluated = path_strings_by_evaluating(
+                            extractor.kind,
+                            expr,
+                            resource,
+                            model,
+                            &EmptyHost,
+                        );
+                        assert_eq!(
+                            walked_values, evaluated,
+                            "{base}.{} ({:?}) over {resource}",
+                            parameter["code"], expr
+                        );
+                    }
+                    compared += 1;
+                    if refhir_fhirpath::member_values(expr, resource, &model).is_some() {
+                        walked += 1;
+                        walked_codes
+                            .insert(format!("{base}.{}", parameter["code"].as_str().unwrap()));
+                        if evaluated_is_empty(&extractor, expr, resource, &model) {
+                            absent += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // The test is worth something only if the walk was used for much of what it compares,
+        // and the walked values were not all empty.
+        assert!(compared > 3000, "{compared}");
+        assert!(walked > compared / 3, "walked {walked} of {compared}");
+        assert!(
+            absent < walked / 2,
+            "{absent} of {walked} walked reads found nothing"
+        );
+        for wanted in [
+            "Slot.start",
+            "Slot.status",
+            "Slot.schedule",
+            "Schedule.actor",
+            "Appointment.actor",
+        ] {
+            assert!(walked_codes.contains(wanted), "{wanted} was not walked");
+        }
+    }
+
+    fn evaluated_is_empty(
+        extractor: &super::Extractor,
+        expr: &refhir_fhirpath::Expr,
+        resource: &Value,
+        model: &Model,
+    ) -> bool {
+        path_strings_by_evaluating(extractor.kind, expr, resource, model, &EmptyHost).is_empty()
+    }
+
+    #[test]
+    fn what_the_walk_is_unsure_of_it_leaves_to_the_evaluator() {
+        let shapes = load();
+        let model = Model::from_definitions(&shapes.definitions);
+        let walk = |expression: &str, resource: &Value| {
+            let expr = refhir_fhirpath::parse(expression).unwrap();
+            refhir_fhirpath::member_values(&expr, resource, &model).map(|found| found.len())
+        };
+        let observation = json!({
+            "resourceType": "Observation", "id": "o1", "status": "final",
+            "valueQuantity": {"value": 1}, "code": {"coding": [{"code": "a"}, {"code": "b"}]}
+        });
+        // A bare path of elements the model holds is walked, however many values it finds.
+        assert_eq!(walk("Observation.status", &observation), Some(1));
+        assert_eq!(walk("Observation.code.coding.code", &observation), Some(2));
+        assert_eq!(
+            walk("Observation.code.coding.system", &observation),
+            Some(0)
+        );
+        assert_eq!(walk("Observation.subject", &observation), Some(0));
+        // A choice element, an element the model does not hold, `id`, a function, a union, another
+        // type's name and a supertype's are the evaluator's.
+        assert_eq!(walk("Observation.value", &observation), None);
+        assert_eq!(walk("Observation.nothing", &observation), None);
+        assert_eq!(walk("Observation.id", &observation), None);
+        assert_eq!(walk("Observation.code.coding.first()", &observation), None);
+        assert_eq!(
+            walk("Observation.status | Observation.code", &observation),
+            None
+        );
+        assert_eq!(walk("Patient.active", &observation), None);
+        assert_eq!(walk("Resource.id", &observation), None);
+        assert_eq!(walk("Observation.status.where(1 = 1)", &observation), None);
+        // A boolean or a number written as a string is turned into one by the evaluator.
+        let slot = json!({"resourceType": "Slot", "overbooked": "true"});
+        assert_eq!(walk("Slot.overbooked", &slot), None);
+        assert_eq!(
+            walk(
+                "Slot.overbooked",
+                &json!({"resourceType": "Slot", "overbooked": true})
+            ),
+            Some(1)
+        );
+        // With no model loaded nothing is known, so nothing is walked.
+        let expr = refhir_fhirpath::parse("Observation.status").unwrap();
+        assert!(refhir_fhirpath::member_values(&expr, &observation, &Model::new()).is_none());
     }
 }

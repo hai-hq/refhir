@@ -25,6 +25,11 @@ await client.create("Patient", {
 
 const watch = await client.search("Patient", { active: "true" });
 console.log(watch.latest());
+// A parameter a URL would give twice (AND) is an array; a comma inside one string is OR.
+await client.search("Slot", {
+  status: "free",
+  "schedule.actor": ["HealthcareService/h1", "Location/l1"],
+});
 
 const updated = await watch.next();
 console.log(updated);

@@ -151,7 +151,8 @@ watch, err := client.Search(ctx, "Observation", map[string]string{
 watch, err := client.Read(ctx, "Patient", "p1")
 ```
 
-Search parameter values must be **strings**, matching the server.
+Search parameter values must be **strings**, matching the server. A comma inside a value is OR
+(`"status": "free,busy"`).
 
 ### Low-level
 
@@ -163,6 +164,16 @@ watch, err := client.Watch(ctx, "Observation/search", map[string]any{
 ```
 
 `Watch` blocks until the first committed result arrives, then returns the `Watch`.
+
+A parameter that a URL would give more than once, which FHIR reads as AND, is a `[]string` in
+`Watch` and `Query` arguments:
+
+```go
+watch, err := client.Watch(ctx, "Slot/search", map[string]any{
+	"status":         "free",
+	"schedule.actor": []string{"HealthcareService/h1", "Location/l1"},
+})
+```
 
 ```go
 value := watch.Latest()           // last committed JSON (search Bundle or single resource)

@@ -50,5 +50,6 @@ pub use run::{
     MAX_OCC_FAILURES,
 };
 pub use search::{
-    add_param, join_repeated, resource_in_compartment, AND, HANDLING, PATIENT_COMPARTMENT,
+    add_param, join_repeated, resource_in_compartment, AND, DEFAULT_COUNT, HANDLING,
+    PATIENT_COMPARTMENT,
 };

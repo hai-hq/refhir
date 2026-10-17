@@ -18,6 +18,7 @@ between deployments, so they stay out of the config file.
 | `REFHIR_ROLE` | `primary`, `standby` or `replica`. The same as `--role`. See [Several processes](/docs/operate/clustering/). |
 | `REFHIR_PRIMARY_URL` | Where a replica sends writes. The same as `--primary-url`. |
 | `REFHIR_DB_POOL` | A positive number: the most Postgres connections (default 8), or on SQLite the read connections next to the one writer (default 4). The same as `--db-pool`. |
+| `REFHIR_DEFAULT_PAGE_SIZE` | How many matches a search `GET` returns on a page when it names no `_count`, with a `next` link for the rest. The default is 100, and `0` returns every match in one response. Overrides `[server].default_page_size`. There is no flag. |
 | `REFHIR_UPDATE_AS_CREATE` | Set to `true` to let `PUT [type]/[id]` create a resource under the id the client names. The same as `--update-as-create`. |
 
 ## Packages

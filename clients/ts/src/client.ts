@@ -425,7 +425,10 @@ export class Client {
     return rest.requestWithHeaders(this, method, path, body);
   }
 
-  search(resourceType: string, params: Record<string, string>): Promise<Watch> {
+  search(
+    resourceType: string,
+    params: Record<string, string | string[]>,
+  ): Promise<Watch> {
     return helpers.search(this, resourceType, params);
   }
 

@@ -475,7 +475,11 @@ async fn a_search_value_that_cannot_be_read_is_a_400_unless_the_client_asks_for_
         assert_eq!(entries[1]["search"]["mode"], "outcome");
         assert_eq!(entries[1]["resource"]["resourceType"], "OperationOutcome");
         assert_eq!(entries[1]["resource"]["issue"][0]["severity"], "warning");
-        assert_eq!(body["link"][0]["url"], "Patient?active=true", "{prefer}");
+        // The parameter set aside is not in the link, and the page the server applied is.
+        assert_eq!(
+            body["link"][0]["url"], "Patient?_count=100&active=true",
+            "{prefer}"
+        );
     }
     let (status, body) = get(
         "/Patient/p1/Observation?date=notadate",
@@ -490,7 +494,10 @@ async fn a_search_value_that_cannot_be_read_is_a_400_unless_the_client_asks_for_
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["link"][0]["url"], "Observation?date=ge2024-01-01");
+    assert_eq!(
+        body["link"][0]["url"],
+        "Observation?_count=100&date=ge2024-01-01"
+    );
 
     // Only that header asks for it, and only for a value. A query string cannot, strict is a
     // request too, and a parameter that does not exist, or a control parameter that cannot be
@@ -6717,15 +6724,15 @@ mod durable_jobs {
 
 // ---- the /sync protocol: gaps found while documenting it ----
 
-mod sync_gaps {
+pub(crate) mod sync_gaps {
     use super::*;
     use crate::auth::SmartStore;
 
-    type Socket = tokio_tungstenite::WebSocketStream<
+    pub(crate) type Socket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
 
-    async fn serve(app: axum::Router) -> std::net::SocketAddr {
+    pub(crate) async fn serve(app: axum::Router) -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6741,7 +6748,13 @@ mod sync_gaps {
             .unwrap();
     }
 
-    async fn add(socket: &mut Socket, base: u64, query_id: u64, path: &str, args: Value) {
+    pub(crate) async fn add(
+        socket: &mut Socket,
+        base: u64,
+        query_id: u64,
+        path: &str,
+        args: Value,
+    ) {
         say(
             socket,
             json!({

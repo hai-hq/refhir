@@ -56,7 +56,7 @@ impl Facts {
             .map(|id| truncate(id, MAX_NAME));
         let mut patient = ["_compartment", "patient", "subject"]
             .into_iter()
-            .find_map(|name| args.get(name).and_then(Value::as_str))
+            .find_map(|name| args.get(name).and_then(first_text))
             .and_then(patient_id_of_reference)
             .or_else(|| args.get("resource").and_then(patient_of_resource));
         if patient.is_none() && resource_type.as_deref() == Some("Patient") {
@@ -79,6 +79,15 @@ impl Facts {
             query,
             patient,
         }
+    }
+}
+
+/// A search argument's text: the string, or the first of an array of strings (a parameter given
+/// more than once, which a live query writes as an array).
+fn first_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Array(items) => items.iter().find_map(Value::as_str),
+        other => other.as_str(),
     }
 }
 
@@ -117,18 +126,25 @@ pub(super) fn resource_id_text(text: &str) -> Option<&str> {
     .then_some(text)
 }
 
-/// The search arguments as `name=value&name=value`, without what the server added itself.
+/// The search arguments as `name=value&name=value`, without what the server added itself. A
+/// parameter given more than once (an array) is written once for each value, as a URL would.
 fn render_query(args: &Value) -> Option<String> {
     let object = args.as_object()?;
     let parts: Vec<String> = object
         .iter()
         .filter(|(name, _)| {
-            !matches!(
-                name.as_str(),
-                "_readScopes" | "_sdcArchiver" | "_compartment" | "access_token"
-            )
+            !refhir_fhir::CONTROL_ARGS.contains(&name.as_str())
+                && !matches!(name.as_str(), "_compartment" | "access_token")
         })
-        .filter_map(|(name, value)| value.as_str().map(|value| format!("{name}={value}")))
+        .flat_map(|(name, value)| {
+            let values: Vec<&str> = match value {
+                Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
+                other => other.as_str().into_iter().collect(),
+            };
+            values
+                .into_iter()
+                .map(move |value| format!("{name}={value}"))
+        })
         .collect();
     if parts.is_empty() {
         None
@@ -646,6 +662,36 @@ mod tests {
             None
         );
         assert_eq!(of(json!({"resourceType": "Organization"})), None);
+    }
+
+    #[test]
+    fn a_parameter_given_as_an_array_is_audited_like_one_given_as_a_string() {
+        // A live query writes a parameter given more than once as an array.
+        let facts = Facts::from_call(
+            "Observation/search",
+            &json!({"patient": ["Patient/p1", "Patient/p2"], "status": "final",
+                    "code": ["8480-6", "8462-4"]}),
+            true,
+        );
+        assert_eq!(facts.patient.as_deref(), Some("p1"));
+        assert_eq!(
+            facts.query.as_deref(),
+            Some("code=8480-6&code=8462-4&patient=Patient/p1&patient=Patient/p2&status=final")
+        );
+    }
+
+    #[test]
+    fn what_the_server_set_on_a_search_is_not_the_audited_query() {
+        // Every control argument is the server's, so none of them is the client's query.
+        let mut args = serde_json::Map::new();
+        for name in refhir_fhir::CONTROL_ARGS {
+            args.insert(name.to_string(), json!("x"));
+        }
+        args.insert("name".into(), json!("ann"));
+        args.insert("_compartment".into(), json!("Patient/p1"));
+        args.insert("access_token".into(), json!("secret"));
+        let facts = Facts::from_call("Patient/search", &Value::Object(args), true);
+        assert_eq!(facts.query.as_deref(), Some("name=ann"));
     }
 
     #[test]

@@ -25,7 +25,9 @@ pub use governance::{
     AuditConfig, Cidr, ClientRate, Costs, Governance, GovernanceConfig, ProxyConfig, QuotaConfig,
     QuotaLimits, RateLimitConfig, RequestLogConfig,
 };
-pub use http::{app, app_parts, app_with, AppState, ServerConfig, SharedGovernanceStore};
+pub use http::{
+    app, app_parts, app_with, AppState, ServerConfig, SharedGovernanceStore, DEFAULT_PAGE_SIZE,
+};
 pub use jobs::SharedJobStore;
 
 /// How long the rows still buffered are given to reach the database once the server is told to
@@ -128,5 +130,7 @@ async fn shutdown_signal() {
     }
 }
 
+#[cfg(test)]
+mod booking_tests;
 #[cfg(test)]
 mod tests;
