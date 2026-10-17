@@ -108,6 +108,18 @@ Migrations are forward-only. [Schema migrations](migrations.md) explains how the
 New SQLite and Postgres migrations should leave the two backends with the same logical schema,
 and neither may change what a query returns without a code change that says so.
 
+Postgres has a third stream. A database that holds many tenants (`refhir tenant create`) is made
+from `crates/postgres/migrations-shared/`, where every table has an `instance_id` leading its
+primary key, its unique constraints and its indexes, and `SHARED_MIGRATIONS` in `migrate.rs` lists
+them. A change to `crates/postgres/migrations/` needs the same change there, with the tenant
+column added, in a migration of the same version. `the_shared_layout_is_the_classic_one_plus_the_tenant_column`
+applies both streams to scratch databases and fails when they differ by anything but the tenant
+column and the short list of tables and columns the shared layout adds (`ADDED_TABLES` and
+`ADDED_COLUMNS` in `tenancy_tests.rs`). The same rule applies to the SQL: a statement that reads
+or writes a tenant's rows takes `Scope` (`scope.rs`) and names the tenant in every table it
+touches, and a new one needs a case in the `tenancy_*` tests that runs it beside another tenant
+holding the same keys.
+
 ## Regenerating fixtures
 
 The server binary carries no FHIR packages (a release adds them as a prepared file, made with `refhir package-bundle`), so the test suites use a copy of `hl7.fhir.r4.core` under
