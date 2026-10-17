@@ -108,7 +108,6 @@ TypeScript client (`npm install @haihq/refhir`).
 | [Several processes](docs/clustering.md) | Failover and read replicas on one database |
 | [Production deployment](deploy/production.md) | Postgres, secrets, Helm, a reverse proxy |
 | [Schema migrations](docs/migrations.md) | Upgrading safely |
-| [Performance](docs/perf/README.md) | Measurements and how to repeat them |
 | [Design](docs/design.md) | Why it exists and how the engine works |
 | [Development](docs/development.md) | Building, testing, changing it |
 | [Brand](docs/brand/README.md) | Logo files, colors and how to use them |
