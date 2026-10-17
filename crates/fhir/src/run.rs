@@ -131,9 +131,13 @@ fn run_in_transaction(
             "operation started"
         );
         set_status(0);
-        let mut value = match body(&mut tx) {
-            Ok(value) => value,
-            Err(err) => return Err(RunError::Fhir(err)),
+        // A definition or code system that could not be read from the store was answered as if it
+        // were not there. That is not an answer to give, or to commit a write on: the request
+        // fails, as any other failure of the store does.
+        let mut value = match refhir_validate::watching_reads(|| body(&mut tx)) {
+            Ok(Ok(value)) => value,
+            Ok(Err(err)) => return Err(RunError::Fhir(err)),
+            Err(failure) => return Err(RunError::Fhir(FhirError::Storage(failure))),
         };
         let status = take_status();
         let reads = tx.read_set().clone();

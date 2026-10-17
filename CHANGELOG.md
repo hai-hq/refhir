@@ -73,6 +73,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   changed it, the new catalog reads what the old one had in use before it takes its place, while
   the old one is still answering, so requests are not sent back to waiting. A replica that lags the
   primary can read a row the primary has just written that its index does not describe yet.
+- **A request that cannot read a definition or a code system from the database fails.** With the
+  reads above, a database error while reading a profile, an extension or a code system used to be
+  logged and the request answered as if it did not exist: a write refused as invalid, or one
+  accepted because nothing was left to check it by. It is now a `500` (`exception`) that names what
+  could not be read, nothing is committed, and the same request is answered once the database is.
 - **A first start stores each package as it reads it.** The prepared file (see below) holds a
   package as values of about 4 MB of rows, and the database takes them one at a time inside one
   transaction, so a package is stored whole or not at all, as before. The largest default package

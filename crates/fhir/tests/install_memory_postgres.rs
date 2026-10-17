@@ -122,10 +122,7 @@ fn installing_a_prepared_package_into_postgres_takes_a_fraction_of_the_package()
             mib(installed.kept)
         );
     } else {
-        // What the package is, as text: what holding it whole would hold, and more. The catalog
-        // this ends in holds the base types and what they bind (17 MiB here, and about as much
-        // for a package ten times this size), so the bound is the text itself and not a fraction
-        // of it; the real packages above are the strict check.
+        // What the package is, as text: what holding it whole would hold, and more.
         let text: usize = store
             .load_structure_definitions()
             .unwrap()
@@ -154,11 +151,17 @@ fn installing_a_prepared_package_into_postgres_takes_a_fraction_of_the_package()
             )
             .sum();
         assert!(text > 20 << 20, "the package is only {} MiB", mib(text));
+        // The catalog this ends in holds the base types and what they bind (17 MiB here, and
+        // about as much for a package ten times this size), which a fraction of the text cannot
+        // allow for. So what is bounded is what installing takes beyond it: staging the package a
+        // few rows at a time takes well under half of it, and holding it whole would take all.
+        let beyond = installed.peak.saturating_sub(installed.kept);
         assert!(
-            installed.peak < text,
-            "installing {} MiB of package peaked at {} MiB (and kept {} MiB)",
+            beyond < text / 2,
+            "installing {} MiB of package peaked at {} MiB, {} MiB above the {} MiB it kept",
             mib(text),
             mib(installed.peak),
+            mib(beyond),
             mib(installed.kept)
         );
     }

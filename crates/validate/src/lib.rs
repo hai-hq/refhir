@@ -1,4 +1,5 @@
 mod cache;
+mod failure;
 mod outcome;
 mod primitive;
 mod schema;
@@ -6,6 +7,7 @@ mod slice;
 mod terminology;
 mod walk;
 
+pub use failure::{note_read_failure, watching_reads};
 pub use outcome::{Issue, Outcome, Severity};
 pub use schema::{DefinitionSource, Schema, SchemaBuilder, Structure};
 pub use terminology::{

@@ -142,6 +142,9 @@ jobs:
       - name: Test Postgres backend
         run: cargo test -p refhir-postgres --locked
 
+      - name: Test installing packages into Postgres
+        run: cargo test -p refhir-fhir --locked --test install_memory_postgres
+
       # The service above does not speak TLS, so this starts a TLS-only Postgres of its own
       # (certificates, client-certificate role and all) and runs the TLS tests against it.
       - name: Test Postgres over TLS
@@ -205,6 +208,30 @@ jobs:
 
       - name: Run the image
         run: docker run --rm refhir:ci --version
+
+      # The release's packages are in the image, so a first start needs no network, and the
+      # deployment guide says to start from 512 MiB: run it so, and see that it starts and is not
+      # killed for memory.
+      - name: Start the image with no network and 512 MiB
+        run: |
+          docker run -d --name refhir-ci --network none --memory 512m --memory-swap 512m refhir:ci
+          # The server answers 503 while it installs packages, so wait for /readyz to say 200. The
+          # image has no curl; bash can open the connection.
+          ready=false
+          for _ in $(seq 1 120); do
+            status="$(docker exec refhir-ci bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && printf "GET /readyz HTTP/1.0\r\nHost: x\r\n\r\n" >&3 && head -1 <&3' 2>/dev/null || true)"
+            case "$status" in *" 200 "*) ready=true; break ;; esac
+            [ "$(docker inspect -f '{{.State.Running}}' refhir-ci)" = "true" ] || break
+            sleep 2
+          done
+          docker logs refhir-ci
+          docker inspect -f 'running={{.State.Running}} oom-killed={{.State.OOMKilled}}' refhir-ci
+          test "$ready" = true
+          test "$(docker inspect -f '{{.State.OOMKilled}}' refhir-ci)" = "false"
+
+      - name: Stop the image
+        if: always()
+        run: docker rm -f refhir-ci
 
   helm:
     name: Helm chart

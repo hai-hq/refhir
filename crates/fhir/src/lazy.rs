@@ -33,8 +33,11 @@ impl StoreSource {
         self.reads.load(Ordering::SeqCst)
     }
 
-    /// The row as JSON. A row that cannot be read is logged and answers as if it were not there:
-    /// a question about a definition or a code system has no way to say the store failed.
+    /// The row as JSON. A row that cannot be read, or is not JSON, is logged and answers as if it
+    /// were not there, because a question about a definition or a code system has no way to say
+    /// the store failed. It is also noted (see [`refhir_validate::watching_reads`]), so that the
+    /// request that asked is failed, and not answered by what was left. A row that is not there is
+    /// not a failure.
     fn parse(
         what: &str,
         package: i64,
@@ -44,20 +47,18 @@ impl StoreSource {
         let text = match row {
             Ok(text) => text?,
             Err(err) => {
-                tracing::error!(
-                    target: "refhir_engine",
-                    "could not read {what} {key} of package {package}: {err}"
-                );
+                let message = format!("could not read {what} {key} of package {package}: {err}");
+                tracing::error!(target: "refhir_engine", "{message}");
+                refhir_validate::note_read_failure(message);
                 return None;
             }
         };
         match serde_json::from_str(&text) {
             Ok(value) => Some(value),
             Err(err) => {
-                tracing::error!(
-                    target: "refhir_engine",
-                    "{what} {key} of package {package} is not JSON: {err}"
-                );
+                let message = format!("{what} {key} of package {package} is not JSON: {err}");
+                tracing::error!(target: "refhir_engine", "{message}");
+                refhir_validate::note_read_failure(message);
                 None
             }
         }

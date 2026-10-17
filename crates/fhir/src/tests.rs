@@ -6081,6 +6081,9 @@ struct WatchedStore {
     /// Counter writes that announce a change to the other processes.
     fail_bump_catalog: AtomicUsize,
     fail_bump_terminology: AtomicUsize,
+    /// How many of the next reads of one stored row (a definition, a code system, an expansion)
+    /// to fail.
+    fail_row_reads: AtomicUsize,
 }
 
 impl WatchedStore {
@@ -6099,6 +6102,7 @@ impl WatchedStore {
             fail_load_terminology: AtomicUsize::new(0),
             fail_bump_catalog: AtomicUsize::new(0),
             fail_bump_terminology: AtomicUsize::new(0),
+            fail_row_reads: AtomicUsize::new(0),
         }
     }
 
@@ -6170,6 +6174,36 @@ impl ConformanceStore for WatchedStore {
         self.full_search_parameter_loads
             .fetch_add(1, Ordering::SeqCst);
         self.inner.load_search_parameters()
+    }
+    fn load_structure_definition_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        if Self::should_fail(&self.fail_row_reads) {
+            return Err(PersistError::Definite("injected: row read".into()));
+        }
+        self.inner.load_structure_definition_json(package_id, url)
+    }
+    fn load_terminology_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        if Self::should_fail(&self.fail_row_reads) {
+            return Err(PersistError::Definite("injected: row read".into()));
+        }
+        self.inner.load_terminology_json(package_id, url)
+    }
+    fn load_expansion_json(
+        &self,
+        package_id: i64,
+        url: &str,
+    ) -> Result<Option<String>, PersistError> {
+        if Self::should_fail(&self.fail_row_reads) {
+            return Err(PersistError::Definite("injected: row read".into()));
+        }
+        self.inner.load_expansion_json(package_id, url)
     }
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
         self.full_terminology_loads.fetch_add(1, Ordering::SeqCst);
@@ -6976,6 +7010,68 @@ fn a_request_of_a_common_kind_reads_nothing_from_the_store() {
                 .operation_outcome();
         assert_eq!(&held, answer);
     }
+}
+
+/// A definition that cannot be read from the store is not a definition that does not exist: the
+/// request that needed it fails, and a write is not committed on what was left to check it by.
+#[test]
+fn a_request_that_could_not_read_a_definition_fails_and_commits_nothing() {
+    let harness = r4();
+    let watched = Arc::new(WatchedStore::new(harness.store.clone()));
+    let source = Arc::new(crate::lazy::StoreSource::new(watched.clone()));
+    let catalog = Catalog::open_from(watched.as_ref(), Some(source)).unwrap();
+    let profile = "http://hl7.org/fhir/StructureDefinition/vitalsigns";
+    let observation = json!({"resourceType": "Observation", "status": "final",
+        "meta": {"profile": [profile]},
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6"}]}});
+    let validate = || {
+        run(
+            &harness.db,
+            &catalog,
+            "Observation/$validate",
+            &json!({"resource": observation}),
+        )
+    };
+
+    // The profile is read when it is first used. If that read fails the request fails, and says
+    // what failed, where it would have been told the profile is unknown.
+    watched.fail_row_reads.store(usize::MAX, Ordering::SeqCst);
+    match validate() {
+        Err(RunError::Fhir(FhirError::Storage(message))) => {
+            assert!(
+                message.contains("could not read structure definition"),
+                "{message}"
+            );
+            assert!(message.contains(profile), "{message}");
+        }
+        other => panic!("expected a storage failure, got {other:?}"),
+    }
+    let create = run(
+        &harness.db,
+        &catalog,
+        "Observation/create",
+        &json!({"resource": observation}),
+    );
+    assert!(
+        matches!(create, Err(RunError::Fhir(FhirError::Storage(_)))),
+        "{create:?}"
+    );
+
+    // Nothing was kept of the failure: the same request, once the store answers, is answered.
+    watched.fail_row_reads.store(0, Ordering::SeqCst);
+    let outcome = validate().expect("the store answers now").value;
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    let created = run(
+        &harness.db,
+        &catalog,
+        "Observation/create",
+        &json!({"resource": observation}),
+    );
+    // Whatever the profile says of it, it is the profile that answered: no read failed.
+    assert!(!matches!(
+        created,
+        Err(RunError::Fhir(FhirError::Storage(_)))
+    ));
 }
 
 /// A catalog that takes the place of another has already read what the requests that were being
