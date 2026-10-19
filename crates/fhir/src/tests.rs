@@ -7189,6 +7189,30 @@ fn the_currencies_value_set_expands_over_the_iso_4217_codes_the_server_carries()
 }
 
 #[test]
+fn the_built_in_terminology_waits_for_a_package_that_could_refer_to_it() {
+    // A server with no package has nothing that refers to ISO 4217, and a replica that starts
+    // serving as soon as any package is stored must not be left with only this one.
+    let harness = empty();
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert!(harness.store.load_packages().unwrap().is_empty());
+
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, minir4_dir()).unwrap();
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    let names: Vec<String> = harness
+        .store
+        .load_packages()
+        .unwrap()
+        .iter()
+        .map(|package| format!("{}@{}", package.name, package.version))
+        .collect();
+    assert!(
+        names.contains(&crate::BUILTIN_PACKAGE.to_string()),
+        "{names:?}"
+    );
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+#[test]
 fn a_database_made_under_the_previous_rules_gains_the_value_sets_that_now_expand_at_its_next_start()
 {
     // The previous version could not expand HL7's service categories, so it stored no expansion

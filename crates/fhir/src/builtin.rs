@@ -55,14 +55,21 @@ fn builtin_package() -> Result<NewPackage, FhirError> {
     })
 }
 
-/// Install the built-in terminology, unless this database has it. A database that has already
-/// expanded every value set it holds gains the expansions that were waiting for it.
+/// Install the built-in terminology, unless this database has it or has no other package. A
+/// database that has already expanded every value set it holds gains the expansions that were
+/// waiting for it.
 pub fn install_builtin_terminology(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
     if packages_installed(store, &[BUILTIN_PACKAGE])? {
+        return Ok(());
+    }
+    // With no other package there is nothing that refers to it, and a replica starts serving once
+    // any package is stored: it must not be left with only this. A server that is given its
+    // packages later has it at its next start.
+    if store.load_packages()?.is_empty() {
         return Ok(());
     }
     let started = std::time::Instant::now();
