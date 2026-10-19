@@ -21,7 +21,7 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 - **Expansions are complete R4 ValueSets.** The ValueSet an expansion comes in has the `status` R4
   requires (that of the value set expanded, `active` when it says nothing), and the expansion has
   the required `timestamp` (the time the server produced it for the request), an `identifier`
-  (a `urn:uuid`, another for each answer), and in `expansion.parameter` what was asked that shaped
+  (a `urn:uuid` made from what the expansion says), and in `expansion.parameter` what was asked that shaped
   it (`filter`, `count`, `offset`, `activeOnly`). An entry carries `"inactive": true` when its code
   system says the concept is inactive.
 - **`$expand` takes `activeOnly`.** `activeOnly=true` leaves out the codes whose code system calls
@@ -30,7 +30,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `/$validate-code`, `CodeSystem/[id]/$validate-code` and `/$subsumes`, and
   `ConceptMap/[id]/$translate`, as `POST` or `GET`, with R4's instance forms (`CodeSystem/$lookup`
   is the type only). The instance is a resource the server stores, and what is asked of it is asked
-  of the value set, code system or concept map its `url` names. A value set that came from a package
+  of the value set, code system or concept map its `url` names (`409` when a package defines that url
+  too, since the terminology cannot tell which is meant). A value set that came from a package
   is expanded by `url`.
 - **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
   and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include

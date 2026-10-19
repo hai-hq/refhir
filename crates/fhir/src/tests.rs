@@ -5962,7 +5962,7 @@ fn a_value_set_over_a_whole_example_system_expands_and_says_it_is_not_complete()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        crate::terms::rfc3339(ms)
+        refhir_types::rfc3339(ms)
     };
     assert!(
         timestamp.len() == 24 && timestamp.as_bytes()[10] == b'T' && timestamp.ends_with('Z'),
@@ -5970,7 +5970,7 @@ fn a_value_set_over_a_whole_example_system_expands_and_says_it_is_not_complete()
     );
     // RFC 3339 instants of one length and zone sort as time does.
     assert!(timestamp <= now().as_str(), "{timestamp} is in the future");
-    let earlier = crate::terms::rfc3339(
+    let earlier = refhir_types::rfc3339(
         (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -6937,7 +6937,7 @@ fn expansions_stored_under_other_rules_are_rebuilt_once_at_the_next_start() {
     assert_eq!(rows[0].package_id, core);
     assert_eq!(
         serde_json::from_str::<Value>(&rows[0].json).unwrap()["rules"],
-        3
+        4
     );
     assert_expansions_match(&harness.store, "after the repair");
     // A second start finds nothing to do: the repair is not repeated.
@@ -7108,15 +7108,25 @@ fn an_expansion_says_which_value_set_status_it_has_which_expansion_it_is_and_wha
     let plain = apply(&harness, "ValueSet/$expand", json!({"url": url}));
     assert_eq!(plain["status"], defined["status"]);
     assert!(defined["status"].is_string());
-    // Each expansion is its own: the identifier says which, a urn:uuid, and is another next time.
+    // The identifier names what the expansion says, a urn:uuid: the same for an answer that says
+    // the same, and another for one that says something else (a filtered one, a page).
     let identifier = plain["expansion"]["identifier"].as_str().unwrap();
     assert!(
         identifier.starts_with("urn:uuid:") && identifier.len() == "urn:uuid:".len() + 36,
         "{identifier}"
     );
     let again = apply(&harness, "ValueSet/$expand", json!({"url": url}));
-    assert_ne!(
+    assert_eq!(
         again["expansion"]["identifier"],
+        plain["expansion"]["identifier"]
+    );
+    let narrower = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": url, "filter": "hospital"}),
+    );
+    assert_ne!(
+        narrower["expansion"]["identifier"],
         plain["expansion"]["identifier"]
     );
     // Nothing was asked, so nothing is listed as asked.
@@ -7165,6 +7175,67 @@ fn an_expansion_says_which_value_set_status_it_has_which_expansion_it_is_and_wha
         bare.expand("http://example.org/v", None).unwrap()["status"],
         "active"
     );
+}
+
+#[test]
+fn an_answer_outside_a_sample_value_set_is_not_refused_but_one_outside_a_complete_one_is() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let questionnaire = |id: &str, value_set: &str| {
+        json!({"resource": {"resourceType": "Questionnaire", "id": id,
+               "url": format!("http://example.org/Questionnaire/{id}"), "status": "active",
+               "item": [{"linkId": "a", "text": "A", "type": "choice",
+                         "answerValueSet": value_set}]}})
+    };
+    let answer = |id: &str, system: &str, code: &str| {
+        run_op(
+            &harness,
+            "QuestionnaireResponse/create",
+            &json!({"resource": {"resourceType": "QuestionnaireResponse", "status": "completed",
+                "questionnaire": format!("http://example.org/Questionnaire/{id}"),
+                "item": [{"linkId": "a", "answer": [{"valueCoding":
+                    {"system": system, "code": code}}]}]}}),
+        )
+    };
+    apply(
+        &harness,
+        "Questionnaire/create",
+        questionnaire("sample", "http://hl7.org/fhir/ValueSet/service-type"),
+    );
+    apply(
+        &harness,
+        "Questionnaire/create",
+        questionnaire("complete", "http://hl7.org/fhir/ValueSet/organization-type"),
+    );
+
+    // A value set that lists only a sample of its code system cannot rule a code out, so a code
+    // that is not in the sample is not an answer outside the value set.
+    let stored = answer(
+        "sample",
+        "http://terminology.hl7.org/CodeSystem/service-type",
+        "not-in-the-sample",
+    );
+    assert!(stored.is_ok(), "{stored:?}");
+    // One that lists all of it can, and the answer is refused.
+    let refused = answer(
+        "complete",
+        "http://terminology.hl7.org/CodeSystem/organization-type",
+        "not-a-type",
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    // A code that is in the sample, and one in the complete set, are both fine.
+    assert!(answer(
+        "sample",
+        "http://terminology.hl7.org/CodeSystem/service-type",
+        "1"
+    )
+    .is_ok());
+    assert!(answer(
+        "complete",
+        "http://terminology.hl7.org/CodeSystem/organization-type",
+        "prov"
+    )
+    .is_ok());
 }
 
 #[test]
@@ -7360,7 +7431,7 @@ fn a_database_made_under_the_previous_rules_gains_the_value_sets_that_now_expand
     assert_expansions_match(&harness.store, "after the repair");
     // The rows it wrote say so, and a second start finds nothing to repeat.
     let stored: Value = serde_json::from_str(&stored_rows(&harness, categories)[0].json).unwrap();
-    assert_eq!(stored["rules"], 3);
+    assert_eq!(stored["rules"], 4);
     assert_eq!(stored["incomplete"][0]["content"], "example");
     publish(&harness.store, &harness.catalog).unwrap();
     assert!(!harness.catalog.read().unwrap().expansions_stale());

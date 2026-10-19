@@ -1012,7 +1012,10 @@ async fn terminology_operations_are_http_routes() {
         timestamp.len() == 24 && timestamp.ends_with('Z') && timestamp.as_bytes()[10] == b'T',
         "{timestamp}"
     );
-    assert!(timestamp.starts_with("202"), "{timestamp}");
+    assert!(
+        timestamp[..4].parse::<u32>().is_ok_and(|year| year >= 2026),
+        "{timestamp}"
+    );
     let all_pets = send(
         &app,
         "GET",
@@ -1288,7 +1291,7 @@ async fn terminology_operations_answer_at_the_instance_too() {
     let db = Arc::new(Database::open(store.clone()).unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::empty()));
     install_package_dir(store.as_ref(), &db, &catalog, r4_dir()).unwrap();
-    let app = app(db, catalog, store);
+    let app = app(db.clone(), catalog.clone(), store.clone());
     let system = "http://example.org/pets";
 
     // The server stores the terminology a client writes, and the instance is one of those.
@@ -1357,7 +1360,8 @@ async fn terminology_operations_answer_at_the_instance_too() {
         .as_str()
         .unwrap()
         .starts_with("urn:uuid:"));
-    assert_ne!(
+    // The same expansion has the same identifier, however it was asked for.
+    assert_eq!(
         got.body["expansion"]["identifier"],
         at_type.body["expansion"]["identifier"]
     );
@@ -1497,6 +1501,72 @@ async fn terminology_operations_answer_at_the_instance_too() {
     .await;
     assert_eq!(translated.status, StatusCode::OK, "{}", translated.body);
     assert_eq!(translated.body["parameter"][0]["valueBoolean"], true);
+
+    // An instance whose url a package defines too cannot be told from that definition, which is
+    // what the url gets, so it is refused (and asked for by url) rather than answered for the
+    // package's. (A write that shadows an installed package's url is refused, so this is a package
+    // installed after the instance was stored.)
+    let shadowed = made(
+        "/ValueSet",
+        json!({"resourceType": "ValueSet", "url": "http://example.org/shadowed",
+               "status": "draft", "compose": {"include": [{"system": system}]}}),
+    )
+    .await;
+    let ok = send(
+        &app,
+        "GET",
+        &instance("ValueSet", &shadowed, "$expand"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+    let dir = std::env::temp_dir().join(format!(
+        "refhir-shadow-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        r#"{"name":"example.shadow","version":"1.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-shadowed.json"),
+        r#"{"resourceType":"ValueSet","url":"http://example.org/shadowed","status":"active","compose":{"include":[{"system":"http://example.org/pets","concept":[{"code":"dog"}]}]}}"#,
+    )
+    .unwrap();
+    install_package_dir(store.as_ref(), &db, &catalog, &dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    for method in ["GET", "POST"] {
+        let refused = send(
+            &app,
+            method,
+            &instance("ValueSet", &shadowed, "$expand"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            StatusCode::CONFLICT,
+            "{method}: {}",
+            refused.body
+        );
+    }
+    let by_url = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": "http://example.org/shadowed"})),
+        None,
+    )
+    .await;
+    assert_eq!(by_url.status, StatusCode::OK, "{}", by_url.body);
 
     // An instance the server does not store is not found, and an id is of one type only.
     for path in [
@@ -2045,14 +2115,14 @@ async fn terminology_operations_need_only_the_read_scope() {
         },
     );
     let gender = "http://hl7.org/fhir/ValueSet/administrative-gender";
-    let call = |access: String, method: &'static str, path: String, body: &'static str| {
+    let call = |access: String, method: &'static str, path: String, body: String| {
         let app = app.clone();
         async move {
             send_text(
                 &app,
                 method,
                 &path,
-                body,
+                &body,
                 &[
                     ("authorization", &format!("Bearer {access}")),
                     ("content-type", "application/fhir+json"),
@@ -2066,17 +2136,20 @@ async fn terminology_operations_need_only_the_read_scope() {
     // or as a GET. They change nothing, so they are not creates.
     let reader = token(&app, "user/ValueSet.read").await;
     let body = format!(r#"{{"url": "{gender}"}}"#);
-    let body: &'static str = Box::leak(body.into_boxed_str());
     for (method, path, body) in [
-        ("POST", "/ValueSet/$expand".to_string(), body),
-        ("GET", format!("/ValueSet/$expand?url={gender}"), ""),
-        ("POST", "/ValueSet/$validate-code".to_string(), body),
+        ("POST", "/ValueSet/$expand".to_string(), body.clone()),
+        (
+            "GET",
+            format!("/ValueSet/$expand?url={gender}"),
+            String::new(),
+        ),
+        ("POST", "/ValueSet/$validate-code".to_string(), body.clone()),
         (
             "GET",
             format!("/ValueSet/$validate-code?url={gender}&code=male"),
-            "",
+            String::new(),
         ),
-        ("POST", "/ValueSet/$expandability".to_string(), body),
+        ("POST", "/ValueSet/$expandability".to_string(), body.clone()),
     ] {
         let reply = call(reader.clone(), method, path.clone(), body).await;
         // Whatever the operation answers about a value set this small package may not hold, the
@@ -2094,7 +2167,7 @@ async fn terminology_operations_need_only_the_read_scope() {
         reader.clone(),
         "POST",
         "/ValueSet".to_string(),
-        r#"{"resourceType":"ValueSet","url":"http://example.org/vs","status":"draft"}"#,
+        r#"{"resourceType":"ValueSet","url":"http://example.org/vs","status":"draft"}"#.to_string(),
     )
     .await;
     assert_eq!(create.0, StatusCode::FORBIDDEN, "{}", create.1);
@@ -2103,7 +2176,7 @@ async fn terminology_operations_need_only_the_read_scope() {
         ("GET", "/CodeSystem/$lookup?system=x&code=y"),
         ("POST", "/ConceptMap/$translate"),
     ] {
-        let reply = call(reader.clone(), method, path.to_string(), "{}").await;
+        let reply = call(reader.clone(), method, path.to_string(), "{}".to_string()).await;
         assert_eq!(
             reply.0,
             StatusCode::FORBIDDEN,
@@ -2115,8 +2188,12 @@ async fn terminology_operations_need_only_the_read_scope() {
     // And a client that may only create is not a reader: the operations used to ask for `create`.
     let writer = token(&app, "user/ValueSet.c").await;
     for (method, path, body) in [
-        ("POST", "/ValueSet/$expand".to_string(), body),
-        ("GET", format!("/ValueSet/$expand?url={gender}"), ""),
+        ("POST", "/ValueSet/$expand".to_string(), body.clone()),
+        (
+            "GET",
+            format!("/ValueSet/$expand?url={gender}"),
+            String::new(),
+        ),
     ] {
         let reply = call(writer.clone(), method, path.clone(), body).await;
         assert_eq!(

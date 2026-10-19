@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 
+use refhir_types::rfc3339;
 use refhir_validate::{ExpansionFailure, MemoryTerminology};
 
 use crate::catalog::Catalog;
@@ -34,15 +35,6 @@ pub fn operation(
                 .get_mut("expansion")
                 .and_then(|value| value.as_object_mut())
             {
-                // R4 requires a timestamp: the time the expanding system produced the expansion,
-                // which is when this one was read out of what the server holds and filtered and
-                // paged for the caller. The identifier names this expansion, as R4 has it, and
-                // is another for each, as the timestamp is.
-                expansion.insert("timestamp".into(), json!(rfc3339_now()));
-                expansion.insert(
-                    "identifier".into(),
-                    json!(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
-                );
                 // What the caller asked that shaped it, which R4 says an expansion should list
                 // (and must, for the offset and count of a page).
                 let mut parameters = Vec::new();
@@ -64,6 +56,19 @@ pub fn operation(
                     }
                     expansion.insert("parameter".into(), Value::Array(parameters));
                 }
+            }
+            // The identifier names what the expansion says, as R4 has it, so two answers that say
+            // the same are the same expansion; the timestamp, which differs, is not part of it.
+            let identifier = expansion_identifier(&expanded);
+            if let Some(expansion) = expanded
+                .get_mut("expansion")
+                .and_then(|value| value.as_object_mut())
+            {
+                // R4 requires a timestamp: the time the expanding system produced the expansion,
+                // which is when this one was read out of what the server holds and filtered and
+                // paged for the caller.
+                expansion.insert("timestamp".into(), json!(rfc3339_now()));
+                expansion.insert("identifier".into(), json!(identifier));
             }
             Ok(expanded)
         }
@@ -90,7 +95,14 @@ pub fn operation(
                 .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
             // `version` is the version of the code system, which this server keeps side by side.
             let version = optional(args, &["version"]);
-            Ok(terms.validate_code(None, Some(&system), version, &code, display.as_deref()))
+            Ok(terms.validate_code_as(
+                None,
+                Some(&system),
+                version,
+                &code,
+                display.as_deref(),
+                optional_bool(args, &["abstract"]),
+            ))
         }
         ("CodeSystem", "$lookup") => {
             let (system, code, _) = code_parts(args)?;
@@ -214,40 +226,24 @@ pub fn resolve_instance(
     Ok(resolved)
 }
 
+/// A `urn:uuid` made from the content of an expansion (a name-based UUID, version 5 in form):
+/// the same for the same value set, status, codes, flags and parameters, another when any differs.
+fn expansion_identifier(expanded: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(expanded.to_string().as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("urn:uuid:{}", uuid::Uuid::from_bytes(bytes))
+}
+
 /// The current time as an RFC 3339 UTC instant, to the millisecond.
 fn rfc3339_now() -> String {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64);
     rfc3339(ms)
-}
-
-/// Unix milliseconds as an RFC 3339 UTC instant.
-pub(crate) fn rfc3339(ms: u64) -> String {
-    let secs = ms / 1000;
-    let (year, month, day) = civil_from_days(secs / 86_400);
-    let rest = secs % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60,
-        ms % 1000
-    )
-}
-
-/// Days since 1970-01-01 as a civil date (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    (year, month, day)
 }
 
 /// A value set that cannot be expanded is a failed request, not an empty answer: HTTP 422, with
@@ -500,17 +496,4 @@ fn outcome(severity: &str, code: &str, diagnostics: &str) -> Value {
             "diagnostics": diagnostics
         }]
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::rfc3339;
-
-    #[test]
-    fn instants_are_rfc3339() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(rfc3339(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
-        assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00.000Z");
-        assert_eq!(rfc3339(4_102_444_799_999), "2099-12-31T23:59:59.999Z");
-    }
 }

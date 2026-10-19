@@ -1513,6 +1513,7 @@ impl MemoryTerminology {
         let mut contains = Vec::new();
         for ((system, code), display) in &expansion.codes {
             if active_only
+                && !expansion.inactive_codes.is_empty()
                 && expansion
                     .inactive_codes
                     .contains(&(system.clone(), code.clone()))
@@ -1596,10 +1597,29 @@ impl MemoryTerminology {
         let Some(expansion) = self.expansion_of(canonical(value_set)) else {
             return false;
         };
-        let system = system.map(canonical);
-        expansion.abstract_codes.iter().any(|(listed, item)| {
-            item == code && system.is_none_or(|system| system == listed || listed.is_empty())
-        })
+        if expansion.abstract_codes.is_empty() {
+            return false;
+        }
+        let flagged = |listed: &str| {
+            expansion
+                .abstract_codes
+                .contains(&(listed.to_string(), code.to_string()))
+        };
+        match system.map(canonical) {
+            Some(system) => flagged(system) || flagged(""),
+            // With no system, a code that is listed under several is abstract only if each of
+            // them says so: one of them may be the one that is meant.
+            None => {
+                let mut listed = expansion
+                    .codes
+                    .keys()
+                    .filter(|(_, item)| item == code)
+                    .map(|(listed, _)| listed.as_str())
+                    .peekable();
+                let any = listed.peek().is_some();
+                any && listed.all(flagged)
+            }
+        }
     }
 
     /// What an expansion that lists only some of a code system's concepts leaves unsaid, for
@@ -1666,31 +1686,19 @@ impl MemoryTerminology {
             return match self.membership(url, system, code) {
                 Some(Membership::In) if self.is_abstract_in(url, system, code) => {
                     match abstract_allowed {
-                        Some(false) => code_parameters(
-                            false,
-                            None,
-                            Some(&format!(
-                                "code {code} is abstract: a grouping concept that is not \
-                                 selectable as a value"
-                            )),
-                        ),
+                        Some(false) => abstract_refused(code),
                         allowed => {
-                            let mut answer = code_parameters(
+                            let answer = code_parameters(
                                 true,
                                 display_of_bound(self, url, system, code, display),
                                 None,
                             );
                             // Said unless the caller has said it is where such a code belongs.
                             if allowed.is_none() {
-                                answer["parameter"]
-                                    .as_array_mut()
-                                    .expect("parameters")
-                                    .push(json!({"name": "message", "valueString": format!(
-                                        "code {code} is abstract: a grouping concept that is not \
-                                         meant to be selected as a value"
-                                    )}));
+                                with_abstract_hint(answer, code)
+                            } else {
+                                answer
                             }
-                            answer
                         }
                     }
                 }
@@ -1734,11 +1742,23 @@ impl MemoryTerminology {
         let url = canonical(url);
         let requested = version.or(suffix).filter(|version| !version.is_empty());
         match self.systems.resolve(url, requested) {
-            Some((_, index)) if index.codes.contains_key(code) => code_parameters(
-                true,
-                display_message(describe_index(&index, code), display),
-                None,
-            ),
+            Some((_, index)) if index.codes.contains_key(code) => {
+                let answer = code_parameters(
+                    true,
+                    display_message(describe_index(&index, code), display),
+                    None,
+                );
+                if !index.codes.get(code).is_some_and(concept_not_selectable) {
+                    answer
+                } else {
+                    // R4 gives `abstract` to this operation as it does to the value set's.
+                    match abstract_allowed {
+                        Some(false) => abstract_refused(code),
+                        Some(true) => answer,
+                        None => with_abstract_hint(answer, code),
+                    }
+                }
+            }
             Some((_, index)) if index.closed => {
                 code_parameters(false, None, Some("code is not in the code system"))
             }
@@ -2998,11 +3018,7 @@ fn expand_include(
 /// concepts), and that it is inactive.
 fn note_concept(expansion: &mut Expansion, system: &str, code: &str, concept: &Concept) {
     let key = || (system.to_string(), code.to_string());
-    if concept
-        .properties
-        .iter()
-        .any(|(name, value)| name == "notSelectable" && value == "true")
-    {
+    if concept_not_selectable(concept) {
         expansion.abstract_codes.insert(key());
     }
     if concept.inactive {
@@ -3010,9 +3026,48 @@ fn note_concept(expansion: &mut Expansion, system: &str, code: &str, concept: &C
     }
 }
 
+fn concept_not_selectable(concept: &Concept) -> bool {
+    concept
+        .properties
+        .iter()
+        .any(|(name, value)| name == "notSelectable" && value == "true")
+}
+
+/// The answer to an abstract code when the caller said it is not where such a code belongs.
+fn abstract_refused(code: &str) -> Json {
+    code_parameters(
+        false,
+        None,
+        Some(&format!(
+            "code {code} is abstract: a grouping concept that is not selectable as a value"
+        )),
+    )
+}
+
+/// A valid answer for an abstract code that says so in its `message`, which R4 allows on a valid
+/// answer. R4 allows one `message`, so the hint joins the one the answer has (a display that does
+/// not match) and does not make a second.
+fn with_abstract_hint(mut answer: Json, code: &str) -> Json {
+    let hint = format!(
+        "code {code} is abstract: a grouping concept that is not meant to be selected as a value"
+    );
+    let parameters = answer["parameter"].as_array_mut().expect("parameters");
+    match parameters.iter_mut().find(|item| item["name"] == "message") {
+        Some(message) => {
+            let existing = message["valueString"].as_str().unwrap_or("").to_string();
+            message["valueString"] = json!(format!("{existing}; {hint}"));
+        }
+        None => parameters.push(json!({"name": "message", "valueString": hint})),
+    }
+    answer
+}
+
 /// Say on an expansion entry what the expansion records about its code: R4's `abstract` and
 /// `inactive`. An entry that is neither carries neither.
 fn flag_entry(expansion: &Expansion, system: &str, code: &str, entry: &mut Json) {
+    if expansion.abstract_codes.is_empty() && expansion.inactive_codes.is_empty() {
+        return;
+    }
     let key = (system.to_string(), code.to_string());
     if expansion.abstract_codes.contains(&key) {
         entry["abstract"] = json!(true);
@@ -3687,8 +3742,10 @@ fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
 /// was made by code that chose a code system version or a value set definition differently (one
 /// pool for every package, the package installed last), or that refused a value set the current
 /// code expands (a whole `example` system, listed and flagged), or listed a code its system
-/// marks `notSelectable` or inactive without saying so, so it is rebuilt once rather than read.
-pub const EXPANSION_RULES: u32 = 3;
+/// marks `notSelectable` or inactive without saying so, or kept no `status`, so it is rebuilt once
+/// rather than read. (3 was only ever a build of this change in progress, which had some of that
+/// and not all.)
+pub const EXPANSION_RULES: u32 = 4;
 
 /// Whether a stored expansion document was made under the current [`EXPANSION_RULES`].
 pub fn expansion_is_current(document: &Json) -> bool {
@@ -4441,6 +4498,114 @@ mod tests {
             assert_eq!(all["expansion"]["total"], 3);
             assert_eq!(codes(&all), ["old"]);
         }
+    }
+
+    #[test]
+    fn abstract_is_judged_the_same_way_for_a_code_system_and_a_value_set_and_only_for_its_code() {
+        let (groups, other) = ("http://example.org/groups", "http://example.org/other");
+        let not_selectable = json!([{"code": "notSelectable", "valueBoolean": true}]);
+        let resources = [
+            json!({"resourceType": "CodeSystem", "url": groups, "content": "complete",
+            "concept": [
+                {"code": "_group", "display": "Group", "property": not_selectable},
+                {"code": "a", "display": "A"},
+                {"code": "x", "display": "X"}
+            ]}),
+            // The same code is selectable in a second system.
+            json!({"resourceType": "CodeSystem", "url": other, "content": "complete",
+                   "concept": [{"code": "_group", "display": "Group"}]}),
+            json!({"resourceType": "CodeSystem", "url": "http://example.org/odd",
+                   "content": "complete",
+                   "concept": [{"code": "x", "display": "X", "property": not_selectable}]}),
+            value_set(
+                "http://example.org/both",
+                json!({"include": [{"system": groups}, {"system": other},
+                                   {"system": "http://example.org/odd"}]}),
+            ),
+        ];
+        let terms = MemoryTerminology::from_resources(&resources);
+        let result = |outcome: &serde_json::Value| {
+            outcome["parameter"][0]["valueBoolean"].as_bool().unwrap()
+        };
+        let messages = |outcome: &serde_json::Value| -> Vec<String> {
+            outcome["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["name"] == "message")
+                .map(|item| item["valueString"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // R4 gives `abstract` to the code system's operation as to the value set's.
+        let in_system = |code: &str, allowed: Option<bool>| {
+            terms.validate_code_as(None, Some(groups), None, code, None, allowed)
+        };
+        let said_nothing = in_system("_group", None);
+        assert!(result(&said_nothing));
+        assert!(messages(&said_nothing)[0].contains("_group is abstract"));
+        let allowed = in_system("_group", Some(true));
+        assert!(result(&allowed) && messages(&allowed).is_empty());
+        let refused = in_system("_group", Some(false));
+        assert!(!result(&refused));
+        assert!(messages(&refused)[0].contains("_group is abstract"));
+        for allowed in [None, Some(true), Some(false)] {
+            let outcome = in_system("a", allowed);
+            assert!(result(&outcome) && messages(&outcome).is_empty());
+        }
+
+        // R4 allows one message, so the hint joins a display that does not match.
+        let mismatched = terms.validate_code_as(
+            Some("http://example.org/both"),
+            Some(groups),
+            None,
+            "_group",
+            Some("Wrong"),
+            None,
+        );
+        assert!(result(&mismatched));
+        let said = messages(&mismatched);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("display does not match") && said[0].contains("is abstract"),
+            "{said:?}"
+        );
+
+        // With no system named, a code that one of its systems makes selectable is not abstract
+        // (`x` is only in `groups` and `odd`: abstract in one and selectable in the other),
+        // while with its system named it is judged by that system.
+        let judged = |system: Option<&str>, code: &str| {
+            terms.validate_code_as(
+                Some("http://example.org/both"),
+                system,
+                None,
+                code,
+                None,
+                Some(false),
+            )
+        };
+        assert!(result(&judged(None, "x")));
+        assert!(result(&judged(Some(other), "_group")));
+        assert!(!result(&judged(Some(groups), "_group")));
+        assert!(!result(&judged(Some("http://example.org/odd"), "x")));
+        assert!(result(&judged(Some(groups), "x")));
+        // Listed under one system only, and abstract there, it is abstract without being named.
+        let only = MemoryTerminology::from_resources(&[
+            resources[0].clone(),
+            value_set(
+                "http://example.org/only-groups",
+                json!({"include": [{"system": groups}]}),
+            ),
+        ]);
+        let alone = only.validate_code_as(
+            Some("http://example.org/only-groups"),
+            None,
+            None,
+            "_group",
+            None,
+            Some(false),
+        );
+        assert!(!result(&alone));
     }
 
     #[test]

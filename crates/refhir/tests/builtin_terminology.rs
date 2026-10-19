@@ -27,8 +27,22 @@ fn currencies_package(dir: &Path) {
     .unwrap();
 }
 
+/// A running server, stopped when this is dropped, so that a test that fails does not leave it
+/// running with its database and its port.
+struct Server {
+    child: Child,
+    bind: String,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A server on `database` with the package, once it answers.
-fn serve(dir: &Path, database: &Path, package: &Path) -> (Child, String) {
+fn serve(dir: &Path, database: &Path, package: &Path) -> Server {
     let bind = format!("127.0.0.1:{}", free_port());
     let log = std::fs::File::create(dir.join("serve.log")).unwrap();
     let mut child = start(
@@ -58,7 +72,7 @@ fn serve(dir: &Path, database: &Path, package: &Path) -> (Child, String) {
             .call()
             .is_ok()
         {
-            return (child, bind);
+            return Server { child, bind };
         }
         if Instant::now() > deadline {
             let _ = child.kill();
@@ -99,18 +113,17 @@ fn a_started_server_expands_the_currencies_it_carries_and_installs_them_once() {
     let expand = "/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/currencies";
 
     // The first start installs the package, then the terminology the value set was waiting for.
-    let (mut first, bind) = serve(&dir, &database, &package);
-    let all = codes(&get(&bind, expand));
+    let first = serve(&dir, &database, &package);
+    let all = codes(&get(&first.bind, expand));
     assert_eq!(all.len(), 178);
     for code in ["NGN", "USD", "GBP"] {
         assert!(all.contains(&code.to_string()), "{code}");
     }
     assert_eq!(
-        codes(&get(&bind, &format!("{expand}&filter=naira"))),
+        codes(&get(&first.bind, &format!("{expand}&filter=naira"))),
         ["NGN"]
     );
-    let _ = first.kill();
-    let _ = first.wait();
+    drop(first);
     let log = std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default();
     assert!(
         log.contains("installed refhir.builtin.terminology@1.0.0"),
@@ -118,13 +131,11 @@ fn a_started_server_expands_the_currencies_it_carries_and_installs_them_once() {
     );
 
     // A second start on the same database finds it there and answers the same.
-    let (mut second, bind) = serve(&dir, &database, &package);
-    assert_eq!(codes(&get(&bind, expand)), all);
+    let second = serve(&dir, &database, &package);
+    assert_eq!(codes(&get(&second.bind, expand)), all);
     let log = std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default();
     assert!(
         !log.contains("refhir.builtin.terminology"),
         "installed again:\n{log}"
     );
-    let _ = second.kill();
-    let _ = second.wait();
 }

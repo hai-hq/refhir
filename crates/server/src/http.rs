@@ -1,12 +1,13 @@
 //! HTTP FHIR mapped onto the operation registry.
 //! The router does not implement a second engine.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::Message;
-use axum::extract::{Extension, Path, Query, RawQuery, State, WebSocketUpgrade};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::extract::{Extension, OriginalUri, Path, Query, RawQuery, State, WebSocketUpgrade};
+use axum::http::{header, HeaderMap, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -236,20 +237,26 @@ pub fn app_parts(
         .route("/:resource_type/$behavior", post(behavior_type))
         .route("/:resource_type/$extract", post(extract_type))
         .route("/:resource_type/$install", post(install_op))
-        .route("/:resource_type/$expand", post(expand_op).get(expand_get))
+        .route(
+            "/:resource_type/$expand",
+            post(expand_op).get(terminology_get),
+        )
         .route("/:resource_type/$expandability", post(expandability_op))
         .route(
             "/:resource_type/$validate-code",
-            post(validate_code_op).get(validate_code_get),
+            post(validate_code_op).get(terminology_get),
         )
-        .route("/:resource_type/$lookup", post(lookup_op).get(lookup_get))
+        .route(
+            "/:resource_type/$lookup",
+            post(lookup_op).get(terminology_get),
+        )
         .route(
             "/:resource_type/$translate",
-            post(translate_op).get(translate_get),
+            post(translate_op).get(terminology_get),
         )
         .route(
             "/:resource_type/$subsumes",
-            post(subsumes_op).get(subsumes_get),
+            post(subsumes_op).get(terminology_get),
         )
         .route("/:resource_type/$export", post(export_type))
         .route("/:resource_type/:id/_history/:vid", get(vread))
@@ -258,19 +265,19 @@ pub fn app_parts(
         .route("/:resource_type/:id/$validate", post(validate_instance))
         .route(
             "/:resource_type/:id/$expand",
-            post(expand_instance_post).get(expand_instance_get),
+            post(terminology_instance_post).get(terminology_get),
         )
         .route(
             "/:resource_type/:id/$validate-code",
-            post(validate_code_instance_post).get(validate_code_instance_get),
+            post(terminology_instance_post).get(terminology_get),
         )
         .route(
             "/:resource_type/:id/$subsumes",
-            post(subsumes_instance_post).get(subsumes_instance_get),
+            post(terminology_instance_post).get(terminology_get),
         )
         .route(
             "/:resource_type/:id/$translate",
-            post(translate_instance_post).get(translate_instance_get),
+            post(terminology_instance_post).get(terminology_get),
         )
         .route("/:resource_type/:id/$populate", post(populate_instance))
         .route("/:resource_type/:id/$assemble", post(assemble_instance))
@@ -1068,61 +1075,66 @@ async fn expand_op(
     terminology_op(app, resource_type, "$expand", body).await
 }
 
-/// The terminology operations have no side effects, so R4 allows each as a `GET` with its
-/// parameters in the query string. They are the arguments a `POST` body of plain JSON would hold,
-/// and a parameter given twice counts once, as its first value. (What cannot be a query parameter,
-/// a `coding` or a `codeableConcept`, is sent as a `POST`.)
-async fn terminology_get(
-    app: AppState,
-    resource_type: String,
-    op: &str,
-    params: Vec<(String, String)>,
-) -> Response {
+/// What a `GET` of a terminology operation puts in the query string, as the arguments a `POST`
+/// body of plain JSON would hold: a parameter given twice counts once, as its first value.
+fn query_args(params: Vec<(String, String)>) -> serde_json::Map<String, Value> {
     let mut args = serde_json::Map::new();
     for (name, value) in params {
         args.entry(name).or_insert(Value::String(value));
     }
-    terminology_call(app, resource_type, op, Value::Object(args)).await
+    args
 }
 
-async fn expand_get(
-    State(app): State<AppState>,
-    Path(resource_type): Path<String>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_get(app, resource_type, "$expand", params).await
+/// The operation a terminology route is for: the last segment of the path it matched.
+fn route_op(uri: &Uri) -> &str {
+    uri.path().rsplit('/').next().unwrap_or("")
 }
 
-async fn validate_code_get(
+/// The terminology operations have no side effects, so R4 allows each as a `GET` with its
+/// parameters in the query string, at the type or, with an `[id]` in the path, at an instance.
+/// (What cannot be a query parameter, a `coding` or a `codeableConcept`, is sent as a `POST`.)
+async fn terminology_get(
     State(app): State<AppState>,
-    Path(resource_type): Path<String>,
+    Path(path): Path<HashMap<String, String>>,
+    OriginalUri(uri): OriginalUri,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    terminology_get(app, resource_type, "$validate-code", params).await
+    let mut args = query_args(params);
+    if let Some(id) = path.get("id") {
+        args.insert(refhir_fhir::INSTANCE.into(), json!(id));
+    }
+    let resource_type = path.get("resource_type").cloned().unwrap_or_default();
+    terminology_call(app, resource_type, route_op(&uri), Value::Object(args)).await
 }
 
-async fn lookup_get(
+/// A terminology operation sent to an instance, `ValueSet/[id]/$expand`, as a `POST`. The body
+/// may be empty: what is asked of is the instance, and nothing else is needed.
+async fn terminology_instance_post(
     State(app): State<AppState>,
-    Path(resource_type): Path<String>,
-    Query(params): Query<Vec<(String, String)>>,
+    Path(path): Path<HashMap<String, String>>,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
 ) -> Response {
-    terminology_get(app, resource_type, "$lookup", params).await
-}
-
-async fn translate_get(
-    State(app): State<AppState>,
-    Path(resource_type): Path<String>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_get(app, resource_type, "$translate", params).await
-}
-
-async fn subsumes_get(
-    State(app): State<AppState>,
-    Path(resource_type): Path<String>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_get(app, resource_type, "$subsumes", params).await
+    let mut args = if body.is_empty() {
+        json!({})
+    } else {
+        match parse_body(&body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        }
+    };
+    let Some(object) = args.as_object_mut() else {
+        return outcome(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "the parameters of an operation are a JSON object",
+        );
+    };
+    if let Some(id) = path.get("id") {
+        object.insert(refhir_fhir::INSTANCE.into(), json!(id));
+    }
+    let resource_type = path.get("resource_type").cloned().unwrap_or_default();
+    terminology_call(app, resource_type, route_op(&uri), args).await
 }
 
 async fn expandability_op(
@@ -1163,113 +1175,6 @@ async fn terminology_op(app: AppState, resource_type: String, op: &str, body: By
         Err(response) => return response,
     };
     terminology_call(app, resource_type, op, args).await
-}
-
-/// A terminology operation sent to an instance, `ValueSet/[id]/$expand`. The body may be empty:
-/// what is asked of is the instance, and nothing else is needed.
-async fn terminology_instance(
-    app: AppState,
-    resource_type: String,
-    id: String,
-    op: &str,
-    body: Bytes,
-) -> Response {
-    let mut args = if body.is_empty() {
-        json!({})
-    } else {
-        match parse_body(&body) {
-            Ok(value) => value,
-            Err(response) => return response,
-        }
-    };
-    let Some(object) = args.as_object_mut() else {
-        return outcome(
-            StatusCode::BAD_REQUEST,
-            "invalid",
-            "the parameters of an operation are a JSON object",
-        );
-    };
-    object.insert(refhir_fhir::INSTANCE.into(), json!(id));
-    terminology_call(app, resource_type, op, args).await
-}
-
-async fn terminology_instance_get(
-    app: AppState,
-    resource_type: String,
-    id: String,
-    op: &str,
-    params: Vec<(String, String)>,
-) -> Response {
-    let mut args = serde_json::Map::new();
-    for (name, value) in params {
-        args.entry(name).or_insert(Value::String(value));
-    }
-    args.insert(refhir_fhir::INSTANCE.into(), json!(id));
-    terminology_call(app, resource_type, op, Value::Object(args)).await
-}
-
-async fn expand_instance_post(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    body: Bytes,
-) -> Response {
-    terminology_instance(app, resource_type, id, "$expand", body).await
-}
-
-async fn expand_instance_get(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_instance_get(app, resource_type, id, "$expand", params).await
-}
-
-async fn validate_code_instance_post(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    body: Bytes,
-) -> Response {
-    terminology_instance(app, resource_type, id, "$validate-code", body).await
-}
-
-async fn validate_code_instance_get(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_instance_get(app, resource_type, id, "$validate-code", params).await
-}
-
-async fn subsumes_instance_post(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    body: Bytes,
-) -> Response {
-    terminology_instance(app, resource_type, id, "$subsumes", body).await
-}
-
-async fn subsumes_instance_get(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_instance_get(app, resource_type, id, "$subsumes", params).await
-}
-
-async fn translate_instance_post(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    body: Bytes,
-) -> Response {
-    terminology_instance(app, resource_type, id, "$translate", body).await
-}
-
-async fn translate_instance_get(
-    State(app): State<AppState>,
-    Path((resource_type, id)): Path<(String, String)>,
-    Query(params): Query<Vec<(String, String)>>,
-) -> Response {
-    terminology_instance_get(app, resource_type, id, "$translate", params).await
 }
 
 async fn terminology_call(app: AppState, resource_type: String, op: &str, args: Value) -> Response {
