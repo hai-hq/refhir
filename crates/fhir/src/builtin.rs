@@ -6,8 +6,10 @@
 //! package. Without one, the value set cannot be expanded, a code cannot be checked against it, and
 //! a client that expands every value set a form binds is left with an error.
 //!
-//! These are installed like a package of two files: stored under their own name and version, so
-//! that they are there for a database that already had the R4 packages, and installed once.
+//! These are installed like a package: stored under their own name and version, so that they are
+//! there for a database that already had the R4 packages, and installed once. They are installed
+//! after the packages that refer to them, because installing a package expands only the value sets
+//! it holds, and what was waiting for them is expanded when they arrive.
 //! Changing what they hold is a new version, which a database takes in addition to the old one.
 
 use std::sync::RwLock;
@@ -25,15 +27,16 @@ use crate::package::{announce_terminology, stage_new_package, terminology_row};
 /// The name the built-in terminology is stored under, with the version of what it holds.
 pub const BUILTIN_PACKAGE: &str = "refhir.builtin.terminology@1.0.0";
 
-/// ISO 4217: the active alphabetic currency codes, with their numeric codes and English names.
-const ISO_4217: &str = include_str!("../builtin/CodeSystem-iso4217.json");
+/// The resources the package holds. ISO 4217 is the active alphabetic currency codes, with their
+/// numeric codes and English names.
+const RESOURCES: [&str; 1] = [include_str!("../builtin/CodeSystem-iso4217.json")];
 
 fn builtin_package() -> Result<NewPackage, FhirError> {
     let (name, version) = BUILTIN_PACKAGE
         .split_once('@')
         .expect("the built-in package is name@version");
     let mut terminology = Vec::new();
-    for text in [ISO_4217] {
+    for text in RESOURCES {
         let resource: Value = serde_json::from_str(text)
             .map_err(|err| FhirError::Invalid(format!("built-in terminology: {err}")))?;
         terminology.push(terminology_row(&resource)?);
@@ -70,10 +73,20 @@ pub fn install_builtin_terminology(
         .map(|row| row.url.clone())
         .collect();
     let (name, version) = (package.name.clone(), package.version.clone());
-    stage_new_package(store, db, catalog, package, started.elapsed(), "read", true)?;
+    // Not published: the catalog is brought up to date below, as it is for a code system that is
+    // written, which reads only the value sets that include what arrives and does not load the
+    // whole catalog again.
+    let pending = stage_new_package(
+        store,
+        db,
+        catalog,
+        package,
+        started.elapsed(),
+        "read",
+        false,
+    )?;
     // Installing a package stores the expansions of its own value sets. The ones that were
-    // waiting for what it carries are in other packages, and are expanded now, as they are when a
-    // code system is written: by reading only the value sets that include it.
+    // waiting for what it carries are in other packages, and are expanded now.
     let package_id = store
         .load_packages()?
         .into_iter()
@@ -81,5 +94,8 @@ pub fn install_builtin_terminology(
         .map(|package| package.id)
         .ok_or_else(|| FhirError::Storage(format!("{name}@{version} was not stored")))?;
     apply_terminology(store, catalog, package_id, &urls, &[])?;
+    if let Some(pending) = pending {
+        pending.create(store, db)?;
+    }
     announce_terminology(store)
 }
