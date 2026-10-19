@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.2] - 2026-10-19
+
 ### Added
 
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
@@ -49,6 +51,36 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `handling=strict` is the default. Conditional create, update and delete, `batch` and
   `transaction` entries, GraphQL and live queries are never lenient. See
   [FHIR API](docs/fhir-api.md#search).
+- **Many tenants in one Postgres database.** A process started with `--tenant NAME` (or
+  `REFHIR_TENANT`, or `tenant` under `[database]`) serves one tenant of a database that many tenants
+  share. Each tenant is a separate FHIR server: its own resources, SMART clients, audit trail,
+  writer, and standbys and replicas. `refhir tenant create | list | delete` manages them, and a
+  process whose tenant the database does not have refuses to start. The first `create` makes an
+  empty database a shared one, and a database keeps the layout it was made with: a database that
+  already holds a ReFHIR without tenants cannot hold them, and the reverse. **Nothing changes
+  without `--tenant`**: the same tables, migrations and SQL as before.
+  - **The packages tenants have in common are stored once.** The FHIR core and what it depends on
+    are read from a prepared file (see above) into the database one time, and each tenant is given
+    them, with its own search parameters and its own value set expansions. Packages installed from a
+    registry or a directory, and everything a tenant writes, stay the tenant's own.
+  - **The database keeps each tenant to its own rows.** Every table that holds tenants' rows has
+    row-level security, enabled and forced, so a connection sees and writes only the tenant it
+    serves. A superuser and a role with `BYPASSRLS` are never bound by it, so a process that connects
+    as one works and logs a warning. Take backups with such a role: `pg_dump` run as the ordinary
+    role refuses the database, and `--enable-row-security` dumps no tenant's rows.
+  - **A replica cannot write into the wrong tenant.** It sends its tenant with everything it
+    forwards, over REST and over `/sync`, and a primary of another tenant answers `421`.
+    `/healthz` names the tenant, `refhir migrate --status` says when a database is shared, and a
+    tenant's package cache and export directory default to a folder named for it. The Helm chart
+    takes `database.tenant` (one release per tenant).
+  - **A tenant announces its commits to its replicas at most every 20 ms.** Every tenant's replicas
+    listen in one database, so an announcement for each commit woke all of them and made busy
+    tenants slow each other down. The first commit after a quiet spell is announced with the commit
+    itself, and a burst ends with one announcement after its last commit. A database without tenants
+    announces every commit as before.
+
+  Each tenant adds a writer, so give the Postgres server room for all of them together. See
+  [Tenants on one database](docs/clustering.md#tenants-on-one-database).
 
 ### Changed
 
@@ -261,6 +293,10 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   primary starts does the same, so a primary that stopped between writing and telling is made up
   for. The cost is that every replica and standby loads the whole catalog (a few seconds of one
   thread each) when a primary starts or a standby takes over.
+- **Claiming jobs on Postgres can no longer take more than was asked for.** The statement that
+  picks the waiting jobs (`$export` and the other durable jobs) let the planner run its locking
+  subquery again for each row it updated, skipping the rows it had just locked, so one claim could
+  take more jobs than the worker asked for. It now picks once, whatever the plan.
 
 ## [0.0.1] - 2026-10-15
 
@@ -307,5 +343,6 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/hai-hq/refhir/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/hai-hq/refhir/releases/tag/v0.0.1
