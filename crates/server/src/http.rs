@@ -256,6 +256,7 @@ pub fn app_parts(
         )
         .route("/:resource_type/:id/$behavior", post(behavior_instance))
         .route("/:resource_type/:id/$extract", post(extract_instance))
+        .route("/:resource_type/:id/$apply", post(apply_op))
         .route("/:resource_type/:id/$everything", get(everything))
         .route("/:resource_type/:id/$document", get(document_op))
         .route("/:resource_type/:id/$websocket", get(subscription_socket))
@@ -1111,6 +1112,46 @@ async fn submit_op(
             None,
             prefer_xml(&headers, &params),
         ),
+        Err(err) => error_response(err),
+    }
+}
+
+/// `POST [base]/ChargeItemDefinition/[id]/$apply`: the body is the operation's `Parameters`
+/// (`chargeItem`, and `account` if there is one). It reads a ChargeItem and an Account the path does
+/// not name, so the token needs to be able to read them, and it answers an Invoice that is not
+/// stored. The body is JSON: the XML that `parse_body` reads does not make these Parameters.
+async fn apply_op(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.first() == Some(&b'<') {
+        return outcome(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "not-supported",
+            "$apply takes its Parameters as JSON; XML is not supported",
+        );
+    }
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        crate::auth::require_scopes(&app, &headers, &refhir_fhir::apply_reads(&resource))
+    {
+        return response;
+    }
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/$apply"),
+        json!({"id": id, "resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
         Err(err) => error_response(err),
     }
 }

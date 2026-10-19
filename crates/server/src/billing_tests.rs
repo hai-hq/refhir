@@ -633,6 +633,12 @@ fn guarded() -> axum::Router {
                 json!({"resourceType": "Coverage", "id": "policy", "status": "active",
                     "beneficiary": {"reference": "Patient/billed"},
                     "payor": [{"reference": "Organization/insurer"}]}),
+                json!({"resourceType": "ChargeItem", "id": "visit", "status": "billable",
+                    "code": {"text": "consultation"}, "subject": {"reference": "Patient/billed"}}),
+                json!({"resourceType": "ChargeItemDefinition", "id": "price", "status": "active",
+                    "url": "http://example.org/cid/guarded",
+                    "propertyGroup": [{"priceComponent": [
+                        {"type": "base", "amount": {"value": 100, "currency": "NGN"}}]}]}),
             ] {
                 refhir_fhir::import_resource(&db, &catalog.read().unwrap(), &resource).unwrap();
             }
@@ -647,6 +653,26 @@ fn guarded() -> axum::Router {
                 None,
             );
             smart.install_token("no-response", &["user/Claim.write"], None);
+            smart.install_token(
+                "pricer",
+                &[
+                    "user/ChargeItemDefinition.read",
+                    "user/ChargeItem.read",
+                    "user/Account.read",
+                ],
+                None,
+            );
+            smart.install_token(
+                "pricer-without-accounts",
+                &["user/ChargeItemDefinition.read", "user/ChargeItem.read"],
+                None,
+            );
+            smart.install_token(
+                "definitions-only",
+                &["user/ChargeItemDefinition.read"],
+                None,
+            );
+            smart.install_token("charge-items-only", &["user/ChargeItem.read"], None);
             smart.install_token("reader", &["user/*.read"], None);
             smart.install_token(
                 "patient",
@@ -720,4 +746,451 @@ async fn a_token_submits_only_what_it_may_write() {
     assert_eq!(status, StatusCode::OK, "{text}");
     let total: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(total["total"], 2, "{text}");
+}
+
+// `$apply`: what a ChargeItem costs under a ChargeItemDefinition.
+
+/// A consultation that costs 15 000 naira, with a quarter more after hours, 1 000 less for a
+/// child, and 7.5 % tax on the base price. The co-payment is only shown.
+fn consultation_prices(id: &str) -> Value {
+    json!({
+        "resourceType": "ChargeItemDefinition", "id": id, "status": "active",
+        "url": format!("http://example.org/cid/{id}"),
+        "applicability": [{
+            "description": "only what can be billed", "language": "text/fhirpath",
+            "expression": "%context.status = 'billable'"
+        }],
+        "propertyGroup": [
+            {"priceComponent": [
+                {"type": "base", "amount": {"value": 15000, "currency": "NGN"}},
+                {"type": "tax", "code": {"text": "VAT"}, "factor": 0.075},
+                {"type": "informational", "code": {"text": "co-payment"},
+                 "amount": {"value": 2000, "currency": "NGN"}}
+            ]},
+            {"applicability": [{"language": "text/fhirpath",
+                "expression": "%context.note.text.contains('after hours')"}],
+             "priceComponent": [
+                {"type": "surcharge", "code": {"text": "after hours"}, "factor": 0.25}]},
+            // Under fourteen. The birth date is far enough ahead that the test stays right.
+            {"applicability": [{"language": "text/fhirpath",
+                "expression": "%context.subject.resolve().birthDate > today() - 14 years"}],
+             "priceComponent": [
+                {"type": "discount", "code": {"text": "child"},
+                 "amount": {"value": 1000, "currency": "NGN"}}]}
+        ]
+    })
+}
+
+fn charged(id: &str, patient: &str, status: &str, note: Option<&str>) -> Value {
+    let mut item = json!({
+        "resourceType": "ChargeItem", "id": id, "status": status,
+        "code": {"text": "consultation"}, "subject": {"reference": format!("Patient/{patient}")}
+    });
+    if let Some(note) = note {
+        item["note"] = json!([{"text": note}]);
+    }
+    item
+}
+
+async fn put_all(resources: Vec<Value>) {
+    for resource in resources {
+        let reply = put(resource).await;
+        assert!(reply.status.is_success(), "{}", reply.body);
+    }
+}
+
+fn apply_body(item: &str, account: Option<&str>) -> Value {
+    let mut parameter = vec![json!({"name": "chargeItem", "valueReference": {"reference": item}})];
+    if let Some(account) = account {
+        parameter.push(json!({"name": "account", "valueReference": {"reference": account}}));
+    }
+    json!({"resourceType": "Parameters", "parameter": parameter})
+}
+
+async fn apply(definition: &str, body: Value) -> crate::tests::Reply {
+    post(&format!("/ChargeItemDefinition/{definition}/$apply"), body).await
+}
+
+fn component<'a>(invoice: &'a Value, kind: &str) -> &'a Value {
+    invoice["lineItem"][0]["priceComponent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|component| component["type"] == kind)
+        .unwrap_or_else(|| panic!("no {kind} in {invoice}"))
+}
+
+#[tokio::test]
+async fn a_price_is_the_base_plus_the_surcharges_less_the_discounts_that_apply() {
+    put_all(vec![
+        json!({"resourceType": "Patient", "id": "kid", "birthDate": "2030-01-01"}),
+        json!({"resourceType": "Patient", "id": "grown", "birthDate": "1980-01-01"}),
+        consultation_prices("consult"),
+        charged("night-kid", "kid", "billable", Some("seen after hours")),
+        charged("day-grown", "grown", "billable", None),
+        charged("day-kid", "kid", "billable", None),
+    ])
+    .await;
+
+    // Base 15 000, and a quarter of it more after hours, and 1 000 less for a child: 17 750. Tax
+    // is 7.5 % of the base price, 1 125.
+    let reply = apply("consult", apply_body("ChargeItem/night-kid", None)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let invoice = &reply.body;
+    assert_eq!(invoice["resourceType"], "Invoice");
+    assert_eq!(invoice["status"], "draft");
+    assert_eq!(
+        invoice["totalNet"],
+        json!({"value": 17750, "currency": "NGN"})
+    );
+    assert_eq!(
+        invoice["totalGross"],
+        json!({"value": 18875, "currency": "NGN"})
+    );
+    assert_eq!(invoice["subject"]["reference"], "Patient/kid");
+    assert_eq!(
+        invoice["lineItem"][0]["chargeItemReference"]["reference"],
+        "ChargeItem/night-kid"
+    );
+    // Each component is as the definition gives it, with the amount worked out for the ones
+    // that were a fraction of the base price.
+    assert_eq!(
+        component(invoice, "base")["amount"],
+        json!({"value": 15000, "currency": "NGN"})
+    );
+    assert_eq!(
+        component(invoice, "surcharge")["amount"],
+        json!({"value": 3750, "currency": "NGN"})
+    );
+    assert_eq!(component(invoice, "surcharge")["factor"], json!(0.25));
+    assert_eq!(
+        component(invoice, "surcharge")["code"]["text"],
+        "after hours"
+    );
+    assert_eq!(
+        component(invoice, "discount")["amount"],
+        json!({"value": 1000, "currency": "NGN"})
+    );
+    assert_eq!(
+        component(invoice, "tax")["amount"],
+        json!({"value": 1125, "currency": "NGN"})
+    );
+    // What is only shown is shown, and is not part of the price.
+    assert_eq!(component(invoice, "informational")["amount"]["value"], 2000);
+    assert_eq!(
+        invoice["lineItem"][0]["priceComponent"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+
+    // By day, for an adult: the base price and tax, no surcharge and no discount.
+    let reply = apply("consult", apply_body("ChargeItem/day-grown", None)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        reply.body["totalNet"],
+        json!({"value": 15000, "currency": "NGN"})
+    );
+    assert_eq!(
+        reply.body["totalGross"],
+        json!({"value": 16125, "currency": "NGN"})
+    );
+    let kinds: Vec<&str> = reply.body["lineItem"][0]["priceComponent"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|component| component["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["base", "tax", "informational"]);
+
+    // By day, for a child: only the discount applies of the two.
+    let reply = apply("consult", apply_body("ChargeItem/day-kid", None)).await;
+    assert_eq!(
+        reply.body["totalNet"],
+        json!({"value": 14000, "currency": "NGN"})
+    );
+    // The Invoice is the answer and is not stored.
+    for patient in ["kid", "grown"] {
+        let stored = get(&format!(
+            "/Invoice?subject=Patient/{patient}&_summary=count"
+        ))
+        .await;
+        assert_eq!(stored.body["total"], 0, "{patient}");
+    }
+}
+
+#[tokio::test]
+async fn amounts_are_added_exactly_in_the_currency_the_definition_gives() {
+    put_all(vec![
+        json!({"resourceType": "Patient", "id": "payer"}),
+        charged("scan", "payer", "billable", None),
+        json!({"resourceType": "ChargeItemDefinition", "id": "scan-usd", "status": "active",
+        "url": "http://example.org/cid/scan-usd",
+        "propertyGroup": [{"priceComponent": [
+            {"type": "base", "amount": {"value": 10.1, "currency": "USD"}},
+            {"type": "surcharge", "amount": {"value": 0.2, "currency": "USD"}},
+            // The sign a discount is written with does not matter.
+            {"type": "discount", "amount": {"value": -0.05, "currency": "USD"}},
+            {"type": "deduction", "amount": {"value": 0.05, "currency": "USD"}}
+        ]}]}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "scan-mixed", "status": "active",
+        "url": "http://example.org/cid/scan-mixed",
+        "propertyGroup": [{"priceComponent": [
+            {"type": "base", "amount": {"value": 10, "currency": "USD"}},
+            {"type": "surcharge", "amount": {"value": 1, "currency": "EUR"}}
+        ]}]}),
+    ])
+    .await;
+    // 10.1 + 0.2 - 0.05 - 0.05 is 10.2 with none of the error floating point adds.
+    let reply = apply("scan-usd", apply_body("ChargeItem/scan", None)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        reply.body["totalNet"],
+        json!({"value": 10.2, "currency": "USD"})
+    );
+    assert_eq!(
+        reply.body["totalGross"],
+        json!({"value": 10.2, "currency": "USD"})
+    );
+    // Two currencies are not added, and no rate is guessed.
+    let reply = apply("scan-mixed", apply_body("ChargeItem/scan", None)).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
+    assert!(
+        issues(&reply.body).contains("USD") && issues(&reply.body).contains("EUR"),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn a_condition_that_is_not_met_gives_no_price() {
+    put_all(vec![
+        json!({"resourceType": "Patient", "id": "waiting"}),
+        charged("planned-visit", "waiting", "planned", None),
+        charged("billable-visit", "waiting", "billable", None),
+        consultation_prices("consult-conditions"),
+        // Its one price is for a condition the ChargeItem does not meet.
+        json!({"resourceType": "ChargeItemDefinition", "id": "weekend-only", "status": "active",
+            "url": "http://example.org/cid/weekend-only",
+            "propertyGroup": [{
+                "applicability": [{"language": "text/fhirpath", "expression": "%context.note.exists()"}],
+                "priceComponent": [{"type": "base", "amount": {"value": 500, "currency": "NGN"}}]}]}),
+    ])
+    .await;
+    // The definition as a whole does not apply: the answer is the reason, as an OperationOutcome.
+    let reply = apply(
+        "consult-conditions",
+        apply_body("ChargeItem/planned-visit", None),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
+    assert_eq!(reply.body["resourceType"], "OperationOutcome");
+    assert_eq!(reply.body["issue"][0]["code"], "business-rule");
+    assert_eq!(
+        reply.body["issue"][0]["expression"][0],
+        "ChargeItemDefinition.applicability[0]"
+    );
+    assert!(
+        issues(&reply.body).contains("only what can be billed"),
+        "{}",
+        reply.body
+    );
+    // No group applies: there is a line for the ChargeItem and no price.
+    let reply = apply(
+        "weekend-only",
+        apply_body("ChargeItem/billable-visit", None),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["resourceType"], "Invoice");
+    assert!(
+        reply.body.get("totalNet").is_none() && reply.body.get("totalGross").is_none(),
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body["lineItem"][0].get("priceComponent").is_none(),
+        "{}",
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn a_request_that_names_what_does_not_exist_is_refused_for_the_reason() {
+    put_all(vec![
+        json!({"resourceType": "Patient", "id": "named"}),
+        charged("named-visit", "named", "billable", None),
+        json!({"resourceType": "Account", "id": "named-account", "status": "active"}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "simple", "status": "active",
+            "url": "http://example.org/cid/simple",
+            "propertyGroup": [{"priceComponent": [
+                {"type": "base", "amount": {"value": 1, "currency": "NGN"}}]}]}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "in-cql", "status": "active",
+            "url": "http://example.org/cid/in-cql",
+            "applicability": [{"language": "text/cql", "expression": "true"}]}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "gibberish", "status": "active",
+            "url": "http://example.org/cid/gibberish",
+            "applicability": [{"language": "text/fhirpath", "expression": "status ="}]}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "not-boolean", "status": "active",
+            "url": "http://example.org/cid/not-boolean",
+            "applicability": [{"language": "text/fhirpath", "expression": "%context.status"}]}),
+    ])
+    .await;
+    // The definition is in the URL: a 404.
+    let reply = apply("nope", apply_body("ChargeItem/named-visit", None)).await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
+    // The ChargeItem and the Account are in the parameters: well formed, and not there, a 422.
+    let reply = apply("simple", apply_body("ChargeItem/nope", None)).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
+    assert!(
+        issues(&reply.body).contains("ChargeItem/nope does not exist"),
+        "{}",
+        reply.body
+    );
+    let reply = apply(
+        "simple",
+        apply_body("ChargeItem/named-visit", Some("Account/nope")),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
+    assert!(
+        issues(&reply.body).contains("Account/nope does not exist"),
+        "{}",
+        reply.body
+    );
+    // The account in context is the Invoice's.
+    let reply = apply(
+        "simple",
+        apply_body("ChargeItem/named-visit", Some("Account/named-account")),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body["account"]["reference"], "Account/named-account");
+    assert_eq!(
+        reply.body["totalNet"],
+        json!({"value": 1, "currency": "NGN"})
+    );
+    // A request that is not one: no chargeItem, the wrong type, an absolute URL, no Parameters.
+    for body in [
+        json!({"resourceType": "Parameters", "parameter": []}),
+        apply_body("Patient/named", None),
+        apply_body("http://elsewhere.example/ChargeItem/named-visit", None),
+        json!({"resourceType": "ChargeItem"}),
+        json!({"resourceType": "Parameters", "parameter": [{"name": "chargeItem", "valueString": "ChargeItem/named-visit"}]}),
+    ] {
+        let reply = apply("simple", body.clone()).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            reply.body
+        );
+    }
+    // A condition that cannot be decided is not taken as true.
+    for (definition, said) in [
+        ("in-cql", "text/cql"),
+        ("gibberish", "cannot be read"),
+        ("not-boolean", "true or false"),
+    ] {
+        let reply = apply(definition, apply_body("ChargeItem/named-visit", None)).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{definition}: {}",
+            reply.body
+        );
+        assert!(
+            issues(&reply.body).contains(said),
+            "{definition}: {}",
+            reply.body
+        );
+    }
+    // A type that has no such operation.
+    let reply = post(
+        "/Patient/named/$apply",
+        apply_body("ChargeItem/named-visit", None),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+}
+
+#[tokio::test]
+async fn the_capability_statement_lists_apply() {
+    let metadata = get("/metadata").await;
+    let entry = metadata.body["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["type"] == "ChargeItemDefinition")
+        .unwrap();
+    assert_eq!(
+        entry["operation"],
+        json!([{"name": "apply",
+            "definition": "http://hl7.org/fhir/OperationDefinition/ChargeItemDefinition-apply"}])
+    );
+}
+
+async fn apply_as(token: &str, definition: &str, body: Value) -> StatusCode {
+    crate::tests::send_text(
+        &guarded(),
+        "POST",
+        &format!("/ChargeItemDefinition/{definition}/$apply"),
+        &body.to_string(),
+        &[
+            ("authorization", &format!("Bearer {token}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await
+    .0
+}
+
+#[tokio::test]
+async fn applying_a_definition_needs_to_read_the_charge_item_and_nothing_more() {
+    let body = apply_body("ChargeItem/visit", None);
+    for (token, wanted) in [
+        // Reading is enough: nothing is written.
+        ("pricer", StatusCode::OK),
+        // Not the ChargeItem the price is of: it is not this token's to read.
+        ("definitions-only", StatusCode::FORBIDDEN),
+        // Nor the definition.
+        ("charge-items-only", StatusCode::FORBIDDEN),
+        // The Account too, when one is named.
+        ("pricer-without-accounts", StatusCode::OK),
+        // A token that is limited to one patient cannot, whatever it may read.
+        ("patient", StatusCode::FORBIDDEN),
+        ("nobody", StatusCode::UNAUTHORIZED),
+    ] {
+        assert_eq!(
+            apply_as(token, "price", body.clone()).await,
+            wanted,
+            "{token}"
+        );
+    }
+    let with_account = apply_body("ChargeItem/visit", Some("Account/anything"));
+    assert_eq!(
+        apply_as("pricer-without-accounts", "price", with_account).await,
+        StatusCode::FORBIDDEN
+    );
 }

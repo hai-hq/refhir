@@ -12,6 +12,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **`POST [base]/ChargeItemDefinition/[id]/$apply`.** It answered `405`. It now takes `chargeItem`
+  (and optionally `account`) as FHIR R4's `Parameters` and answers with a draft `Invoice`, not stored,
+  that prices the ChargeItem under the definition: the definition's `applicability` conditions are
+  evaluated as FHIRPath with the ChargeItem as `%context` (every one of the definition's must be true,
+  or the answer is a `422` that names it), and the price components of each `propertyGroup` whose
+  conditions are true are put on the line. `totalNet` is the base price plus surcharges less
+  deductions and discounts, and `totalGross` adds tax; `informational` components are only shown.
+  Amounts are added as decimals, keep the definition's currency, and are never converted: two
+  currencies are a `422`. R4 leaves the answer as "Any" resource, so the Invoice is a choice, made
+  because its line has price components shaped like the definition's. A definition that is not there is
+  a `404`, a ChargeItem or Account that is not there a `422`. With SMART the token needs to read the
+  definition, the ChargeItem and the Account; a token limited to one patient cannot use it. See
+  [FHIR API](docs/fhir-api.md#pricing-a-charge-item-chargeitemdefinitionapply).
 - **`POST [base]/Claim/$submit` and `POST [base]/CoverageEligibilityRequest/$submit`.** Both answered
   `405`. They now take FHIR R4's `Parameters` with a `resource`, a `Claim` or `CoverageEligibilityRequest`
   or a `Bundle` of them (or that resource as the body), store them with whatever the Bundle brings

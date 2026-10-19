@@ -420,6 +420,10 @@ pub fn patient_http_operation(
     }
     let id = parts.next();
     let tail = parts.next();
+    // It prices a ChargeItem the path does not name, which may be another patient's.
+    if tail == Some("$apply") {
+        return Err(OUTSIDE.into());
+    }
     match (method, id, tail) {
         ("GET" | "HEAD", None, None) => Ok(None),
         ("POST", None, None) => {

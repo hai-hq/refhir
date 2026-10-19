@@ -136,7 +136,63 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
+| `$apply` | `ChargeItemDefinition/[id]` | Prices a ChargeItem under a definition. See [Pricing a charge item](#pricing-a-charge-item-chargeitemdefinitionapply) |
 | `$submit` | `Claim`, `CoverageEligibilityRequest` | Stores a claim, pre-authorisation or eligibility request and answers with a response that says it is queued. See [Submitting a claim](#submitting-a-claim-or-an-eligibility-request) |
+
+### Pricing a charge item: `ChargeItemDefinition/$apply`
+
+`POST [base]/ChargeItemDefinition/[id]/$apply` takes the FHIR R4 `Parameters` `chargeItem` (a
+`valueReference` to a `ChargeItem` in this store, as `ChargeItem/[id]`) and, optionally, `account` (a
+`valueReference` to an `Account`). It works out what the ChargeItem costs under the definition and
+answers with a draft `Invoice` that is not stored. R4 says only that the answer is "Any" resource, so
+this is the choice made here: an Invoice is what the resource page says these prices are for, its line has
+price components of the shape the definition's have, and the `account` is the Invoice's.
+
+```bash
+curl -s -X POST http://localhost:8080/ChargeItemDefinition/consultation/\$apply -H 'content-type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [{"name": "chargeItem", "valueReference": {"reference": "ChargeItem/visit-1"}}]
+}'
+```
+
+```json
+{
+  "resourceType": "Invoice", "status": "draft",
+  "subject": {"reference": "Patient/ada"},
+  "lineItem": [{"sequence": 1, "chargeItemReference": {"reference": "ChargeItem/visit-1"},
+    "priceComponent": [
+      {"type": "base", "amount": {"value": 15000, "currency": "NGN"}},
+      {"type": "surcharge", "code": {"text": "after hours"}, "factor": 0.25, "amount": {"value": 3750, "currency": "NGN"}}]}],
+  "totalNet": {"value": 18750, "currency": "NGN"},
+  "totalGross": {"value": 18750, "currency": "NGN"}
+}
+```
+
+- **Conditions.** `applicability` of the definition and of a `propertyGroup` is FHIRPath (`text/fhirpath`,
+  which is what a condition with no `language` is), with the ChargeItem as `%context` and its references
+  followed with `resolve()`: `%context.subject.resolve().birthDate > today() - 14 years`. Every condition
+  of the definition must be true, or it does not apply to this ChargeItem and the answer is a `422`
+  `OperationOutcome` (`business-rule`) that names the condition. A group is used when every condition of
+  its own is true, and a group with none always is. A condition the server cannot decide (another
+  language such as `text/cql`, no `expression`, one that does not parse or run, or one that is not true or
+  false) is a `422` that says which, and is never taken as true: a price for a condition nobody checked
+  would be a wrong price.
+- **Amounts.** The Invoice line has the price components of the groups that apply, as the definition gives
+  them. A component with a `factor` and no `amount` is that fraction of the base price, and the Invoice
+  has the amount worked out beside the `factor`. `totalNet` is the base price plus surcharges, less
+  deductions and discounts (written positive or negative: both are taken off), and `totalGross` adds
+  tax. `informational` components are shown and never added. Amounts are added as decimals, not rounded,
+  and keep the currency of the definition; amounts in two currencies are a `422`, because no rate is
+  guessed. The ChargeItem's `quantity` is not applied, since the definition does not say what its prices
+  are for. With no base price (no group applies) there is a line and no totals: no price.
+- **Not found.** An `[id]` that is not a definition is a `404`. A `chargeItem` or `account` that does not
+  exist is a `422`: the request is well formed, and what it names is not there. A parameter that is
+  missing, is not a reference, or refers to a resource of another type is a `400`. The body is JSON: XML
+  is a `415`.
+- **Access.** With SMART the token needs to be able to read the definition, the ChargeItem and, if one is
+  named, the Account: the operation writes nothing, so reading is enough. A token that is limited to one
+  patient cannot use it, since it prices a ChargeItem the path does not name. It is not available over
+  `/sync`.
 
 ### Submitting a claim or an eligibility request
 

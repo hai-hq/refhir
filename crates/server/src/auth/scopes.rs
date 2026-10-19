@@ -5,9 +5,10 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         if op == "$install" {
             return "install";
         }
+        // `$apply` works out a price and stores nothing.
         if matches!(
             op,
-            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
+            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior" | "$apply"
         ) {
             return "read";
         }
