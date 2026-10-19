@@ -6933,6 +6933,138 @@ fn currency_errors(harness: &Harness, currency: &str) -> Vec<String> {
         .collect()
 }
 
+/// The entries of an expansion as `code -> abstract`, for those that have a code.
+fn abstract_flags(expanded: &Value) -> std::collections::BTreeMap<String, bool> {
+    expanded["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["code"].as_str().unwrap().to_string(),
+                entry["abstract"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_expansion_marks_the_codes_its_system_does_not_let_you_select_as_abstract() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let coverage = "http://hl7.org/fhir/ValueSet/coverage-type";
+    let act_code = "http://terminology.hl7.org/CodeSystem/v3-ActCode";
+
+    // The v3 grouping concepts are in the expansion, flagged, and the codes that are meant to be
+    // chosen are not. ActCode says so with the `notSelectable` property, which is what R4's
+    // `abstract` on an expansion entry means.
+    let expanded = apply(&harness, "ValueSet/$expand", json!({"url": coverage}));
+    assert_eq!(expanded["expansion"]["total"], 58);
+    let flags = abstract_flags(&expanded);
+    assert_eq!(flags.len(), 58);
+    let abstract_codes: Vec<&str> = flags
+        .iter()
+        .filter(|(_, flagged)| **flagged)
+        .map(|(code, _)| code.as_str())
+        .collect();
+    assert_eq!(
+        abstract_codes,
+        [
+            "_ActCoverageTypeCode",
+            "_ActHealthInsuranceTypeCode",
+            "_ActInsurancePolicyCode",
+            "_ActInsuranceTypeCode",
+            "_ActProgramTypeCode"
+        ]
+    );
+    for code in ["HMO", "PPO", "PUBLICPOL", "pay"] {
+        assert_eq!(flags.get(code), Some(&false), "{code}");
+    }
+    // The flag is on the entry, as R4 puts it, and an entry that is not abstract says nothing.
+    let entries = expanded["expansion"]["contains"].as_array().unwrap();
+    let entry = |code: &str| entries.iter().find(|entry| entry["code"] == code).unwrap();
+    assert_eq!(entry("_ActCoverageTypeCode")["abstract"], true);
+    assert_eq!(entry("_ActCoverageTypeCode")["system"], act_code);
+    assert!(entry("HMO").get("abstract").is_none());
+
+    // A filter and a page still carry it.
+    let filtered = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": coverage, "filter": "ActCoverage"}),
+    );
+    assert_eq!(
+        abstract_flags(&filtered).get("_ActCoverageTypeCode"),
+        Some(&true)
+    );
+    let paged = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": coverage, "count": 1000}),
+    );
+    assert_eq!(abstract_flags(&paged), flags);
+
+    // A value set whose codes carry no such property flags nothing.
+    let types = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/organization-type"}),
+    );
+    assert!(abstract_flags(&types).values().all(|flagged| !flagged));
+    assert!(!types.to_string().contains("abstract"));
+
+    // R4 lets a client say whether it is where an abstract code may be used (`abstract`). The
+    // code is a member of the value set either way; what changes is whether it is valid.
+    let check = |extra: Value| {
+        let mut args = json!({"url": coverage, "system": act_code, "code": "_ActCoverageTypeCode"});
+        for (name, value) in extra.as_object().unwrap() {
+            args[name] = value.clone();
+        }
+        validated(&harness, args)
+    };
+    // Said nothing: valid, with a hint that it is a grouping concept.
+    let (valid, message) = check(json!({}));
+    assert!(valid);
+    assert!(message.unwrap().contains("is abstract"));
+    // Said it is where such a code belongs: valid, nothing to add.
+    assert_eq!(check(json!({"abstract": true})), (true, None));
+    // Said it is not: not valid, and why.
+    let (valid, message) = check(json!({"abstract": false}));
+    assert!(!valid);
+    assert!(message.unwrap().contains("is abstract"));
+    // As a Parameters resource the same input is `valueBoolean`.
+    let as_parameters = apply(
+        &harness,
+        "ValueSet/$validate-code",
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": coverage},
+            {"name": "system", "valueUri": act_code},
+            {"name": "code", "valueCode": "_ActCoverageTypeCode"},
+            {"name": "abstract", "valueBoolean": false}
+        ]}),
+    );
+    assert_eq!(as_parameters["parameter"][0]["valueBoolean"], false);
+    // A code that is selectable is valid whatever is said.
+    for extra in [
+        json!({}),
+        json!({"abstract": false}),
+        json!({"abstract": true}),
+    ] {
+        let mut args = json!({"url": coverage, "system": act_code, "code": "HMO"});
+        for (name, value) in extra.as_object().unwrap() {
+            args[name] = value.clone();
+        }
+        assert_eq!(validated(&harness, args), (true, None), "{extra}");
+    }
+
+    // The flag is stored with the expansion, so a server that reads it back says the same, and a
+    // rebuild from the stored resources makes the same documents.
+    publish(&harness.store, &harness.catalog).unwrap();
+    let reread = apply(&harness, "ValueSet/$expand", json!({"url": coverage}));
+    assert_eq!(abstract_flags(&reread), flags);
+    assert_expansions_match(&harness.store, "with abstract codes");
+}
+
 #[test]
 fn the_currencies_value_set_expands_over_the_iso_4217_codes_the_server_carries() {
     let currencies = "http://hl7.org/fhir/ValueSet/currencies";

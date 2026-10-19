@@ -26,6 +26,13 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   message that says the list is only a sample, and the resource validator reports the code as one it
   cannot check, not as an error.
 
+- **Expansions mark abstract codes.** An entry of `$expand` carries `"abstract": true` when its code
+  system marks the concept `notSelectable`, as HL7's v3 code systems do for their grouping concepts
+  (R4's `ValueSet.expansion.contains.abstract`). `coverage-type` flags `_ActCoverageTypeCode`,
+  `_ActHealthInsuranceTypeCode`, `_ActInsurancePolicyCode`, `_ActInsuranceTypeCode` and
+  `_ActProgramTypeCode`, and no other entry. `ValueSet/$validate-code` takes R4's `abstract` input:
+  `false` refuses an abstract code, `true` accepts it, and without it the code is valid and the
+  `message` says it is a grouping concept.
 - **ISO 4217 currency codes are built in.** HL7 publishes `ValueSet/currencies` (the required
   binding of `Money.currency`) as an include of `urn:iso:std:iso:4217` and no CodeSystem for it, so
   the value set could not be expanded and a currency could not be checked. The server now installs the

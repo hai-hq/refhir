@@ -29,12 +29,13 @@ pub fn operation(
             let url = required(args, &["url"])?;
             let (system, code, display) = code_parts(args)?;
             let system_version = optional(args, &["systemVersion", "system-version"]);
-            Ok(terms.validate_code(
+            Ok(terms.validate_code_as(
                 Some(url),
                 system.as_deref(),
                 system_version,
                 &code,
                 display.as_deref(),
+                optional_bool(args, &["abstract"]),
             ))
         }
         ("CodeSystem", "$validate-code") => {
@@ -275,6 +276,37 @@ fn optional<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
                         return Some(text);
                     }
                 }
+            }
+        }
+    }
+    None
+}
+
+/// A boolean argument: a JSON boolean, `true` or `false` as text (a query string), or a
+/// `valueBoolean` parameter.
+fn optional_bool(args: &Value, names: &[&str]) -> Option<bool> {
+    let read = |value: &Value| match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => match text.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    for name in names {
+        if let Some(flag) = args.get(*name).and_then(read) {
+            return Some(flag);
+        }
+    }
+    let parameters = parameters(args)?;
+    for name in names {
+        for parameter in parameters {
+            if parameter.get("name").and_then(|value| value.as_str()) != Some(*name) {
+                continue;
+            }
+            if let Some(flag) = parameter.get("valueBoolean").and_then(read) {
+                return Some(flag);
             }
         }
     }
