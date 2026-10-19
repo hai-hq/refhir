@@ -22,9 +22,14 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         name: "governance",
         sql: include_str!("../migrations/0002_governance.sql"),
     },
+    Migration {
+        version: 3,
+        name: "near_index",
+        sql: include_str!("../migrations/0003_near_index.sql"),
+    },
 ];
 
-/// The same two steps for a database in the shared tenant layout. A database has one stream or the
+/// The same steps for a database in the shared tenant layout. A database has one stream or the
 /// other for good; see `crate::tenant::Layout`.
 pub(crate) static SHARED_MIGRATIONS: &[Migration] = &[
     Migration {
@@ -41,6 +46,11 @@ pub(crate) static SHARED_MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "row_security",
         sql: include_str!("../migrations-shared/0003_row_security.sql"),
+    },
+    Migration {
+        version: 4,
+        name: "near_index",
+        sql: include_str!("../migrations-shared/0004_near_index.sql"),
     },
 ];
 
@@ -344,7 +354,7 @@ mod tests {
         assert!(!exists(&mut client, "audit_log"));
 
         PostgresPersistence::connect(&url).unwrap();
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
         for table in [
             "usage_daily",
             "request_log",
@@ -372,7 +382,7 @@ mod tests {
         PostgresPersistence::connect(&url).unwrap();
         let mut client = connect(&url);
         let applied = read_applied(&mut client).unwrap();
-        assert_eq!(applied.len(), 2);
+        assert_eq!(applied.len(), 3);
         assert_eq!(applied[0].version, 1);
         assert_eq!(applied[0].checksum, MIGRATIONS[0].checksum());
         assert!(
@@ -386,7 +396,7 @@ mod tests {
         assert!(index_is_valid(&mut client));
         // Connecting again changes nothing.
         PostgresPersistence::connect(&url).unwrap();
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
     }
 
     #[test]
@@ -430,7 +440,7 @@ mod tests {
             .unwrap();
         client.batch_execute("COMMIT").unwrap();
 
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
         assert_eq!(
             read_applied(&mut client).unwrap()[0].checksum,
             MIGRATIONS[0].checksum()
@@ -469,7 +479,7 @@ mod tests {
             .unwrap();
         assert_eq!(migration_report(&url).unwrap().existing, Existing::Partial);
         PostgresPersistence::connect(&url).unwrap();
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
         assert_eq!(existing(&mut client).unwrap(), Existing::Complete);
         let cursor: String = client
             .query_one("SELECT cursor_id FROM index_backfills", &[])
@@ -502,7 +512,7 @@ mod tests {
         assert_eq!(existing(&mut client).unwrap(), Existing::Partial);
         PostgresPersistence::connect(&url).unwrap();
         assert!(index_is_valid(&mut client));
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
     }
 
     #[test]
@@ -515,7 +525,7 @@ mod tests {
         let mut client = connect(&url);
         client
             .execute(
-                "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'from-the-future')",
+                "INSERT INTO schema_migrations (version, checksum) VALUES (4, 'from-the-future')",
                 &[],
             )
             .unwrap();
@@ -524,7 +534,7 @@ mod tests {
             Ok(_) => panic!("a database from a newer version was opened"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("schema version 3"), "{err}");
+        assert!(err.contains("schema version 4"), "{err}");
         assert!(err.contains("newer ReFHIR"), "{err}");
 
         // A replica refuses at once too, instead of waiting for a primary that cannot help.
@@ -538,7 +548,7 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
 
         assert!(!migration_report(&url).unwrap().can_start());
-        assert_eq!(versions(&mut client), [1, 2, 3], "nothing was written");
+        assert_eq!(versions(&mut client), [1, 2, 3, 4], "nothing was written");
     }
 
     #[test]
@@ -558,7 +568,7 @@ mod tests {
         assert!(err.contains("checksum"), "{err}");
     }
 
-    static FAILING: [Migration; 3] = [
+    static FAILING: [Migration; 4] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -571,6 +581,11 @@ mod tests {
         },
         Migration {
             version: 3,
+            name: "near_index",
+            sql: include_str!("../migrations/0003_near_index.sql"),
+        },
+        Migration {
+            version: 4,
             name: "half_done",
             // The table is created, then the second statement fails.
             sql: "CREATE TABLE half_done (x INTEGER); INSERT INTO no_such_table VALUES (1);",
@@ -587,7 +602,7 @@ mod tests {
         let url = fresh_database(&admin, "mfail");
         let mut client = connect(&url);
         let err = run(&mut client, &FAILING).unwrap_err().to_string();
-        assert!(err.contains("migration 3 (half_done) failed"), "{err}");
+        assert!(err.contains("migration 4 (half_done) failed"), "{err}");
         assert!(err.contains("no_such_table"), "{err}");
         assert!(!exists(&mut client, "half_done"));
         assert!(!exists(&mut client, "documents"));
@@ -596,14 +611,14 @@ mod tests {
         // On a database already at version 1 the earlier work is kept and the failed one is not.
         run(&mut client, MIGRATIONS).unwrap();
         assert!(run(&mut client, &FAILING).is_err());
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
         assert!(!exists(&mut client, "half_done"));
         assert!(exists(&mut client, "documents"));
         // And the connection is usable afterwards: the failed transaction did not wedge it.
-        assert_eq!(versions(&mut client), [1, 2]);
+        assert_eq!(versions(&mut client), [1, 2, 3]);
     }
 
-    static WITH_SECOND: [Migration; 3] = [
+    static WITH_SECOND: [Migration; 4] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -616,6 +631,11 @@ mod tests {
         },
         Migration {
             version: 3,
+            name: "near_index",
+            sql: include_str!("../migrations/0003_near_index.sql"),
+        },
+        Migration {
+            version: 4,
             name: "probe",
             // Not idempotent: a second run is an error.
             sql: "CREATE TABLE probe (n INTEGER); INSERT INTO probe VALUES (1);",
@@ -649,7 +669,7 @@ mod tests {
             result.expect("every process gets through");
         }
         let mut client = connect(&url);
-        assert_eq!(versions(&mut client), [1, 2, 3]);
+        assert_eq!(versions(&mut client), [1, 2, 3, 4]);
         let rows: i64 = client
             .query_one("SELECT COUNT(*) FROM probe", &[])
             .unwrap()
@@ -669,7 +689,7 @@ mod tests {
         for result in run_together(&url, 8) {
             result.expect("every process gets through");
         }
-        assert_eq!(versions(&mut client), [1, 2, 3]);
+        assert_eq!(versions(&mut client), [1, 2, 3, 4]);
         let rows: i64 = client
             .query_one("SELECT COUNT(*) FROM probe", &[])
             .unwrap()
@@ -703,7 +723,7 @@ mod tests {
         );
         holder.batch_execute("COMMIT").unwrap();
         waiter.join().unwrap().unwrap();
-        assert_eq!(versions(&mut holder), [1, 2]);
+        assert_eq!(versions(&mut holder), [1, 2, 3]);
     }
 
     #[test]
@@ -764,6 +784,271 @@ mod tests {
             .join()
             .unwrap()
             .expect("starts once the primary has migrated");
+    }
+
+    /// (parameters, jobs) as text, one line each, for the near-index tests. A shared database
+    /// puts the tenant first on every line.
+    fn near_dump(client: &mut Client, shared: bool) -> (Vec<String>, Vec<String>) {
+        let tenant = if shared {
+            "instance_id::text || ' ' || "
+        } else {
+            ""
+        };
+        let same_tenant = if shared {
+            "AND p.instance_id = b.instance_id"
+        } else {
+            ""
+        };
+        let lines = |client: &mut Client, sql: String| -> Vec<String> {
+            client
+                .query(&sql, &[])
+                .unwrap()
+                .iter()
+                .map(|row| row.get::<_, String>(0))
+                .collect()
+        };
+        let parameters = lines(
+            client,
+            format!(
+                "SELECT {tenant}package_id::text || ' ' || url || ' ' || status \
+                 FROM search_parameters ORDER BY 1"
+            ),
+        );
+        let jobs = lines(
+            client,
+            format!(
+                "SELECT {}'job ' || b.id || ' package ' || b.package_id || ' ' || b.tablet \
+                        || ' watermark ' || b.watermark_ts || ' cursor ' \
+                        || COALESCE(b.cursor_id, '-') || ' done ' || b.done || ' epoch ' \
+                        || COALESCE(b.claimed_epoch::text, '-') || ' urls ' \
+                        || COALESCE((SELECT string_agg(p.url, ',' ORDER BY p.url) \
+                                     FROM backfill_parameter p \
+                                     WHERE p.backfill_id = b.id {same_tenant}), '') \
+                 FROM index_backfills b ORDER BY b.id",
+                if shared {
+                    "b.instance_id::text || ' ' || "
+                } else {
+                    ""
+                }
+            ),
+        );
+        (parameters, jobs)
+    }
+
+    /// The rows of a database that has the baseline and a half-built install: `near` of two
+    /// packages that is ready, one that is pending with a job under way, a parameter of another
+    /// name, and two documents. For the instance `tenant` when there is one.
+    fn near_fixtures(tenant: Option<i32>) -> String {
+        let (column, value) = match tenant {
+            Some(id) => ("instance_id, ".to_string(), format!("{id}, ")),
+            None => (String::new(), String::new()),
+        };
+        format!(
+            "INSERT INTO search_parameters ({column}package_id, url, base, code, param_type, \
+                 expression, status, json) VALUES \
+                 ({value}1, 'u/near', 'Location', 'near', 'special', NULL, 'ready', '{{}}'), \
+                 ({value}1, 'u/name', 'Location', 'name', 'string', NULL, 'ready', '{{}}'), \
+                 ({value}2, 'u/near', 'Location', 'near', 'special', NULL, 'ready', '{{}}'), \
+                 ({value}3, 'u/near', 'Location', 'near', 'special', NULL, 'pending', '{{}}'), \
+                 ({value}3, 'u/other', 'Patient', 'name', 'string', NULL, 'pending', '{{}}'); \
+             INSERT INTO documents ({column}id, ts, table_id, json_value, deleted, prev_ts) VALUES \
+                 ({value}'\\x6c31', 9, '\\x4c', '{{}}', 0, NULL), \
+                 ({value}'\\x6c32', 12, '\\x4c', '{{}}', 0, NULL);"
+        )
+    }
+
+    const NEAR_PARAMETERS: [&str; 5] = [
+        "1 u/name ready",
+        "1 u/near pending",
+        "2 u/near pending",
+        "3 u/near pending",
+        "3 u/other pending",
+    ];
+
+    #[test]
+    fn a_ready_near_parameter_goes_back_to_pending_with_a_backfill_for_its_type() {
+        let Some(admin) = test_url("postgres migrations: near index") else {
+            return;
+        };
+        let url = fresh_database(&admin, "mnear");
+        let mut client = connect(&url);
+        run(&mut client, &MIGRATIONS[..2]).unwrap();
+        client.batch_execute(&near_fixtures(None)).unwrap();
+        // The job that was under way when the old release stopped.
+        client
+            .batch_execute(
+                "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done, \
+                     claimed_epoch) VALUES (3, 4, 'Location', 'l2', 0, 7); \
+                 INSERT INTO backfill_parameter (backfill_id, url) VALUES (1, 'u/near')",
+            )
+            .unwrap();
+
+        run(&mut client, MIGRATIONS).unwrap();
+
+        let (parameters, jobs) = near_dump(&mut client, false);
+        // What was ready and is `near` waits for its index; nothing else changed.
+        assert_eq!(parameters, NEAR_PARAMETERS);
+        // The job that was there is as it was. One new job for each package whose `near` was
+        // ready, with the newest document as its watermark, and only `near` to mark ready.
+        assert_eq!(
+            jobs,
+            [
+                "job 1 package 3 Location watermark 4 cursor l2 done 0 epoch 7 urls u/near",
+                "job 2 package 1 Location watermark 12 cursor - done 0 epoch - urls u/near",
+                "job 3 package 2 Location watermark 12 cursor - done 0 epoch - urls u/near",
+            ]
+        );
+        assert_eq!(versions(&mut client), [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_database_with_no_near_parameter_is_not_touched_by_the_near_index_migration() {
+        let Some(admin) = test_url("postgres migrations: no near parameter") else {
+            return;
+        };
+        let url = fresh_database(&admin, "mnonear");
+        let mut client = connect(&url);
+        run(&mut client, &MIGRATIONS[..2]).unwrap();
+        client
+            .batch_execute(
+                "INSERT INTO search_parameters (package_id, url, base, code, param_type, \
+                     expression, status, json) \
+                 VALUES (1, 'u/name', 'Location', 'name', 'string', NULL, 'ready', '{}')",
+            )
+            .unwrap();
+        run(&mut client, MIGRATIONS).unwrap();
+        assert_eq!(
+            near_dump(&mut client, false),
+            (vec!["1 u/name ready".to_string()], Vec::new())
+        );
+    }
+
+    /// The four of the shared layout, then a migration that records which tenant the connection
+    /// has selected when it runs. The runner applies every pending migration in one transaction,
+    /// so a migration that follows `near_index` runs with whatever it left selected.
+    static SHARED_THEN_PROBE: [Migration; 5] = [
+        Migration {
+            version: 1,
+            name: "baseline",
+            sql: include_str!("../migrations-shared/0001_baseline.sql"),
+        },
+        Migration {
+            version: 2,
+            name: "governance",
+            sql: include_str!("../migrations-shared/0002_governance.sql"),
+        },
+        Migration {
+            version: 3,
+            name: "row_security",
+            sql: include_str!("../migrations-shared/0003_row_security.sql"),
+        },
+        Migration {
+            version: 4,
+            name: "near_index",
+            sql: include_str!("../migrations-shared/0004_near_index.sql"),
+        },
+        Migration {
+            version: 5,
+            name: "probe",
+            sql: "CREATE TABLE tenant_probe AS \
+                  SELECT COALESCE(current_setting('refhir.tenant', true), 'unset') AS selected",
+        },
+    ];
+
+    /// The shared layout hides every tenant's rows from a connection that has not said which
+    /// tenant it serves, and the owner of the tables is bound by that, so a migration that did not
+    /// take the tenants in turn would change nothing and say nothing.
+    #[test]
+    fn the_near_index_migration_works_on_each_tenant_under_row_security() {
+        let Some(admin) = test_url("postgres migrations: near index per tenant") else {
+            return;
+        };
+        crate::test_support::ensure_ordinary_role(&admin);
+        let url = fresh_database(&admin, "mnearshared");
+        let mut operator = connect(&url);
+        operator
+            .batch_execute(&format!(
+                "ALTER DATABASE {} OWNER TO {}",
+                crate::test_support::database_name(&url),
+                crate::test_support::ORDINARY_ROLE
+            ))
+            .unwrap();
+        // The application's role makes the tables, so it owns them and the policies bind it.
+        let mut app = connect(&crate::test_support::as_ordinary_role(&url));
+        run(&mut app, &SHARED_MIGRATIONS[..3]).unwrap();
+        operator
+            .batch_execute("INSERT INTO refhir_tenants (name) VALUES ('a'), ('b'), ('c')")
+            .unwrap();
+        for tenant in [1, 2] {
+            operator
+                .batch_execute(&near_fixtures(Some(tenant)))
+                .unwrap();
+        }
+        // The third tenant has nothing a migration would change.
+        operator
+            .batch_execute(
+                "INSERT INTO search_parameters (instance_id, package_id, url, base, code, \
+                     param_type, expression, status, json) \
+                 VALUES (3, 1, 'u/name', 'Location', 'name', 'string', NULL, 'ready', '{}')",
+            )
+            .unwrap();
+        operator
+            .batch_execute(
+                "INSERT INTO index_backfills (instance_id, package_id, watermark_ts, tablet, \
+                     cursor_id, done, claimed_epoch) VALUES (2, 3, 4, 'Location', 'l2', 0, 7); \
+                 INSERT INTO backfill_parameter (instance_id, backfill_id, url) \
+                     VALUES (2, 1, 'u/near')",
+            )
+            .unwrap();
+        // The connection that migrates serves no tenant, and sees none of this.
+        let none: i64 = app
+            .query_one("SELECT count(*) FROM search_parameters", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(none, 0);
+
+        run(&mut app, &SHARED_THEN_PROBE).unwrap();
+
+        let (parameters, jobs) = near_dump(&mut operator, true);
+        let mut wanted: Vec<String> = [1, 2]
+            .iter()
+            .flat_map(|tenant| {
+                NEAR_PARAMETERS
+                    .iter()
+                    .map(move |line| format!("{tenant} {line}"))
+            })
+            .collect();
+        wanted.push("3 1 u/name ready".to_string());
+        wanted.sort();
+        assert_eq!(parameters, wanted);
+        // Tenant 1 had no job, so its jobs are the two new ones; tenant 2 has the one it had, then
+        // its two. Each job has its own tenant's watermark: here the same newest document.
+        assert_eq!(
+            jobs,
+            [
+                "2 job 1 package 3 Location watermark 4 cursor l2 done 0 epoch 7 urls u/near",
+                "1 job 2 package 1 Location watermark 12 cursor - done 0 epoch - urls u/near",
+                "1 job 3 package 2 Location watermark 12 cursor - done 0 epoch - urls u/near",
+                "2 job 4 package 1 Location watermark 12 cursor - done 0 epoch - urls u/near",
+                "2 job 5 package 2 Location watermark 12 cursor - done 0 epoch - urls u/near",
+            ]
+        );
+        // And the migration did not leave a tenant selected: the one that ran after it, in the same
+        // transaction, found none, and nor does the connection now.
+        let selected: String = operator
+            .query_one("SELECT selected FROM tenant_probe", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(selected, "");
+        let left: String = app
+            .query_one(
+                "SELECT COALESCE(current_setting('refhir.tenant', true), '')",
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!(left, "");
+        assert_eq!(versions(&mut app), [1, 2, 3, 4, 5]);
     }
 
     #[test]

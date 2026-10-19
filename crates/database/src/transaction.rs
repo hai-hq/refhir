@@ -262,6 +262,40 @@ impl Transaction {
         Ok(self.merge_scanned(index, &interval, persisted, |json| json.to_string()))
     }
 
+    /// `index_range_text` for each of `intervals`: the rows of each, in a list of its own, and every
+    /// interval recorded as read. Storage is asked for all of them at once where it can be, which
+    /// is what a search narrowed to dozens of ranges needs.
+    pub fn index_ranges_text(
+        &mut self,
+        index: &IndexId,
+        intervals: &[Interval],
+    ) -> Result<Vec<Vec<ScannedText>>, PersistError> {
+        for interval in intervals {
+            self.reads.record(index.clone(), interval.clone());
+        }
+        let scanned = self
+            .reader
+            .index_scan_ranges(index, self.begin_ts, intervals)?;
+        Ok(scanned
+            .into_iter()
+            .zip(intervals)
+            .map(|(rows, interval)| {
+                let persisted = rows
+                    .into_iter()
+                    .map(|row| {
+                        (
+                            row.key,
+                            Some(row.document.ts),
+                            row.document.id,
+                            row.document.value,
+                        )
+                    })
+                    .collect();
+                self.merge_scanned(index, interval, persisted, |json| json.to_string())
+            })
+            .collect())
+    }
+
     /// The same rows, in the same order and recording the same read, without reading any document
     /// from storage. `entry_json` reads the ones a caller turns out to need.
     pub fn index_range_entries(

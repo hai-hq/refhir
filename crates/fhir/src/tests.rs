@@ -7866,7 +7866,7 @@ fn a_control_that_takes_one_value_is_refused_as_an_array_not_misread() {
     let found = apply(
         &harness,
         "Patient/search",
-        json!({"_sort": ["name", "-_id"], "active": ["true", "true"], "_include": ["Patient:link"]}),
+        json!({"_sort": ["name", "-_id"], "active": ["true", "true"], "_include": ["Observation:subject"]}),
     );
     assert_eq!(found["total"], 1);
 }
@@ -9493,6 +9493,1278 @@ mod sorted_pages {
                     fastest(&seeded.harness, &query)
                 );
             }
+        }
+    }
+}
+
+mod near_search {
+    use super::*;
+    use crate::catalog::{index_keys, CatalogClock};
+    use crate::resolve::TxHost;
+    use crate::search::{search_counted, search_handling, Handling, Work};
+    use crate::spatial::haversine_km;
+    use std::time::{Duration, Instant};
+
+    /// Nigeria's bounding box, where ByteNetwork's places are.
+    const SOUTH: f64 = 4.27;
+    const NORTH: f64 = 13.89;
+    const WEST: f64 = 2.67;
+    const EAST: f64 = 14.68;
+
+    const DISTANCE_EXTENSION: &str = "http://hl7.org/fhir/StructureDefinition/location-distance";
+
+    /// A small, fixed stream of numbers in [0, 1).
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn between(&mut self, low: f64, high: f64) -> f64 {
+            low + self.next() * (high - low)
+        }
+    }
+
+    fn location(id: &str, latitude: f64, longitude: f64) -> Value {
+        json!({
+            "resourceType": "Location", "id": id, "status": "active",
+            "name": format!("Place {id}"),
+            "position": {"latitude": latitude, "longitude": longitude}
+        })
+    }
+
+    /// Stores the resources as Locations, a thousand to a transaction. They are not validated,
+    /// which costs far more than storing them, so a table of tens of thousands is quick to make.
+    fn store_places(harness: &Harness, places: &[Value]) {
+        for batch in places.chunks(1000) {
+            let catalog = harness.catalog.read().unwrap();
+            let model = catalog.get("Location").unwrap();
+            let mut tx = harness.db.begin();
+            for resource in batch {
+                let keys = {
+                    let host = TxHost::new(&mut tx, &catalog);
+                    index_keys(catalog.path_model(), model, resource, &host).unwrap()
+                };
+                tx.stage_put(Put {
+                    tablet: model.tablet(),
+                    id: resource["id"].as_str().unwrap().to_string(),
+                    json: resource.clone(),
+                    new_keys: keys,
+                    old_keys: Vec::new(),
+                    prev_ts: None,
+                })
+                .unwrap();
+            }
+            harness.db.commit(tx).unwrap();
+        }
+    }
+
+    /// `count` places spread evenly over Nigeria, the same ones every run.
+    fn spread(count: usize) -> Vec<Value> {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        (0..count)
+            .map(|n| {
+                location(
+                    &format!("l{n:05}"),
+                    random.between(SOUTH, NORTH),
+                    random.between(WEST, EAST),
+                )
+            })
+            .collect()
+    }
+
+    fn query_params(query: &[(&str, &str)]) -> BTreeMap<String, String> {
+        query
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn search(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work, Duration) {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get("Location").unwrap();
+        let params = query_params(query);
+        let mut tx = harness.db.begin();
+        let started = Instant::now();
+        let (bundle, work) =
+            search_counted(&mut tx, &catalog, model, &params, Handling::Strict).unwrap();
+        (bundle, work, started.elapsed())
+    }
+
+    /// The best of a few runs, so a pause of the machine does not decide the answer.
+    fn fastest(harness: &Harness, query: &[(&str, &str)]) -> Duration {
+        (0..5)
+            .map(|_| search(harness, query).2)
+            .min()
+            .expect("a run")
+    }
+
+    /// The ids of the matches, in the order the bundle has them.
+    fn ids(bundle: &Value) -> Vec<String> {
+        bundle["entry"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// What `near` meant before it had an index, as it was written: the answer the index is held to.
+    fn near_before(resource: &Value, expected: &str) -> bool {
+        let Some(position) = resource.get("position") else {
+            return false;
+        };
+        let Some(lat) = position.get("latitude").and_then(|value| value.as_f64()) else {
+            return false;
+        };
+        let Some(lon) = position.get("longitude").and_then(|value| value.as_f64()) else {
+            return false;
+        };
+        let mut parts = expected.split('|');
+        let Some(query_lat) = parts.next().and_then(|text| text.parse::<f64>().ok()) else {
+            return false;
+        };
+        let Some(query_lon) = parts.next().and_then(|text| text.parse::<f64>().ok()) else {
+            return false;
+        };
+        let distance = parts
+            .next()
+            .and_then(|text| text.parse::<f64>().ok())
+            .unwrap_or(10.0);
+        let units = parts.next().unwrap_or("km");
+        let limit_km = if units == "mi" {
+            distance * 1.60934
+        } else {
+            distance
+        };
+        let radius = 6371.0;
+        let dlat = (query_lat - lat).to_radians();
+        let dlon = (query_lon - lon).to_radians();
+        let a = (dlat / 2.0).sin().powi(2)
+            + lat.to_radians().cos() * query_lat.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+        2.0 * radius * a.sqrt().asin() <= limit_km
+    }
+
+    /// The places that `near_before` says match, sorted by id.
+    fn expected(places: &[Value], near: &str) -> Vec<String> {
+        let mut found: Vec<String> = places
+            .iter()
+            .filter(|place| near_before(place, near))
+            .map(|place| place["id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn found(harness: &Harness, near: &str) -> Vec<String> {
+        let (bundle, _, _) = search(harness, &[("near", near)]);
+        let mut found = ids(&bundle);
+        found.sort();
+        found
+    }
+
+    /// Places where a square round a circle bends or the index cannot say where they are: at the
+    /// poles and the antimeridian, off the map, and with no usable position at all.
+    fn awkward() -> Vec<Value> {
+        let mut places: Vec<Value> = [
+            ("pole-n", 89.95, 10.0),
+            ("pole-n2", 89.95, -170.0),
+            ("pole-90", 90.0, 0.0),
+            ("pole-s", -89.97, 100.0),
+            ("pole--90", -90.0, 45.0),
+            ("east", 0.1, 179.99),
+            ("west", 0.1, -179.99),
+            ("east-180", 0.0, 180.0),
+            ("west-180", 0.0, -180.0),
+            ("greenwich", 51.48, 0.0),
+            ("equator", 0.0, 0.0),
+            ("lat-over", 91.0, 5.0),
+            ("lat-under", -90.5, 5.0),
+            ("lon-over", 5.0, 181.0),
+            ("lon-under", 5.0, -200.0),
+        ]
+        .iter()
+        .map(|(id, latitude, longitude)| location(id, *latitude, *longitude))
+        .collect();
+        places.push(json!({"resourceType": "Location", "id": "nowhere"}));
+        places.push(json!({"resourceType": "Location", "id": "half",
+            "position": {"latitude": 6.5}}));
+        places.push(json!({"resourceType": "Location", "id": "text",
+            "position": {"latitude": "6.5", "longitude": "3.4"}}));
+        places
+    }
+
+    #[test]
+    fn near_finds_what_a_read_of_every_place_found() {
+        let harness = r4();
+        let mut places = awkward();
+        // A dense patch (Lagos), so that a circle holds hundreds of places and the edge of the
+        // circle matters, and the whole country, so most circles hold none.
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        for n in 0..1500 {
+            places.push(location(
+                &format!("lagos{n:04}"),
+                random.between(6.3, 6.7),
+                random.between(3.2, 3.7),
+            ));
+        }
+        places.extend(spread(1500));
+        store_places(&harness, &places);
+
+        let mut queries: Vec<String> = Vec::new();
+        for (latitude, longitude) in [
+            (6.5, 3.4),
+            (6.31, 3.21),
+            (9.06, 7.49),
+            (89.9, 10.0),
+            (89.99, 100.0),
+            (-89.9, 0.0),
+            (0.1, 179.995),
+            (0.0, -180.0),
+            (0.0, 180.0),
+            (51.48, 0.0),
+            (0.0, 0.0),
+            (6.5, 3.4),
+        ] {
+            for tail in [
+                "", "|1|km", "|5|km", "|10", "|10|km", "|25|km", "|60|km", "|10|mi", "|150|km",
+                "|500|km", "|2000|km", "|0|km",
+            ] {
+                queries.push(format!("{latitude}|{longitude}{tail}"));
+            }
+        }
+        // Centres anywhere, and one on each place the index cannot place, and queries that make
+        // no sense, which are read as they always were.
+        for round in 0..400 {
+            let (latitude, longitude) =
+                (random.between(-90.0, 90.0), random.between(-180.0, 180.0));
+            let distance = [5.0, 50.0, 400.0, 3000.0][round % 4];
+            queries.push(format!("{latitude}|{longitude}|{distance}|km"));
+        }
+        queries.extend(
+            [
+                "95|10|10|km",
+                "10|190|10|km",
+                "-95|10|1000|km",
+                "10|10|-5|km",
+                "10|10|16000|km",
+                "10|10|10000|mi",
+                "6.5|3.4||km",
+                "6.5|3.4|10|furlongs",
+                "91|5|10|km",
+                "5|181|10|km",
+            ]
+            .map(String::from),
+        );
+        let mut hits = 0;
+        for query in &queries {
+            let want = expected(&places, query);
+            hits += want.len();
+            assert_eq!(found(&harness, query), want, "near={query}");
+        }
+        assert!(hits > 20_000, "the queries find something: {hits}");
+    }
+
+    #[test]
+    fn a_small_near_reads_a_small_part_of_the_table() {
+        let harness = r4();
+        store_places(&harness, &spread(4000));
+        let (bundle, work, _) = search(&harness, &[("near", "6.60|3.35|10|km"), ("_count", "20")]);
+        assert!(bundle["total"].as_u64().unwrap() > 0);
+        assert_eq!(
+            bundle["total"],
+            expected(&spread(4000), "6.60|3.35|10|km").len()
+        );
+        // The index narrows the read to a few places round the point, and not to the table.
+        assert!(
+            work.rows * 40 < 4000,
+            "read {} of 4000 places for a circle of 10 km",
+            work.rows
+        );
+        assert_eq!(work.decoded, work.rows);
+        // And a circle that holds much of the table reads much of it, which is as it was.
+        let (_, wide, _) = search(&harness, &[("near", "9|8|600|km"), ("_count", "20")]);
+        assert!(wide.rows > 400, "{}", wide.rows);
+        // Other parameters do not make it wider: it is the narrowest read there is, even beside
+        // a status that every place has.
+        let (bundle, with_status, _) = search(
+            &harness,
+            &[
+                ("near", "6.60|3.35|10|km"),
+                ("status", "active"),
+                ("_count", "20"),
+            ],
+        );
+        assert_eq!(with_status.rows, work.rows);
+        assert_eq!(
+            bundle["total"],
+            expected(&spread(4000), "6.60|3.35|10|km").len()
+        );
+        // A circle too wide for an index to help (past a quarter of the way round the Earth) is
+        // read through whichever index is narrowest of what the search names, as it always was.
+        let (_, huge, _) = search(&harness, &[("near", "9|8|12000|km")]);
+        assert_eq!(huge.rows, 4000);
+    }
+
+    /// The distance between two places, as the search measures it.
+    fn km(from: (f64, f64), to: (f64, f64)) -> f64 {
+        haversine_km(to.0, to.1, from.0, from.1)
+    }
+
+    #[test]
+    fn a_place_exactly_at_the_radius_is_found_and_one_just_beyond_it_is_not() {
+        let harness = r4();
+        let centre: (f64, f64) = (6.5244, 3.3792);
+        let mut random = Random(0x1234_5678_9abc_def1);
+        let mut places = Vec::new();
+        for n in 0..60 {
+            // Places at every distance from nothing to far, in every direction.
+            let distance = [
+                0.0, 0.0005, 0.9, 4.99, 5.0, 9.999, 10.0, 10.001, 11.0, 200.0,
+            ][n % 10];
+            let bearing = random.between(0.0, std::f64::consts::TAU);
+            let latitude = centre.0 + (distance / 111.195) * bearing.cos();
+            let longitude =
+                centre.1 + (distance / (111.195 * centre.0.to_radians().cos())) * bearing.sin();
+            places.push(location(&format!("p{n:02}"), latitude, longitude));
+        }
+        store_places(&harness, &places);
+        for place in &places {
+            let id = place["id"].as_str().unwrap().to_string();
+            // The place as it is stored: a number does not always come back from JSON text as the
+            // very float that was written, and the search measures what comes back.
+            let stored = apply(&harness, "Location/read", json!({"id": id}));
+            let position = (
+                stored["position"]["latitude"].as_f64().unwrap(),
+                stored["position"]["longitude"].as_f64().unwrap(),
+            );
+            // The distance is the very number the search computes, written as text and read back,
+            // so the place is at the radius to the last digit: in at it, out a hair under it.
+            let exact = km(centre, position);
+            let at =
+                |radius: f64| found(&harness, &format!("{}|{}|{radius}|km", centre.0, centre.1));
+            assert!(
+                at(exact).contains(&id),
+                "{id} at {exact} km is at the radius"
+            );
+            assert!(at(exact.next_up()).contains(&id), "{id} just inside");
+            assert!(!at(exact.next_down()).contains(&id), "{id} just outside");
+            // A metre either side, which is what a client can tell.
+            assert!(at(exact + 0.001).contains(&id), "{id} a metre inside");
+            if exact > 0.002 {
+                assert!(!at(exact - 0.001).contains(&id), "{id} a metre outside");
+            }
+            // The same in miles.
+            let miles = exact / 1.60934;
+            let in_miles =
+                |radius: f64| found(&harness, &format!("{}|{}|{radius}|mi", centre.0, centre.1));
+            assert!(
+                in_miles(miles + 1e-6).contains(&id),
+                "{id} just inside, in miles"
+            );
+            if miles > 1e-5 {
+                assert!(
+                    !in_miles(miles - 1e-6).contains(&id),
+                    "{id} just outside, in miles"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_distance_is_in_kilometres_when_the_units_are_left_out() {
+        let harness = r4();
+        let centre: (f64, f64) = (6.5244, 3.3792);
+        // Ten kilometres is 6.2 miles, so a place at 9.9 km is within ten of either and within six
+        // miles only, and one at 10.1 km is within neither ten kilometres nor six miles.
+        let east = |km: f64| {
+            (
+                centre.0,
+                centre.1 + (km / (111.195 * centre.0.to_radians().cos())),
+            )
+        };
+        let places = [("near", 9.9), ("far", 10.1), ("farther", 16.0)]
+            .map(|(id, km)| location(id, east(km).0, east(km).1));
+        store_places(&harness, &places);
+        let query = |tail: &str| found(&harness, &format!("{}|{}{tail}", centre.0, centre.1));
+        // No distance: ten, in kilometres.
+        assert_eq!(query(""), ["near"]);
+        assert_eq!(query("||km"), ["near"]);
+        // A distance with no units is in kilometres, as R4 says, and not in miles.
+        assert_eq!(query("|10"), ["near"]);
+        assert_eq!(query("|10|"), ["near"]);
+        assert_eq!(query("|10|km"), ["near"]);
+        assert_eq!(query("|10.2"), ["far", "near"]);
+        assert_eq!(query("|16.5"), ["far", "farther", "near"]);
+        // Miles are read as miles: six are 9.66 km, and 6.2 are just under ten.
+        assert!(query("|6|mi").is_empty());
+        assert_eq!(query("|6.2|mi"), ["near"]);
+        assert_eq!(query("|6.3|mi"), ["far", "near"]);
+        assert_eq!(query("|10|mi"), ["far", "farther", "near"]);
+    }
+
+    #[test]
+    fn near_with_other_parameters_and_in_a_chain_answers_as_before() {
+        let harness = r4();
+        let mut places = awkward();
+        places.extend(spread(600));
+        // Half the places are closed, half have an organization.
+        for (n, place) in places.iter_mut().enumerate() {
+            place["status"] = json!(if n % 2 == 0 { "active" } else { "suspended" });
+            if n % 3 == 0 {
+                place["managingOrganization"] = json!({"reference": "Organization/o1"});
+            }
+        }
+        store_places(&harness, &places);
+        for (query, filter) in [
+            (
+                vec![("near", "9.06|7.49|300|km"), ("status", "active")],
+                (|place: &Value| place["status"] == "active") as fn(&Value) -> bool,
+            ),
+            (
+                vec![
+                    ("near", "9.06|7.49|500|km"),
+                    ("organization", "Organization/o1"),
+                ],
+                |place: &Value| place.get("managingOrganization").is_some(),
+            ),
+            (
+                vec![("near", "9.06|7.49|300|km"), ("status:not", "active")],
+                |place: &Value| place["status"] != "active",
+            ),
+        ] {
+            let mut want: Vec<String> = places
+                .iter()
+                .filter(|place| near_before(place, query[0].1) && filter(place))
+                .map(|place| place["id"].as_str().unwrap().to_string())
+                .collect();
+            want.sort();
+            let (bundle, _, _) = search(&harness, &query);
+            let mut got = ids(&bundle);
+            got.sort();
+            assert_eq!(got, want, "{query:?}");
+            assert!(!want.is_empty(), "{query:?}");
+        }
+        // The same points as the first of a chain: services at the places that are near.
+        for (n, place) in places.iter().take(40).enumerate() {
+            let id = place["id"].as_str().unwrap();
+            let service = json!({"resourceType": "HealthcareService", "id": format!("h{n}"),
+                "location": [{"reference": format!("Location/{id}")}]});
+            apply(
+                &harness,
+                "HealthcareService/create",
+                json!({"resource": service}),
+            );
+        }
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get("HealthcareService").unwrap();
+        let near = "6.5|3.4|3000|km";
+        let mut tx = harness.db.begin();
+        let bundle = search_handling(
+            &mut tx,
+            &catalog,
+            model,
+            &query_params(&[("location.near", near)]),
+            Handling::Strict,
+        )
+        .unwrap();
+        let mut got = ids(&bundle);
+        got.sort();
+        let mut want: Vec<String> = places
+            .iter()
+            .take(40)
+            .enumerate()
+            .filter(|(_, place)| near_before(place, near))
+            .map(|(n, _)| format!("h{n}"))
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(!want.is_empty());
+    }
+
+    fn run(
+        harness: &Harness,
+        type_name: &str,
+        query: &[(&str, &str)],
+        handling: Handling,
+    ) -> Result<Value, FhirError> {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get(type_name).unwrap();
+        let mut tx = harness.db.begin();
+        search_handling(&mut tx, &catalog, model, &query_params(query), handling)
+    }
+
+    /// The query a `next` or `self` link of a bundle stands for.
+    fn params_of(bundle: &Value, relation: &str) -> Option<Vec<(String, String)>> {
+        let url = bundle["link"]
+            .as_array()?
+            .iter()
+            .find(|link| link["relation"] == relation)?["url"]
+            .as_str()?;
+        let (_, query) = url.split_once('?')?;
+        Some(
+            query
+                .split('&')
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (name.to_string(), value.to_string())
+                })
+                .collect(),
+        )
+    }
+
+    fn follow(harness: &Harness, bundle: &Value) -> Option<Value> {
+        let next = params_of(bundle, "next")?;
+        let query: Vec<(&str, &str)> = next
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        Some(run(harness, "Location", &query, Handling::Strict).unwrap())
+    }
+
+    /// The distance an entry says its place is from the point searched from, with its units.
+    fn distance_of(entry: &Value) -> (f64, String, String, String) {
+        let extensions = entry["search"]["extension"]
+            .as_array()
+            .expect("an extension");
+        assert_eq!(extensions.len(), 1, "{entry}");
+        assert_eq!(extensions[0]["url"], DISTANCE_EXTENSION);
+        let distance = &extensions[0]["valueDistance"];
+        (
+            distance["value"].as_f64().expect("a value"),
+            distance["unit"].as_str().unwrap().to_string(),
+            distance["system"].as_str().unwrap().to_string(),
+            distance["code"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// 300 places over Nigeria, and four more that sit on one another, so that distances tie.
+    fn places_to_sort() -> Vec<Value> {
+        let mut places = spread(300);
+        for id in ["tie-d", "tie-b", "tie-c", "tie-a"] {
+            places.push(location(id, 6.7, 3.5));
+        }
+        places
+    }
+
+    /// The ids of `places` within `km` of `centre`, nearest first, ties by id: the order
+    /// `_sort=near` is to give. `farthest_first` reverses the distances and not the ties.
+    fn by_distance(
+        places: &[Value],
+        centre: (f64, f64),
+        limit_km: f64,
+        farthest_first: bool,
+    ) -> Vec<(String, f64)> {
+        let mut found: Vec<(String, f64)> = places
+            .iter()
+            .map(|place| {
+                let position = (
+                    place["position"]["latitude"].as_f64().unwrap(),
+                    place["position"]["longitude"].as_f64().unwrap(),
+                );
+                (
+                    place["id"].as_str().unwrap().to_string(),
+                    km(centre, position),
+                )
+            })
+            .filter(|(_, distance)| *distance <= limit_km)
+            .collect();
+        found.sort_by(|left, right| {
+            let by_distance = left.1.total_cmp(&right.1);
+            let by_distance = if farthest_first {
+                by_distance.reverse()
+            } else {
+                by_distance
+            };
+            by_distance.then_with(|| left.0.cmp(&right.0))
+        });
+        found
+    }
+
+    #[test]
+    fn sorting_by_near_puts_the_nearest_first_and_a_distance_on_every_entry() {
+        let harness = r4();
+        let places = places_to_sort();
+        store_places(&harness, &places);
+        let centre = (6.60, 3.35);
+        let near = "6.60|3.35|250|km";
+        for (sort, farthest_first) in [("near", false), ("-near", true)] {
+            let want = by_distance(&places, centre, 250.0, farthest_first);
+            assert!(want.len() > 20, "{}", want.len());
+            let bundle = run(
+                &harness,
+                "Location",
+                &[("near", near), ("_sort", sort)],
+                Handling::Strict,
+            )
+            .unwrap();
+            assert_eq!(
+                ids(&bundle),
+                want.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                "_sort={sort}"
+            );
+            // Every match says how far it is, in kilometres, as the search measures it.
+            let entries = bundle["entry"].as_array().unwrap();
+            assert_eq!(entries.len(), want.len());
+            for (entry, (id, distance)) in entries.iter().zip(&want) {
+                let (value, unit, system, code) = distance_of(entry);
+                assert!(
+                    (value - distance).abs() < 1e-6,
+                    "{id}: {value} is not {distance}"
+                );
+                assert_eq!(
+                    (unit.as_str(), system.as_str(), code.as_str()),
+                    ("km", "http://unitsofmeasure.org", "km")
+                );
+            }
+            // The self link keeps the sort, since it was applied.
+            let self_link = params_of(&bundle, "self").unwrap();
+            assert!(
+                self_link.contains(&("_sort".into(), sort.into())),
+                "{self_link:?}"
+            );
+        }
+        // The nearest is nearer than the next, and the four on top of one another go by id.
+        let nearest = by_distance(&places, centre, 250.0, false);
+        assert!(nearest.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+        let ties: Vec<&str> = nearest
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| id.starts_with("tie"))
+            .collect();
+        assert_eq!(ties, ["tie-a", "tie-b", "tie-c", "tie-d"]);
+        // Distances in miles, when the search was in miles.
+        let miles = run(
+            &harness,
+            "Location",
+            &[
+                ("near", "6.60|3.35|150|mi"),
+                ("_sort", "near"),
+                ("_count", "3"),
+            ],
+            Handling::Strict,
+        )
+        .unwrap();
+        for entry in miles["entry"].as_array().unwrap() {
+            let (value, unit, _, code) = distance_of(entry);
+            let id = entry["resource"]["id"].as_str().unwrap();
+            let position = places.iter().find(|place| place["id"] == id).unwrap();
+            let kilometres = km(
+                centre,
+                (
+                    position["position"]["latitude"].as_f64().unwrap(),
+                    position["position"]["longitude"].as_f64().unwrap(),
+                ),
+            );
+            assert_eq!((unit.as_str(), code.as_str()), ("mi", "[mi_i]"));
+            assert!((value - kilometres / 1.60934).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_sorted_near_keeps_its_order_across_pages() {
+        let harness = r4();
+        let places = places_to_sort();
+        store_places(&harness, &places);
+        let centre = (6.60, 3.35);
+        for (sort, farthest_first) in [("near", false), ("-near", true)] {
+            let want: Vec<String> = by_distance(&places, centre, 250.0, farthest_first)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            // Seven to a page: the four that tie fall across a page boundary for one of the sorts.
+            let mut bundle = run(
+                &harness,
+                "Location",
+                &[
+                    ("near", "6.60|3.35|250|km"),
+                    ("_sort", sort),
+                    ("_count", "7"),
+                ],
+                Handling::Strict,
+            )
+            .unwrap();
+            let mut read = ids(&bundle);
+            let mut pages = 1;
+            assert_eq!(bundle["total"], want.len());
+            while let Some(next) = follow(&harness, &bundle) {
+                // Each page is full but the last, says how many there are, and keeps its sort.
+                assert_eq!(bundle["entry"].as_array().unwrap().len(), 7);
+                assert_eq!(next["total"], want.len());
+                let kept = params_of(&next, "self").unwrap();
+                assert!(kept.contains(&("_sort".into(), sort.into())), "{kept:?}");
+                // A distance on every entry of every page.
+                for entry in next["entry"].as_array().unwrap() {
+                    distance_of(entry);
+                }
+                read.extend(ids(&next));
+                bundle = next;
+                pages += 1;
+            }
+            assert_eq!(read, want, "_sort={sort} over {pages} pages");
+            assert!(pages > 3, "{pages}");
+        }
+    }
+
+    #[test]
+    fn a_near_search_that_is_not_sorted_has_distances_too_and_includes_have_none() {
+        let harness = r4();
+        let mut places = vec![
+            json!({"resourceType": "Location", "id": "parent", "status": "active",
+            "name": "Campus"}),
+        ];
+        places.push({
+            let mut child = location("child", 6.52, 3.38);
+            child["partOf"] = json!({"reference": "Location/parent"});
+            child
+        });
+        store_places(&harness, &places);
+        let bundle = run(
+            &harness,
+            "Location",
+            &[("near", "6.5|3.4|20|km"), ("_include", "Location:partof")],
+            Handling::Strict,
+        )
+        .unwrap();
+        let entries = bundle["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let child = entries
+            .iter()
+            .find(|e| e["resource"]["id"] == "child")
+            .unwrap();
+        let parent = entries
+            .iter()
+            .find(|e| e["resource"]["id"] == "parent")
+            .unwrap();
+        assert_eq!(child["search"]["mode"], "match");
+        distance_of(child);
+        // The place that was included was not found by distance, and has none.
+        assert_eq!(parent["search"], json!({"mode": "include"}));
+        // A search with no near has no distance; nor one with two (which point?), nor with a
+        // comma's alternatives.
+        for query in [
+            vec![("name", "Campus")],
+            vec![("near", "6.5|3.4|20|km"), ("near", "6.6|3.5|20|km")],
+            vec![("near", "6.5|3.4|20|km,6.6|3.5|20|km")],
+        ] {
+            // A repeated parameter is an AND, which the engine reads as it is joined.
+            let mut params = BTreeMap::new();
+            for (name, value) in &query {
+                crate::search::add_param(&mut params, name.to_string(), value.to_string());
+            }
+            let catalog = harness.catalog.read().unwrap();
+            let model = catalog.get("Location").unwrap();
+            let mut tx = harness.db.begin();
+            let bundle =
+                search_handling(&mut tx, &catalog, model, &params, Handling::Strict).unwrap();
+            for entry in bundle["entry"].as_array().unwrap() {
+                assert_eq!(entry["search"], json!({"mode": "match"}), "{query:?}");
+            }
+        }
+    }
+
+    fn self_url(bundle: &Value) -> String {
+        bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["relation"] == "self")
+            .unwrap()["url"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn outcome_issues(bundle: &Value) -> Vec<Value> {
+        bundle["entry"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["search"]["mode"] == "outcome")
+            .flat_map(|entry| entry["resource"]["issue"].as_array().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_sort_the_server_cannot_apply_is_refused_when_strict_and_left_out_when_lenient() {
+        let harness = r4();
+        store_places(&harness, &places_to_sort());
+        // Strict: a 400 that names the parameter and the term.
+        for sort in ["bogus", "-bogus", "name,bogus", "+bogus"] {
+            let query = [("_sort", sort)];
+            let err = match run(&harness, "Location", &query, Handling::Strict) {
+                Err(FhirError::Invalid(message)) => message,
+                other => panic!("_sort={sort}: expected a refusal, got {other:?}"),
+            };
+            assert!(err.contains("_sort") && err.contains("bogus"), "{err}");
+            assert!(err.contains("Location"), "{err}");
+            // Lenient: the search runs, the link says what ran, and the outcome says why.
+            let bundle = run(&harness, "Location", &query, Handling::Lenient).unwrap();
+            let url = self_url(&bundle);
+            assert!(!url.contains("bogus"), "{url}");
+            let kept = sort != "bogus" && sort != "-bogus" && sort != "+bogus";
+            assert_eq!(url.contains("_sort=name"), kept, "{url}");
+            let issues = outcome_issues(&bundle);
+            assert_eq!(issues.len(), 1, "{bundle}");
+            assert_eq!(issues[0]["expression"], json!(["_sort"]));
+            assert_eq!(issues[0]["severity"], "warning");
+            assert!(issues[0]["diagnostics"].as_str().unwrap().contains("bogus"));
+            assert_eq!(bundle["total"], 304);
+        }
+        // What is left of the list is applied: the order is by name.
+        let bundle = run(
+            &harness,
+            "Location",
+            &[("_sort", "-name,bogus"), ("_count", "3")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert!(
+            self_url(&bundle).contains("_sort=-name"),
+            "{}",
+            self_url(&bundle)
+        );
+        let names: Vec<&str> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Place tie-d", "Place tie-c", "Place tie-b"]);
+        // A page that follows keeps to what ran: no `_sort=bogus` in its link.
+        let next = params_of(&bundle, "next").unwrap();
+        assert!(
+            next.iter().all(|(_, value)| !value.contains("bogus")),
+            "{next:?}"
+        );
+        assert!(next.contains(&("_sort".into(), "-name".into())));
+        // A sort that is understood is kept, and so is every control that was applied.
+        for sort in [
+            "name",
+            "-name",
+            "status,-name",
+            "_id",
+            "-_lastUpdated",
+            "organization",
+            "-near",
+        ] {
+            let query: Vec<(&str, &str)> = if sort.ends_with("near") {
+                vec![("_sort", sort), ("near", "6.5|3.4|50|km")]
+            } else {
+                vec![("_sort", sort)]
+            };
+            let bundle = run(&harness, "Location", &query, Handling::Strict)
+                .unwrap_or_else(|err| panic!("_sort={sort}: {err}"));
+            assert!(
+                self_url(&bundle).contains(&format!("_sort={sort}")),
+                "{}",
+                self_url(&bundle)
+            );
+            assert!(outcome_issues(&bundle).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_sort_by_something_that_is_not_ordered_as_text_is_not_pretended() {
+        let harness = r4();
+        store_places(&harness, &places_to_sort());
+        // `near` sorts by distance from a point, and with no one point there is nothing to measure.
+        for query in [
+            vec![("_sort", "near")],
+            vec![("_sort", "-near"), ("near", "6.5|3.4|10|km,6.6|3.5|10|km")],
+            vec![("_sort", "near"), ("name", "Place"), ("near", "bad")],
+        ] {
+            // The last has a `near` that cannot be read, which strict refuses first.
+            let strict = run(&harness, "Location", &query, Handling::Strict);
+            assert!(matches!(strict, Err(FhirError::Invalid(_))), "{query:?}");
+        }
+        let lenient = run(
+            &harness,
+            "Location",
+            &[("_sort", "near")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert!(!self_url(&lenient).contains("near"));
+        let message = outcome_issues(&lenient)[0]["diagnostics"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("distance"), "{message}");
+        // A number, a quantity or an age has no order the index gives: refused, not ignored.
+        for (type_name, sort) in [
+            ("Observation", "value-quantity"),
+            ("Observation", "-value-quantity"),
+            ("Patient", "age"),
+        ] {
+            let query = [("_sort", sort)];
+            match run(&harness, type_name, &query, Handling::Strict) {
+                Err(FhirError::Invalid(message)) => {
+                    assert!(message.contains(sort.trim_start_matches('-')), "{message}");
+                    assert!(message.contains("cannot sort"), "{message}");
+                }
+                other => panic!("{type_name} _sort={sort}: {other:?}"),
+            }
+            let bundle = run(&harness, type_name, &query, Handling::Lenient).unwrap();
+            assert!(
+                !self_url(&bundle).contains("_sort"),
+                "{}",
+                self_url(&bundle)
+            );
+        }
+        // Full text and content have no values of a resource to order by either.
+        for sort in ["_text", "_content"] {
+            let query = [("_sort", sort)];
+            assert!(matches!(
+                run(&harness, "Observation", &query, Handling::Strict),
+                Err(FhirError::Invalid(_))
+            ));
+            let bundle = run(&harness, "Observation", &query, Handling::Lenient).unwrap();
+            assert!(
+                !self_url(&bundle).contains("_sort"),
+                "{}",
+                self_url(&bundle)
+            );
+        }
+        // The id is every resource's own, and sorts without a parameter for it.
+        let bundle = run(
+            &harness,
+            "Location",
+            &[("_sort", "-_id"), ("_count", "3")],
+            Handling::Strict,
+        )
+        .unwrap();
+        assert!(self_url(&bundle).contains("_sort=-_id"));
+    }
+
+    #[test]
+    fn the_other_controls_the_server_cannot_apply_are_held_to_the_same_rule() {
+        let harness = r4();
+        store_places(&harness, &places_to_sort());
+        for (name, value, why) in [
+            ("_summary", "bogus", "_summary"),
+            ("_total", "bogus", "_total"),
+            ("_include", "Location:bogus", "no search parameter"),
+            ("_include", "Bogus:partof", "not a resource type"),
+            ("_include", "Location:name", "only a reference"),
+            (
+                "_revinclude",
+                "HealthcareService:bogus",
+                "no search parameter",
+            ),
+            ("_revinclude:iterate", "Location:name", "only a reference"),
+            ("_include:iterate", "Location:bogus", "no search parameter"),
+        ] {
+            let query = [(name, value)];
+            let err = match run(&harness, "Location", &query, Handling::Strict) {
+                Err(FhirError::Invalid(message)) => message,
+                other => panic!("{name}={value}: expected a refusal, got {other:?}"),
+            };
+            assert!(err.contains(name) && err.contains(why), "{err}");
+            let bundle = run(&harness, "Location", &query, Handling::Lenient).unwrap();
+            let url = self_url(&bundle);
+            assert!(!url.contains(name), "{name}={value}: {url}");
+            let issues = outcome_issues(&bundle);
+            assert_eq!(issues.len(), 1, "{name}={value}");
+            assert_eq!(issues[0]["expression"], json!([name]));
+        }
+        // One bad rule among good ones: the good ones stay, in the order they were given.
+        let bundle = run(
+            &harness,
+            "Location",
+            &[(
+                "_include",
+                "Location:partof,Location:bogus,Location:organization",
+            )],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert!(
+            self_url(&bundle).ends_with("_include=Location:partof,Location:organization"),
+            "{}",
+            self_url(&bundle)
+        );
+        // What is understood is kept, in the link and in the answer.
+        for (name, value) in [
+            ("_summary", "count"),
+            ("_summary", "text"),
+            ("_summary", "data"),
+            ("_summary", "true"),
+            ("_summary", "false"),
+            ("_total", "none"),
+            ("_total", "estimate"),
+            ("_total", "accurate"),
+            ("_include", "Location:partof"),
+            ("_include", "Location:*"),
+            ("_include", "*"),
+            ("_include:iterate", "Location:partof"),
+            ("_revinclude", "HealthcareService:location"),
+            ("_revinclude", "Location:partof"),
+            // A rule for another type of resource than the one searched is well formed.
+            ("_include", "Slot:schedule"),
+        ] {
+            let bundle = run(&harness, "Location", &[(name, value)], Handling::Strict)
+                .unwrap_or_else(|err| panic!("{name}={value}: {err}"));
+            assert!(
+                self_url(&bundle).contains(&format!("{name}={value}")),
+                "{name}={value}"
+            );
+        }
+        // A parameter that is not a control and is not known stays a refusal either way.
+        assert!(matches!(
+            run(&harness, "Location", &[("bogus", "x")], Handling::Lenient),
+            Err(FhirError::Invalid(_))
+        ));
+    }
+
+    /// A live query is woken by a write whose index keys land in what the search read. A `near`
+    /// search used to read every place, so any place that was written woke it; it reads the
+    /// ranges round its point, so a place that could change its answer does and no other does.
+    #[test]
+    fn a_live_near_search_is_woken_only_by_places_that_could_change_its_answer() {
+        let harness = r4();
+        store_places(
+            &harness,
+            &[
+                location("inside", 6.50, 3.40),
+                location("far", 9.06, 7.49),
+                json!({"resourceType": "Location", "id": "nowhere"}),
+            ],
+        );
+        let reads = run_op(
+            &harness,
+            "Location/search",
+            &json!({"near": "6.5|3.4|10|km"}),
+        )
+        .unwrap()
+        .reads;
+        // The keys a write of `resource` would commit, as readers of the database are told of them.
+        let woken = |resource: &Value| {
+            let catalog = harness.catalog.read().unwrap();
+            let model = catalog.get("Location").unwrap();
+            let mut tx = harness.db.begin();
+            let keys = {
+                let host = TxHost::new(&mut tx, &catalog);
+                index_keys(catalog.path_model(), model, resource, &host).unwrap()
+            };
+            reads.first_overlap(&keys).is_some()
+        };
+        // A place that arrives in the circle changes the answer, and so does one that leaves it (the
+        // keys it had are in the circle).
+        assert!(woken(&location("arrives", 6.51, 3.41)));
+        assert!(woken(&location("inside", 6.50, 3.40)));
+        // A place a few hundred kilometres away, or with no position, cannot.
+        assert!(!woken(&location("elsewhere", 12.0, 8.5)));
+        assert!(!woken(&location("far", 9.06, 7.49)));
+        assert!(!woken(
+            &json!({"resourceType": "Location", "id": "x", "name": "No position"})
+        ));
+        // A position the index cannot place is read by every `near`, as it is measured every time.
+        assert!(woken(&location("off-the-map", 95.0, 3.4)));
+    }
+
+    /// What the release that has the index does at its start, to a database the release before it
+    /// made: the places are stored and `near` is `ready`, and there is no key of the index for
+    /// any of them. The migration puts `near` back to `pending` with a backfill for Location, the
+    /// backfill indexes every place, and a search then finds what it found before the index.
+    #[test]
+    fn a_database_made_before_the_index_has_it_built_when_the_new_release_starts() {
+        let path = std::env::temp_dir().join(format!(
+            "refhir-near-upgrade-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let remove = || {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        };
+        remove();
+        let mut places = awkward();
+        let mut random = Random(0x0123_4567_89ab_cdef);
+        for n in 0..600 {
+            places.push(location(
+                &format!("lagos{n:04}"),
+                random.between(6.3, 6.7),
+                random.between(3.2, 3.7),
+            ));
+        }
+        places.extend(spread(600));
+        let queries = [
+            "6.5|3.4|10|km",
+            "6.5|3.4|25",
+            "6.45|3.38",
+            "9.06|7.49|300|km",
+            "89.9|10|50|km",
+            "0.1|179.995|100|km",
+            "6.5|3.4|10|mi",
+        ];
+        {
+            // The release that has the index makes the database and stores the places...
+            let store = SqlitePersistence::open(&path).unwrap();
+            let db = Database::open(Arc::new(store.clone())).unwrap();
+            let harness = Harness {
+                store,
+                db,
+                catalog: std::sync::RwLock::new(Catalog::empty()),
+            };
+            install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+            store_places(&harness, &places);
+            for query in queries {
+                assert_eq!(found(&harness, query), expected(&places, query), "{query}");
+            }
+        }
+        // ...and then it is made into what the release before left: no key of the index for any
+        // place, schema version 2, and no record that anything is owed.
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let deleted = connection
+                .execute(
+                    "DELETE FROM indexes WHERE index_id = ?1",
+                    [b"Location/near".as_slice()],
+                )
+                .unwrap();
+            assert!(deleted > 1000, "the places were indexed: {deleted} keys");
+            connection
+                .execute_batch(
+                    "DELETE FROM schema_migrations WHERE version = 3; \
+                     DELETE FROM index_backfills; DELETE FROM backfill_parameter;",
+                )
+                .unwrap();
+            let ready: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM search_parameters \
+                     WHERE code = 'near' AND status = 'ready'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ready, 1);
+        }
+
+        // The new release starts on it: the migration runs as the database opens.
+        let store = SqlitePersistence::open(&path).unwrap();
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let (loaded, _) = Catalog::open_consistent(&store, CatalogClock::Latest).unwrap();
+        let harness = Harness {
+            store,
+            db,
+            catalog: std::sync::RwLock::new(loaded),
+        };
+        {
+            // `near` waits for its index: nothing searches by it until it is whole, and a place
+            // that is stored meanwhile is given its key at once.
+            let catalog = harness.catalog.read().unwrap();
+            assert!(catalog.has_pending_parameters());
+            let model = catalog.get("Location").unwrap();
+            assert!(model.ready_param("near").is_none());
+            assert!(model.pending_params().any(|param| param.name == "near"));
+        }
+        assert!(matches!(
+            run(&harness, "Location", &[("near", "6.5|3.4|10|km")], Handling::Strict),
+            Err(FhirError::Invalid(message)) if message.contains("unsupported search parameter near")
+        ));
+        let during = location("during", 6.5, 3.4);
+        apply(&harness, "Location/create", json!({"resource": during}));
+        let keys = harness
+            .db
+            .reader()
+            .index_scan(
+                &IndexId::new("Location/near"),
+                harness.db.latest_ts(),
+                &refhir_types::Interval::all(),
+                Order::Asc,
+            )
+            .unwrap();
+        assert_eq!(keys.len(), 1, "the place stored meanwhile has its key");
+
+        run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+
+        {
+            let catalog = harness.catalog.read().unwrap();
+            assert!(!catalog.has_pending_parameters());
+            assert!(catalog
+                .get("Location")
+                .unwrap()
+                .ready_param("near")
+                .is_some());
+        }
+        let placed = places
+            .iter()
+            .filter(|place| crate::spatial::position(place).is_some())
+            .count();
+        let keys = harness
+            .db
+            .reader()
+            .index_scan(
+                &IndexId::new("Location/near"),
+                harness.db.latest_ts(),
+                &refhir_types::Interval::all(),
+                Order::Asc,
+            )
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            placed + 1,
+            "every place that has a position is indexed once"
+        );
+        let mut now = places.clone();
+        now.push(location("during", 6.5, 3.4));
+        for query in queries {
+            assert_eq!(found(&harness, query), expected(&now, query), "{query}");
+        }
+        let (_, work, _) = search(&harness, &[("near", "9.06|7.49|20|km")]);
+        assert!(work.rows < 200, "the index is used: {} rows", work.rows);
+        drop(harness);
+
+        // And the next start has nothing to do: no job, `near` still ready.
+        let store = SqlitePersistence::open(&path).unwrap();
+        assert!(store.load_backfills().unwrap().iter().all(|job| job.done));
+        let (again, _) = Catalog::open_consistent(&store, CatalogClock::Latest).unwrap();
+        assert!(!again.has_pending_parameters());
+        remove();
+    }
+
+    /// A query in a long run of searches over 40,000 places, as a provider directory sends.
+    #[test]
+    #[ignore = "40,000 places: run with --release, as the timing asks for"]
+    fn forty_thousand_places_answer_a_near_search_in_fifty_milliseconds() {
+        let harness = r4();
+        let started = Instant::now();
+        store_places(&harness, &spread(40_000));
+        eprintln!("stored 40,000 places in {:.1?}", started.elapsed());
+        for query in [
+            vec![("near", "6.60|3.35|10|km"), ("_count", "20")],
+            vec![
+                ("near", "6.60|3.35|10|km"),
+                ("_count", "20"),
+                ("_sort", "near"),
+            ],
+            vec![("near", "9.06|7.49|50|km"), ("_count", "20")],
+            vec![
+                ("near", "9.06|7.49|50|km"),
+                ("_count", "20"),
+                ("_sort", "near"),
+            ],
+            vec![("near", "6.60|3.35"), ("_count", "20")],
+            vec![
+                ("near", "6.60|3.35|10|km"),
+                ("status", "active"),
+                ("_count", "20"),
+            ],
+        ] {
+            let took = fastest(&harness, &query);
+            eprintln!("{query:?}: {took:.2?}");
+            assert!(
+                took < Duration::from_millis(50),
+                "{query:?} took {took:.2?} over 40,000 places"
+            );
         }
     }
 }

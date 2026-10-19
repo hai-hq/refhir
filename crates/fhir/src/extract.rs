@@ -14,6 +14,8 @@ use refhir_types::{
 };
 use serde_json::Value;
 
+use crate::spatial::{self, Near};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchKind {
     Token,
@@ -41,6 +43,18 @@ impl SearchKind {
             SearchKind::Special => "special",
         }
     }
+}
+
+/// How a search can order its matches by a parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sorting {
+    /// By the first value the parameter reads from the resource, as text.
+    Text,
+    /// By distance from the point of the search's own `near`.
+    Distance,
+    /// Not at all: the parameter's values are not ordered as text (numbers, quantities, an age) or
+    /// are not values of the resource (full text, a filter).
+    No,
 }
 
 /// A bare id stands for at most this many resource types. A reference parameter that can point at
@@ -75,6 +89,12 @@ pub enum Probe<'a> {
     AtMost(&'a str),
     /// Inclusive start, exclusive end, over number or quantity keys.
     Range(Interval),
+    /// The ranges of a position index that hold every place within a distance: more than the
+    /// places within it, never fewer. `narrow` says the circle is small.
+    Cells {
+        ranges: Vec<Interval>,
+        narrow: bool,
+    },
     Scan,
 }
 
@@ -108,6 +128,36 @@ pub struct Extractor {
 impl Extractor {
     pub fn kind(&self) -> SearchKind {
         self.kind
+    }
+
+    /// Whether this is the `near` parameter, which finds places by their distance from a point.
+    pub fn is_near(&self) -> bool {
+        matches!(self.source, Source::Near)
+    }
+
+    /// How a search can order its matches by this parameter.
+    pub fn sorting(&self) -> Sorting {
+        let text = |kind: SearchKind| {
+            matches!(
+                kind,
+                SearchKind::Token
+                    | SearchKind::Reference
+                    | SearchKind::Uri
+                    | SearchKind::String
+                    | SearchKind::Date
+            )
+        };
+        match &self.source {
+            Source::Near => Sorting::Distance,
+            Source::MultipleBirth => Sorting::Text,
+            Source::Path(_) if text(self.kind) => Sorting::Text,
+            Source::Composite { parts, .. }
+                if parts.first().is_some_and(|part| text(part.kind)) =>
+            {
+                Sorting::Text
+            }
+            _ => Sorting::No,
+        }
     }
 
     /// What `query` names, for a reference parameter read from a path.
@@ -207,12 +257,16 @@ impl Extractor {
                 let first = query.split('$').next().unwrap_or(query);
                 probe_kind(parts.first().map(|part| part.kind), first)
             }
-            Source::Narrative
-            | Source::Content
-            | Source::Age
-            | Source::Near
-            | Source::Filter
-            | Source::Query => Probe::Scan,
+            Source::Near => match Near::parse(query).and_then(|near| near.cells()) {
+                Some(cells) => Probe::Cells {
+                    ranges: cells.ranges,
+                    narrow: cells.narrow,
+                },
+                None => Probe::Scan,
+            },
+            Source::Narrative | Source::Content | Source::Age | Source::Filter | Source::Query => {
+                Probe::Scan
+            }
             Source::MultipleBirth => Probe::Token(query),
             Source::Path(_) => probe_kind(Some(self.kind), query),
         }
@@ -310,13 +364,19 @@ impl Extractor {
                 })
                 .collect();
         }
+        if matches!(self.source, Source::Near) {
+            return spatial::key(resource, id)
+                .map(|key| (index.clone(), key))
+                .into_iter()
+                .collect();
+        }
         let values = self.indexed_values(resource, path_model, host);
         match self.probe("") {
             Probe::Token(_) | Probe::Tokens(_) => token_rows(index, id, &values),
             Probe::Prefix(_) | Probe::AtLeast(_) | Probe::AtMost(_) => {
                 string_rows(index, id, &values)
             }
-            Probe::Range(_) | Probe::Scan => Vec::new(),
+            Probe::Range(_) | Probe::Cells { .. } | Probe::Scan => Vec::new(),
         }
     }
 
@@ -1190,42 +1250,7 @@ fn multiple_birth_tokens(resource: &Value) -> Vec<String> {
 }
 
 fn near_match(resource: &Value, expected: &str) -> bool {
-    let Some(position) = resource.get("position") else {
-        return false;
-    };
-    let Some(lat) = position.get("latitude").and_then(|value| value.as_f64()) else {
-        return false;
-    };
-    let Some(lon) = position.get("longitude").and_then(|value| value.as_f64()) else {
-        return false;
-    };
-    let mut parts = expected.split('|');
-    let Some(query_lat) = parts.next().and_then(|text| text.parse::<f64>().ok()) else {
-        return false;
-    };
-    let Some(query_lon) = parts.next().and_then(|text| text.parse::<f64>().ok()) else {
-        return false;
-    };
-    let distance = parts
-        .next()
-        .and_then(|text| text.parse::<f64>().ok())
-        .unwrap_or(10.0);
-    let units = parts.next().unwrap_or("km");
-    let limit_km = if units == "mi" {
-        distance * 1.60934
-    } else {
-        distance
-    };
-    haversine_km(lat, lon, query_lat, query_lon) <= limit_km
-}
-
-fn haversine_km(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let radius = 6371.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1.to_radians().cos() * lat2.to_radians().cos() * (dlon / 2.0).sin().powi(2);
-    2.0 * radius * a.sqrt().asin()
+    Near::parse(expected).is_some_and(|near| near.matches(resource))
 }
 
 struct Span {

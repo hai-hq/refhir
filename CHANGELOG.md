@@ -50,7 +50,44 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `transaction` entries, GraphQL and live queries are never lenient. See
   [FHIR API](docs/fhir-api.md#search).
 
+- **`_sort=near`, and the distance of each place `near` finds.** `Location?near=6.45|3.40|10|km&_sort=near`
+  returns the places nearest first (`-near`: farthest first, places the same distance away by id),
+  and every place a `near` search finds carries its distance in `entry.search.extension`, as the
+  FHIR `location-distance` extension (`valueDistance`, in kilometres, or miles when the search said
+  `mi`). Paging keeps the order across `next` links. A search that cannot be measured from one
+  point (no `near`, two of them, or a comma's alternatives) is refused as any other `_sort` that
+  cannot be applied (see Changed). See [FHIR API](docs/fhir-api.md#search).
+
 ### Changed
+
+- **`near` reads the places round the point, not every place.** The search used to read and
+  measure every Location, so its time grew with the table: `Location?near=6.60|3.35|10|km&_count=20`
+  took 0.4 s over 40,000 Locations and 0.7 s for 50 km. `Location.position` now has an index (a
+  Z-order curve over latitude and longitude, in the byte-ordered keys SQLite and Postgres both
+  hold, so no extension is needed), a search reads the few ranges of it that cover the circle, and
+  the places found are measured exactly as before. Over 40,000 Locations the same searches take
+  5 ms on SQLite and 16 ms on Postgres (a 50 km search that finds 209 places, 14 ms and 42 ms).
+  On Postgres the ranges are read in one statement, not one for each: a search sent 33 statements
+  and now sends 2, and any search that is checked row by row over several index ranges gets the
+  same. What a search finds is unchanged: the distance is still measured with the same formula, and
+  a place exactly at the distance is still in. **Schema migration 3 (4 in the shared tenant layout)
+  makes the first start after upgrading build the index** for the places already stored: it puts
+  `near` back to pending and queues a backfill, which the server runs as it starts, before it
+  answers requests. That takes about 5 seconds for 40,000 places on SQLite and about 3 minutes on
+  Postgres, which commits 16 places at a time. Until it is done `near` answers `400` (unsupported
+  search parameter) on a replica, and a replica waits for the migration as for any other. Back the
+  database up first, as for any migration ([Schema migrations](docs/migrations.md)); there is no
+  going back to an earlier release afterwards.
+- **A control the server cannot apply is refused, not echoed.** `Location?_sort=bogus` answered
+  `200` and its `self` link still said `_sort=bogus`, as if the order had been applied, though FHIR
+  says that link holds the parameters the server used. The same held for `_sort` by a parameter
+  the server cannot order by (a number, a quantity, an age), `_summary` or `_total` with a value
+  they do not take, and an `_include` or `_revinclude` naming a resource type or parameter that
+  does not exist or is not a reference. Each is now a `400` that names it, unless the request has
+  `Prefer: handling=lenient`, which runs the search without it: it is not in the `self` or `next`
+  link, and the `OperationOutcome` entry says what was left out. `_sort=_id` sorts by the resource
+  id. **A client that sent such a term and relied on its being ignored now gets a `400`:** remove
+  it, or send `Prefer: handling=lenient`. See [FHIR API](docs/fhir-api.md#search).
 
 - **A running server holds what every request needs and an index of the rest, and reads the rest
   the first time a request uses it.** It used to hold every StructureDefinition, code system,

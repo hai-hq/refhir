@@ -149,6 +149,7 @@ pub(crate) fn rows_of(url: &str, tenant: &str, table: &str) -> i64 {
 pub(crate) fn suite(p: &PostgresPersistence) {
     conformance::exercise(p);
     conformance::exercise_index_scan_ids(p);
+    conformance::exercise_index_scan_ranges(p);
 }
 
 /// Makes `tenant` a poison tenant: from now on, every row any other tenant inserts into any

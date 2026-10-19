@@ -896,6 +896,93 @@ mod tests {
         .unwrap();
     }
 
+    /// Reading several ranges of an index at once gives each range what reading it alone does,
+    /// the transaction's own staged writes included, and records every one as read.
+    #[test]
+    fn several_ranges_read_at_once_are_each_what_the_range_alone_is() {
+        let by_name = IndexId::new("t/by_name");
+        let put_named = |tx: &mut Transaction, id: &str, name: &str, prev: Option<Timestamp>| {
+            let key = (by_name.clone(), format!("{name}|{id}").into_bytes());
+            tx.stage_put(Put {
+                tablet: tablet(),
+                id: id.into(),
+                json: json!({"id": id, "name": name}),
+                new_keys: vec![key.clone()],
+                old_keys: if prev.is_some() { vec![key] } else { vec![] },
+                prev_ts: prev,
+            })
+            .unwrap();
+        };
+        let db = memory_db();
+        let mut seed = db.begin();
+        for (id, name) in [("d1", "ann"), ("d2", "bea"), ("d3", "cy"), ("d4", "dee")] {
+            put_named(&mut seed, id, name, None);
+        }
+        db.commit(seed).unwrap();
+
+        let ranges = [
+            Interval::prefix(b"d".to_vec()),
+            Interval::prefix(b"a".to_vec()),
+            // Overlaps both of the others' neighbours, and holds a row of two intervals.
+            Interval {
+                start: b"b".to_vec(),
+                end: Some(b"dee|d4\x01".to_vec()),
+            },
+            Interval::prefix(b"nobody".to_vec()),
+        ];
+        let ids = |lists: &[Vec<ScannedText>]| -> Vec<Vec<String>> {
+            lists
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .map(|row| row.id.id_str().unwrap().to_string())
+                        .collect()
+                })
+                .collect()
+        };
+        // First in transactions that have written nothing, then in ones that have staged documents
+        // into two of the ranges. Each range alone is read in one transaction, and all at once in
+        // another.
+        let open = |staged: bool| {
+            let mut tx = db.begin();
+            if staged {
+                put_named(&mut tx, "d5", "ann2", None);
+                put_named(&mut tx, "d6", "dora", None);
+            }
+            tx
+        };
+        for staged in [false, true] {
+            let mut alone = open(staged);
+            let each: Vec<Vec<ScannedText>> = ranges
+                .iter()
+                .map(|range| alone.index_range_text(&by_name, range.clone()).unwrap())
+                .collect();
+            let mut at_once = open(staged);
+            let together = at_once.index_ranges_text(&by_name, &ranges).unwrap();
+            let keys = |lists: &[Vec<ScannedText>]| -> Vec<Vec<Vec<u8>>> {
+                lists
+                    .iter()
+                    .map(|list| list.iter().map(|row| row.key.clone()).collect())
+                    .collect()
+            };
+            assert_eq!(ids(&together), ids(&each), "staged {staged}");
+            assert_eq!(keys(&together), keys(&each), "staged {staged}");
+            // The same reads are recorded: a write into any of the ranges wakes a subscriber.
+            assert_eq!(at_once.read_set(), alone.read_set());
+            let found = ids(&together);
+            assert!(found[3].is_empty());
+            assert!(found[2].len() >= 2);
+            // The staged documents are in the ranges that hold their keys, and in no other.
+            assert_eq!(found[0].contains(&"d6".to_string()), staged);
+            assert_eq!(found[1].contains(&"d5".to_string()), staged);
+            assert!(!found[3].contains(&"d6".to_string()));
+        }
+        // A transaction that reads none reads nothing.
+        let mut tx = db.begin();
+        assert!(tx.index_ranges_text(&by_name, &[]).unwrap().is_empty());
+        assert_eq!(*tx.read_set(), ReadSet::default());
+    }
+
     #[test]
     fn readonly_commit_does_not_publish() {
         let db = memory_db();

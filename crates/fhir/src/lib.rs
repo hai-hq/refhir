@@ -22,6 +22,7 @@ mod run;
 mod s3;
 mod sdc;
 mod search;
+mod spatial;
 mod terms;
 
 #[cfg(test)]

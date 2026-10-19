@@ -64,7 +64,7 @@ fn status_and_dry_run_of_a_current_database() {
     let status = migrate(&["--status", "--sqlite", file]);
     assert!(status.status.success(), "{}", stderr(&status));
     let text = stdout(&status);
-    assert!(text.contains("up to date at version 2"), "{text}");
+    assert!(text.contains("up to date at version 3"), "{text}");
     assert!(text.contains("baseline"), "{text}");
     assert!(
         !text.contains("would run"),
@@ -109,7 +109,7 @@ fn a_database_from_a_newer_version_is_reported_and_exits_nonzero() {
     drop(refhir_sqlite::SqlitePersistence::open(&path).unwrap());
     sqlite(
         &path,
-        "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'future')",
+        "INSERT INTO schema_migrations (version, checksum) VALUES (4, 'future')",
     );
     let output = migrate(&["--status", "--sqlite", path.to_str().unwrap()]);
     assert_eq!(output.status.code(), Some(1));
@@ -265,7 +265,7 @@ fn the_server_refuses_to_start_on_a_database_from_a_newer_version() {
     drop(refhir_sqlite::SqlitePersistence::open(&path).unwrap());
     sqlite(
         &path,
-        "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'future')",
+        "INSERT INTO schema_migrations (version, checksum) VALUES (4, 'future')",
     );
     let dir = path.parent().unwrap();
     let output = common::exits(
@@ -300,7 +300,7 @@ fn postgres_status_reports_the_recorded_versions() {
     let after = migrate(&["--status", "--postgres", &database.url]);
     assert!(after.status.success(), "{}", stderr(&after));
     assert!(
-        stdout(&after).contains("up to date at version 2"),
+        stdout(&after).contains("up to date at version 3"),
         "{}",
         stdout(&after)
     );
@@ -317,7 +317,7 @@ fn status_says_when_a_postgres_database_is_shared_by_tenants() {
     assert!(shared.status.success(), "{}", stderr(&shared));
     let said = stdout(&shared);
     assert!(said.contains("layout: shared by tenants"), "{said}");
-    assert!(said.contains("up to date at version 3"), "{said}");
+    assert!(said.contains("up to date at version 4"), "{said}");
 
     // A database made without tenants says nothing of the kind.
     let plain = common::fresh_database(&admin, "migrateplain");

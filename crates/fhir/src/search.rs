@@ -3,17 +3,22 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use refhir_database::{ScannedEntry, ScannedRow, ScannedText, Transaction};
 use refhir_types::{
-    exact_key, string_at_least, string_at_most, string_interval, token_interval, IndexId, Interval,
-    Timestamp,
+    exact_key, sortable_f64, string_at_least, string_at_most, string_interval, token_interval,
+    IndexId, Interval, Timestamp,
 };
 use refhir_validate::{TermAnswer, Terminology};
 use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
 use crate::error::FhirError;
-use crate::extract::{Probe, ReferenceId};
+use crate::extract::{Probe, ReferenceId, SearchKind, Sorting};
 use crate::ops::decorate;
 use crate::resolve::TxHost;
+use crate::spatial::Near;
+
+/// The extension FHIR defines for the distance between a place found by `near` and the point
+/// searched from. It goes on the entry's `search`.
+const LOCATION_DISTANCE: &str = "http://hl7.org/fhir/StructureDefinition/location-distance";
 
 const MODIFIERS: &[&str] = &[
     "exact",
@@ -178,6 +183,9 @@ struct Controls {
     /// Every one of these must contain a match: the caller's own `_compartment`, and the limit the
     /// server set on the caller (`_patientCompartment`).
     compartments: Vec<Within>,
+    /// Where the search's one `near` is, which each entry's distance and `_sort=near` are measured
+    /// from. Not set by `controls_from`: it comes from the clauses.
+    near: Option<Near>,
 }
 
 /// A compartment a search is limited to.
@@ -336,11 +344,20 @@ pub(crate) fn search_counted(
     if let Some(query) = params.get("_query") {
         return Err(FhirError::Invalid(format!("unknown query {query}")));
     }
-    let (clauses, ignored) = clauses_from(catalog, model, params, handling)?;
+    let (clauses, mut ignored) = clauses_from(catalog, model, params, handling)?;
+    let near = near_of(model, &clauses);
+    ignored.extend(control_issues(
+        catalog,
+        model,
+        params,
+        near.is_some(),
+        handling,
+    )?);
     // The links, and the cursor in them, describe the search that ran, so a parameter that was set
     // aside is in neither, and a `_cursor` is checked against the same parameters it was made from.
     let ran = without_ignored(params, &ignored);
-    let controls = controls_from(&ran)?;
+    let mut controls = controls_from(&ran)?;
+    controls.near = near;
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
@@ -391,15 +408,17 @@ fn without_ignored<'a>(
         let Some(value) = ran.get(&item.key) else {
             continue;
         };
-        // Only that occurrence goes: the others of the same parameter are clauses that were read.
-        let mut kept: Vec<&str> = value.split(AND).collect();
+        // Only that occurrence goes: the others of the same parameter are clauses that were read,
+        // or the other terms of a list (`_sort=name,-bogus`).
+        let separator = if is_list_control(&item.key) { ',' } else { AND };
+        let mut kept: Vec<&str> = value.split(separator).collect();
         if let Some(at) = kept.iter().position(|text| *text == item.occurrence) {
             kept.remove(at);
         }
         if kept.is_empty() {
             ran.remove(&item.key);
         } else {
-            let joined = kept.join(&AND.to_string());
+            let joined = kept.join(&separator.to_string());
             ran.insert(item.key.clone(), joined);
         }
     }
@@ -528,7 +547,13 @@ fn page_by_checking(
             if wanted > 0 {
                 work.keyed += controls.sort.len();
                 ranked.push(Ranked {
-                    keys: sort_keys(catalog, model, &json, &controls.sort),
+                    keys: sort_keys(
+                        catalog,
+                        model,
+                        &json,
+                        &controls.sort,
+                        controls.near.as_ref(),
+                    ),
                     id: row.id.id_str().unwrap_or("").to_string(),
                     json,
                     ts: row.ts,
@@ -569,12 +594,21 @@ fn assemble(
     total: usize,
 ) -> Result<Value, FhirError> {
     let mut entries = Vec::new();
-    for (id, resource) in &page {
+    for (_, resource) in &page {
+        let mut search = json!({"mode": "match"});
+        // How far each place is from the point searched from, in the units the search used.
+        if let Some(near) = &controls.near {
+            if let Some(distance) = near.distance_km(resource) {
+                search["extension"] = json!([{
+                    "url": LOCATION_DISTANCE,
+                    "valueDistance": near.value_distance(distance)
+                }]);
+            }
+        }
         entries.push(json!({
             "resource": project_resource(resource, controls),
-            "search": {"mode": "match"}
+            "search": search
         }));
-        let _ = id;
     }
     // `_summary=count` shows no entry, so it follows no `_include` or `_revinclude` either.
     if controls.summary.as_deref() != Some("count") {
@@ -613,7 +647,8 @@ pub(crate) fn search_reference(
         return Err(FhirError::Invalid(format!("unknown query {query}")));
     }
     let (clauses, _) = clauses_from(catalog, model, params, Handling::Strict)?;
-    let controls = controls_from(params)?;
+    let mut controls = controls_from(params)?;
+    controls.near = near_of(model, &clauses);
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
     let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
@@ -644,7 +679,13 @@ pub(crate) fn search_reference(
             decorate(row.json, row.id.id_str().unwrap_or(""), row.ts),
         ));
     }
-    sort_matches(catalog, model, &mut matched, &controls.sort);
+    sort_matches(
+        catalog,
+        model,
+        &mut matched,
+        &controls.sort,
+        controls.near.as_ref(),
+    );
     let total = matched.len();
     let page: Vec<_> = matched
         .into_iter()
@@ -733,6 +774,7 @@ fn controls_from(params: &BTreeMap<String, String>) -> Result<Controls, FhirErro
         include: include_specs(params, "_include")?,
         revinclude: include_specs(params, "_revinclude")?,
         compartments,
+        near: None,
     })
 }
 
@@ -819,6 +861,16 @@ fn parse_include(text: &str, iterate: bool) -> Option<IncludeSpec> {
 /// Most characters of a value an error message repeats.
 const ECHO_LIMIT: usize = 64;
 
+/// A value as an error message repeats it. A long one is not echoed whole: the message goes into
+/// the response, a live query's error and the logs.
+fn shown(value: &str) -> String {
+    let mut shown: String = value.chars().take(ECHO_LIMIT).collect();
+    if shown.len() < value.len() {
+        shown.push('…');
+    }
+    shown
+}
+
 /// The clauses of a search, and the parameters a lenient search set aside.
 ///
 /// A value is read here, before any row is, so whether it is well formed never depends on what
@@ -838,12 +890,7 @@ fn clauses_from(
         let Err((value, reason)) = verdict else {
             return Ok(true);
         };
-        // A long value is not echoed whole: the message goes into the response, a live query's
-        // error and the logs.
-        let mut shown: String = value.chars().take(ECHO_LIMIT).collect();
-        if shown.len() < value.len() {
-            shown.push('…');
-        }
+        let shown = shown(&value);
         let message = format!(
             "invalid value {shown:?} for search parameter {key} on {}: {reason}",
             model.name
@@ -983,6 +1030,147 @@ fn reads_on<'a>(
         }
     }
     Ok(())
+}
+
+/// The point of the one `near` a search has, which entries' distances and `_sort=near` are measured
+/// from. Two `near` parameters (AND), or a comma's alternatives, leave no one point.
+fn near_of(model: &ResourceModel, clauses: &[Clause]) -> Option<Near> {
+    let mut found = None;
+    for clause in clauses {
+        let Clause::Param {
+            name,
+            modifier: None,
+            values,
+        } = clause
+        else {
+            continue;
+        };
+        if !model
+            .ready_param(name)
+            .is_some_and(|param| param.extractor.is_near())
+        {
+            continue;
+        }
+        if found.is_some() || values.len() != 1 {
+            return None;
+        }
+        found = Near::parse(&values[0]);
+    }
+    found
+}
+
+/// The values of the result controls (`_sort`, `_summary`, `_total`, `_include`, `_revinclude`)
+/// that the server cannot apply, and so leaves out if the search is lenient, and refuses if it is
+/// strict. A search that ignored one would still show it in its `self` link, as if it had applied
+/// it, and FHIR says that link holds what the server used.
+fn control_issues(
+    catalog: &Catalog,
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+    has_near: bool,
+    handling: Handling,
+) -> Result<Vec<Ignored>, FhirError> {
+    let mut issues = Vec::new();
+    let mut note = |key: &str, occurrence: &str, reason: String| {
+        let message = format!(
+            "invalid value {:?} for {key} on {}: {reason}",
+            shown(occurrence),
+            model.name
+        );
+        match handling {
+            Handling::Strict => Err(FhirError::Invalid(message)),
+            Handling::Lenient => {
+                issues.push(Ignored {
+                    key: key.to_string(),
+                    occurrence: occurrence.to_string(),
+                    message,
+                });
+                Ok(())
+            }
+        }
+    };
+    if let Some(sort) = params.get("_sort") {
+        for term in sort.split(',').filter(|term| !term.is_empty()) {
+            let name = term
+                .strip_prefix('-')
+                .unwrap_or_else(|| term.trim_start_matches('+'));
+            // The id is every resource's own, and a search by it needs no parameter either.
+            if name == "_id" {
+                continue;
+            }
+            let reason = match model.ready_param(name).map(|param| &param.extractor) {
+                None => Some(format!("{} has no search parameter {name}", model.name)),
+                Some(extractor) => match extractor.sorting() {
+                    Sorting::Text => None,
+                    Sorting::Distance if has_near => None,
+                    Sorting::Distance => Some(format!(
+                        "{name} sorts by distance, and the search has no single near=latitude|longitude to measure it from"
+                    )),
+                    Sorting::No => Some(format!(
+                        "the server cannot sort by {name}: it is a {} parameter",
+                        extractor.kind().fhir_type()
+                    )),
+                },
+            };
+            if let Some(reason) = reason {
+                note("_sort", term, reason)?;
+            }
+        }
+    }
+    for (name, allowed) in [
+        ("_summary", &["true", "text", "data", "count", "false"][..]),
+        ("_total", &["none", "estimate", "accurate"][..]),
+    ] {
+        if let Some(value) = params
+            .get(name)
+            .filter(|value| !allowed.contains(&value.as_str()))
+        {
+            note(name, value, format!("it is one of {}", allowed.join(", ")))?;
+        }
+    }
+    for name in [
+        "_include",
+        "_include:iterate",
+        "_revinclude",
+        "_revinclude:iterate",
+    ] {
+        let Some(rules) = params.get(name) else {
+            continue;
+        };
+        for rule in rules.split(',').filter(|rule| !rule.is_empty()) {
+            // A rule that cannot be read is skipped by the search, as it always was.
+            let Some(spec) = parse_include(rule, name.ends_with(":iterate")) else {
+                continue;
+            };
+            if let Some(reason) = include_problem(catalog, &spec) {
+                note(name, rule, reason)?;
+            }
+        }
+    }
+    Ok(issues)
+}
+
+/// Why a rule of `_include` or `_revinclude` can never follow a reference, or `None` when it names
+/// a reference parameter of a resource type the server has (or names none, which is a rule for
+/// any type). A type that is not the one searched is fine: an `:iterate` rule follows the
+/// resources others have added.
+fn include_problem(catalog: &Catalog, spec: &IncludeSpec) -> Option<String> {
+    let source = spec.source.as_deref().filter(|source| *source != "*")?;
+    if spec.param == "*" {
+        return None;
+    }
+    let Ok(model) = catalog.get(source) else {
+        return Some(format!("{source} is not a resource type"));
+    };
+    match model.ready_param(&spec.param) {
+        None => Some(format!("{source} has no search parameter {}", spec.param)),
+        Some(param) if param.kind != SearchKind::Reference => Some(format!(
+            "{} of {source} is a {} parameter, and only a reference can be followed",
+            spec.param,
+            param.kind.fhir_type()
+        )),
+        Some(_) => None,
+    }
 }
 
 fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause, FhirError> {
@@ -1211,11 +1399,9 @@ impl Scan {
     /// The rows of the ranges, each with its document as JSON text, in key order and each
     /// document once.
     fn text(&self, tx: &mut Transaction) -> Result<Vec<ScannedText>, FhirError> {
-        let mut lists = Vec::with_capacity(self.intervals.len());
-        for interval in &self.intervals {
-            lists.push(tx.index_range_text(&self.index, interval.clone())?);
-        }
-        Ok(in_key_order(lists))
+        Ok(in_key_order(
+            tx.index_ranges_text(&self.index, &self.intervals)?,
+        ))
     }
 }
 
@@ -1237,12 +1423,22 @@ fn in_key_order<P>(mut lists: Vec<Vec<ScannedRow<P>>>) -> Vec<ScannedRow<P>> {
 /// can stand for), and how wide they are likely to be (lower is narrower).
 fn probe_ranges(probe: Probe<'_>) -> Option<(u8, Vec<Interval>)> {
     Some(match probe {
-        Probe::Token(text) => (0, vec![token_interval(text)]),
-        Probe::Tokens(tokens) => (0, tokens.iter().map(|text| token_interval(text)).collect()),
-        Probe::Prefix(text) => (1, vec![string_interval(text)]),
-        Probe::AtLeast(text) => (2, vec![string_at_least(text)]),
-        Probe::AtMost(text) => (2, vec![string_at_most(text)]),
-        Probe::Range(interval) => (2, vec![interval]),
+        // A small circle round a point holds a handful of places, fewer than any value of another
+        // parameter is likely to: a status or a type that most places share is a whole table.
+        Probe::Cells {
+            ranges,
+            narrow: true,
+        } => (0, ranges),
+        Probe::Token(text) => (1, vec![token_interval(text)]),
+        Probe::Tokens(tokens) => (1, tokens.iter().map(|text| token_interval(text)).collect()),
+        Probe::Prefix(text) => (2, vec![string_interval(text)]),
+        Probe::AtLeast(text) => (3, vec![string_at_least(text)]),
+        Probe::AtMost(text) => (3, vec![string_at_most(text)]),
+        Probe::Range(interval) => (3, vec![interval]),
+        Probe::Cells {
+            ranges,
+            narrow: false,
+        } => (3, ranges),
         Probe::Scan => return None,
     })
 }
@@ -1698,14 +1894,15 @@ fn sort_matches(
     model: &ResourceModel,
     rows: &mut [(String, Value)],
     sort: &[(String, bool)],
+    near: Option<&Near>,
 ) {
     if sort.is_empty() {
         return;
     }
     rows.sort_by(|left, right| {
         for (name, desc) in sort {
-            let ordering = sort_key(catalog, model, &left.1, name)
-                .cmp(&sort_key(catalog, model, &right.1, name));
+            let ordering = sort_key(catalog, model, &left.1, name, near)
+                .cmp(&sort_key(catalog, model, &right.1, name, near));
             let ordering = if *desc { ordering.reverse() } else { ordering };
             if ordering != std::cmp::Ordering::Equal {
                 return ordering;
@@ -1715,10 +1912,36 @@ fn sort_matches(
     });
 }
 
-fn sort_key(catalog: &Catalog, model: &ResourceModel, resource: &Value, name: &str) -> String {
+fn sort_key(
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: &Value,
+    name: &str,
+    near: Option<&Near>,
+) -> String {
+    if name == "_id" {
+        return resource
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_lowercase)
+            .unwrap_or_default();
+    }
     let Some(param) = model.ready_param(name) else {
         return String::new();
     };
+    if param.extractor.is_near() {
+        // The distance as text that sorts as the number does, so a key is one kind of thing
+        // whatever the parameter. A place with no position (it could not have matched) sorts first.
+        return near
+            .and_then(|near| near.distance_km(resource))
+            .map(|distance| {
+                sortable_f64(distance)
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
     let host = SortHost;
     param
         .extractor
@@ -1735,9 +1958,10 @@ fn sort_keys(
     model: &ResourceModel,
     resource: &Value,
     sort: &[(String, bool)],
+    near: Option<&Near>,
 ) -> Vec<String> {
     sort.iter()
-        .map(|(name, _)| sort_key(catalog, model, resource, name))
+        .map(|(name, _)| sort_key(catalog, model, resource, name, near))
         .collect()
 }
 

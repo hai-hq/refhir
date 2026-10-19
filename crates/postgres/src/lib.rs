@@ -368,40 +368,7 @@ impl PersistenceReader for PostgresPersistence {
             } else {
                 ""
             };
-            let ord = order_sql(order);
-            // Every table the statement reads carries the tenant, so a join cannot pick up a row
-            // of another tenant that happens to share an index id, key, table id or document id.
-            let (on_a, on_b, on_c, on_d) = (
-                self.scope.and(),
-                self.scope.and_in("B"),
-                self.scope.and_in("C"),
-                self.scope.and_in("D"),
-            );
-            let sql = format!(
-                r#"
-SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
-FROM (
-    SELECT index_id, key, MAX(ts) as max_ts
-    FROM indexes
-    WHERE {on_a}index_id = $1 AND ts <= $2 AND key >= $3{upper}
-    GROUP BY index_id, key
-) A
-JOIN indexes B
-  ON {on_b}B.deleted = 0
- AND A.index_id = B.index_id
- AND A.key = B.key
- AND A.max_ts = B.ts
-JOIN documents C
-  ON {on_c}C.table_id = B.table_id
- AND C.id = B.document_id
- AND C.deleted = 0
- AND C.ts = (
-    SELECT MAX(D.ts) FROM documents D
-    WHERE {on_d}D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= $2
- )
-ORDER BY B.key {ord}
-"#
-            );
+            let sql = self.scan_sql(&format!("key >= $3{upper}"), order_sql(order));
             let mut guard = self.inner.lock()?;
             let ts = i64_ts(read_timestamp)?;
             let rows = if let Some(end) = &interval.end {
@@ -414,40 +381,51 @@ ORDER BY B.key {ord}
                     .query(&sql, &[&index_id.as_bytes(), &ts, &interval.start])
             }
             .map_err(definite)?;
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                let key: Vec<u8> = row.get(0);
-                let row_ts: i64 = row.get(1);
-                let document_id: Vec<u8> = row.get(2);
-                let table_id: Vec<u8> = row.get(3);
-                let json_value: Option<String> = row.get(4);
-                let prev_ts: Option<i64> = row.get(5);
-                let json_value = json_value.ok_or_else(|| {
-                    PersistError::Definite(format!(
-                        "index {} points at a document with no json at ts {row_ts}",
-                        index_id.as_str()
-                    ))
-                })?;
-                let entry = document_from_parts(
-                    document_id,
-                    row_ts,
-                    table_id,
-                    Some(json_value),
-                    false,
-                    prev_ts,
-                )?;
-                let value = entry.value.expect("live document");
-                out.push(IndexScanRow {
-                    key,
-                    document: LatestDocument {
-                        ts: entry.ts,
-                        id: entry.id,
-                        value,
-                        prev_ts: entry.prev_ts,
-                    },
-                });
+            rows.iter().map(|row| scan_row(index_id, row)).collect()
+        })
+    }
+
+    /// One statement for every interval: the rows whose key is in any of them, which an index range
+    /// scan finds for each arm in turn, and then each row goes to the lists of the intervals that
+    /// hold it. A search narrowed to dozens of ranges is one round trip, not dozens.
+    fn index_scan_ranges(
+        &self,
+        index_id: &IndexId,
+        read_timestamp: Timestamp,
+        intervals: &[Interval],
+    ) -> Result<Vec<Vec<IndexScanRow>>, PersistError> {
+        if intervals.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::off_runtime(|| {
+            let ts = i64_ts(read_timestamp)?;
+            let id = index_id.as_bytes();
+            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id, &ts];
+            let mut arms = Vec::with_capacity(intervals.len());
+            for interval in intervals {
+                let start = params.len() + 1;
+                params.push(&interval.start);
+                match &interval.end {
+                    Some(end) => {
+                        arms.push(format!("(key >= ${start} AND key < ${})", start + 1));
+                        params.push(end);
+                    }
+                    None => arms.push(format!("key >= ${start}")),
+                }
             }
-            Ok(out)
+            let sql = self.scan_sql(&format!("({})", arms.join(" OR ")), "ASC");
+            let mut guard = self.inner.lock()?;
+            let rows = guard.client.query(&sql, &params).map_err(definite)?;
+            let mut lists: Vec<Vec<IndexScanRow>> = vec![Vec::new(); intervals.len()];
+            for row in &rows {
+                let scanned = scan_row(index_id, row)?;
+                for (list, interval) in lists.iter_mut().zip(intervals) {
+                    if interval.contains(&scanned.key) {
+                        list.push(scanned.clone());
+                    }
+                }
+            }
+            Ok(lists)
         })
     }
 
@@ -599,6 +577,45 @@ ORDER BY B.key {ord}
 }
 
 impl PostgresPersistence {
+    /// The statement behind `index_scan`: the live document of each key of an index at a read
+    /// timestamp, the keys picked by `key_filter` (`$1` is the index, `$2` the read timestamp, and
+    /// the filter's own parameters follow), in key order.
+    fn scan_sql(&self, key_filter: &str, ord: &str) -> String {
+        // Every table the statement reads carries the tenant, so a join cannot pick up a row
+        // of another tenant that happens to share an index id, key, table id or document id.
+        let (on_a, on_b, on_c, on_d) = (
+            self.scope.and(),
+            self.scope.and_in("B"),
+            self.scope.and_in("C"),
+            self.scope.and_in("D"),
+        );
+        format!(
+            r#"
+SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
+FROM (
+    SELECT index_id, key, MAX(ts) as max_ts
+    FROM indexes
+    WHERE {on_a}index_id = $1 AND ts <= $2 AND {key_filter}
+    GROUP BY index_id, key
+) A
+JOIN indexes B
+  ON {on_b}B.deleted = 0
+ AND A.index_id = B.index_id
+ AND A.key = B.key
+ AND A.max_ts = B.ts
+JOIN documents C
+  ON {on_c}C.table_id = B.table_id
+ AND C.id = B.document_id
+ AND C.deleted = 0
+ AND C.ts = (
+    SELECT MAX(D.ts) FROM documents D
+    WHERE {on_d}D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= $2
+ )
+ORDER BY B.key {ord}
+"#
+        )
+    }
+
     fn one(
         &self,
         sql: &str,
@@ -1026,6 +1043,40 @@ fn sql_max_ts(scope: Scope) -> String {
     )
 }
 
+/// A row of the statement `scan_sql` makes, as the row `index_scan` returns.
+fn scan_row(index_id: &IndexId, row: &Row) -> Result<IndexScanRow, PersistError> {
+    let key: Vec<u8> = row.get(0);
+    let row_ts: i64 = row.get(1);
+    let document_id: Vec<u8> = row.get(2);
+    let table_id: Vec<u8> = row.get(3);
+    let json_value: Option<String> = row.get(4);
+    let prev_ts: Option<i64> = row.get(5);
+    let json_value = json_value.ok_or_else(|| {
+        PersistError::Definite(format!(
+            "index {} points at a document with no json at ts {row_ts}",
+            index_id.as_str()
+        ))
+    })?;
+    let entry = document_from_parts(
+        document_id,
+        row_ts,
+        table_id,
+        Some(json_value),
+        false,
+        prev_ts,
+    )?;
+    let value = entry.value.expect("live document");
+    Ok(IndexScanRow {
+        key,
+        document: LatestDocument {
+            ts: entry.ts,
+            id: entry.id,
+            value,
+            prev_ts: entry.prev_ts,
+        },
+    })
+}
+
 fn order_sql(order: Order) -> &'static str {
     match order {
         Order::Asc => "ASC",
@@ -1257,6 +1308,7 @@ mod tests {
         }
         conformance::exercise(&persistence);
         conformance::exercise_index_scan_ids(&persistence);
+        conformance::exercise_index_scan_ranges(&persistence);
     }
 
     #[test]

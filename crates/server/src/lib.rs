@@ -133,4 +133,6 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod booking_tests;
 #[cfg(test)]
+mod near_tests;
+#[cfg(test)]
 mod tests;

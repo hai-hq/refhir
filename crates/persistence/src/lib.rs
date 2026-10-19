@@ -294,6 +294,26 @@ pub trait PersistenceReader: Send + Sync {
         order: Order,
     ) -> Result<Vec<IndexScanRow>, PersistError>;
 
+    /// `index_scan`, in key order, for each of `intervals`: item `n` of the result holds the rows
+    /// of `intervals[n]`, so a key that is in several intervals is in several lists, and an
+    /// interval that holds no row has an empty one.
+    ///
+    /// The default reads them one at a time, which is right for a backend where a read is cheap. A
+    /// backend where each read is a trip to a server should override it to read them all in one,
+    /// as a search that is narrowed to dozens of ranges (a circle round a point) would otherwise
+    /// spend its time waiting for the round trips.
+    fn index_scan_ranges(
+        &self,
+        index_id: &IndexId,
+        read_timestamp: Timestamp,
+        intervals: &[Interval],
+    ) -> Result<Vec<Vec<IndexScanRow>>, PersistError> {
+        intervals
+            .iter()
+            .map(|interval| self.index_scan(index_id, read_timestamp, interval, Order::Asc))
+            .collect()
+    }
+
     /// The live rows of an index range as keys and document ids, in key order (`order`), at most
     /// `limit` of them: for each key the latest row at `read_timestamp`, unless that row is a
     /// tombstone. These are the rows `index_scan` returns, without the document each one is joined
@@ -3544,6 +3564,80 @@ pub mod conformance {
             4 + 1 + 40,
             "a, b, c, e plus the hot key plus forty"
         );
+    }
+
+    /// `index_scan_ranges` lists, for each interval, exactly the rows `index_scan` does for it, at
+    /// any read timestamp, whether the intervals are disjoint, overlap, are open at the end, hold
+    /// nothing, or are not there at all. Run after `exercise_index_scan_ids`, on the same database,
+    /// whose rows have been rewritten, moved and deleted.
+    pub fn exercise_index_scan_ranges(p: &dyn Persistence) {
+        let index = IndexId::new("scan_ids/by_name");
+        let at = |n: u64| Timestamp::from_u64(n).unwrap();
+        let open = |start: &str| Interval {
+            start: start.as_bytes().to_vec(),
+            end: None,
+        };
+        let between = |start: &str, end: &str| Interval {
+            start: start.as_bytes().to_vec(),
+            end: Some(end.as_bytes().to_vec()),
+        };
+        let sets: Vec<Vec<Interval>> = vec![
+            vec![],
+            vec![Interval::all()],
+            vec![Interval::prefix(b"nothing".to_vec())],
+            // Disjoint, given out of key order, with the last one open.
+            vec![
+                Interval::prefix(b"k".to_vec()),
+                between("a|d1", "c"),
+                between("h", "i"),
+                open("zzz"),
+            ],
+            // Overlapping, and one inside another, so a row is in several lists.
+            vec![
+                Interval::prefix(b"b".to_vec()),
+                between("b|d3", "c"),
+                Interval::all(),
+                Interval::prefix(b"k|1".to_vec()),
+            ],
+            // The same interval twice.
+            vec![between("a", "c"), between("a", "c")],
+        ];
+        // A row as it is compared: its key, document, revision and text.
+        type Seen = (Vec<u8>, DocumentId, Timestamp, String);
+        let rows = |lists: Vec<Vec<IndexScanRow>>| -> Vec<Vec<Seen>> {
+            lists
+                .into_iter()
+                .map(|list| {
+                    list.into_iter()
+                        .map(|row| {
+                            (
+                                row.key,
+                                row.document.id,
+                                row.document.ts,
+                                row.document.value,
+                            )
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let mut listed = 0;
+        for read_at in [9, 10, 11, 12, 13, 14, 20, 30, 44, 45, 60] {
+            for set in &sets {
+                let each = rows(
+                    set.iter()
+                        .map(|interval| {
+                            p.index_scan(&index, at(read_at), interval, Order::Asc)
+                                .unwrap()
+                        })
+                        .collect(),
+                );
+                let together = rows(p.index_scan_ranges(&index, at(read_at), set).unwrap());
+                assert_eq!(together, each, "read at {read_at}, {set:?}");
+                listed += each.iter().map(Vec::len).sum::<usize>();
+            }
+        }
+        assert!(listed > 300, "the exercise lists rows: {listed}");
     }
 }
 

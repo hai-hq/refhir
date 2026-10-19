@@ -769,6 +769,7 @@ mod tests {
         let persistence = SqlitePersistence::open_in_memory().unwrap();
         conformance::exercise(&persistence);
         conformance::exercise_index_scan_ids(&persistence);
+        conformance::exercise_index_scan_ranges(&persistence);
     }
 
     fn temp_db(tag: &str) -> PathBuf {
