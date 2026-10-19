@@ -64,7 +64,9 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `Invoice.lineItem.chargeItemReference` = `ChargeItem/nope` and `ChargeItem.productReference` =
   `Medication/nope`, because an element that FHIR lets hold a reference or something else
   (`xxx[x]`) was never looked at. Every such element is now checked: the target must exist (or, in a
-  transaction Bundle, be named by the `fullUrl` of an entry), and be a type the element allows.
+  transaction Bundle, be named by the `fullUrl` of an entry), and be a type the element allows. As
+  everywhere else under `strict`, a reference to a contained resource (`#id`) is refused, so a
+  `MedicationRequest` whose `medicationReference` is `#med1` is now refused too.
   `--references fhir` stays lenient. A resource that already holds a dangling reference of this
   kind is not changed, but a later update that keeps it is refused. See
   [FHIR API](docs/fhir-api.md#reference-checking).
