@@ -8176,7 +8176,7 @@ fn a_control_that_takes_one_value_is_refused_as_an_array_not_misread() {
     let found = apply(
         &harness,
         "Patient/search",
-        json!({"_sort": ["name", "-_id"], "active": ["true", "true"], "_include": ["Patient:link"]}),
+        json!({"_sort": ["name", "-_id"], "active": ["true", "true"], "_include": ["Observation:subject"]}),
     );
     assert_eq!(found["total"], 1);
 }

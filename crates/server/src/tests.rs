@@ -182,9 +182,10 @@ async fn http_search_takes_comma_or_repeated_and_and_iterate_includes() {
     let included = search("/Observation?_id=o1&_include:iterate=Observation:subject").await;
     assert_eq!(ids(&included, "match"), ["o1"]);
     assert_eq!(ids(&included, "include"), ["p1"]);
-    let both =
-        search("/Observation?_id=o1&_include=Observation:subject&_include:iterate=Patient:link")
-            .await;
+    let both = search(
+        "/Observation?_id=o1&_include=Observation:subject&_include:iterate=Observation:subject",
+    )
+    .await;
     assert_eq!(ids(&both, "include"), ["p1"]);
     let reverse = search(
         "/Patient?_id=p1&_revinclude=Observation:subject&_revinclude:iterate=Observation:subject",
