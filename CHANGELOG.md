@@ -18,9 +18,20 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   for `$expand`; `system`, `code`, `display`, `abstract` and so on for the rest), and the answer is
   the one the `POST` gives. A `coding` or `codeableConcept` is still sent as a `POST`. See
   [FHIR API](docs/fhir-api.md#terminology).
-- **Expansions carry `timestamp` and `inactive`.** `ValueSet.expansion.timestamp`, which R4
-  requires, is the time the server produced the expansion for the request. An entry carries
-  `"inactive": true` when its code system says the concept is inactive.
+- **Expansions are complete R4 ValueSets.** The ValueSet an expansion comes in has the `status` R4
+  requires (that of the value set expanded, `active` when it says nothing), and the expansion has
+  the required `timestamp` (the time the server produced it for the request), an `identifier`
+  (a `urn:uuid`, another for each answer), and in `expansion.parameter` what was asked that shaped
+  it (`filter`, `count`, `offset`, `activeOnly`). An entry carries `"inactive": true` when its code
+  system says the concept is inactive.
+- **`$expand` takes `activeOnly`.** `activeOnly=true` leaves out the codes whose code system calls
+  them inactive; the `total` counts what is left.
+- **The terminology operations answer at the instance.** `ValueSet/[id]/$expand` and
+  `/$validate-code`, `CodeSystem/[id]/$validate-code` and `/$subsumes`, and
+  `ConceptMap/[id]/$translate`, as `POST` or `GET`, with R4's instance forms (`CodeSystem/$lookup`
+  is the type only). The instance is a resource the server stores, and what is asked of it is asked
+  of the value set, code system or concept map its `url` names. A value set that came from a package
+  is expanded by `url`.
 - **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
   and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include
   of a code system whose `content` is `example`, and were refused for that. They now expand to the

@@ -55,3 +55,4 @@ pub use search::{
     add_param, join_repeated, resource_in_compartment, AND, DEFAULT_COUNT, HANDLING,
     PATIENT_COMPARTMENT,
 };
+pub use terms::INSTANCE;

@@ -404,6 +404,9 @@ struct Expansion {
     /// The codes the expansion lists that their code system says are inactive: no longer to be
     /// used, but kept to make sense of old data.
     inactive_codes: BTreeSet<(String, String)>,
+    /// The `status` of the value set definition it was expanded from, which R4 requires of the
+    /// ValueSet an expansion is returned in.
+    status: Option<String>,
 }
 
 impl Expansion {
@@ -1089,8 +1092,16 @@ fn order_held(
 /// it. A value set is held until every code system is in, and for good when it cannot be
 /// expanded, so everything else (the narrative, the descriptions, contacts and usage notes) is
 /// left out of what is held: the narrative alone is more than half the text of the value sets in
-/// the R4 packages.
-const VALUE_SET_FIELDS: [&str; 5] = ["resourceType", "url", "version", "compose", "expansion"];
+/// the R4 packages. What is kept is what an expansion is made from, and what it says of the value
+/// set it came from (its `status`, which R4 requires of the ValueSet an expansion is returned in).
+const VALUE_SET_FIELDS: [&str; 6] = [
+    "resourceType",
+    "url",
+    "version",
+    "status",
+    "compose",
+    "expansion",
+];
 
 fn slim_value_set(mut value_set: Json) -> Json {
     if let Json::Object(fields) = &mut value_set {
@@ -1487,9 +1498,27 @@ impl MemoryTerminology {
     }
 
     pub fn expand(&self, url: &str, text_filter: Option<&str>) -> Option<Json> {
+        self.expand_with(url, text_filter, false)
+    }
+
+    /// The expansion of `url`, as a ValueSet. With `active_only` the codes their code system calls
+    /// inactive are left out, which R4's `activeOnly` asks for.
+    pub fn expand_with(
+        &self,
+        url: &str,
+        text_filter: Option<&str>,
+        active_only: bool,
+    ) -> Option<Json> {
         let expansion = self.expansion_of(canonical(url))?;
         let mut contains = Vec::new();
         for ((system, code), display) in &expansion.codes {
+            if active_only
+                && expansion
+                    .inactive_codes
+                    .contains(&(system.clone(), code.clone()))
+            {
+                continue;
+            }
             if let Some(filter) = text_filter {
                 let display_text = display.as_deref().unwrap_or("");
                 let needle = filter.to_ascii_lowercase();
@@ -1528,6 +1557,8 @@ impl MemoryTerminology {
         Some(json!({
             "resourceType": "ValueSet",
             "url": canonical(url),
+            // R4 requires a status. The definition's own, when the expansion recorded one.
+            "status": expansion.status.as_deref().unwrap_or("active"),
             "expansion": body
         }))
     }
@@ -1765,7 +1796,19 @@ impl MemoryTerminology {
         offset: usize,
         count: Option<usize>,
     ) -> Option<Json> {
-        let mut expanded = self.expand(url, text_filter)?;
+        self.expand_page_with(url, text_filter, false, offset, count)
+    }
+
+    /// [`Self::expand_page`] with [`Self::expand_with`]'s `active_only`.
+    pub fn expand_page_with(
+        &self,
+        url: &str,
+        text_filter: Option<&str>,
+        active_only: bool,
+        offset: usize,
+        count: Option<usize>,
+    ) -> Option<Json> {
+        let mut expanded = self.expand_with(url, text_filter, active_only)?;
         let Some(contains) = expanded
             .pointer_mut("/expansion/contains")
             .and_then(|value| value.as_array_mut())
@@ -2676,6 +2719,10 @@ impl Expander<'_> {
         self.stack.pop();
         if let Ok(expansion) = &mut expansion {
             expansion.scope = Some(owner);
+            expansion.status = value_set
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
         }
         self.cache.insert(key, expansion.clone());
         expansion
@@ -3587,7 +3634,13 @@ fn collect_expansion(contains: &[Json], expansion: &mut Expansion, note_systems:
 
 fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
     let url = document.get("url").and_then(|value| value.as_str())?;
-    let mut expansion = Expansion::default();
+    let mut expansion = Expansion {
+        status: document
+            .get("status")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        ..Expansion::default()
+    };
     if let Some(systems) = document.get("systems").and_then(|value| value.as_array()) {
         for system in systems {
             let Some(system_url) = system.get("url").and_then(|value| value.as_str()) else {
@@ -3665,6 +3718,9 @@ fn expansion_document(url: &str, expansion: &Expansion) -> Json {
         .collect();
     let mut document =
         json!({"url": url, "systems": systems, "contains": contains, "rules": EXPANSION_RULES});
+    if let Some(status) = &expansion.status {
+        document["status"] = json!(status);
+    }
     if !expansion.incomplete.is_empty() {
         document["incomplete"] = expansion
             .incomplete
@@ -4316,6 +4372,75 @@ mod tests {
             live.contains("http://example.org/whole", Some(system), "old"),
             TermAnswer::Yes
         );
+    }
+
+    #[test]
+    fn an_expansion_has_its_definitions_status_and_active_only_leaves_out_what_is_inactive() {
+        let system = "http://example.org/states";
+        let resources = [
+            json!({"resourceType": "CodeSystem", "url": system, "content": "complete",
+            "concept": [
+                {"code": "live", "display": "Live"},
+                {"code": "old", "display": "Old",
+                 "property": [{"code": "inactive", "valueBoolean": true}]},
+                {"code": "older", "display": "Older",
+                 "property": [{"code": "inactive", "valueBoolean": true}]}
+            ]}),
+            json!({"resourceType": "ValueSet", "url": "http://example.org/drafted",
+                   "status": "draft", "compose": {"include": [{"system": system}]}}),
+            json!({"resourceType": "ValueSet", "url": "http://example.org/retired",
+                   "status": "retired", "compose": {"include": [{"system": system}]}}),
+            // Another's status is not this one's, however it was put together.
+            json!({"resourceType": "ValueSet", "url": "http://example.org/nested",
+                   "status": "active",
+                   "compose": {"include": [{"valueSet": ["http://example.org/drafted"]}]}}),
+            json!({"resourceType": "ValueSet", "url": "http://example.org/unsaid",
+                   "compose": {"include": [{"system": system}]}}),
+        ];
+        let live = MemoryTerminology::from_resources(&resources);
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        let stored = MemoryTerminology::from_stored(&resources, &documents);
+        for terms in [&live, &stored] {
+            let status = |url: &str| {
+                terms.expand(url, None).unwrap()["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            assert_eq!(status("http://example.org/drafted"), "draft");
+            assert_eq!(status("http://example.org/retired"), "retired");
+            assert_eq!(status("http://example.org/nested"), "active");
+            // R4 requires one, so a definition that says nothing is `active`.
+            assert_eq!(status("http://example.org/unsaid"), "active");
+
+            // `activeOnly` leaves out the inactive codes, and the page and the total follow.
+            let codes = |expanded: &serde_json::Value| -> Vec<String> {
+                expanded["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["code"].as_str().unwrap().to_string())
+                    .collect()
+            };
+            let url = "http://example.org/drafted";
+            assert_eq!(
+                codes(&terms.expand_with(url, None, false).unwrap()),
+                ["live", "old", "older"]
+            );
+            assert_eq!(
+                codes(&terms.expand_with(url, None, true).unwrap()),
+                ["live"]
+            );
+            // Together with a filter that matches what is inactive, nothing is left.
+            assert!(codes(&terms.expand_with(url, Some("old"), true).unwrap()).is_empty());
+            let page = terms.expand_page_with(url, None, true, 0, Some(5)).unwrap();
+            assert_eq!(page["expansion"]["total"], 1);
+            let all = terms
+                .expand_page_with(url, None, false, 1, Some(1))
+                .unwrap();
+            assert_eq!(all["expansion"]["total"], 3);
+            assert_eq!(codes(&all), ["old"]);
+        }
     }
 
     #[test]

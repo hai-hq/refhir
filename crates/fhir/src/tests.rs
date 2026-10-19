@@ -5881,8 +5881,9 @@ fn value_sets_that_cannot_expand_say_why() {
     assert!(!urls.contains(&"http://hl7.org/fhir/ValueSet/service-category"));
 }
 
-/// The codes of an expansion as `system|code`, and the `expansion.parameter` entries it carries
-/// as `name = value`.
+/// The codes of an expansion as `system|code`, and the `expansion.parameter` entries that say a code
+/// system was drawn on in part, as `name = value`. (The entries that say what was asked of the
+/// expansion are not these.)
 fn expansion_summary(expanded: &Value) -> (Vec<String>, Vec<String>) {
     let codes = expanded["expansion"]["contains"]
         .as_array()
@@ -5901,6 +5902,11 @@ fn expansion_summary(expanded: &Value) -> (Vec<String>, Vec<String>) {
         .map(|items| {
             items
                 .iter()
+                .filter(|item| {
+                    item["name"]
+                        .as_str()
+                        .is_some_and(|name| name.ends_with("#CodeSystem.content"))
+                })
                 .map(|item| {
                     format!(
                         "{} = {}",
@@ -7086,6 +7092,79 @@ fn an_expansion_marks_the_codes_its_system_does_not_let_you_select_as_abstract()
     let reread = apply(&harness, "ValueSet/$expand", json!({"url": coverage}));
     assert_eq!(abstract_flags(&reread), flags);
     assert_expansions_match(&harness.store, "with abstract codes");
+}
+
+#[test]
+fn an_expansion_says_which_value_set_status_it_has_which_expansion_it_is_and_what_was_asked() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let url = "http://hl7.org/fhir/ValueSet/organization-type";
+    let defined: Value = serde_json::from_str(
+        &std::fs::read_to_string(r4_dir().join("ValueSet-organization-type.json")).unwrap(),
+    )
+    .unwrap();
+
+    // R4 requires a status of the ValueSet an expansion is in: the definition's own.
+    let plain = apply(&harness, "ValueSet/$expand", json!({"url": url}));
+    assert_eq!(plain["status"], defined["status"]);
+    assert!(defined["status"].is_string());
+    // Each expansion is its own: the identifier says which, a urn:uuid, and is another next time.
+    let identifier = plain["expansion"]["identifier"].as_str().unwrap();
+    assert!(
+        identifier.starts_with("urn:uuid:") && identifier.len() == "urn:uuid:".len() + 36,
+        "{identifier}"
+    );
+    let again = apply(&harness, "ValueSet/$expand", json!({"url": url}));
+    assert_ne!(
+        again["expansion"]["identifier"],
+        plain["expansion"]["identifier"]
+    );
+    // Nothing was asked, so nothing is listed as asked.
+    assert!(plain["expansion"].get("parameter").is_none());
+
+    // What was asked that shaped the expansion is listed, as R4 says it should be, and a page
+    // says its offset and count.
+    let asked = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": url, "filter": "hospital", "count": 1, "offset": 0, "activeOnly": true}),
+    );
+    let parameters = asked["expansion"]["parameter"].as_array().unwrap();
+    for expected in [
+        json!({"name": "filter", "valueString": "hospital"}),
+        json!({"name": "activeOnly", "valueBoolean": true}),
+        json!({"name": "count", "valueInteger": 1}),
+        json!({"name": "offset", "valueInteger": 0}),
+    ] {
+        assert!(
+            parameters.contains(&expected),
+            "{expected} in {parameters:?}"
+        );
+    }
+    assert_eq!(parameters.len(), 4);
+    // `activeOnly` only says that inactive codes were left out, and none of these is inactive.
+    let all = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": url, "activeOnly": "true"}),
+    );
+    assert_eq!(all["expansion"]["total"], 12);
+    assert!(all["expansion"]["parameter"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"name": "activeOnly", "valueBoolean": true})));
+
+    // A value set that is not expanded from a definition with a status is `active`.
+    let bare = refhir_validate::MemoryTerminology::from_resources(&[
+        json!({"resourceType": "CodeSystem", "url": "http://example.org/s", "content": "complete",
+               "concept": [{"code": "a"}]}),
+        json!({"resourceType": "ValueSet", "url": "http://example.org/v",
+               "compose": {"include": [{"system": "http://example.org/s"}]}}),
+    ]);
+    assert_eq!(
+        bare.expand("http://example.org/v", None).unwrap()["status"],
+        "active"
+    );
 }
 
 #[test]

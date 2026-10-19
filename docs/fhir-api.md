@@ -252,13 +252,15 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 
 ## Terminology
 
-`ValueSet/$expand` takes `url`, and optionally `filter`, `count` and `offset`, as a `POST` (a JSON body or a Parameters resource) or as a `GET` with the same names in the query string:
+`ValueSet/$expand` takes `url`, and optionally `filter`, `count`, `offset` and `activeOnly`, as a `POST` (a JSON body or a Parameters resource) or as a `GET` with the same names in the query string:
 
 ```bash
 curl 'http://localhost:8080/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/organization-type&filter=hospital&count=10'
 ```
 
-The other terminology operations (`$validate-code`, `$lookup`, `$subsumes`, `$translate`) take their parameters the same way: as a `POST`, or as a `GET` with plain names in the query string (`system`, `code`, `display`, `url`, `version`, `codeA`, `codeB`, `targetsystem`, `abstract`). A parameter that is not a plain value, a `coding` or a `codeableConcept`, is sent as a `POST`. These operations change nothing, so with SMART they need only the `read` permission, whichever way they are sent, and a client that may only create is refused.
+The other terminology operations (`$validate-code`, `$lookup`, `$subsumes`, `$translate`) take their parameters the same way: as a `POST`, or as a `GET` with plain names in the query string (`system`, `code`, `display`, `url`, `version`, `codeA`, `codeB`, `targetsystem`, `abstract`). A parameter that is not a plain value, a `coding` or a `codeableConcept`, is sent as a `POST`. R4 also defines `$expand` and `$validate-code` on a value set, `$validate-code` and `$subsumes` on a code system, and `$translate` on a concept map at the instance level: `POST` or `GET /ValueSet/[id]/$expand`, `/ValueSet/[id]/$validate-code`, `/CodeSystem/[id]/$validate-code`, `/CodeSystem/[id]/$subsumes`, `/ConceptMap/[id]/$translate`. The instance is a resource the server stores, one written through the API, and what is asked of it is asked of the value set, code system (at its `version`) or concept map its `url` names, so no `url` or `system` is given. The body may be empty. An id the server does not store is `404`; a value set that came from a package has no id to ask for, and is expanded by `url`. (`CodeSystem/$lookup` is defined on the type only.)
+
+These operations change nothing, so with SMART they need only the `read` permission, whichever way they are sent, and a client that may only create is refused.
 
 It returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned without saying so, because a client cannot tell it from a complete one.
 
@@ -276,7 +278,7 @@ One partial case is expanded, and says so. A code system whose `content` is `exa
 
 A client that needs a closed list checks for such a parameter. Only an include of the whole system is expanded this way: a filter on a sample, an exclusion of one, a sample that holds no concepts, and a `fragment` are still refused. `$validate-code` against such a value set answers from the same list, with `result` false and a `message` that says the list is only a sample for a code outside it. A resource whose binding is to one is not rejected for a code the sample lacks: the validator reports that the code cannot be checked.
 
-An expansion carries the `timestamp` R4 requires, the time the server produced it for the request. An entry says `"inactive": true` when its code system says the concept is inactive (no longer to be used, but kept to make sense of old data); it is still listed.
+The ValueSet an expansion comes in has the `status` of the value set it was expanded from (`active` when that says nothing), and the expansion carries the `timestamp` R4 requires, the time the server produced it for the request, and an `identifier` (a `urn:uuid`) that is another for each answer. What was asked that shaped it is listed in `expansion.parameter`: `filter`, `count`, `offset` and `activeOnly`. An entry says `"inactive": true` when its code system says the concept is inactive (no longer to be used, but kept to make sense of old data); it is still listed, unless the request said `activeOnly=true`, which leaves such codes out (and the `total` counts what is left).
 
 An expansion marks an entry `"abstract": true` when its code system says the concept is not to be selected as a value (the `notSelectable` property, which HL7's v3 code systems use for their grouping concepts: `_ActCoverageTypeCode`, `_ActInsuranceTypeCode` and so on in `coverage-type`). The entry is still listed, for navigation, so a picker leaves out the entries that carry the flag. `$validate-code` takes R4's `abstract` input: with `abstract=false` an abstract code is not valid (`result` false, and the `message` says why), with `abstract=true` it is valid, and without the input it is valid and the `message` says it is a grouping concept.
 

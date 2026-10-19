@@ -256,6 +256,22 @@ pub fn app_parts(
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id/$meta", get(meta_get).post(meta_post))
         .route("/:resource_type/:id/$validate", post(validate_instance))
+        .route(
+            "/:resource_type/:id/$expand",
+            post(expand_instance_post).get(expand_instance_get),
+        )
+        .route(
+            "/:resource_type/:id/$validate-code",
+            post(validate_code_instance_post).get(validate_code_instance_get),
+        )
+        .route(
+            "/:resource_type/:id/$subsumes",
+            post(subsumes_instance_post).get(subsumes_instance_get),
+        )
+        .route(
+            "/:resource_type/:id/$translate",
+            post(translate_instance_post).get(translate_instance_get),
+        )
         .route("/:resource_type/:id/$populate", post(populate_instance))
         .route("/:resource_type/:id/$assemble", post(assemble_instance))
         .route(
@@ -1147,6 +1163,113 @@ async fn terminology_op(app: AppState, resource_type: String, op: &str, body: By
         Err(response) => return response,
     };
     terminology_call(app, resource_type, op, args).await
+}
+
+/// A terminology operation sent to an instance, `ValueSet/[id]/$expand`. The body may be empty:
+/// what is asked of is the instance, and nothing else is needed.
+async fn terminology_instance(
+    app: AppState,
+    resource_type: String,
+    id: String,
+    op: &str,
+    body: Bytes,
+) -> Response {
+    let mut args = if body.is_empty() {
+        json!({})
+    } else {
+        match parse_body(&body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        }
+    };
+    let Some(object) = args.as_object_mut() else {
+        return outcome(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "the parameters of an operation are a JSON object",
+        );
+    };
+    object.insert(refhir_fhir::INSTANCE.into(), json!(id));
+    terminology_call(app, resource_type, op, args).await
+}
+
+async fn terminology_instance_get(
+    app: AppState,
+    resource_type: String,
+    id: String,
+    op: &str,
+    params: Vec<(String, String)>,
+) -> Response {
+    let mut args = serde_json::Map::new();
+    for (name, value) in params {
+        args.entry(name).or_insert(Value::String(value));
+    }
+    args.insert(refhir_fhir::INSTANCE.into(), json!(id));
+    terminology_call(app, resource_type, op, Value::Object(args)).await
+}
+
+async fn expand_instance_post(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    terminology_instance(app, resource_type, id, "$expand", body).await
+}
+
+async fn expand_instance_get(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    terminology_instance_get(app, resource_type, id, "$expand", params).await
+}
+
+async fn validate_code_instance_post(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    terminology_instance(app, resource_type, id, "$validate-code", body).await
+}
+
+async fn validate_code_instance_get(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    terminology_instance_get(app, resource_type, id, "$validate-code", params).await
+}
+
+async fn subsumes_instance_post(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    terminology_instance(app, resource_type, id, "$subsumes", body).await
+}
+
+async fn subsumes_instance_get(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    terminology_instance_get(app, resource_type, id, "$subsumes", params).await
+}
+
+async fn translate_instance_post(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    body: Bytes,
+) -> Response {
+    terminology_instance(app, resource_type, id, "$translate", body).await
+}
+
+async fn translate_instance_get(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    terminology_instance_get(app, resource_type, id, "$translate", params).await
 }
 
 async fn terminology_call(app: AppState, resource_type: String, op: &str, args: Value) -> Response {

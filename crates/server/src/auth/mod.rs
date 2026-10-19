@@ -1023,6 +1023,12 @@ mod tests {
             ("POST", "/CodeSystem/$subsumes"),
             ("GET", "/ConceptMap/$translate"),
             ("POST", "/ConceptMap/$translate"),
+            ("GET", "/ValueSet/vs1/$expand"),
+            ("POST", "/ValueSet/vs1/$expand"),
+            ("GET", "/ValueSet/vs1/$validate-code"),
+            ("POST", "/CodeSystem/cs1/$validate-code"),
+            ("GET", "/CodeSystem/cs1/$subsumes"),
+            ("POST", "/ConceptMap/cm1/$translate"),
         ] {
             assert_eq!(http_interaction(method, path), "read", "{method} {path}");
         }

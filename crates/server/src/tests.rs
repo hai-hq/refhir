@@ -1272,13 +1272,264 @@ fn expanded_codes(reply: &Reply) -> Vec<String> {
         .collect()
 }
 
-/// An expansion without its `timestamp`, which is when it was answered and so differs between
-/// two requests for the same thing.
+/// An expansion without its `timestamp` and `identifier`, which say when and which answer it was
+/// and so differ between two requests for the same thing.
 fn without_timestamp(mut body: Value) -> Value {
     if let Some(expansion) = body.get_mut("expansion").and_then(Value::as_object_mut) {
         expansion.remove("timestamp");
+        expansion.remove("identifier");
     }
     body
+}
+
+#[tokio::test]
+async fn terminology_operations_answer_at_the_instance_too() {
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, r4_dir()).unwrap();
+    let app = app(db, catalog, store);
+    let system = "http://example.org/pets";
+
+    // The server stores the terminology a client writes, and the instance is one of those.
+    let made = |path: &'static str, body: Value| {
+        let app = app.clone();
+        async move {
+            let created = send(&app, "POST", path, Some(body), None).await;
+            assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+            created.body["id"].as_str().unwrap().to_string()
+        }
+    };
+    let code_system = made(
+        "/CodeSystem",
+        json!({"resourceType": "CodeSystem", "url": system, "version": "2",
+        "status": "active", "content": "complete",
+        "concept": [{"code": "mammal", "display": "Mammal", "concept": [
+            {"code": "dog", "display": "Dog"},
+            {"code": "dodo", "display": "Dodo",
+             "property": [{"code": "inactive", "valueBoolean": true}]}
+        ]}]}),
+    )
+    .await;
+    let value_set = made(
+        "/ValueSet",
+        json!({"resourceType": "ValueSet", "url": "http://example.org/pet-values",
+               "status": "draft", "compose": {"include": [{"system": system}]}}),
+    )
+    .await;
+    let concept_map = made(
+        "/ConceptMap",
+        json!({"resourceType": "ConceptMap", "url": "http://example.org/pet-map",
+               "status": "active", "group": [{"source": system,
+                   "target": "http://example.org/words",
+                   "element": [{"code": "dog", "target": [
+                       {"code": "canine", "equivalence": "equivalent"}]}]}]}),
+    )
+    .await;
+    let instance = |kind: &str, id: &str, op: &str| format!("/{kind}/{id}/{op}");
+
+    // `ValueSet/[id]/$expand` is the expansion of that value set: the one `url` gives, and it
+    // says the status the value set has, and which expansion it is.
+    let at_type = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": "http://example.org/pet-values"})),
+        None,
+    )
+    .await;
+    assert_eq!(at_type.status, StatusCode::OK, "{}", at_type.body);
+    let got = send(
+        &app,
+        "GET",
+        &instance("ValueSet", &value_set, "$expand"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    assert_eq!(
+        without_timestamp(got.body.clone()),
+        without_timestamp(at_type.body.clone())
+    );
+    assert_eq!(got.body["status"], "draft");
+    assert!(got.body["expansion"]["identifier"]
+        .as_str()
+        .unwrap()
+        .starts_with("urn:uuid:"));
+    assert_ne!(
+        got.body["expansion"]["identifier"],
+        at_type.body["expansion"]["identifier"]
+    );
+    assert_eq!(expanded_codes(&got), ["dodo", "dog", "mammal"]);
+    // A POST with no body at all is the same request, and so is one with a body of parameters.
+    let posted = send(
+        &app,
+        "POST",
+        &instance("ValueSet", &value_set, "$expand"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        without_timestamp(posted.body.clone()),
+        without_timestamp(got.body.clone())
+    );
+    // `activeOnly` leaves out the inactive codes, and the expansion says it did.
+    let active = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?activeOnly=true&filter=o",
+            instance("ValueSet", &value_set, "$expand")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(active.status, StatusCode::OK, "{}", active.body);
+    assert_eq!(expanded_codes(&active), ["dog"]);
+    assert_eq!(active.body["expansion"]["total"], 1);
+    let parameters = active.body["expansion"]["parameter"].as_array().unwrap();
+    assert!(parameters.contains(&json!({"name": "activeOnly", "valueBoolean": true})));
+    assert!(parameters.contains(&json!({"name": "filter", "valueString": "o"})));
+    let everything = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?activeOnly=false",
+            instance("ValueSet", &value_set, "$expand")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(expanded_codes(&everything), ["dodo", "dog", "mammal"]);
+    // A Parameters resource has an id of its own, which is not an instance.
+    let with_id = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(
+            json!({"resourceType": "Parameters", "id": "nothing-to-do-with-it",
+                    "parameter": [
+                        {"name": "url", "valueUri": "http://example.org/pet-values"},
+                        {"name": "activeOnly", "valueBoolean": true}]}),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(with_id.status, StatusCode::OK, "{}", with_id.body);
+    assert_eq!(expanded_codes(&with_id), ["dog", "mammal"]);
+
+    // The others, as a GET and as a POST, with the instance as what they are asked of.
+    let checked = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?code=dog",
+            instance("ValueSet", &value_set, "$validate-code")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(checked.status, StatusCode::OK, "{}", checked.body);
+    assert_eq!(checked.body["parameter"][0]["valueBoolean"], true);
+    let unknown = send(
+        &app,
+        "POST",
+        &instance("ValueSet", &value_set, "$validate-code"),
+        Some(json!({"code": "unicorn"})),
+        None,
+    )
+    .await;
+    assert_eq!(unknown.body["parameter"][0]["valueBoolean"], false);
+    let in_system = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?code=dog",
+            instance("CodeSystem", &code_system, "$validate-code")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(in_system.status, StatusCode::OK, "{}", in_system.body);
+    assert_eq!(in_system.body["parameter"][0]["valueBoolean"], true);
+    // The system the instance is wins over one the caller names.
+    let named = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?code=dog&system=http://example.org/other",
+            instance("CodeSystem", &code_system, "$validate-code")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(named.body["parameter"][0]["valueBoolean"], true);
+    let subsumed = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?codeA=mammal&codeB=dog",
+            instance("CodeSystem", &code_system, "$subsumes")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(subsumed.status, StatusCode::OK, "{}", subsumed.body);
+    assert_eq!(subsumed.body["parameter"][0]["valueCode"], "subsumes");
+    let translated = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?system={system}&code=dog",
+            instance("ConceptMap", &concept_map, "$translate")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(translated.status, StatusCode::OK, "{}", translated.body);
+    assert_eq!(translated.body["parameter"][0]["valueBoolean"], true);
+
+    // An instance the server does not store is not found, and an id is of one type only.
+    for path in [
+        instance("ValueSet", "nothing-here", "$expand"),
+        instance("CodeSystem", &value_set, "$validate-code"),
+        instance("ValueSet", &code_system, "$expand"),
+        // HL7's own value sets are installed from a package, not stored, so they have no id to
+        // be asked for: they are expanded by `url`.
+        instance("ValueSet", "organization-type", "$expand"),
+    ] {
+        let missing = send(&app, "GET", &path, None, None).await;
+        assert_eq!(
+            missing.status,
+            StatusCode::NOT_FOUND,
+            "{path}: {}",
+            missing.body
+        );
+    }
+    // R4 defines `$lookup` on the type only, and these operations only on terminology.
+    let lookup = send(
+        &app,
+        "GET",
+        &format!(
+            "{}?code=dog",
+            instance("CodeSystem", &code_system, "$lookup")
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert!(lookup.status.is_client_error(), "{}", lookup.body);
+    let wrong = send(&app, "GET", "/Patient/p1/$expand", None, None).await;
+    assert!(wrong.status.is_client_error(), "{}", wrong.body);
 }
 
 #[tokio::test]

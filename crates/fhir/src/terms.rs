@@ -18,18 +18,52 @@ pub fn operation(
         ("ValueSet", "$expand") => {
             let url = required(args, &["url"])?;
             let filter = optional(args, &["filter"]);
-            let offset = optional_usize(args, &["offset"]).unwrap_or(0);
+            let offset = optional_usize(args, &["offset"]);
             let count = optional_usize(args, &["count"]);
+            let active_only = optional_bool(args, &["activeOnly"]);
             let mut expanded = terms
-                .expand_page(url, filter, offset, count)
+                .expand_page_with(
+                    url,
+                    filter,
+                    active_only.unwrap_or(false),
+                    offset.unwrap_or(0),
+                    count,
+                )
                 .ok_or_else(|| not_expandable(terms, url))?;
-            // R4 requires it: the time the expanding system produced the expansion, which is when
-            // this one was read out of what the server holds and filtered and paged for the caller.
             if let Some(expansion) = expanded
                 .get_mut("expansion")
                 .and_then(|value| value.as_object_mut())
             {
+                // R4 requires a timestamp: the time the expanding system produced the expansion,
+                // which is when this one was read out of what the server holds and filtered and
+                // paged for the caller. The identifier names this expansion, as R4 has it, and
+                // is another for each, as the timestamp is.
                 expansion.insert("timestamp".into(), json!(rfc3339_now()));
+                expansion.insert(
+                    "identifier".into(),
+                    json!(format!("urn:uuid:{}", uuid::Uuid::new_v4())),
+                );
+                // What the caller asked that shaped it, which R4 says an expansion should list
+                // (and must, for the offset and count of a page).
+                let mut parameters = Vec::new();
+                if let Some(filter) = filter {
+                    parameters.push(json!({"name": "filter", "valueString": filter}));
+                }
+                if let Some(active_only) = active_only {
+                    parameters.push(json!({"name": "activeOnly", "valueBoolean": active_only}));
+                }
+                if let Some(count) = count {
+                    parameters.push(json!({"name": "count", "valueInteger": count}));
+                }
+                if let Some(offset) = offset {
+                    parameters.push(json!({"name": "offset", "valueInteger": offset}));
+                }
+                if !parameters.is_empty() {
+                    if let Some(Value::Array(own)) = expansion.remove("parameter") {
+                        parameters.extend(own);
+                    }
+                    expansion.insert("parameter".into(), Value::Array(parameters));
+                }
             }
             Ok(expanded)
         }
@@ -117,6 +151,67 @@ pub fn operation(
             "unsupported operation {type_name}/{op}"
         ))),
     }
+}
+
+/// The key a terminology operation sent to an instance (`ValueSet/[id]/$expand`) carries the id
+/// under. It is not `id`, which a Parameters resource has of its own.
+pub const INSTANCE: &str = "_instance";
+
+/// Whether R4 defines `op` on `type_name` at the instance level: `CodeSystem/$lookup` is only
+/// defined on the type.
+fn at_instance(type_name: &str, op: &str) -> bool {
+    matches!(
+        (type_name, op),
+        ("ValueSet", "$expand" | "$validate-code")
+            | ("CodeSystem", "$validate-code" | "$subsumes")
+            | ("ConceptMap", "$translate")
+    )
+}
+
+/// The arguments of an operation sent to an instance, as the operation takes them at the type
+/// level: the instance is a resource the server stores, and what is asked of it is asked of the
+/// value set, code system or concept map that its `url` names (and, for a code system, its
+/// `version`). Arguments that are not for an instance are returned as they are.
+pub fn resolve_instance(
+    tx: &mut refhir_database::Transaction,
+    catalog: &Catalog,
+    type_name: &str,
+    op: &str,
+    args: &Value,
+) -> Result<Value, FhirError> {
+    let Some(id) = args.get(INSTANCE).and_then(|value| value.as_str()) else {
+        return Ok(args.clone());
+    };
+    if !at_instance(type_name, op) {
+        return Err(FhirError::Unsupported(format!(
+            "{op} is not an operation of {type_name}/[id]"
+        )));
+    }
+    catalog.deny_response_read(type_name)?;
+    let resource = crate::ops::read(tx, catalog.get(type_name)?, id)?;
+    let url = resource
+        .get("url")
+        .and_then(|value| value.as_str())
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| {
+            FhirError::Invalid(format!(
+                "{type_name}/{id} has no url, which is what its terminology is known by"
+            ))
+        })?;
+    let mut resolved = args.clone();
+    if let Some(object) = resolved.as_object_mut() {
+        object.remove(INSTANCE);
+        object.insert("url".into(), json!(url));
+        // A code system is kept in each of its versions, and this is the one asked of. Its
+        // operations name it as `system` before `url`, so a `system` the caller sent is replaced.
+        if type_name == "CodeSystem" {
+            object.insert("system".into(), json!(url));
+            if let Some(version) = resource.get("version").and_then(|value| value.as_str()) {
+                object.insert("version".into(), json!(version));
+            }
+        }
+    }
+    Ok(resolved)
 }
 
 /// The current time as an RFC 3339 UTC instant, to the millisecond.
