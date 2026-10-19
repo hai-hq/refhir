@@ -60,12 +60,32 @@ fn package() -> Result<NewPackage, FhirError> {
 /// them. It says whether it stored them.
 ///
 /// It is cheap to call on every start: the answer is one read of the list of packages. Publishing
-/// rebuilds the catalog, so a server calls it after the packages of its release are stored and
-/// not between them.
+/// rebuilds the catalog, which is the cost of it, so a database that is about to be given the
+/// packages of its release uses [`stage_builtin_terminology`] and lets their publish include
+/// these.
 pub fn install_builtin_terminology(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
+) -> Result<bool, FhirError> {
+    store_builtin(store, db, catalog, true)
+}
+
+/// [`install_builtin_terminology`] without the publish: stored, and in the catalog at the next
+/// publish, which is the one that ends installing the packages of the release.
+pub fn stage_builtin_terminology(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+) -> Result<bool, FhirError> {
+    store_builtin(store, db, catalog, false)
+}
+
+fn store_builtin(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    publish_now: bool,
 ) -> Result<bool, FhirError> {
     let installed = store.load_packages().map_err(FhirError::from)?;
     if installed
@@ -74,6 +94,7 @@ pub fn install_builtin_terminology(
     {
         return Ok(false);
     }
+    // The package has no search parameters, so there is no backfill to queue for it.
     stage_new_package(
         store,
         db,
@@ -81,7 +102,7 @@ pub fn install_builtin_terminology(
         package()?,
         Duration::ZERO,
         "built in",
-        true,
+        publish_now,
     )?;
     Ok(true)
 }

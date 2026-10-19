@@ -7749,11 +7749,15 @@ fn a_currency_is_one_of_the_codes_of_iso_4217() {
 
 #[test]
 fn the_currency_codes_do_not_depend_on_which_package_came_first() {
-    // What a server stores them after is no matter: the order the packages came in does not
-    // change what the value set expands to.
+    // The order the packages came in does not change what the value set expands to. A first start
+    // stores the code systems first, with no publish of their own, and the one that ends
+    // installing the release's packages includes them.
     let harness = empty();
     assert!(
-        crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
+        crate::stage_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
+    );
+    assert!(
+        !crate::stage_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
     );
     install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
     assert_eq!(

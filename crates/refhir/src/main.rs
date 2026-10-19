@@ -995,13 +995,18 @@ fn install_packages(
     plan: &PackagePlan,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PackagePlan::Bundled(release, extra) = plan;
-    install_release_defaults(store, db, catalog, *release)?;
     // The code systems FHIR binds to and its packages do not carry (ISO 4217, for currencies). A
-    // database that has the release's packages is given them once, at the first start that knows
-    // them, and every other start finds them stored and does nothing. They come after the
-    // release's packages so that a replica, which starts serving once any package is stored, is
-    // never left with only these.
-    if !skip_release_defaults() {
+    // database with no packages is given them first, without a publish of their own: the one that
+    // ends installing the release's packages includes them, so a first start rebuilds the catalog
+    // once, as it did. A database that has the release's packages is given them once, at the first
+    // start that knows them, and every other start finds them stored and does nothing.
+    let builtin = !skip_release_defaults();
+    let fresh = builtin && store.load_packages()?.is_empty();
+    if fresh {
+        refhir_fhir::stage_builtin_terminology(store, db, catalog)?;
+    }
+    install_release_defaults(store, db, catalog, *release)?;
+    if builtin && !fresh {
         refhir_fhir::install_builtin_terminology(store, db, catalog)?;
     }
     for spec in extra {
