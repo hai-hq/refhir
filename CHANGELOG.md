@@ -12,6 +12,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
+  to answer `405`. It now takes FHIR R4's `Parameters` (`resource`, `onlyCertainMatches`, `count`)
+  and answers a `searchset` Bundle, best first, with a `search.score` and the `match-grade`
+  extension on each entry: `certain` for an identifier with the same system and value, `probable`
+  for the same name, full birth date and a phone number or email address, `possible` for the same
+  name and full birth date. Names ignore case, accents and order (a family name written as a given
+  name matches), phone numbers ignore spacing and whether they have a country code (`+234`, or the
+  `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
+  is not active, or that another replaced (`link` type `replaced-by`), is never returned.
+  `onlyCertainMatches` returns nothing when more than one Patient is a potential match. The
+  CapabilityStatement lists the operation on `Patient`. A scope that may search Patients may use
+  it; a token limited to one patient may not. See
+  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
   in a file, `refhir-packages.bundle`, that is made when they are built: the packages are

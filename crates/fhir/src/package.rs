@@ -39,6 +39,17 @@ pub fn extra_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/extra"))
 }
 
+/// A small `Patient` for `$match`: the elements it compares (identifier, name, birth date, gender,
+/// telecom, contact, link) and the search parameters that find a candidate (`identifier`, `name`,
+/// `active`, `birthdate`). It stands alone, so it is not installed with `minir4_dir`, which has its
+/// own `Patient`. A test that does not need the whole release loads this instead.
+pub fn patient_match_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/patient-match"
+    ))
+}
+
 pub fn version_clash_dir() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),

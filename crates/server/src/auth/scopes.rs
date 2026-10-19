@@ -5,6 +5,10 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         if op == "$install" {
             return "install";
         }
+        // It looks for Patients, whatever it is sent with: a token that may search them may match.
+        if op == "$match" {
+            return "search";
+        }
         if matches!(
             op,
             "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"

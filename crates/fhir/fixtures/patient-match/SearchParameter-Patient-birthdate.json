@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/individual-birthdate",
+  "name": "birthdate",
+  "status": "active",
+  "code": "birthdate",
+  "base": ["Patient"],
+  "type": "date",
+  "expression": "Patient.birthDate"
+}
