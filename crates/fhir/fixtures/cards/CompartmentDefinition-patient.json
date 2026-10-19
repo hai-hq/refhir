@@ -1,0 +1,13 @@
+{
+  "resourceType": "CompartmentDefinition",
+  "url": "http://hl7.org/fhir/CompartmentDefinition/patient",
+  "name": "Base FHIR compartment definition for Patient",
+  "status": "draft",
+  "code": "Patient",
+  "search": true,
+  "resource": [
+    {"code": "Patient", "param": ["link"]},
+    {"code": "Immunization", "param": ["patient"]},
+    {"code": "Composition", "param": ["subject", "author"]}
+  ]
+}

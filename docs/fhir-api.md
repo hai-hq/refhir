@@ -21,12 +21,43 @@ Every resource type gets the same set:
 | System | `transaction` and `batch` (`POST /`), `history`, `search` |
 
 Every resource is versioned, and the server sets `meta.versionId` to the commit timestamp of the
-write. A version conflict (`If-Match`) is a `409`, after the server has retried optimistic
+write, and `meta.lastUpdated` to the time it received it (see [When a resource was
+written](#when-a-resource-was-written)). A version conflict (`If-Match`) is a `409`, after the server has retried optimistic
 concurrency conflicts. A `transaction` Bundle is one atomic commit, which is what lets
 [live queries](sync-protocol.md) move from one consistent snapshot to the next.
 
 `PUT` does not create a resource under an id the client chooses unless you opt in; see
 [Resource ids](#resource-ids).
+
+### When a resource was written
+
+The server sets `meta.lastUpdated` on every version it writes, to the time it received the write: a
+FHIR instant in UTC, to the millisecond (`2026-10-18T04:45:36.123Z`). A value in the body of a
+create or an update is replaced, never kept. A patch, a change of tags with `$meta-add`, and each
+entry of a transaction are writes like any other. Each version keeps its own time, so a `vread` or
+an entry of a history shows when that version was written.
+
+- **Search by it** with `_lastUpdated` and the usual prefixes:
+  `GET [type]?_lastUpdated=ge2026-10-18T04:45:36Z`. Give it twice for a window:
+  `_lastUpdated=ge2026-10-01&_lastUpdated=lt2026-11-01`.
+- **List by it** with `_since` on a history: `GET [type]/_history?_since=2026-10-18T04:45:36Z`, or
+  `GET /_history?_since=...` for the whole server, lists the versions written at or after that time.
+  A value that is all digits is read as it always was, as a version of the server's log, so write
+  a date with its month and day (`2026-01-01`), never as a year alone. A deletion
+  has no time of its own, so the list starts at the last change before the time and holds any
+  deletion since then: a deletion from just before the time may be listed, and one after it is never
+  missed.
+- **Cards** for what is new: `_since` on [`$health-cards-issue`](health-cards.md).
+
+A date, or a time that stops short, stands for the start of what it names, and a time with no zone
+is UTC. Dates and times are compared to the millisecond and in the zone they are written in, so
+`2026-10-18T06:00:00+01:00` and `2026-10-18T05:00:00Z` are the same moment. A value such as
+`2026-10-18T04:45:36.5` stands for a tenth of a second, and one with no fraction for the whole
+second.
+
+Versions written before the server kept times have none. A search by time does not find them, and a
+history by time lists them only when the time is earlier than the first version that has one. A
+resource gets its time the next time it is written.
 
 ## Search
 
@@ -127,16 +158,33 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 
 | Operation | Where | Notes |
 |-----------|-------|-------|
-| `$everything` | `Patient/[id]` | |
+| `$everything` | `Patient/[id]` | Holds only the kinds of resource the caller's scopes let them read |
 | `$export` | system, type, instance | Asynchronous (`202`, then `GET /export/{job}` and `GET /export/{job}/file`). Jobs are durable; see [Operations](operations.md#export-jobs) |
 | `$validate` | type, instance | Validates against the installed StructureDefinitions |
 | `$match` | `Patient` | Finds the Patients that may be the person a Patient resource describes. See [Finding a patient](#finding-a-patient-patientmatch) |
 | `$meta`, `$meta-add`, `$meta-delete` | instance | |
-| `$document` | `Composition/[id]` | |
+| `$document` | `Composition/[id]` | A document Bundle of the Composition and what it references; see [Documents](#documents) |
+| `$summary` | `Patient`, `Patient/[id]` | An International Patient Summary. See [Patient summary](patient-summary.md) |
+| `$health-cards-issue` | `Patient/[id]` | A SMART Health Card, where the server has a signing key. See [SMART Health Cards](health-cards.md) |
 | `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology) |
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
+
+### Documents
+
+`Composition/[id]/$document` returns a Bundle of type `document`. The Composition is its first entry,
+followed by every resource it references, and every resource those reference in turn, each once.
+The Bundle has an `identifier` and a `timestamp`, every entry has a `urn:uuid` `fullUrl`, and each
+reference to a resource in the document points at that `fullUrl`, so the document stands on its own.
+A resource the caller's scopes do not let them read is left out. A document of more than 1000
+resources is refused with a `422`.
+
+Resources are validated entry by entry. A Bundle's `entry.resource`, and any other element that
+holds a whole resource, is checked as the resource it holds, against the profiles the element
+names and the ones the resource states in `meta.profile`. A narrative (`text.div`) is checked for
+what FHIR allows in one: a single `div` in the XHTML namespace, only the basic formatting
+elements, no script, and some text.
 
 ### Finding a patient: `Patient/$match`
 

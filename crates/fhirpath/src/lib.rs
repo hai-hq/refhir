@@ -10,14 +10,16 @@ mod model;
 mod parse;
 mod ucum;
 mod value;
+mod xhtml;
 
 pub use ast::Expr;
 pub use error::{Error, ErrorKind};
 pub use eval::{days_in_month, member_values};
-pub use host::{days_from_civil, EmptyHost, Host};
+pub use host::{civil_from_days, days_from_civil, EmptyHost, Host};
 pub use model::{Model, ModelBuilder};
 pub use parse::parse;
 pub use value::{Temporal, Value};
+pub use xhtml::html_checks;
 
 use serde_json::Value as Json;
 

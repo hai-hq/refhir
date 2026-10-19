@@ -13,7 +13,13 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         }
         if matches!(
             op,
-            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
+            "$populate"
+                | "$assemble"
+                | "$extract"
+                | "$next-question"
+                | "$behavior"
+                | "$summary"
+                | "$health-cards-issue"
         ) {
             return "read";
         }

@@ -42,6 +42,8 @@ pub struct ServerConfig {
     pub oidc: Option<crate::auth::OidcConfig>,
     /// Accept any username with no credential check. For testing only; ignored when `oidc` is set.
     pub smart_demo_login: bool,
+    /// The key that signs SMART Health Cards. Without one the server issues none, and says so.
+    pub health_cards: Option<std::sync::Arc<crate::health_cards::IssuerKey>>,
     /// Injected SMART tables for tests. A fresh store is created when this is `None`.
     pub smart: Option<std::sync::Arc<crate::auth::SmartStore>>,
     /// Where a replica sends what it cannot do itself: writes, and reads that need a newer
@@ -107,6 +109,7 @@ impl Default for ServerConfig {
             export_dir: "export".into(),
             terminology_urls: Vec::new(),
             sdc_archiver: false,
+            health_cards: None,
             public_url: None,
             smart_patient: None,
             smart_encounter: None,
@@ -244,6 +247,10 @@ pub fn app_parts(
         .route("/:resource_type/$subsumes", post(subsumes_op))
         .route("/:resource_type/$match", post(match_op))
         .route("/:resource_type/$export", post(export_type))
+        .route(
+            "/:resource_type/$summary",
+            get(summary_type).post(summary_type),
+        )
         .route("/:resource_type/:id/_history/:vid", get(vread))
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id/$meta", get(meta_get).post(meta_post))
@@ -258,6 +265,18 @@ pub fn app_parts(
         .route("/:resource_type/:id/$extract", post(extract_instance))
         .route("/:resource_type/:id/$everything", get(everything))
         .route("/:resource_type/:id/$document", get(document_op))
+        .route(
+            "/:resource_type/:id/$summary",
+            get(summary_instance).post(summary_instance),
+        )
+        .route(
+            "/:resource_type/:id/$health-cards-issue",
+            post(health_cards_issue),
+        )
+        .route(
+            "/health-cards/.well-known/jwks.json",
+            get(health_cards_jwks),
+        )
         .route("/:resource_type/:id/$websocket", get(subscription_socket))
         .route("/:resource_type/:id/$export", post(export_instance))
         .route(
@@ -380,6 +399,28 @@ async fn metadata(State(app): State<AppState>, headers: HeaderMap) -> Response {
             );
         }
     }
+    if app.config.health_cards.is_some() {
+        // Health cards are issued only where a signing key is set, so only then is it named.
+        if let Some(patient) = statement
+            .pointer_mut("/rest/0/resource")
+            .and_then(|value| value.as_array_mut())
+            .and_then(|resources| {
+                resources.iter_mut().find(|resource| {
+                    resource.get("type").and_then(|kind| kind.as_str()) == Some("Patient")
+                })
+            })
+        {
+            if let Some(operations) = patient
+                .get_mut("operation")
+                .and_then(|operations| operations.as_array_mut())
+            {
+                operations.push(json!({
+                    "name": "health-cards-issue",
+                    "definition": "http://hl7.org/fhir/uv/smart-health-cards-and-links/OperationDefinition/patient-i-health-cards-issue"
+                }));
+            }
+        }
+    }
     fhir_json(StatusCode::OK, statement)
 }
 
@@ -405,7 +446,10 @@ async fn cors(State(app): State<AppState>, request: Request<Body>, next: Next) -
 }
 
 fn is_discovery(path: &str) -> bool {
-    path == "/metadata" || path.starts_with("/.well-known")
+    path == "/metadata"
+        || path.starts_with("/.well-known")
+        // A health card is checked by an app in a browser, which reads the key set from here.
+        || path == "/health-cards/.well-known/jwks.json"
 }
 
 /// Whether `origin` belongs to a registered SMART client. The list is cached in memory; when
@@ -567,6 +611,7 @@ async fn smart_guard(
         let open = (path == "/healthz" && !verbose_health)
             || path == "/metadata"
             || path.starts_with("/.well-known")
+            || path == "/health-cards/.well-known/jwks.json"
             || path.starts_with("/oauth/");
         if !open {
             let method = request.method().as_str().to_string();
@@ -1549,25 +1594,201 @@ async fn validate_instance(
 async fn everything(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    run_read(
-        &app,
-        &format!("{resource_type}/$everything"),
-        json!({"id": id}),
-    )
-    .await
+    // The caller's scopes ride with the request, so the answer holds only what they may read.
+    let mut args = json!({"id": id});
+    stamp_sdc(&app, &headers, &mut args);
+    run_read(&app, &format!("{resource_type}/$everything"), args).await
 }
 
 async fn document_op(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> Response {
-    run_read(
-        &app,
-        &format!("{resource_type}/$document"),
-        json!({"id": id}),
+    let mut args = json!({"id": id});
+    stamp_sdc(&app, &headers, &mut args);
+    // A token that belongs to one patient is held to that patient's record by what the engine
+    // follows from the Composition, as it is by what a search finds.
+    if let Some(map) = args.as_object_mut() {
+        limit_to_patient(&app, &headers, None, map);
+    }
+    run_read(&app, &format!("{resource_type}/$document"), args).await
+}
+
+async fn summary_instance(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    summary_call(app, resource_type, Some(id), headers, params, body).await
+}
+
+async fn summary_type(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    summary_call(app, resource_type, None, headers, params, body).await
+}
+
+/// `$health-cards-issue`: the engine picks and shrinks what a card holds, and this signs it.
+async fn health_cards_issue(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(key) = app.config.health_cards.clone() else {
+        return outcome(
+            StatusCode::NOT_IMPLEMENTED,
+            "not-supported",
+            "this server issues no health cards: no signing key is set",
+        );
+    };
+    if resource_type != "Patient" {
+        return outcome(
+            StatusCode::BAD_REQUEST,
+            "not-supported",
+            "$health-cards-issue is a Patient operation",
+        );
+    }
+    let parameters = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let mut args = json!({"id": id, "resource": parameters});
+    stamp_sdc(&app, &headers, &mut args);
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        "Patient/$health-cards-issue",
+        args,
     )
     .await
+    {
+        Ok(result) => {
+            let base = crate::auth::issuer(&app, &headers);
+            match issued_cards(&key, &base, &result.value) {
+                Ok(parameters) => fhir_json(StatusCode::OK, parameters),
+                Err(message) => outcome(StatusCode::INTERNAL_SERVER_ERROR, "exception", &message),
+            }
+        }
+        Err(err) => error_response(err),
+    }
+}
+
+/// The response of `$health-cards-issue`: each credential signed, and a `resourceLink` for each
+/// resource in it that says where on this server it is. No credential is an empty Parameters.
+fn issued_cards(
+    key: &crate::health_cards::IssuerKey,
+    base: &str,
+    material: &Value,
+) -> Result<Value, String> {
+    let iss = format!("{base}/health-cards");
+    let nbf = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let fhir_version = material
+        .get("fhirVersion")
+        .and_then(|version| version.as_str())
+        .unwrap_or("4.0.1");
+    let credentials = material
+        .get("credentials")
+        .and_then(|credentials| credentials.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut cards = Vec::new();
+    let mut links = Vec::new();
+    for (index, credential) in credentials.iter().enumerate() {
+        let types: Vec<String> = credential
+            .get("types")
+            .and_then(|types| types.as_array())
+            .map(|types| {
+                types
+                    .iter()
+                    .filter_map(|kind| kind.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let bundle = credential.get("bundle").cloned().unwrap_or(Value::Null);
+        cards.push(json!({
+            "name": "verifiableCredential",
+            "valueString": key.sign(&iss, nbf, &types, fhir_version, &bundle)?
+        }));
+        for link in credential
+            .get("links")
+            .and_then(|links| links.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let bundled = link.get("bundledResource").and_then(|value| value.as_str());
+            let hosted = link.get("hostedResource").and_then(|value| value.as_str());
+            if let (Some(bundled), Some(hosted)) = (bundled, hosted) {
+                links.push(json!({"name": "resourceLink", "part": [
+                    {"name": "vcIndex", "valueInteger": index},
+                    {"name": "bundledResource", "valueUri": bundled},
+                    {"name": "hostedResource", "valueUri": format!("{base}/{hosted}")}
+                ]}));
+            }
+        }
+    }
+    let mut parameter = cards;
+    parameter.extend(links);
+    if parameter.is_empty() {
+        return Ok(json!({"resourceType": "Parameters"}));
+    }
+    Ok(json!({"resourceType": "Parameters", "parameter": parameter}))
+}
+
+/// The public key that checks the cards, where a card's `iss` says to look for it.
+async fn health_cards_jwks(State(app): State<AppState>) -> Response {
+    match &app.config.health_cards {
+        Some(key) => axum::Json(key.jwks()).into_response(),
+        None => outcome(
+            StatusCode::NOT_FOUND,
+            "not-found",
+            "this server issues no health cards",
+        ),
+    }
+}
+
+/// `$summary`, by `GET` (the patient is the id in the path, or the `identifier` of the query) or
+/// by `POST` (the same, or a Parameters body).
+async fn summary_call(
+    app: AppState,
+    resource_type: String,
+    id: Option<String>,
+    headers: HeaderMap,
+    params: Vec<(String, String)>,
+    body: Bytes,
+) -> Response {
+    let mut args = json!({});
+    // Only what the operation defines is taken from the query. The server's own controls ride
+    // beside the caller's arguments, so a client does not get to name them.
+    for (key, value) in params {
+        if matches!(key.as_str(), "identifier" | "profile") {
+            args[key] = json!(value);
+        }
+    }
+    if !body.is_empty() {
+        match parse_body(&body) {
+            Ok(value) => args["resource"] = value,
+            Err(response) => return response,
+        }
+    }
+    if let Some(id) = id {
+        args["id"] = json!(id);
+    }
+    stamp_sdc(&app, &headers, &mut args);
+    run_read(&app, &format!("{resource_type}/$summary"), args).await
 }
 
 async fn subsumes_op(

@@ -3,12 +3,15 @@
 //! Handlers are Rust functions on `Transaction`. Operation names look like `Patient/read`.
 
 mod bundle;
+mod cards;
 mod catalog;
 mod compartment;
 mod conform;
+mod document;
 mod error;
 mod extract;
 mod history;
+mod instant;
 mod lazy;
 mod memory;
 mod meta;
@@ -23,6 +26,7 @@ mod run;
 mod s3;
 mod sdc;
 mod search;
+mod summary;
 mod terms;
 
 #[cfg(test)]
@@ -39,10 +43,11 @@ pub use npm::{
     DOWNLOAD_VARIABLE,
 };
 pub use package::{
-    cross_version_dir, default_r4_registry_specs, expression_clash_dir, extension_copies_dir,
-    extra_dir, install_package_dir, minir4_dir, newer_terminology_dir, patient_match_dir, r4_dir,
-    r4_examples_dir, reload_catalog, run_backfills, sdc_dir, stage_package_dir, version_clash_dir,
-    watch_catalog, CatalogWatcher, R4_CORE_PACKAGE, SDC_PACKAGE,
+    cards_dir, cross_version_dir, default_r4_registry_specs, expression_clash_dir,
+    extension_copies_dir, extra_dir, install_package_dir, ips_package, minir4_dir,
+    newer_terminology_dir, patient_match_dir, r4_dir, r4_examples_dir, reload_catalog,
+    run_backfills, sdc_dir, stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher,
+    R4_CORE_PACKAGE, SDC_PACKAGE,
 };
 pub use prepared::{install_prepared, write_prepared, PreparedBundle, BUNDLE_FILE};
 pub use refhir_persistence::ConformanceStore;

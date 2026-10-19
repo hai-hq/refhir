@@ -597,8 +597,28 @@ impl Catalog {
         });
         refhir_sdc::annotate_capability(&mut statement);
         annotate_install(&mut statement);
+        annotate_patient_operations(&mut statement);
         crate::patient_match::annotate_capability(&mut statement);
         statement
+    }
+}
+
+/// The operations of a Patient this server runs besides the interactions: its International
+/// Patient Summary.
+fn annotate_patient_operations(statement: &mut Value) {
+    let Some(resources) = statement
+        .pointer_mut("/rest/0/resource")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    for resource in resources {
+        if resource.get("type").and_then(|value| value.as_str()) == Some("Patient") {
+            resource["operation"] = json!([{
+                "name": "summary",
+                "definition": "http://hl7.org/fhir/uv/ips/OperationDefinition/summary"
+            }]);
+        }
     }
 }
 

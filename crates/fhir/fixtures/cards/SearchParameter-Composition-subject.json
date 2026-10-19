@@ -1,0 +1,11 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/Composition-subject",
+  "name": "subject",
+  "status": "active",
+  "code": "subject",
+  "base": ["Composition"],
+  "type": "reference",
+  "target": ["Patient"],
+  "expression": "Composition.subject"
+}

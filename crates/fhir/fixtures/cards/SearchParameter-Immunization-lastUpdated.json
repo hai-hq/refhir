@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/Immunization-lastUpdated",
+  "name": "_lastUpdated",
+  "status": "active",
+  "code": "_lastUpdated",
+  "base": ["Immunization"],
+  "type": "date",
+  "expression": "Immunization.meta.lastUpdated"
+}

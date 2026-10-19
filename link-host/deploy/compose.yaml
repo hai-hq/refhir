@@ -1,0 +1,69 @@
+# A link host with HTTPS that looks after itself: Caddy gets and renews the certificate, and passes
+# requests on to the host, which keeps its links in Postgres.
+#
+#   1. Point a DNS name at this machine and open ports 80 and 443.
+#   2. Make a .env file beside this one:  DOMAIN=links.example.org
+#                                         ADMIN_TOKEN=<a secret: openssl rand -base64 32>
+#                                         POSTGRES_PASSWORD=<another: openssl rand -hex 32>
+#   3. docker compose up -d
+#
+# Links and their files are in the `pg-data` volume: back up the database.
+services:
+  link-host:
+    build: ..
+    restart: unless-stopped
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in the .env file}
+      PUBLIC_URL: https://${DOMAIN:?set DOMAIN in the .env file}
+      DATABASE_URL: postgres://links:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the .env file}@postgres:5432/links
+      # Caddy is the one proxy, so the caller is the address it saw.
+      TRUST_PROXY: "1"
+      # Time for Caddy to see that it is going before it stops listening.
+      SHUTDOWN_DELAY_SECONDS: "3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: links
+      POSTGRES_DB: links
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in the .env file}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U links -d links"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - link-host
+
+volumes:
+  pg-data:
+  caddy-data:
+  caddy-config:
