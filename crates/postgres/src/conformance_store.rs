@@ -441,7 +441,7 @@ impl PostgresPersistence {
         }
         let newly_pending =
             insert_search_parameters(&mut tx, scope, package_id, &parameters, &superseded)?;
-        let retired = retire_superseded(&mut tx, scope, &superseded)?;
+        let retired = remove_superseded(&mut tx, scope, &superseded)?;
         tx.execute(
             &format!(
                 "INSERT INTO value_set_expansion ({}package_id, url, json) \
@@ -1687,8 +1687,8 @@ struct Installer<'a, 'c> {
     expansions_cleared: bool,
     /// The most JSON text any one call was given.
     heaviest: usize,
-    /// The older versions of this package that the tenant has, whose search parameters this
-    /// install replaces. Empty for a package that was there before.
+    /// The older versions of this package that the tenant has, which this install replaces. Empty
+    /// for a package that was there before.
     superseded: Vec<i64>,
 }
 
@@ -1787,7 +1787,7 @@ impl<'a, 'c> Installer<'a, 'c> {
     fn finish(mut self) -> Result<(InstallOutcome, usize), InstallError> {
         // A package that is installed again and brings no expansions has none afterwards.
         self.clear_expansions()?;
-        let retired = retire_superseded(self.tx, self.scope, &self.superseded)?;
+        let retired = remove_superseded(self.tx, self.scope, &self.superseded)?;
         Ok((
             InstallOutcome {
                 package_id: self.package_id,
@@ -2014,10 +2014,16 @@ fn older_versions(
         .collect())
 }
 
-/// Remove the search parameters of the older versions of a package from the tenant, whichever the
-/// new version has carried over: the ones it defines again are stored under it. Says which of
-/// them nothing defines now.
-fn retire_superseded(
+/// Remove the older versions of a package from the tenant, with everything they hold: definitions,
+/// search parameters, terminology, expansions, and the backfills that were queued for them.
+/// Whatever the new version has carried over is stored under it. Says which search parameters
+/// nothing defines now.
+///
+/// Every statement is limited to the tenant's own rows. A package that every tenant shares keeps
+/// its definitions and terminology under the shared catalog (instance 0), which no tenant's
+/// statement reaches, so the tenant gives up its link to it and its own copies of what changes per
+/// tenant, and the shared copy stays for the tenants that still have it.
+fn remove_superseded(
     tx: &mut Transaction<'_>,
     scope: Scope,
     superseded: &[i64],
@@ -2025,25 +2031,64 @@ fn retire_superseded(
     if superseded.is_empty() {
         return Ok(Vec::new());
     }
+    let and = scope.and();
     let removed = tx
         .query(
             &format!(
-                "DELETE FROM search_parameters WHERE {}package_id = ANY($1) RETURNING base, code",
-                scope.and()
+                "DELETE FROM search_parameters WHERE {and}package_id = ANY($1) RETURNING base, code"
             ),
             &[&superseded],
         )
         .map_err(definite)?;
     let gone: std::collections::BTreeSet<(String, String)> =
         removed.iter().map(|row| (row.get(0), row.get(1))).collect();
+    for statement in [
+        format!(
+            "DELETE FROM backfill_parameter WHERE {and}backfill_id IN \
+             (SELECT id FROM index_backfills WHERE {and}package_id = ANY($1))"
+        ),
+        format!("DELETE FROM index_backfills WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM value_set_expansion WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM structure_definitions WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM terminology WHERE {and}package_id = ANY($1)"),
+    ] {
+        tx.execute(&statement, &[&superseded]).map_err(definite)?;
+    }
+    if let Scope::Tenant(tenant) = scope {
+        tx.execute(
+            &format!(
+                "DELETE FROM tenant_packages WHERE instance_id = {tenant} AND package_id = ANY($1)"
+            ),
+            &[&superseded],
+        )
+        .map_err(definite)?;
+    }
+    let delete_rows = format!("DELETE FROM packages WHERE {and}id = ANY($1)");
+    match scope {
+        Scope::Classic => {
+            tx.execute(&delete_rows, &[&superseded]).map_err(definite)?;
+        }
+        Scope::Tenant(_) => {
+            // The row goes unless a link of another tenant still names it, which this crate never
+            // makes but the database permits and a tenant cannot see through its row policy: that
+            // tenant keeps its package, and the statement is undone alone. (A shared package's row
+            // is instance 0's, which the filter leaves alone.)
+            let mut attempt = tx.savepoint("drop_superseded").map_err(definite)?;
+            match attempt.execute(&delete_rows, &[&superseded]) {
+                Ok(_) => attempt.commit().map_err(definite)?,
+                Err(err)
+                    if err.code() == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {}
+                Err(err) => return Err(InstallError::Persist(definite(err))),
+            }
+        }
+    }
     let mut retired = Vec::new();
     for (base, code) in gone {
         let defined: bool = tx
             .query_one(
                 &format!(
                     "SELECT EXISTS (SELECT 1 FROM search_parameters \
-                     WHERE {}base = $1 AND code = $2)",
-                    scope.and()
+                     WHERE {and}base = $1 AND code = $2)"
                 ),
                 &[&base, &code],
             )

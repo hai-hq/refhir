@@ -1093,14 +1093,15 @@ pub trait ConformanceStore: Send + Sync {
     /// transaction, so it is there whole or not at all.
     ///
     /// The newest version of a package is the one in force. A package that is stored replaces the
-    /// search parameters of the older versions of the same name (ordered by [`compare_versions`])
-    /// in that transaction: the parameters it defines again take their place, the others go, and the
-    /// older versions stay stored as packages, so installing one of them again finds it there. The
-    /// older versions' parameters take no part in a clash with the new ones. A parameter keeps the
-    /// status of the one it replaces (`Ready`: what was indexed holds) when its type, expression,
-    /// `target` and `component` are the same, and is otherwise stored as the package gives it, to
-    /// be backfilled. `InstallOutcome::retired` says which parameters nothing defines afterwards.
-    /// Parameters of packages with other names are never replaced.
+    /// older versions of the same name (ordered by [`compare_versions`]) in that transaction: each
+    /// is removed with everything it holds, its definitions, search parameters, terminology and
+    /// expansions, and so is its row in the list of packages, so what the store holds is one version
+    /// of each package. What the new version defines again takes the place of what it defined
+    /// before. The older versions' search parameters take no part in a clash with the new ones. A
+    /// search parameter keeps the status of the one it replaces (`Ready`: what was indexed holds)
+    /// when its type, expression, `target` and `component` are the same, and is otherwise stored as
+    /// the package gives it, to be backfilled. `InstallOutcome::retired` says which search
+    /// parameters nothing defines afterwards. Packages with other names are never replaced.
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
 
     /// [`ConformanceStore::install_package`] for a package that is not held whole: `feed` is
@@ -3312,14 +3313,73 @@ pub mod conformance {
             status: ParamStatus::Pending,
             json: r#"{"type":"string"}"#.into(),
         };
+        // What a package holds besides its search parameters: a definition every version has, one
+        // only its own version has, a code system and a value set expansion.
         let package = |name: &str, version: &str, parameters: Vec<NewSearchParameter>| NewPackage {
             name: name.into(),
             version: version.into(),
             fhir_version: "4.0.1".into(),
-            structure_definitions: Vec::new(),
+            structure_definitions: ["kept".to_string(), format!("only-{version}")]
+                .iter()
+                .map(|what| NewStructureDefinition {
+                    url: format!("http://example.org/sd/{name}/{what}"),
+                    type_name: "Patient".into(),
+                    kind: "resource".into(),
+                    is_abstract: false,
+                    json: "{}".into(),
+                })
+                .collect(),
             search_parameters: parameters,
-            terminology: Vec::new(),
-            expansions: Vec::new(),
+            terminology: vec![NewTerminology {
+                resource_type: "CodeSystem".into(),
+                url: format!("http://example.org/cs/{name}/{version}"),
+                json: "{}".into(),
+            }],
+            expansions: vec![NewExpansion {
+                url: format!("http://example.org/vs/{name}/{version}"),
+                json: "{}".into(),
+            }],
+        };
+        // The definitions, terminology and expansions of the package `owner`, as the parts of their
+        // URLs after its name, and the id of the package they are stored under.
+        let content = |owner: &str| -> (Vec<String>, Vec<String>, Vec<String>, Vec<i64>) {
+            let part = |url: &str| {
+                url.rsplit(&format!("/{owner}/"))
+                    .next()
+                    .unwrap()
+                    .to_string()
+            };
+            let mut ids = Vec::new();
+            let mut definitions: Vec<String> = store
+                .load_structure_definitions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{owner}/")))
+                .map(|row| {
+                    ids.push(row.package_id);
+                    part(&row.url)
+                })
+                .collect();
+            let mut terminology: Vec<String> = store
+                .load_terminology()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{owner}/")))
+                .map(|row| part(&row.url))
+                .collect();
+            let mut expansions: Vec<String> = store
+                .load_expansions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{owner}/")))
+                .map(|row| part(&row.url))
+                .collect();
+            definitions.sort();
+            terminology.sort();
+            expansions.sort();
+            ids.sort();
+            ids.dedup();
+            (definitions, terminology, expansions, ids)
         };
         // This test's rows, as (code, expression, status, package id), by code.
         let rows = || -> Vec<(String, String, ParamStatus, i64)> {
@@ -3381,14 +3441,33 @@ pub mod conformance {
             .unwrap();
         assert!(first.retired.is_empty());
         store.mark_base_ready(first.package_id, "Patient").unwrap();
+        let bystander = format!("bystander.{tag}");
         let other = store
             .install_package(&package(
-                &format!("bystander.{tag}"),
+                &bystander,
                 "1.0.0",
                 vec![param("bystander", "Patient.bystander")],
             ))
             .unwrap();
         store.mark_base_ready(other.package_id, "Patient").unwrap();
+        assert_eq!(content(&name).0, ["kept", "only-0.1.0"]);
+        // Each package has a backfill queued, as an install that had stored parameters waiting for
+        // their index would have left.
+        let queued = |package_id: i64| {
+            store
+                .load_backfills()
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.package_id == package_id)
+                .count()
+        };
+        store
+            .insert_backfill(first.package_id, 1, "Patient", &[])
+            .unwrap();
+        store
+            .insert_backfill(other.package_id, 1, "Patient", &[])
+            .unwrap();
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (1, 1));
 
         // 0.2.0 keeps one as it was, gives one another expression, leaves one out, moves one to
         // another code under the same URL, and adds one.
@@ -3451,9 +3530,29 @@ pub mod conformance {
             (short.to_string(), expression.to_string(), status, id)
         });
         assert_eq!(now, held);
-        // The older version is still a package that is installed, which is what installing it
-        // again finds.
-        assert_eq!(package_id("0.1.0"), Some(first.package_id));
+        // The older version is gone with everything it held: its definitions, its terminology,
+        // its expansions and its place among the packages. What the new version holds, and what
+        // another package holds, is there.
+        assert_eq!(package_id("0.1.0"), None);
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (0, 1));
+        assert_eq!(
+            content(&name),
+            (
+                vec!["kept".to_string(), "only-0.2.0".to_string()],
+                vec!["0.2.0".to_string()],
+                vec!["0.2.0".to_string()],
+                vec![second.package_id]
+            )
+        );
+        assert_eq!(
+            content(&bystander),
+            (
+                vec!["kept".to_string(), "only-1.0.0".to_string()],
+                vec!["1.0.0".to_string()],
+                vec!["1.0.0".to_string()],
+                vec![other.package_id]
+            )
+        );
 
         // An install that fails changes nothing: the version that was in force still is, whether
         // the package was handed over whole or in pieces.
@@ -3461,6 +3560,7 @@ pub mod conformance {
             url: url.into(),
             ..param("added", expression)
         };
+        let content_before = content(&name);
         let twice = package(
             &name,
             "0.3.0",
@@ -3496,7 +3596,9 @@ pub mod conformance {
             .unwrap_err();
         assert!(matches!(err, InstallError::Persist(_)), "{err}");
         assert_eq!(rows(), now);
+        assert_eq!(content(&name), content_before);
         assert_eq!(package_id("0.3.0"), None);
+        assert!(package_id("0.2.0").is_some());
 
         // In pieces, a newer version replaces them as well. `added` is still waiting for its
         // index, so its definition is new again; a `keep` of another type, or that points at other

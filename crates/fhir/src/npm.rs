@@ -161,12 +161,15 @@ pub fn install_with(
     Ok(())
 }
 
-/// Whether every `name@version` spec is already in the database.
+/// Whether every `name@version` spec is in the database, or has been replaced there by a newer
+/// version of the package, which is what installing it would leave.
 pub fn packages_installed(store: &dyn ConformanceStore, specs: &[&str]) -> Result<bool, FhirError> {
     for spec in specs {
         match parse_package_spec(spec)? {
             PackageSpec::Npm { name, version } => {
-                if !already_installed(store, &name, &version)? {
+                if !already_installed(store, &name, &version)?
+                    && newer_installed(store, &name, &version)?.is_none()
+                {
                     return Ok(false);
                 }
             }
@@ -309,8 +312,8 @@ fn npm_spec_from_args(args: &Value) -> Result<(String, String), FhirError> {
 ///
 /// A package that is installed already, or of which a newer version is, has nothing to install:
 /// the newest version of a package is the one in force, and a server started again on an older
-/// release of its package stays on what it has. Installing a newer version replaces the search
-/// parameters of the older ones (see `ConformanceStore::install_package`).
+/// release of its package stays on what it has. Installing a newer version replaces the older ones
+/// (see `ConformanceStore::install_package`).
 fn install_tree(
     store: &dyn ConformanceStore,
     db: &Database,
@@ -390,8 +393,8 @@ const PREFETCH_THREADS: usize = 4;
 ///   made by a version that was later replaced do not count.
 /// - A version named by the caller is fixed: a dependency that needs something newer is an
 ///   error.
-/// - An installed version at least as new as the request is used as is. A newer request is
-///   installed next to it, since there is no way to remove the old one.
+/// - An installed version at least as new as the request is used as is. A newer request replaces
+///   the installed one (see `ConformanceStore::install_package`).
 /// - Versions that are not `major.minor.patch` still order (see [`compare_versions`]).
 pub(crate) struct Resolver<'a> {
     fetcher: &'a dyn PackageFetcher,

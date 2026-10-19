@@ -889,8 +889,8 @@ fn install_in_tx(
 /// A package the store already has (same name and version) takes only terminology, which is
 /// added to what it has, and expansions, which replace what it has. A package it does not have
 /// gets its definitions and search parameters too, and the search parameters are checked against
-/// the ones installed, except those of older versions of the same package: it replaces them, and
-/// they are removed when it is stored whole.
+/// the ones installed, except those of older versions of the same package: it replaces those
+/// versions, which are removed when it is stored whole.
 struct Installer<'a, 'c> {
     tx: &'a Transaction<'c>,
     package_id: i64,
@@ -959,10 +959,11 @@ impl<'a, 'c> Installer<'a, 'c> {
         })
     }
 
-    /// Remove the search parameters of the older versions of the package, whichever the new
-    /// version has carried over: the ones it defines again are stored under it. Says which of
-    /// them nothing defines now.
-    fn retire_superseded(&self) -> Result<Vec<RetiredParam>, InstallError> {
+    /// Remove the older versions of the package, with everything they hold: definitions, search
+    /// parameters, terminology, expansions and the backfills that were queued for them. Whatever
+    /// the new version has carried over is stored under it. Says which search parameters nothing
+    /// defines now.
+    fn remove_superseded(&self) -> Result<Vec<RetiredParam>, InstallError> {
         let mut gone = std::collections::BTreeSet::new();
         for package_id in &self.superseded {
             let mut stmt = self
@@ -977,12 +978,20 @@ impl<'a, 'c> Installer<'a, 'c> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(definite)?;
             gone.extend(rows);
-            self.tx
-                .execute(
-                    "DELETE FROM search_parameters WHERE package_id = ?1",
-                    params![package_id],
-                )
-                .map_err(definite)?;
+            for statement in [
+                "DELETE FROM backfill_parameter WHERE backfill_id IN \
+                 (SELECT id FROM index_backfills WHERE package_id = ?1)",
+                "DELETE FROM index_backfills WHERE package_id = ?1",
+                "DELETE FROM search_parameters WHERE package_id = ?1",
+                "DELETE FROM structure_definitions WHERE package_id = ?1",
+                "DELETE FROM terminology WHERE package_id = ?1",
+                "DELETE FROM value_set_expansion WHERE package_id = ?1",
+                "DELETE FROM packages WHERE id = ?1",
+            ] {
+                self.tx
+                    .execute(statement, params![package_id])
+                    .map_err(definite)?;
+            }
         }
         let mut retired = Vec::new();
         for (base, code) in gone {
@@ -1017,7 +1026,7 @@ impl<'a, 'c> Installer<'a, 'c> {
     fn finish(mut self) -> Result<InstallOutcome, InstallError> {
         // A package that is installed again and brings no expansions has none afterwards.
         self.clear_expansions()?;
-        let retired = self.retire_superseded()?;
+        let retired = self.remove_superseded()?;
         Ok(InstallOutcome {
             package_id: self.package_id,
             inserted: !self.existing,
@@ -1227,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn a_newer_version_of_a_package_replaces_the_search_parameters_of_the_older_ones() {
+    fn a_newer_version_of_a_package_replaces_the_older_ones() {
         let store = SqlitePersistence::open_in_memory().unwrap();
         refhir_persistence::conformance::exercise_package_versions(&store, "sqlite");
     }

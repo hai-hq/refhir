@@ -33,24 +33,26 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
-- **A newer version of a package takes the place of the older version's search parameters.** A
-  package at a higher version used to be stored next to the one the database held, and the
-  parameters of both stayed in force: a version that changed a parameter's expression stopped the
-  server from starting (`search parameter ChargeItem.status expression conflicts with an installed
-  package`), one that gave a parameter another code left the old code answering beside the new,
-  and one that left a parameter out kept it. The newest version of a package is now the one in
-  force. A parameter the new version defines again takes its definition, and the resources already
-  stored are indexed again for it when its expression, type or targets changed (before the server
-  answers requests, or before `$install` returns); one that did not change is left as it was. A
-  parameter whose code changed is searched by the new code only, a parameter the version leaves
-  out is no longer accepted or listed in the CapabilityStatement, and what was indexed under a
-  code that is gone is cleared. The same holds for a package that another package depends on.
-  Parameters of other packages are never replaced, and a clash with one of them still refuses the
-  install. Installing the same version again, or a version older than the one the database holds,
-  changes nothing, so a server can be started again on an earlier release of its package. An
-  install that fails leaves the database on the version it had. Only search parameters are
-  replaced: the profiles, value sets and code systems of an older version stay beside the newer
-  ones. See [Upgrading a package](docs/configuration.md#upgrading-a-package).
+- **A newer version of a package takes the place of the older version.** A package at a higher
+  version used to be stored next to the one the database held, and what both defined stayed in
+  force: a version that changed a search parameter's expression stopped the server from starting
+  (`search parameter ChargeItem.status expression conflicts with an installed package`), one that
+  gave a parameter another code left the old code answering beside the new, one that left a
+  parameter out kept it, and a profile that a new version changed could lose to the older one's.
+  The newest version of a package is now the one in force, and the database holds one version of
+  each package: installing a newer one removes the older one with its profiles, value sets, code
+  systems and search parameters. A search parameter the new version defines again takes its
+  definition, and the resources already stored are indexed again for it when its expression, type
+  or targets changed (before the server answers requests, or before `$install` returns); one that
+  did not change is left as it was. A parameter whose code changed is searched by the new code only,
+  a parameter the version leaves out is no longer accepted or listed in the CapabilityStatement,
+  and what was indexed under a code that is gone is cleared. The same holds for a package that
+  another package depends on. Other packages are never replaced, and a clash between a parameter
+  and one of theirs still refuses the install. Installing the same version again, or a version
+  older than the one the database holds, changes nothing, so a server can be started again on an
+  earlier release of its package. An install that fails leaves the database on the version it had.
+  Resources of a type that only the older version defined stay in the database but are not served.
+  See [Upgrading a package](docs/configuration.md#upgrading-a-package).
 
 ## [0.0.2] - 2026-10-19
 

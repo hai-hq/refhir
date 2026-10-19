@@ -128,8 +128,7 @@ fn terminology(store: &PostgresPersistence) -> Vec<(i64, String)> {
 /// that installs it, and of no other: another tenant keeps the version it has until it installs the
 /// newer one, which it is given from the copy that was built.
 #[test]
-fn a_newer_version_of_a_shared_package_replaces_the_search_parameters_of_the_tenant_that_installs_it(
-) {
+fn a_newer_version_of_a_shared_package_replaces_the_older_one_for_the_tenant_that_installs_it() {
     let Some(admin) = test_url("shared package versions") else {
         return;
     };
@@ -155,6 +154,38 @@ fn a_newer_version_of_a_shared_package_replaces_the_search_parameters_of_the_ten
     };
     let codes = |list: &[refhir_persistence::PendingParam]| -> Vec<String> {
         list.iter().map(|param| param.code.clone()).collect()
+    };
+    // The versions of the package a tenant has, and the packages its definitions and expansions of
+    // it are stored under.
+    let versions = |store: &PostgresPersistence| -> Vec<String> {
+        store
+            .load_packages()
+            .unwrap()
+            .into_iter()
+            .filter(|package| package.name == "versioned")
+            .map(|package| package.version)
+            .collect()
+    };
+    let owners = |store: &PostgresPersistence| -> (Vec<i64>, Vec<i64>) {
+        let mut definitions: Vec<i64> = store
+            .load_structure_definitions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.contains("/versioned/"))
+            .map(|row| row.package_id)
+            .collect();
+        let mut expansions: Vec<i64> = store
+            .load_expansions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.contains("/versioned/"))
+            .map(|row| row.package_id)
+            .collect();
+        definitions.sort();
+        definitions.dedup();
+        expansions.sort();
+        expansions.dedup();
+        (definitions, expansions)
     };
     let first = demo("versioned", "4.0.1");
     let (one_a, _) = install(&a, &first, "one").unwrap();
@@ -197,10 +228,14 @@ fn a_newer_version_of_a_shared_package_replaces_the_search_parameters_of_the_ten
             ),
         ]
     );
-    // The other tenant is as it was.
+    assert_eq!(versions(&a), ["2.0.0"]);
+    assert_eq!(owners(&a), (vec![two_a.package_id], vec![two_a.package_id]));
+    // The other tenant is as it was: the shared copy of 1.0.0 is still its package.
     let untouched = rows(&b);
     assert_eq!(untouched.len(), 3);
     assert!(untouched.iter().all(|row| row.3 == one_b.package_id));
+    assert_eq!(versions(&b), ["1.0.0"]);
+    assert_eq!(owners(&b), (vec![one_b.package_id], vec![one_b.package_id]));
 
     // It is given the newer version from the copy, and has not marked any of its own parameters
     // ready, so each of the two it keeps is waiting for its index.
@@ -213,6 +248,8 @@ fn a_newer_version_of_a_shared_package_replaces_the_search_parameters_of_the_ten
     );
     assert_eq!(two_b.retired.len(), 1);
     assert_eq!(rows(&b).len(), 2);
+    assert_eq!(versions(&b), ["2.0.0"]);
+    assert_eq!(owners(&b), (vec![two_b.package_id], vec![two_b.package_id]));
     // And the first is not disturbed by it.
     assert_eq!(rows(&a), held);
 }
