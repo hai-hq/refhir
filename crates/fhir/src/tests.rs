@@ -5949,6 +5949,29 @@ fn a_value_set_over_a_whole_example_system_expands_and_says_it_is_not_complete()
     let (codes, parameters) = expansion_summary(&expanded);
     assert_eq!(codes.len(), 38);
     assert_eq!(expanded["expansion"]["total"], 38);
+    // R4 requires a timestamp: when the expansion was produced, here a moment ago.
+    let timestamp = expanded["expansion"]["timestamp"].as_str().unwrap();
+    let now = || {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        crate::terms::rfc3339(ms)
+    };
+    assert!(
+        timestamp.len() == 24 && timestamp.as_bytes()[10] == b'T' && timestamp.ends_with('Z'),
+        "{timestamp}"
+    );
+    // RFC 3339 instants of one length and zone sort as time does.
+    assert!(timestamp <= now().as_str(), "{timestamp} is in the future");
+    let earlier = crate::terms::rfc3339(
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            .saturating_sub(10 * 60 * 1000),
+    );
+    assert!(timestamp >= earlier.as_str(), "{timestamp} is not recent");
     assert_eq!(
         parameters,
         [format!("{categories}|4.0.1#CodeSystem.content = example")]

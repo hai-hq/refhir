@@ -974,7 +974,7 @@ async fn terminology_operations_are_http_routes() {
     .unwrap();
     std::fs::write(
         dir.join("CodeSystem-animals.json"),
-        r#"{"resourceType":"CodeSystem","url":"http://example.org/animals","name":"Animals","content":"complete","concept":[{"code":"mammal","display":"Mammal","concept":[{"code":"dog","display":"Dog","definition":"A dog"}]}]}"#,
+        r#"{"resourceType":"CodeSystem","url":"http://example.org/animals","name":"Animals","content":"complete","concept":[{"code":"mammal","display":"Mammal","concept":[{"code":"dog","display":"Dog","definition":"A dog"},{"code":"dodo","display":"Dodo","property":[{"code":"inactive","valueBoolean":true}]}]}]}"#,
     )
     .unwrap();
     std::fs::write(
@@ -1005,6 +1005,83 @@ async fn terminology_operations_are_http_routes() {
     assert_eq!(expanded.status, StatusCode::OK);
     assert_eq!(expanded.body["resourceType"], "ValueSet");
     assert_eq!(expanded.body["expansion"]["contains"][0]["code"], "dog");
+
+    // R4 requires a timestamp on an expansion, and an entry says when its code is inactive.
+    let timestamp = expanded.body["expansion"]["timestamp"].as_str().unwrap();
+    assert!(
+        timestamp.len() == 24 && timestamp.ends_with('Z') && timestamp.as_bytes()[10] == b'T',
+        "{timestamp}"
+    );
+    assert!(timestamp.starts_with("202"), "{timestamp}");
+    let all_pets = send(
+        &app,
+        "GET",
+        "/ValueSet/$expand?url=http://example.org/pets",
+        None,
+        None,
+    )
+    .await;
+    let entries = all_pets.body["expansion"]["contains"].as_array().unwrap();
+    let entry = |code: &str| entries.iter().find(|entry| entry["code"] == code).unwrap();
+    assert_eq!(entry("dodo")["inactive"], true);
+    assert!(entry("dog").get("inactive").is_none());
+    assert!(entry("dog").get("abstract").is_none());
+
+    // The other terminology operations answer a GET with the same answer as a POST.
+    let both = |get: String, post_path: &'static str, body: Value| {
+        let app = &app;
+        async move {
+            let got = send(app, "GET", &get, None, None).await;
+            let posted = send(app, "POST", post_path, Some(body), None).await;
+            assert_eq!(got.status, StatusCode::OK, "{get}: {}", got.body);
+            assert_eq!(got.status, posted.status);
+            assert_eq!(got.body, posted.body, "{get}");
+            got.body
+        }
+    };
+    let checked_by_get = both(
+        "/ValueSet/$validate-code?url=http://example.org/pets&code=dog&display=Hound".to_string(),
+        "/ValueSet/$validate-code",
+        json!({"url": "http://example.org/pets", "code": "dog", "display": "Hound"}),
+    )
+    .await;
+    assert_eq!(checked_by_get["parameter"][0]["valueBoolean"], true);
+    let looked_by_get = both(
+        "/CodeSystem/$lookup?system=http://example.org/animals&code=dog".to_string(),
+        "/CodeSystem/$lookup",
+        json!({"system": "http://example.org/animals", "code": "dog"}),
+    )
+    .await;
+    assert_eq!(looked_by_get["resourceType"], "Parameters");
+    let subsumed_by_get = both(
+        "/CodeSystem/$subsumes?system=http://example.org/animals&codeA=mammal&codeB=dog"
+            .to_string(),
+        "/CodeSystem/$subsumes",
+        json!({"system": "http://example.org/animals", "codeA": "mammal", "codeB": "dog"}),
+    )
+    .await;
+    assert_eq!(subsumed_by_get["parameter"][0]["valueCode"], "subsumes");
+    let translated_by_get = both(
+        "/ConceptMap/$translate?url=http://example.org/map&system=http://example.org/animals&code=dog"
+            .to_string(),
+        "/ConceptMap/$translate",
+        json!({"url": "http://example.org/map", "system": "http://example.org/animals", "code": "dog"}),
+    )
+    .await;
+    assert_eq!(translated_by_get["parameter"][0]["valueBoolean"], true);
+    // A code that is not there is the same answer too, and an operation is still only for its
+    // own resource type.
+    let missing = send(
+        &app,
+        "GET",
+        "/CodeSystem/$validate-code?url=http://example.org/animals&code=unicorn",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::OK, "{}", missing.body);
+    let wrong = send(&app, "GET", "/Patient/$lookup?system=x&code=y", None, None).await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
 
     let checked = send(
         &app,
@@ -1195,6 +1272,15 @@ fn expanded_codes(reply: &Reply) -> Vec<String> {
         .collect()
 }
 
+/// An expansion without its `timestamp`, which is when it was answered and so differs between
+/// two requests for the same thing.
+fn without_timestamp(mut body: Value) -> Value {
+    if let Some(expansion) = body.get_mut("expansion").and_then(Value::as_object_mut) {
+        expansion.remove("timestamp");
+    }
+    body
+}
+
 #[tokio::test]
 async fn expand_is_a_get_as_well_as_a_post() {
     let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
@@ -1225,7 +1311,10 @@ async fn expand_is_a_get_as_well_as_a_post() {
     )
     .await;
     assert_eq!(got.status, StatusCode::OK, "{}", got.body);
-    assert_eq!(got.body, posted.body);
+    assert_eq!(
+        without_timestamp(got.body.clone()),
+        without_timestamp(posted.body.clone())
+    );
     assert_eq!(got.body["expansion"]["total"], 12);
 
     // `filter`, `count` and `offset` work as they do in a body.
@@ -1269,7 +1358,10 @@ async fn expand_is_a_get_as_well_as_a_post() {
         None,
     )
     .await;
-    assert_eq!(page.body, paged_post.body);
+    assert_eq!(
+        without_timestamp(page.body.clone()),
+        without_timestamp(paged_post.body.clone())
+    );
 
     // The url may be percent-encoded, and a parameter given twice counts once.
     let encoded = send(
@@ -1280,7 +1372,10 @@ async fn expand_is_a_get_as_well_as_a_post() {
         None,
     )
     .await;
-    assert_eq!(encoded.body, posted.body);
+    assert_eq!(
+        without_timestamp(encoded.body.clone()),
+        without_timestamp(posted.body.clone())
+    );
 
     // The value sets that cannot be expanded say why, as a POST does.
     let refused = send(
@@ -1348,7 +1443,10 @@ async fn expand_is_a_get_as_well_as_a_post() {
         None,
     )
     .await;
-    assert_eq!(posted.body, flagged.body);
+    assert_eq!(
+        without_timestamp(posted.body.clone()),
+        without_timestamp(flagged.body.clone())
+    );
     // The currencies HL7 binds Money to come from the ISO 4217 codes the server carries.
     let currencies = "http://hl7.org/fhir/ValueSet/currencies";
     let naira = send(
@@ -1677,6 +1775,106 @@ async fn a_live_search_under_smart_returns_results_and_follows_writes() {
         left["modifications"][0]["value"]["entry"][0]["resource"]["id"],
         "p2"
     );
+}
+
+#[tokio::test]
+async fn terminology_operations_need_only_the_read_scope() {
+    let (db, catalog, store) = memory();
+    let app = crate::app_with(
+        db.clone(),
+        catalog.clone(),
+        store.clone(),
+        crate::ServerConfig {
+            auth: true,
+            smart_demo_login: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+            ..Default::default()
+        },
+    );
+    let gender = "http://hl7.org/fhir/ValueSet/administrative-gender";
+    let call = |access: String, method: &'static str, path: String, body: &'static str| {
+        let app = app.clone();
+        async move {
+            send_text(
+                &app,
+                method,
+                &path,
+                body,
+                &[
+                    ("authorization", &format!("Bearer {access}")),
+                    ("content-type", "application/fhir+json"),
+                ],
+            )
+            .await
+        }
+    };
+
+    // A client that may only read a type may use that type's terminology operations, as a POST
+    // or as a GET. They change nothing, so they are not creates.
+    let reader = token(&app, "user/ValueSet.read").await;
+    let body = format!(r#"{{"url": "{gender}"}}"#);
+    let body: &'static str = Box::leak(body.into_boxed_str());
+    for (method, path, body) in [
+        ("POST", "/ValueSet/$expand".to_string(), body),
+        ("GET", format!("/ValueSet/$expand?url={gender}"), ""),
+        ("POST", "/ValueSet/$validate-code".to_string(), body),
+        (
+            "GET",
+            format!("/ValueSet/$validate-code?url={gender}&code=male"),
+            "",
+        ),
+        ("POST", "/ValueSet/$expandability".to_string(), body),
+    ] {
+        let reply = call(reader.clone(), method, path.clone(), body).await;
+        // Whatever the operation answers about a value set this small package may not hold, the
+        // scope let the request through.
+        assert!(
+            !matches!(reply.0, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+            "{method} {path}: {} {}",
+            reply.0,
+            reply.1
+        );
+    }
+    // Reading is only that: it does not let the client write a value set, nor use the
+    // operations of another type.
+    let create = call(
+        reader.clone(),
+        "POST",
+        "/ValueSet".to_string(),
+        r#"{"resourceType":"ValueSet","url":"http://example.org/vs","status":"draft"}"#,
+    )
+    .await;
+    assert_eq!(create.0, StatusCode::FORBIDDEN, "{}", create.1);
+    for (method, path) in [
+        ("POST", "/CodeSystem/$lookup"),
+        ("GET", "/CodeSystem/$lookup?system=x&code=y"),
+        ("POST", "/ConceptMap/$translate"),
+    ] {
+        let reply = call(reader.clone(), method, path.to_string(), "{}").await;
+        assert_eq!(
+            reply.0,
+            StatusCode::FORBIDDEN,
+            "{method} {path}: {}",
+            reply.1
+        );
+    }
+
+    // And a client that may only create is not a reader: the operations used to ask for `create`.
+    let writer = token(&app, "user/ValueSet.c").await;
+    for (method, path, body) in [
+        ("POST", "/ValueSet/$expand".to_string(), body),
+        ("GET", format!("/ValueSet/$expand?url={gender}"), ""),
+    ] {
+        let reply = call(writer.clone(), method, path.clone(), body).await;
+        assert_eq!(
+            reply.0,
+            StatusCode::FORBIDDEN,
+            "{method} {path}: {}",
+            reply.1
+        );
+    }
 }
 
 #[tokio::test]

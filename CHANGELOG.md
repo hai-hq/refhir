@@ -12,10 +12,15 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
-- **`GET /ValueSet/$expand`.** R4 allows `$expand` as a `GET` because it changes nothing, and it was
-  a `POST` only (a `GET` answered `405`). `url`, `filter`, `count` and `offset` go in the query
-  string, and the answer is the one the `POST` gives. With SMART the `GET` needs the `read`
-  permission. See [FHIR API](docs/fhir-api.md#terminology).
+- **The terminology operations answer a `GET`.** R4 defines `$expand`, `$validate-code`, `$lookup`,
+  `$subsumes` and `$translate` as having no side effects, and they were `POST` only (a `GET`
+  answered `405`). Their parameters go in the query string (`url`, `filter`, `count` and `offset`
+  for `$expand`; `system`, `code`, `display`, `abstract` and so on for the rest), and the answer is
+  the one the `POST` gives. A `coding` or `codeableConcept` is still sent as a `POST`. See
+  [FHIR API](docs/fhir-api.md#terminology).
+- **Expansions carry `timestamp` and `inactive`.** `ValueSet.expansion.timestamp`, which R4
+  requires, is the time the server produced the expansion for the request. An entry carries
+  `"inactive": true` when its code system says the concept is inactive.
 - **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
   and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include
   of a code system whose `content` is `example`, and were refused for that. They now expand to the
@@ -25,7 +30,6 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   refused. `$validate-code` agrees with `$expand`; a code outside the sample is `false` with a
   message that says the list is only a sample, and the resource validator reports the code as one it
   cannot check, not as an error.
-
 - **Expansions mark abstract codes.** An entry of `$expand` carries `"abstract": true` when its code
   system marks the concept `notSelectable`, as HL7's v3 code systems do for their grouping concepts
   (R4's `ValueSet.expansion.contains.abstract`). `coverage-type` flags `_ActCoverageTypeCode`,
@@ -43,6 +47,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **With SMART, the terminology operations need the `read` permission, not `create`.** `$expand`,
+  `$expandability`, `$validate-code`, `$lookup`, `$subsumes` and `$translate` change nothing, but a
+  `POST` of one was authorised as a create, so a client with only `read` could not use them and
+  one with only `create` could. They are reads, as a `GET` of them is. A client that was given only
+  `create` for these resources to call them needs `read` now.
 - **Stored expansions are rebuilt once at the first start after this version**, so a database
   that holds the R4 packages gains the expansions above. It is the same one-time rebuild an upgrade
   has done before, and the next start finds nothing to do.

@@ -5,9 +5,22 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         if op == "$install" {
             return "install";
         }
+        // Operations that read, whichever way they are sent: the SDC ones, and the terminology
+        // ones, which R4 defines as having no side effects (so a `POST` is only a way to send what
+        // does not fit in a URL).
         if matches!(
             op,
-            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
+            "$populate"
+                | "$assemble"
+                | "$extract"
+                | "$next-question"
+                | "$behavior"
+                | "$expand"
+                | "$expandability"
+                | "$validate-code"
+                | "$lookup"
+                | "$subsumes"
+                | "$translate"
         ) {
             return "read";
         }

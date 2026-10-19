@@ -20,9 +20,18 @@ pub fn operation(
             let filter = optional(args, &["filter"]);
             let offset = optional_usize(args, &["offset"]).unwrap_or(0);
             let count = optional_usize(args, &["count"]);
-            terms
+            let mut expanded = terms
                 .expand_page(url, filter, offset, count)
-                .ok_or_else(|| not_expandable(terms, url))
+                .ok_or_else(|| not_expandable(terms, url))?;
+            // R4 requires it: the time the expanding system produced the expansion, which is when
+            // this one was read out of what the server holds and filtered and paged for the caller.
+            if let Some(expansion) = expanded
+                .get_mut("expansion")
+                .and_then(|value| value.as_object_mut())
+            {
+                expansion.insert("timestamp".into(), json!(rfc3339_now()));
+            }
+            Ok(expanded)
         }
         ("ValueSet", "$expandability") => Ok(expandability(terms, &all_urls(args))),
         ("ValueSet", "$validate-code") => {
@@ -108,6 +117,42 @@ pub fn operation(
             "unsupported operation {type_name}/{op}"
         ))),
     }
+}
+
+/// The current time as an RFC 3339 UTC instant, to the millisecond.
+fn rfc3339_now() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    rfc3339(ms)
+}
+
+/// Unix milliseconds as an RFC 3339 UTC instant.
+pub(crate) fn rfc3339(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (year, month, day) = civil_from_days(secs / 86_400);
+    let rest = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60,
+        ms % 1000
+    )
+}
+
+/// Days since 1970-01-01 as a civil date (Howard Hinnant's `civil_from_days`).
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+    (year, month, day)
 }
 
 /// A value set that cannot be expanded is a failed request, not an empty answer: HTTP 422, with
@@ -360,4 +405,17 @@ fn outcome(severity: &str, code: &str, diagnostics: &str) -> Value {
             "diagnostics": diagnostics
         }]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rfc3339;
+
+    #[test]
+    fn instants_are_rfc3339() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rfc3339(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00.000Z");
+        assert_eq!(rfc3339(4_102_444_799_999), "2099-12-31T23:59:59.999Z");
+    }
 }

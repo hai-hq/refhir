@@ -401,6 +401,9 @@ struct Expansion {
     /// The codes the expansion lists for navigation and that cannot be selected as a value:
     /// their code system marks them `notSelectable`. R4 calls them `abstract`.
     abstract_codes: BTreeSet<(String, String)>,
+    /// The codes the expansion lists that their code system says are inactive: no longer to be
+    /// used, but kept to make sense of old data.
+    inactive_codes: BTreeSet<(String, String)>,
 }
 
 impl Expansion {
@@ -413,6 +416,7 @@ impl Expansion {
             + self
                 .abstract_codes
                 .iter()
+                .chain(&self.inactive_codes)
                 .map(|(system, code)| 48 + system.len() + code.len())
                 .sum::<usize>()
             + self
@@ -1502,12 +1506,7 @@ impl MemoryTerminology {
             if let Some(display) = display {
                 entry["display"] = json!(display);
             }
-            if expansion
-                .abstract_codes
-                .contains(&(system.clone(), code.clone()))
-            {
-                entry["abstract"] = json!(true);
-            }
+            flag_entry(&expansion, system, code, &mut entry);
             contains.push(entry);
         }
         let mut body = json!({"contains": contains});
@@ -2730,6 +2729,7 @@ fn expand_value_set(
                     for code in excluded.codes.keys() {
                         expansion.codes.remove(code);
                         expansion.abstract_codes.remove(code);
+                        expansion.inactive_codes.remove(code);
                     }
                 }
                 Err(more) => failures.extend(more),
@@ -2840,13 +2840,8 @@ fn expand_include(
                     })
                 });
             let system_name = system.clone().unwrap_or_default();
-            if described
-                .as_ref()
-                .is_some_and(|index| not_selectable(index, code))
-            {
-                listed
-                    .abstract_codes
-                    .insert((system_name.clone(), code.to_string()));
+            if let Some(concept) = described.as_ref().and_then(|index| index.codes.get(code)) {
+                note_concept(&mut listed, &system_name, code, concept);
             }
             listed
                 .codes
@@ -2914,10 +2909,8 @@ fn expand_include(
                     .codes
                     .get(&code)
                     .and_then(|concept| concept.display.clone());
-                if not_selectable(&index, &code) {
-                    expansion
-                        .abstract_codes
-                        .insert((system.clone(), code.clone()));
+                if let Some(concept) = index.codes.get(&code) {
+                    note_concept(&mut expansion, &system, &code, concept);
                 }
                 expansion.codes.insert((system.clone(), code), display);
             }
@@ -2945,11 +2938,7 @@ fn expand_include(
             .insert((system.clone(), read), index.content.clone());
     }
     for (code, concept) in &index.codes {
-        if is_not_selectable(concept) {
-            expansion
-                .abstract_codes
-                .insert((system.clone(), code.clone()));
-        }
+        note_concept(&mut expansion, &system, code, concept);
         expansion
             .codes
             .insert((system.clone(), code.clone()), concept.display.clone());
@@ -2957,17 +2946,33 @@ fn expand_include(
     Ok(expansion)
 }
 
-/// Whether the code system marks `code` as one that is not to be selected as a value
-/// (`notSelectable`, the concept property HL7 code systems use for grouping concepts).
-fn not_selectable(index: &SystemIndex, code: &str) -> bool {
-    index.codes.get(code).is_some_and(is_not_selectable)
-}
-
-fn is_not_selectable(concept: &Concept) -> bool {
-    concept
+/// Record what the code system says about a code the expansion lists: that it is not to be
+/// selected as a value (`notSelectable`, the concept property HL7 code systems use for grouping
+/// concepts), and that it is inactive.
+fn note_concept(expansion: &mut Expansion, system: &str, code: &str, concept: &Concept) {
+    let key = || (system.to_string(), code.to_string());
+    if concept
         .properties
         .iter()
         .any(|(name, value)| name == "notSelectable" && value == "true")
+    {
+        expansion.abstract_codes.insert(key());
+    }
+    if concept.inactive {
+        expansion.inactive_codes.insert(key());
+    }
+}
+
+/// Say on an expansion entry what the expansion records about its code: R4's `abstract` and
+/// `inactive`. An entry that is neither carries neither.
+fn flag_entry(expansion: &Expansion, system: &str, code: &str, entry: &mut Json) {
+    let key = (system.to_string(), code.to_string());
+    if expansion.abstract_codes.contains(&key) {
+        entry["abstract"] = json!(true);
+    }
+    if expansion.inactive_codes.contains(&key) {
+        entry["inactive"] = json!(true);
+    }
 }
 
 fn nested_present(include: &Json) -> bool {
@@ -3084,6 +3089,7 @@ fn merge_expansion(into: &mut Expansion, other: Expansion) {
     into.codes.extend(other.codes);
     into.incomplete.extend(other.incomplete);
     into.abstract_codes.extend(other.abstract_codes);
+    into.inactive_codes.extend(other.inactive_codes);
 }
 
 /// Plain resources as one scope: terminology that does not track packages.
@@ -3563,10 +3569,13 @@ fn collect_expansion(contains: &[Json], expansion: &mut Expansion, note_systems:
                 .get("display")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
-            if item.get("abstract").and_then(|value| value.as_bool()) == Some(true) {
-                expansion
-                    .abstract_codes
-                    .insert((system.clone(), code.to_string()));
+            for (name, flagged) in [
+                ("abstract", &mut expansion.abstract_codes),
+                ("inactive", &mut expansion.inactive_codes),
+            ] {
+                if item.get(name).and_then(|value| value.as_bool()) == Some(true) {
+                    flagged.insert((system.clone(), code.to_string()));
+                }
             }
             expansion.codes.insert((system, code.to_string()), display);
         }
@@ -3625,7 +3634,7 @@ fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
 /// was made by code that chose a code system version or a value set definition differently (one
 /// pool for every package, the package installed last), or that refused a value set the current
 /// code expands (a whole `example` system, listed and flagged), or listed a code its system
-/// marks `notSelectable` without saying it is abstract, so it is rebuilt once rather than read.
+/// marks `notSelectable` or inactive without saying so, so it is rebuilt once rather than read.
 pub const EXPANSION_RULES: u32 = 3;
 
 /// Whether a stored expansion document was made under the current [`EXPANSION_RULES`].
@@ -3650,12 +3659,7 @@ fn expansion_document(url: &str, expansion: &Expansion) -> Json {
             if let Some(display) = display {
                 entry["display"] = json!(display);
             }
-            if expansion
-                .abstract_codes
-                .contains(&(system.clone(), code.clone()))
-            {
-                entry["abstract"] = json!(true);
-            }
+            flag_entry(expansion, system, code, &mut entry);
             entry
         })
         .collect();
@@ -4213,6 +4217,105 @@ mod tests {
             );
             assert!(!result(&bare));
         }
+    }
+
+    fn flagged(expanded: &serde_json::Value, flag: &str) -> Vec<String> {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry[flag] == true)
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_code_its_system_calls_inactive_is_listed_as_inactive() {
+        let system = "http://example.org/old";
+        let on = |property: &str, value: bool| json!([{"code": property, "valueBoolean": value}]);
+        let resources = [
+            json!({"resourceType": "CodeSystem", "url": system, "content": "complete",
+            "concept": [
+                {"code": "live"},
+                {"code": "old", "property": on("inactive", true)},
+                {"code": "kept", "property": on("inactive", false)},
+                // Both at once, which are two things to say about it.
+                {"code": "_gone", "property": [
+                    {"code": "inactive", "valueBoolean": true},
+                    {"code": "notSelectable", "valueBoolean": true}
+                ]},
+                {"code": "grouped", "property": on("notSelectable", true)},
+                {"code": "tagged", "inactive": true}
+            ]}),
+            value_set(
+                "http://example.org/whole",
+                json!({"include": [{"system": system}]}),
+            ),
+            value_set(
+                "http://example.org/filtered",
+                json!({"include": [{"system": system,
+                    "filter": [{"property": "concept", "op": "in", "value": "live,old,_gone"}]}]}),
+            ),
+            value_set(
+                "http://example.org/listed",
+                json!({"include": [{"system": system, "concept": [{"code": "old"}, {"code": "live"}]}]}),
+            ),
+            value_set(
+                "http://example.org/nested",
+                json!({"include": [{"valueSet": ["http://example.org/listed"]}]}),
+            ),
+            value_set(
+                "http://example.org/without",
+                json!({"include": [{"system": system}],
+                       "exclude": [{"system": system, "concept": [{"code": "old"}]}]}),
+            ),
+        ];
+        let live = MemoryTerminology::from_resources(&resources);
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        let stored = MemoryTerminology::from_stored(&resources, &documents);
+        for terms in [&live, &stored] {
+            let expand = |url: &str| terms.expand(url, None).unwrap_or_else(|| panic!("{url}"));
+            let whole = expand("http://example.org/whole");
+            assert_eq!(flagged(&whole, "inactive"), ["_gone", "old", "tagged"]);
+            // Not the same thing as abstract, and neither implies the other.
+            assert_eq!(flagged(&whole, "abstract"), ["_gone", "grouped"]);
+            // `inactive: false` says nothing, and neither does a code with no word about it.
+            let entry = |code: &str| {
+                whole["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["code"] == code)
+                    .unwrap()
+                    .clone()
+            };
+            assert!(entry("kept").get("inactive").is_none());
+            assert!(entry("live").get("inactive").is_none());
+            assert!(entry("live").get("abstract").is_none());
+            // The other ways to include a code say the same of it.
+            assert_eq!(
+                flagged(&expand("http://example.org/filtered"), "inactive"),
+                ["_gone", "old"]
+            );
+            assert_eq!(
+                flagged(&expand("http://example.org/listed"), "inactive"),
+                ["old"]
+            );
+            assert_eq!(
+                flagged(&expand("http://example.org/nested"), "inactive"),
+                ["old"]
+            );
+            // What is excluded is not there to be flagged.
+            assert_eq!(
+                flagged(&expand("http://example.org/without"), "inactive"),
+                ["_gone", "tagged"]
+            );
+        }
+        // An inactive code is still a member: `inactive` informs, it does not remove.
+        assert_eq!(
+            live.contains("http://example.org/whole", Some(system), "old"),
+            TermAnswer::Yes
+        );
     }
 
     #[test]
