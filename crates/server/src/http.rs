@@ -245,6 +245,7 @@ pub fn app_parts(
         .route("/:resource_type/$lookup", post(lookup_op))
         .route("/:resource_type/$translate", post(translate_op))
         .route("/:resource_type/$subsumes", post(subsumes_op))
+        .route("/:resource_type/$match", post(match_op))
         .route("/:resource_type/$export", post(export_type))
         .route(
             "/:resource_type/$summary",
@@ -1118,6 +1119,25 @@ async fn translate_op(
     body: Bytes,
 ) -> Response {
     terminology_op(app, resource_type, "$translate", body).await
+}
+
+/// `POST [base]/Patient/$match`: the body is the operation's `Parameters`, and what the engine makes
+/// of them (and refuses in them) is its answer. It reads, so a replica answers it itself. The body
+/// is JSON: the XML that `parse_body` can read does not make the Parameters this needs, and a
+/// request it answered with "resource is required" would send its sender looking in the wrong place.
+async fn match_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    body: Bytes,
+) -> Response {
+    if body.first() == Some(&b'<') {
+        return outcome(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "not-supported",
+            "$match takes its Parameters as JSON; XML is not supported",
+        );
+    }
+    terminology_op(app, resource_type, "$match", body).await
 }
 
 async fn terminology_op(app: AppState, resource_type: String, op: &str, body: Bytes) -> Response {

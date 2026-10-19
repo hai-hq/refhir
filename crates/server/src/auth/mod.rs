@@ -462,6 +462,10 @@ pub fn guard_patient_operation(
     if op == "search" {
         return Ok(());
     }
+    // It reads every Patient there is, which is not this token's patient.
+    if op == "$match" {
+        return Err(OUTSIDE.into());
+    }
     if resource == "Patient" && !patient_args_match(&format!("Patient/{patient_id}"), args) {
         return Err(OUTSIDE.into());
     }

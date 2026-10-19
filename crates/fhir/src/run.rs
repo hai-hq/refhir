@@ -387,6 +387,7 @@ pub fn dispatch(
             catalog.deny_response_read(type_name)?;
             crate::summary::summary(tx, catalog, model, args)
         }
+        "$match" => crate::patient_match::operation(tx, catalog, type_name, args),
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"
         ))),

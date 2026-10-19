@@ -598,6 +598,7 @@ impl Catalog {
         refhir_sdc::annotate_capability(&mut statement);
         annotate_install(&mut statement);
         annotate_patient_operations(&mut statement);
+        crate::patient_match::annotate_capability(&mut statement);
         statement
     }
 }

@@ -161,6 +161,7 @@ resource gets its time the next time it is written.
 | `$everything` | `Patient/[id]` | Holds only the kinds of resource the caller's scopes let them read |
 | `$export` | system, type, instance | Asynchronous (`202`, then `GET /export/{job}` and `GET /export/{job}/file`). Jobs are durable; see [Operations](operations.md#export-jobs) |
 | `$validate` | type, instance | Validates against the installed StructureDefinitions |
+| `$match` | `Patient` | Finds the Patients that may be the person a Patient resource describes. See [Finding a patient](#finding-a-patient-patientmatch) |
 | `$meta`, `$meta-add`, `$meta-delete` | instance | |
 | `$document` | `Composition/[id]` | A document Bundle of the Composition and what it references; see [Documents](#documents) |
 | `$summary` | `Patient`, `Patient/[id]` | An International Patient Summary. See [Patient summary](patient-summary.md) |
@@ -184,6 +185,136 @@ holds a whole resource, is checked as the resource it holds, against the profile
 names and the ones the resource states in `meta.profile`. A narrative (`text.div`) is checked for
 what FHIR allows in one: a single `div` in the XHTML namespace, only the basic formatting
 elements, no script, and some text.
+
+### Finding a patient: `Patient/$match`
+
+`POST [base]/Patient/$match` takes the FHIR R4 `Parameters`: `resource` (a Patient, required),
+`onlyCertainMatches` (boolean) and `count` (integer). It answers a `searchset` Bundle, best match
+first. Each entry has `search.mode` `match`, a `search.score` from 0 to 1 and the `match-grade`
+extension (`http://hl7.org/fhir/StructureDefinition/match-grade`) on `search`:
+
+```bash
+curl -s -X POST http://localhost:8080/Patient/\$match -H 'content-type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [
+    {"name": "resource", "resource": {
+      "resourceType": "Patient",
+      "name": [{"family": "Okafor", "given": ["Ada", "Chinwe"]}],
+      "birthDate": "1985-03-02",
+      "telecom": [{"system": "phone", "value": "0803 123 4567"}]
+    }},
+    {"name": "onlyCertainMatches", "valueBoolean": false}
+  ]
+}'
+```
+
+The algorithm is the server's own; FHIR leaves it to it. A stored Patient gets the first grade whose
+conditions it meets, and one that meets none is not returned.
+
+| Grade | When | Score |
+|-------|------|-------|
+| `certain` | An identifier has the same `system` and the same `value`, compared exactly | 1 |
+| `probable` | The name, the full birth date and a phone number or email address in `telecom` are the same | 0.75 to 0.95 |
+| `possible` | The name and the full birth date are the same | 0.40 to 0.70 |
+
+`certainly-not` is a grade FHIR defines, and the server never returns it: a Patient that cannot be
+the person is left out. A birth date that differs is not a match, however much else is the same.
+Whether a `probable` match may be treated as the person is for the caller to decide: the server
+does not know whether a phone number or an email address was ever checked.
+
+Each entry also says what it was found by, in `match-evidence` extensions on `search`
+(`https://refhir.dev/StructureDefinition/match-evidence`), one for each thing. Each has a `kind`,
+and some a `value`:
+
+| `kind` | Means | `value` |
+|--------|-------|---------|
+| `identifier` | An identifier of the request is on the Patient | `valueIdentifier`: the system and value as the request wrote them. One extension for each that matched |
+| `replaced-record` | The Patient is not what the request matched but what replaced it. Comes first. The other evidence on the entry is what this Patient itself shares with the request, which can be less than the replaced one had | `valueReference`: the replaced Patient. One extension for each replaced Patient it was found through |
+| `name` | A name of the request is a name of the Patient | |
+| `name-reordered` | Said as well as `name` when the words are the same but not in the same places (a family name written as a given name) | |
+| `birth-date` | The same full birth date | |
+| `phone`, `email` | A phone number or an email address of the request is the Patient's | `valueContactPoint`: the number or address **as the request wrote it**, not the Patient's copy. One extension for each that matched |
+| `gender`, `gender-differs` | Both have a gender, and it is the same, or is not | |
+
+```json
+"search": {
+  "mode": "match",
+  "score": 0.85,
+  "extension": [
+    {"url": "http://hl7.org/fhir/StructureDefinition/match-grade", "valueCode": "probable"},
+    {"url": "https://refhir.dev/StructureDefinition/match-evidence",
+     "extension": [{"url": "kind", "valueCode": "phone"},
+                   {"url": "value", "valueContactPoint": {"system": "phone", "value": "0803 123 4567"}}]},
+    {"url": "https://refhir.dev/StructureDefinition/match-evidence",
+     "extension": [{"url": "kind", "valueCode": "name"}]}
+  ]
+}
+```
+
+This is what a caller needs to decide whether a `probable` match may be treated as the person. If it
+sends a phone number it has verified, the `phone` evidence with that number shows that it is the
+one the Patient has, and an email address that matched but was not verified shows as `email`. Only
+what matched is said: a phone number of the request that the Patient does not have is not there.
+
+How things are compared:
+
+- **Names** are compared by their words. Case, accents (including the dots and tone marks of Yoruba
+  and Igbo), apostrophes, hyphens, spacing and the order of the words do not matter, so
+  `Ọláwálé Adébáyò`, `ADEBAYO olawale` and a family name written in the given name's place are one
+  name. The letters of Hausa that have no accented form (`ɓ`, `ɗ`, `ƙ`) match the letters they are
+  written as. A word missing or added is a different name, and a name of fewer than two words is
+  not enough to go on. Any name of the request is compared with any name of the Patient, and a
+  name given as `text` alone is read word by word. A name in another order scores a little lower.
+- **Birth dates** must be full dates (`YYYY-MM-DD`) on both sides. A year, or a year and month,
+  is never enough, and a `birthDate` that is not a date is a `400`.
+- **Phone numbers** are compared by what they dial: `+234 803 123 4567`, `0803 123 4567`,
+  `2348031234567` and `00234 (0) 803-123-4567` are one number. A number written without a country
+  code is taken to be Nigerian (`234`). Email addresses ignore case. Only the Patient's own
+  `telecom` counts, never `Patient.contact`, and a `telecom` with `use` `old` does not count, since
+  numbers are given to someone else once they are given up. A `telecom` without a `system` is read
+  as an email address if it has an `@`, and as a phone number otherwise.
+- **Identifiers** count only with both a `system` and a `value`, and not when `use` is `temp`.
+- **Gender** only moves the score within its grade: a gender that agrees is a little higher, and
+  one that differs is lower. It never decides a grade. `unknown` is no gender: it neither agrees
+  nor differs.
+
+A Patient with `active` false is never returned, and neither is one that another Patient replaced
+(it has a `link` of type `replaced-by`, with `active` false or not). A match on a replaced Patient is
+still a match on the person, so the server follows the link to the Patient that replaced it and
+returns that one:
+
+- Only a relative `Patient/id` in this store is followed, through up to five links, and never round a
+  cycle. It ends at a Patient that is in use and has not been replaced itself. A link to a Patient
+  that is gone, that was switched off, or that is on another server leads nowhere, and then nothing
+  is returned for that match.
+- The Patient it finds has the grade of the match on the replaced one, but at most `probable`: the
+  server compared the replaced Patient with the request, not this one, and the link was made by
+  whoever merged them. So it is never `certain`, and `onlyCertainMatches` never returns it.
+- The entry says so with `replaced-record` evidence, a `valueReference` to each replaced Patient it
+  was found through, so that a caller or the person looking can see where the match came from. The
+  rest of its evidence is what the Patient it returns shares with the request, and nothing the
+  replaced one had that it does not: if the replaced Patient had the birth date or the phone number
+  and this one has not, the entry does not say `birth-date` or `phone`.
+- A Patient found both ways, itself and through a replaced one, is one entry: whichever scores
+  higher, and itself when they score the same.
+
+`onlyCertainMatches` is for linking without a person looking. When it is `true`, the server returns
+a match only if exactly one Patient is a potential match (one with any grade) and that one is
+`certain`. When more than one is, nothing is returned for it, even if one of them is certain: two
+records that carry the same identifier, or one that does and another with the same name and birth
+date, are for a person to settle. `count` limits the entries and is applied after that, so it never
+turns many potential matches into one.
+
+A Patient with nothing to look up (no identifier with a system and a value, and no name with a full
+birth date) matches nothing, and the Bundle is empty. More than 20,000 Patients sharing an
+identifier or the birth date is a `422` (`too-costly`) rather than an answer that left some out.
+A resource with more than 50 identifiers, names or telecoms is a `400`. The body is JSON: an XML
+body is a `415`.
+
+Only the store the request is made to is searched. The caller needs a scope that may search
+Patients (`user/Patient.read` or `user/Patient.rs`). A token limited to one patient is refused,
+because the operation reads every Patient there is, and `$match` is not available over `/sync`.
+The audit trail records it as an operation on `Patient`, without the Patient in the request.
 
 Beyond REST:
 

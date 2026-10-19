@@ -64,43 +64,24 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   - **Can be changed in code**: `authenticate`, `authorizeCreate`, `authorizeManifest` (to check who a
     recipient is), `onEvent`, and a `store` that another database can stand in for.
 
-- **A first start installs prepared packages, with no registry and little memory.** Release archives
-  and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
-  in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
-  downloaded, read and expanded once, there. A server finds the file beside its binary (or in
-  `../share/refhir/` from it, or at `[conformance].package_bundle` / `REFHIR_PACKAGE_BUNDLE`; `off`
-  says not to look) and stores what is in it, so the first start needs no network and no package
-  cache, and a first start peaks at a small fraction of the memory it did. A file that is there and
-  cannot be used (damaged, or made for another release) stops the start with an error that says so.
-  `refhir package-bundle` makes the file for a binary you built yourself, or for other packages
-  (`--spec`). See [Preparing the packages](deploy/production.md#preparing-the-packages).
-- **A repeated search parameter in a live query.** A `/sync` query's arguments are a JSON object, so
-  a parameter that a URL would give twice (AND) had no way to be written. It is now an array of
-  strings: `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}` finds the Slots whose
-  Schedule has both as actors, as `schedule.actor=…&schedule.actor=…` does over REST. An empty
-  array, or one with anything but strings in it, is refused (`QueryFailed`). The Go and TypeScript
-  clients carry an array through `Watch`, `Query` and `search`.
-- **`[server].default_page_size`** (or `REFHIR_DEFAULT_PAGE_SIZE`). See Changed.
-- **Subscriptions send `channel.header`.** Each entry (R4 says `Name: value`, for example
-  `Authorization: Bearer …`) is added to the `rest-hook` request, so a receiver that needs a
-  token can be served. A name can be given once. An entry that is not a valid header, that
-  repeats a name, or that sets a header the server controls (`Host`, `Content-Length`,
-  `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`,
-  `Cookie`, `Proxy-*`) fails the notification and puts the Subscription in `error` with the
-  reason. A `Content-Type` entry replaces the default, whatever its case.
-- **A Subscription's `status` follows its deliveries.** When a `rest-hook` notification still
-  fails after its eight attempts (about ten seconds), the server sets `status` to `error` and
-  `error` to the time and the reason. The next notification that gets through sets `status` back
-  to `active` and clears `error`. Delivery continues while the status is `error`; only `off`
-  stops it, and the server never changes an `off` Subscription.
-- **`Prefer: handling=lenient` on a search `GET`.** A search whose parameter value cannot be read
-  (see Changed) can ask for the parameter to be left out instead: the search runs on the rest, the
-  Bundle carries an `OperationOutcome` entry (`search.mode` `outcome`) with a warning for each
-  parameter set aside, and its `self` link no longer has them. The response says
-  `Preference-Applied: handling=lenient`, and search responses now carry `Vary: Prefer`.
-  `handling=strict` is the default. Conditional create, update and delete, `batch` and
-  `transaction` entries, GraphQL and live queries are never lenient. See
-  [FHIR API](docs/fhir-api.md#search).
+- **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
+  to answer `405`. It now takes FHIR R4's `Parameters` (`resource`, `onlyCertainMatches`, `count`)
+  and answers a `searchset` Bundle, best first, with a `search.score` and the `match-grade`
+  extension on each entry: `certain` for an identifier with the same system and value, `probable`
+  for the same name, full birth date and a phone number or email address, `possible` for the same
+  name and full birth date. Names ignore case, accents and order (a family name written as a given
+  name matches), phone numbers ignore spacing and whether they have a country code (`+234`, or the
+  `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
+  is not active is never returned, and a match on one that another replaced (`link` type
+  `replaced-by`) is the Patient that replaced it, followed through up to five links in the store,
+  `probable` at the most and never `certain`. `onlyCertainMatches` returns nothing when more than
+  one Patient is a potential match. Each entry says what it was found by in `match-evidence`
+  extensions on `search`: the name, birth date, identifier, phone number or email address that
+  matched (the last three as the request wrote them, so a caller can tell which of its own phone
+  numbers matched), and the replaced Patient a match came through. The request is JSON: an XML body
+  is refused with a `415`. The CapabilityStatement lists the operation on `Patient`. A scope that
+  may search Patients may use it; a token limited to one patient may not. See
+  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
 
 ### Changed
 
@@ -152,6 +133,81 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   read every kind of resource of the compartment or the document regardless of the token.
 - The built-in Patient compartment holds `MedicationStatement` and `Immunization`, for a server
   with no `CompartmentDefinition` installed.
+
+## [0.0.2] - 2026-10-19
+
+### Added
+
+- **A first start installs prepared packages, with no registry and little memory.** Release archives
+  and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
+  in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
+  downloaded, read and expanded once, there. A server finds the file beside its binary (or in
+  `../share/refhir/` from it, or at `[conformance].package_bundle` / `REFHIR_PACKAGE_BUNDLE`; `off`
+  says not to look) and stores what is in it, so the first start needs no network and no package
+  cache, and a first start peaks at a small fraction of the memory it did. A file that is there and
+  cannot be used (damaged, or made for another release) stops the start with an error that says so.
+  `refhir package-bundle` makes the file for a binary you built yourself, or for other packages
+  (`--spec`). See [Preparing the packages](deploy/production.md#preparing-the-packages).
+- **A repeated search parameter in a live query.** A `/sync` query's arguments are a JSON object, so
+  a parameter that a URL would give twice (AND) had no way to be written. It is now an array of
+  strings: `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}` finds the Slots whose
+  Schedule has both as actors, as `schedule.actor=…&schedule.actor=…` does over REST. An empty
+  array, or one with anything but strings in it, is refused (`QueryFailed`). The Go and TypeScript
+  clients carry an array through `Watch`, `Query` and `search`.
+- **`[server].default_page_size`** (or `REFHIR_DEFAULT_PAGE_SIZE`). See Changed.
+- **Subscriptions send `channel.header`.** Each entry (R4 says `Name: value`, for example
+  `Authorization: Bearer …`) is added to the `rest-hook` request, so a receiver that needs a
+  token can be served. A name can be given once. An entry that is not a valid header, that
+  repeats a name, or that sets a header the server controls (`Host`, `Content-Length`,
+  `Transfer-Encoding`, `Connection`, `Keep-Alive`, `Upgrade`, `TE`, `Trailer`, `Expect`,
+  `Cookie`, `Proxy-*`) fails the notification and puts the Subscription in `error` with the
+  reason. A `Content-Type` entry replaces the default, whatever its case.
+- **A Subscription's `status` follows its deliveries.** When a `rest-hook` notification still
+  fails after its eight attempts (about ten seconds), the server sets `status` to `error` and
+  `error` to the time and the reason. The next notification that gets through sets `status` back
+  to `active` and clears `error`. Delivery continues while the status is `error`; only `off`
+  stops it, and the server never changes an `off` Subscription.
+- **`Prefer: handling=lenient` on a search `GET`.** A search whose parameter value cannot be read
+  (see Changed) can ask for the parameter to be left out instead: the search runs on the rest, the
+  Bundle carries an `OperationOutcome` entry (`search.mode` `outcome`) with a warning for each
+  parameter set aside, and its `self` link no longer has them. The response says
+  `Preference-Applied: handling=lenient`, and search responses now carry `Vary: Prefer`.
+  `handling=strict` is the default. Conditional create, update and delete, `batch` and
+  `transaction` entries, GraphQL and live queries are never lenient. See
+  [FHIR API](docs/fhir-api.md#search).
+- **Many tenants in one Postgres database.** A process started with `--tenant NAME` (or
+  `REFHIR_TENANT`, or `tenant` under `[database]`) serves one tenant of a database that many tenants
+  share. Each tenant is a separate FHIR server: its own resources, SMART clients, audit trail,
+  writer, and standbys and replicas. `refhir tenant create | list | delete` manages them, and a
+  process whose tenant the database does not have refuses to start. The first `create` makes an
+  empty database a shared one, and a database keeps the layout it was made with: a database that
+  already holds a ReFHIR without tenants cannot hold them, and the reverse. **Nothing changes
+  without `--tenant`**: the same tables, migrations and SQL as before.
+  - **The packages tenants have in common are stored once.** The FHIR core and what it depends on
+    are read from a prepared file (see above) into the database one time, and each tenant is given
+    them, with its own search parameters and its own value set expansions. Packages installed from a
+    registry or a directory, and everything a tenant writes, stay the tenant's own.
+  - **The database keeps each tenant to its own rows.** Every table that holds tenants' rows has
+    row-level security, enabled and forced, so a connection sees and writes only the tenant it
+    serves. A superuser and a role with `BYPASSRLS` are never bound by it, so a process that connects
+    as one works and logs a warning. Take backups with such a role: `pg_dump` run as the ordinary
+    role refuses the database, and `--enable-row-security` dumps no tenant's rows.
+  - **A replica cannot write into the wrong tenant.** It sends its tenant with everything it
+    forwards, over REST and over `/sync`, and a primary of another tenant answers `421`.
+    `/healthz` names the tenant, `refhir migrate --status` says when a database is shared, and a
+    tenant's package cache and export directory default to a folder named for it. The Helm chart
+    takes `database.tenant` (one release per tenant).
+  - **A tenant announces its commits to its replicas at most every 20 ms.** Every tenant's replicas
+    listen in one database, so an announcement for each commit woke all of them and made busy
+    tenants slow each other down. The first commit after a quiet spell is announced with the commit
+    itself, and a burst ends with one announcement after its last commit. A database without tenants
+    announces every commit as before.
+
+  Each tenant adds a writer, so give the Postgres server room for all of them together. See
+  [Tenants on one database](docs/clustering.md#tenants-on-one-database).
+
+### Changed
+
 - **A running server holds what every request needs and an index of the rest, and reads the rest
   the first time a request uses it.** It used to hold every StructureDefinition, code system,
   value set expansion and concept map of the installed packages in memory: about 100 MB for R4
@@ -361,6 +417,10 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   primary starts does the same, so a primary that stopped between writing and telling is made up
   for. The cost is that every replica and standby loads the whole catalog (a few seconds of one
   thread each) when a primary starts or a standby takes over.
+- **Claiming jobs on Postgres can no longer take more than was asked for.** The statement that
+  picks the waiting jobs (`$export` and the other durable jobs) let the planner run its locking
+  subquery again for each row it updated, skipping the rows it had just locked, so one claim could
+  take more jobs than the worker asked for. It now picks once, whatever the plan.
 
 ## [0.0.1] - 2026-10-15
 
@@ -407,5 +467,6 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/hai-hq/refhir/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/hai-hq/refhir/releases/tag/v0.0.1

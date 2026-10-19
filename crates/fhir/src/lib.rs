@@ -19,6 +19,7 @@ mod npm;
 mod ops;
 mod package;
 mod patch;
+mod patient_match;
 mod prepared;
 mod resolve;
 mod run;
@@ -44,9 +45,9 @@ pub use npm::{
 pub use package::{
     cards_dir, cross_version_dir, default_r4_registry_specs, expression_clash_dir,
     extension_copies_dir, extra_dir, install_package_dir, ips_package, minir4_dir,
-    newer_terminology_dir, r4_dir, r4_examples_dir, reload_catalog, run_backfills, sdc_dir,
-    stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher, R4_CORE_PACKAGE,
-    SDC_PACKAGE,
+    newer_terminology_dir, patient_match_dir, r4_dir, r4_examples_dir, reload_catalog,
+    run_backfills, sdc_dir, stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher,
+    R4_CORE_PACKAGE, SDC_PACKAGE,
 };
 pub use prepared::{install_prepared, write_prepared, PreparedBundle, BUNDLE_FILE};
 pub use refhir_persistence::ConformanceStore;
