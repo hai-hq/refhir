@@ -10,6 +10,27 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
+  to answer `405`. It now takes FHIR R4's `Parameters` (`resource`, `onlyCertainMatches`, `count`)
+  and answers a `searchset` Bundle, best first, with a `search.score` and the `match-grade`
+  extension on each entry: `certain` for an identifier with the same system and value, `probable`
+  for the same name, full birth date and a phone number or email address, `possible` for the same
+  name and full birth date. Names ignore case, accents and order (a family name written as a given
+  name matches), phone numbers ignore spacing and whether they have a country code (`+234`, or the
+  `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
+  is not active is never returned, and a match on one that another replaced (`link` type
+  `replaced-by`) is the Patient that replaced it, followed through up to five links in the store,
+  `probable` at the most and never `certain`. `onlyCertainMatches` returns nothing when more than
+  one Patient is a potential match. Each entry says what it was found by in `match-evidence`
+  extensions on `search`: the name, birth date, identifier, phone number or email address that
+  matched (the last three as the request wrote them, so a caller can tell which of its own phone
+  numbers matched), and the replaced Patient a match came through. The request is JSON: an XML body
+  is refused with a `415`. The CapabilityStatement lists the operation on `Patient`. A scope that
+  may search Patients may use it; a token limited to one patient may not. See
+  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
+
 ## [0.0.2] - 2026-10-19
 
 ### Added
