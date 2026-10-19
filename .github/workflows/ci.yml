@@ -86,6 +86,10 @@ jobs:
           npm run build
           npm test
 
+      - name: Test the link host
+        working-directory: link-host
+        run: npm test
+
   # Warnings fail the build, so the code base stays clean. The toolchain is the pinned 1.88.0,
   # whose lints are the ones that count: a newer clippy knows lints this one does not.
   clippy:
@@ -220,6 +224,17 @@ jobs:
 
       - name: Run the image
         run: docker run --rm refhir:ci --version
+
+      - name: Build the link host image, and see that it starts
+        run: |
+          docker build -t refhir-link-host:ci link-host
+          docker run -d --name link-host-ci -e ADMIN_TOKEN=ci-token-of-sixteen-characters refhir-link-host:ci
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' link-host-ci)" = "healthy" ] && break
+            sleep 2
+          done
+          docker logs link-host-ci
+          test "$(docker inspect -f '{{.State.Health.Status}}' link-host-ci)" = "healthy"
 
       # The release's packages are in the image, so a first start needs no network, and the
       # deployment guide says to start from 512 MiB: run it so, and see that it starts and is not

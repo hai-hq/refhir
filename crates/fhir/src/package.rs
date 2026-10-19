@@ -88,6 +88,22 @@ pub fn expression_clash_dir() -> &'static Path {
     ))
 }
 
+/// The International Patient Summary package as the registry serves it: `hl7.fhir.uv.ips` 2.0.1
+/// for R4, with its profiles, value sets, `$summary` definition and example summaries.
+pub fn ips_package() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/ips/hl7.fhir.uv.ips-2.0.1.tgz"
+    ))
+}
+
+/// A tiny package for the tests of SMART Health Cards over HTTP: a Patient and an Immunization,
+/// with the search a card needs. The whole R4 release holds far more than such a test uses, and
+/// loading it is most of what the test costs.
+pub fn cards_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/cards"))
+}
+
 pub fn sdc_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sdc"))
 }

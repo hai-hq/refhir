@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/Patient-lastUpdated",
+  "name": "_lastUpdated",
+  "status": "active",
+  "code": "_lastUpdated",
+  "base": ["Patient"],
+  "type": "date",
+  "expression": "Patient.meta.lastUpdated"
+}

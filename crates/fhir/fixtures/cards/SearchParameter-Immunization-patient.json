@@ -1,0 +1,11 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/Immunization-patient",
+  "name": "patient",
+  "status": "active",
+  "code": "patient",
+  "base": ["Immunization"],
+  "type": "reference",
+  "target": ["Patient"],
+  "expression": "Immunization.patient"
+}

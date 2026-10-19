@@ -1118,6 +1118,23 @@ impl Ctx<'_> {
             "hasValue" => Ok(one(Value::system_bool(
                 input.items.iter().any(|item| item.has_primitive_value()),
             ))),
+            "htmlChecks" => {
+                // Defined by FHIR for the xhtml of a narrative. Nothing in, nothing to say.
+                let Some(item) = singleton(&input.items)? else {
+                    return Ok(Outcome {
+                        items: vec![],
+                        ordered: true,
+                    });
+                };
+                let text = match item {
+                    Value::String(text) => Some(text.as_str()),
+                    Value::Node { json, .. } => json.as_str(),
+                    _ => None,
+                };
+                Ok(one(Value::system_bool(
+                    text.is_some_and(crate::xhtml::html_checks),
+                )))
+            }
             "resolve" => self.resolve(input),
             "memberOf" => self.member_of(input, args),
             "type" => {

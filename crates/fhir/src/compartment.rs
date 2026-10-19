@@ -84,6 +84,8 @@ fn builtin() -> BTreeMap<String, Compartment> {
                 ("Condition", &["subject", "patient"]),
                 ("Procedure", &["subject", "patient"]),
                 ("MedicationRequest", &["subject"]),
+                ("MedicationStatement", &["subject"]),
+                ("Immunization", &["patient"]),
                 ("DiagnosticReport", &["subject"]),
                 ("AllergyIntolerance", &["patient"]),
                 ("CarePlan", &["subject", "patient"]),

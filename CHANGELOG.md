@@ -12,6 +12,33 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **`Patient/$summary`: an International Patient Summary.** `GET` or `POST` it on a patient (or on
+  `Patient`, with an `identifier`) and it returns an IPS document Bundle: a Composition with
+  allergies, problems and medications (always there, with `emptyReason` when there is nothing),
+  and immunizations, laboratory results and procedures (left out when empty), each with a table
+  in its text, together with the patient's own resources and what they point at. It holds only
+  what the caller's scopes let them read, and never another patient. With the IPS package
+  installed, the summary validates against the IPS profiles. See
+  [Patient summary](docs/patient-summary.md).
+- **`Patient/[id]/$health-cards-issue`: SMART Health Cards.** With a P-256 key in
+  `[health_cards].key_file` (or `REFHIR_HEALTH_CARDS_KEY_FILE`), the server signs cards that hold the
+  patient's name and birth date and the resources asked for by `credentialType`, shrunk as the card
+  format asks, and publishes the public key at `/health-cards/.well-known/jwks.json`. `_since` holds
+  a card to what was written at or after it. See [SMART Health Cards](docs/health-cards.md).
+- **`meta.lastUpdated`, `_lastUpdated`, and history by date.** The server sets `meta.lastUpdated` on
+  every version it writes, to the millisecond, in UTC. `_lastUpdated` finds resources by it (it
+  matched nothing before, because nothing was ever set), and `_since` on a type's or the server's
+  history takes a date and time as FHIR has it (it was a `400` for anything but a version id). A
+  version id still works. Versions written before this release have no time: they are not found by
+  `_lastUpdated`, and get one the next time they are written. A deletion has no time, so a history
+  by date lists a deletion from just before the date, never leaves one out. See
+  [When a resource was written](docs/fhir-api.md#when-a-resource-was-written).
+- **A guide to SMART Health Links**, with a script that fetches a summary, encrypts it and
+  makes the link, and a small link host (`docs/examples/link-host.mjs`, Node, no packages) that
+  stores the encrypted files and answers whoever opens a link. The server does not host links: a
+  separate host holds the encrypted files, so the key is never on a server that holds the record.
+  See [SMART Health Links](docs/health-links.md).
+
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
   in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
@@ -52,6 +79,38 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **A date search compares to the millisecond and in the zone a time is written in.** It compared
+  in whole seconds, so two times in one second could not be told apart (`lt` on a time missed a time
+  33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an
+  hour or more away from where it is. A value that is a date, or that has no fraction, still
+  stands for all of the day or the second it names.
+- **A date search no longer misses a time because of how the time is written.** The index was
+  read in the order of the text, which is not the order of time: `ge2026-10-18T04:45:53Z` found
+  nothing where a time was stored as `...:53.065Z` (a `.` sorts before a `Z`), and a time in another
+  zone was cut off the same way. A date search now reads every day it could reach, and a date
+  written to the year or the month is read by its own key, and the comparison above decides.
+- **A resource inside a Bundle entry is validated as the resource it is.** `entry.resource` (and
+  any other element that holds a whole resource, such as a Parameters part) was checked as the
+  abstract `Resource`, so every element of every entry was "unknown" and a Bundle with entries
+  could not be validated. It is now checked against its own type, the profiles the entry's slice
+  names and the ones it states in `meta.profile`. HL7's own example IPS summaries now validate.
+- **A narrative is checked, not refused.** `txt-1` and `txt-2` use FHIR's `htmlChecks()`, which
+  the server did not implement, so `$validate` of any resource with a narrative failed with
+  "unsupported function htmlChecks". It now checks that the narrative is one `div` in the XHTML
+  namespace with only the basic formatting elements, no script and some text.
+- **A complex extension is validated by the values inside it,** as is anything else a profile
+  slices: the `value[x]` of a part of an extension (the `lang` and `content` of a translation)
+  was looked for under that literal name and reported missing. Slices of an element that sits
+  inside a slice of its parent (each section of a Composition slicing its `entry`) are now told
+  apart, and no longer applied to every value of the element.
+- **`$document` returns a valid document.** It has an `identifier`, a `timestamp` and a `urn:uuid`
+  `fullUrl` for each entry, references that point at them, and holds what the Composition's
+  resources reference as well as what it references itself, each once. A document of more than
+  1000 resources is a `422`.
+- **`$everything` and `$document` hold only what the caller's scopes let them read.** They used to
+  read every kind of resource of the compartment or the document regardless of the token.
+- The built-in Patient compartment holds `MedicationStatement` and `Immunization`, for a server
+  with no `CompartmentDefinition` installed.
 - **A running server holds what every request needs and an index of the rest, and reads the rest
   the first time a request uses it.** It used to hold every StructureDefinition, code system,
   value set expansion and concept map of the installed packages in memory: about 100 MB for R4

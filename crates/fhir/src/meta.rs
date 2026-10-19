@@ -6,8 +6,9 @@ use refhir_database::Transaction;
 use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
+use crate::document;
 use crate::error::FhirError;
-use crate::ops::{self, decorate};
+use crate::ops;
 use crate::search;
 
 pub fn get(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<Value, FhirError> {
@@ -89,8 +90,10 @@ pub fn everything(
     catalog: &Catalog,
     model: &ResourceModel,
     id: &str,
+    args: &Value,
 ) -> Result<Value, FhirError> {
     catalog.deny_response_read(&model.name)?;
+    let may_read = document::may_read(args);
     let focus = ops::read(tx, model, id)?;
     let mut entries = vec![json!({"resource": focus, "search": {"mode": "match"}})];
     let Some(compartment) = catalog.compartment(&model.name) else {
@@ -100,7 +103,10 @@ pub fn everything(
         let Ok(other) = catalog.get(&link.code) else {
             continue;
         };
-        if link.params.is_empty() || catalog.deny_response_read(&link.code).is_err() {
+        if link.params.is_empty()
+            || catalog.deny_response_read(&link.code).is_err()
+            || !may_read(&link.code)
+        {
             continue;
         }
         let mut params = BTreeMap::new();
@@ -118,6 +124,7 @@ pub fn document(
     catalog: &Catalog,
     model: &ResourceModel,
     id: &str,
+    args: &Value,
 ) -> Result<Value, FhirError> {
     if model.name != "Composition" {
         return Err(FhirError::Unsupported(
@@ -125,31 +132,14 @@ pub fn document(
         ));
     }
     let composition = ops::read(tx, model, id)?;
-    let mut entries = vec![json!({"resource": composition.clone()})];
-    let mut refs = Vec::new();
-    collect_refs(&composition, &mut refs);
-    for reference in refs {
-        let Some((type_name, id)) = reference.rsplit_once('/') else {
-            continue;
-        };
-        let type_name = type_name.rsplit('/').next().unwrap_or(type_name);
-        if catalog.deny_response_read(type_name).is_err() {
-            continue;
-        }
-        let Ok(target) = catalog.get(type_name) else {
-            continue;
-        };
-        if let Some(stored) = tx.get(&target.tablet(), id, &target.by_id())? {
-            entries.push(json!({
-                "resource": decorate(stored.json, id, stored.ts)
-            }));
-        }
-    }
-    Ok(json!({
-        "resourceType": "Bundle",
-        "type": "document",
-        "entry": entries
-    }))
+    let resources = document::gather(
+        tx,
+        catalog,
+        vec![composition],
+        &document::may_read(args),
+        &|_| true,
+    )?;
+    Ok(document::package(resources))
 }
 
 fn bundle(entries: Vec<Value>) -> Value {
@@ -214,23 +204,4 @@ fn meta_same(left: &Value, right: &Value) -> bool {
     let left_code = code(left);
     left_code.0.is_some() && left_code == code(right)
         || left.as_str().is_some() && left.as_str() == right.as_str()
-}
-
-fn collect_refs(value: &Value, refs: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(reference) = map.get("reference").and_then(|item| item.as_str()) {
-                refs.push(reference.to_string());
-            }
-            for item in map.values() {
-                collect_refs(item, refs);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_refs(item, refs);
-            }
-        }
-        _ => {}
-    }
 }

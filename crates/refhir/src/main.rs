@@ -393,6 +393,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    let health_cards = load_health_cards_key(&cfg)?;
     check_tenant(&cfg)?;
     check_role(&cfg)?;
     // A tenant's files are its own: another tenant's process on this host must not write in them.
@@ -631,6 +632,7 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             smart_confidential_secret,
             oidc: cfg.oidc,
             smart_demo_login: cfg.smart_demo_login,
+            health_cards,
             smart,
             primary_url: cfg.primary_url,
             tenant: cfg.tenant,
@@ -648,6 +650,32 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         },
     ))?;
     Ok(())
+}
+
+/// The key that signs SMART Health Cards, read before anything else starts so a key that cannot
+/// be used stops the server with the reason, not the first request for a card. A card names where
+/// its key is published, so the server has to know the address it is reached at.
+fn load_health_cards_key(
+    cfg: &ResolvedConfig,
+) -> Result<Option<std::sync::Arc<refhir_server::IssuerKey>>, Box<dyn std::error::Error>> {
+    let Some(path) = &cfg.health_cards_key_file else {
+        return Ok(None);
+    };
+    let loopback = cfg.bind.parse::<SocketAddr>()?.ip().is_loopback();
+    if cfg.public_url.is_none() && !loopback {
+        return Err("[health_cards] on a non-loopback bind requires --public-url: a card says where its key is published".into());
+    }
+    if let Some(url) = &cfg.public_url {
+        if !url.starts_with("https://") {
+            tracing::warn!(
+                "SMART Health Cards name {url} as their issuer, and a verifier accepts only an https address"
+            );
+        }
+    }
+    let key = refhir_server::IssuerKey::from_file(path)
+        .map_err(|err| format!("[health_cards] key_file {path}: {err}"))?;
+    tracing::info!("SMART Health Cards are signed with key {}", key.kid());
+    Ok(Some(std::sync::Arc::new(key)))
 }
 
 /// A tenant is a part of a Postgres database that many tenants share: nothing else holds one.

@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
 use refhir_fhir::{
-    extra_dir, install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore,
+    cards_dir, extra_dir, install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore,
     MAX_OCC_FAILURES,
 };
 use refhir_sqlite::SqlitePersistence;
@@ -2660,6 +2660,10 @@ fn two_patients_app() -> axum::Router {
         Some("p1"),
     );
     smart.install_token("admin", &["user/*.read", "user/*.write"], None);
+    // Bound to `p1` and may read the Patient, and nothing else.
+    smart.install_token("p1-patient-only", &["patient/Patient.read"], Some("p1"));
+    // Not bound to a patient, and may not read any Patient.
+    smart.install_token("observations-only", &["user/Observation.read"], None);
     crate::app_with(
         db,
         catalog,
@@ -2686,6 +2690,110 @@ async fn get_as(app: &axum::Router, token: &str, uri: &str) -> (StatusCode, Valu
     )
     .await;
     (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+async fn post_as(app: &axum::Router, token: &str, uri: &str, body: &Value) -> (StatusCode, Value) {
+    let (status, body) = send_text(
+        app,
+        "POST",
+        uri,
+        &body.to_string(),
+        &[
+            ("authorization", &format!("Bearer {token}")),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_patient_summary_is_read_by_get_or_post_and_a_patients_token_reaches_only_its_own() {
+    let app = two_patients_app();
+    let parameters = json!({"resourceType": "Parameters", "parameter": []});
+
+    let own = get_as(&app, "p1-reader", "/Patient/p1/$summary").await;
+    assert_eq!(own.0, StatusCode::OK, "{}", own.1);
+    assert_eq!(own.1["type"], "document");
+    assert_eq!(own.1["entry"][0]["resource"]["resourceType"], "Composition");
+    assert!(resource_ids(&own.1).contains(&"p1".to_string()));
+    assert!(!resource_ids(&own.1).contains(&"p2".to_string()));
+
+    // A POST is a read of the patient too, and its body is parameters, not a resource to place
+    // in the token's compartment.
+    let posted = post_as(&app, "p1-reader", "/Patient/p1/$summary", &parameters).await;
+    assert_eq!(posted.0, StatusCode::OK, "{}", posted.1);
+    let admin_post = post_as(&app, "admin", "/Patient/p2/$summary", &parameters).await;
+    assert_eq!(admin_post.0, StatusCode::OK, "{}", admin_post.1);
+
+    // Another patient's summary, and the type-level form that finds a patient by identifier, are
+    // not for a token confined to one patient.
+    let other = get_as(&app, "p1-reader", "/Patient/p2/$summary").await;
+    assert_eq!(other.0, StatusCode::FORBIDDEN, "{}", other.1);
+    let other_post = post_as(&app, "p1-reader", "/Patient/p2/$summary", &parameters).await;
+    assert_eq!(other_post.0, StatusCode::FORBIDDEN, "{}", other_post.1);
+    let by_identifier = get_as(&app, "p1-reader", "/Patient/$summary?identifier=x").await;
+    assert_eq!(
+        by_identifier.0,
+        StatusCode::FORBIDDEN,
+        "{}",
+        by_identifier.1
+    );
+
+    // A token that may not read Patients, or none at all, is refused.
+    let blind = get_as(&app, "observations-only", "/Patient/p1/$summary").await;
+    assert_eq!(blind.0, StatusCode::FORBIDDEN, "{}", blind.1);
+    let anonymous = send(&app, "GET", "/Patient/p1/$summary", None, None).await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    // A caller that is not confined to a patient names one by identifier, or does not find it.
+    let unknown = get_as(
+        &app,
+        "admin",
+        "/Patient/$summary?identifier=http%3A%2F%2Fh%7Cnone",
+    )
+    .await;
+    assert_eq!(unknown.0, StatusCode::NOT_FOUND, "{}", unknown.1);
+    let unnamed = get_as(&app, "admin", "/Patient/$summary").await;
+    assert_eq!(unnamed.0, StatusCode::BAD_REQUEST, "{}", unnamed.1);
+    let wrong_type = get_as(&app, "admin", "/Observation/o1/$summary").await;
+    assert_eq!(wrong_type.0, StatusCode::BAD_REQUEST, "{}", wrong_type.1);
+}
+
+#[tokio::test]
+async fn everything_holds_only_what_the_tokens_scopes_let_it_read() {
+    let app = two_patients_app();
+    let all = get_as(&app, "p1-reader", "/Patient/p1/$everything").await;
+    assert_eq!(all.0, StatusCode::OK, "{}", all.1);
+    let ids = resource_ids(&all.1);
+    assert!(
+        ids.contains(&"p1".to_string()) && ids.contains(&"o1".to_string()),
+        "{ids:?}"
+    );
+    assert!(!ids.contains(&"o2".to_string()), "{ids:?}");
+
+    // The same patient with a token that may read the Patient and nothing else.
+    let narrow = get_as(&app, "p1-patient-only", "/Patient/p1/$everything").await;
+    assert_eq!(narrow.0, StatusCode::OK, "{}", narrow.1);
+    assert_eq!(resource_ids(&narrow.1), ["p1"]);
+}
+
+#[tokio::test]
+async fn the_capability_statement_names_the_summary_operation_of_a_patient() {
+    let app = two_patients_app();
+    let metadata = send(&app, "GET", "/metadata", None, None).await;
+    assert_eq!(metadata.status, StatusCode::OK);
+    let patient = metadata.body["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Patient")
+        .unwrap();
+    assert_eq!(patient["operation"][0]["name"], "summary");
+    assert_eq!(
+        patient["operation"][0]["definition"],
+        "http://hl7.org/fhir/uv/ips/OperationDefinition/summary"
+    );
 }
 
 async fn post_bundle_as(app: &axum::Router, token: &str, bundle: &Value) -> (StatusCode, Value) {
@@ -7249,4 +7357,452 @@ pub(crate) mod sync_gaps {
         );
         assert!(ended(&mut socket).await, "the socket stayed open");
     }
+}
+
+/// A server over a tiny package (Patient and Immunization) with a signing key (or none), holding
+/// three patients, two of them with an immunization. `p1-reader` is bound to `p1`; `admin` is not.
+fn cards_app(signing: bool) -> axum::Router {
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, cards_dir()).unwrap();
+    {
+        let loaded = catalog.read().expect("catalog");
+        for resource in [
+            json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Lovelace", "given": ["Ada"]}],
+                "birthDate": "1815-12-10", "gender": "female"}),
+            json!({"resourceType": "Patient", "id": "p2", "name": [{"family": "Other"}], "birthDate": "1990-01-01"}),
+            json!({"resourceType": "Patient", "id": "p3", "name": [{"family": "Empty"}], "birthDate": "2000-01-01"}),
+            json!({"resourceType": "Immunization", "id": "i1", "status": "completed",
+                "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "140", "display": "Influenza"}]},
+                "patient": {"reference": "Patient/p1"}, "occurrenceDateTime": "2023-10-01"}),
+            json!({"resourceType": "Immunization", "id": "i2", "status": "completed",
+                "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "88"}]},
+                "patient": {"reference": "Patient/p2"}, "occurrenceDateTime": "2022-01-01"}),
+        ] {
+            refhir_fhir::import_resource(&db, &loaded, &resource).unwrap();
+        }
+    }
+    let smart = Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token("p1-reader", &["patient/*.read"], Some("p1"));
+    smart.install_token("admin", &["user/*.read"], None);
+    smart.install_token("observations-only", &["user/Observation.read"], None);
+    crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            smart_demo_login: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+            smart: Some(smart),
+            public_url: Some("https://refhir.example.org/fhir".into()),
+            health_cards: signing.then(|| {
+                Arc::new(crate::IssuerKey::from_pem(&crate::health_cards::generated_pem()).unwrap())
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+fn card_parameters(extra: Value) -> Value {
+    let mut parameter = vec![json!({"name": "credentialType", "valueUri": "Immunization"})];
+    parameter.extend(extra.as_array().cloned().unwrap_or_default());
+    json!({"resourceType": "Parameters", "parameter": parameter})
+}
+
+/// The claims of a card, once its signature has been checked against `jwks`.
+fn checked_claims(card: &str, jwks: &Value) -> Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+    use std::io::Read;
+
+    let parts: Vec<&str> = card.split('.').collect();
+    assert_eq!(parts.len(), 3);
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+    let key = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["kid"] == header["kid"])
+        .expect("the key set holds the key the card names");
+    let mut point = vec![4u8];
+    point.extend(URL_SAFE_NO_PAD.decode(key["x"].as_str().unwrap()).unwrap());
+    point.extend(URL_SAFE_NO_PAD.decode(key["y"].as_str().unwrap()).unwrap());
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
+        .verify(
+            format!("{}.{}", parts[0], parts[1]).as_bytes(),
+            &URL_SAFE_NO_PAD.decode(parts[2]).unwrap(),
+        )
+        .expect("the signature checks");
+    let mut payload = String::new();
+    flate2::read::DeflateDecoder::new(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()[..])
+        .read_to_string(&mut payload)
+        .unwrap();
+    serde_json::from_str(&payload).unwrap()
+}
+
+/// Loading the R4 release is most of what a card test costs, so the tests of a server with a
+/// signing key are the steps of one test, over one server.
+#[tokio::test]
+async fn a_server_with_a_signing_key_issues_cards_that_its_published_key_checks() {
+    let app = cards_app(true);
+    a_health_card_is_signed_by_the_server_and_checked_with_its_published_key(&app).await;
+    a_health_card_is_issued_to_the_patient_it_is_about_and_to_no_one_else(&app).await;
+    a_health_card_request_that_cannot_be_met_is_refused_and_says_why(&app).await;
+    a_health_card_for_what_is_new_holds_only_what_is_new(&app).await;
+    a_server_with_a_key_says_it_issues_cards(&app).await;
+}
+
+async fn a_health_card_for_what_is_new_holds_only_what_is_new(app: &axum::Router) {
+    let asked = |since: &str| {
+        let app = app.clone();
+        let parameters = card_parameters(json!([{"name": "_since", "valueDateTime": since}]));
+        async move {
+            let reply = post_as(
+                &app,
+                "admin",
+                "/Patient/p1/$health-cards-issue",
+                &parameters,
+            )
+            .await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1);
+            reply.1
+        }
+    };
+    // Everything here was written when the server was made, so a time before that holds it all, and
+    // one after it holds nothing, and an empty answer is not an error.
+    let all = asked("2000-01-01").await;
+    assert_eq!(all["parameter"][0]["name"], "verifiableCredential");
+    assert_eq!(
+        asked("2999-01-01T00:00:00Z").await,
+        json!({"resourceType": "Parameters"})
+    );
+}
+
+async fn a_health_card_is_signed_by_the_server_and_checked_with_its_published_key(
+    app: &axum::Router,
+) {
+    // The key set is open, and readable from a browser.
+    let anonymous = send(
+        app,
+        "GET",
+        "/health-cards/.well-known/jwks.json",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(anonymous.status, StatusCode::OK, "{}", anonymous.body);
+    let jwks = anonymous.body.clone();
+    assert_eq!(jwks["keys"][0]["alg"], "ES256");
+    assert!(jwks["keys"][0].get("d").is_none());
+    // Any origin may read it, a GET or a preflight: that is how a wallet in a browser checks a card.
+    for method in ["GET", "OPTIONS"] {
+        let origin = cors_header(
+            app,
+            method,
+            "/health-cards/.well-known/jwks.json",
+            &[("origin", "https://wallet.example")],
+            "access-control-allow-origin",
+        )
+        .await;
+        assert_eq!(origin.as_deref(), Some("*"), "{method}");
+    }
+
+    let issued = post_as(
+        app,
+        "admin",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::OK, "{}", issued.1);
+    let parameters = issued.1["parameter"].as_array().unwrap();
+    let card = parameters[0]["valueString"].as_str().unwrap();
+    assert_eq!(parameters[0]["name"], "verifiableCredential");
+
+    let claims = checked_claims(card, &jwks);
+    assert_eq!(
+        claims["iss"],
+        "https://refhir.example.org/fhir/health-cards"
+    );
+    assert!(claims["nbf"].as_u64().unwrap() > 1_700_000_000);
+    assert_eq!(
+        claims["vc"]["type"],
+        json!([
+            "https://smarthealth.cards#health-card",
+            "https://smarthealth.cards#immunization"
+        ])
+    );
+    assert_eq!(claims["vc"]["credentialSubject"]["fhirVersion"], "4.0.1");
+    let bundle = &claims["vc"]["credentialSubject"]["fhirBundle"];
+    assert_eq!(bundle["type"], "collection");
+    let entries = bundle["entry"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "p1 and p1's immunization, not p2's: {bundle}"
+    );
+    assert_eq!(entries[0]["resource"]["name"][0]["family"], "Lovelace");
+    assert_eq!(entries[1]["resource"]["patient"]["reference"], "resource:0");
+    assert!(
+        !card.contains("Lovelace"),
+        "the card is compressed, not readable text"
+    );
+
+    // Where each resource came from.
+    let link = |bundled: &str| {
+        parameters
+            .iter()
+            .filter(|parameter| parameter["name"] == "resourceLink")
+            .find(|parameter| parameter["part"][1]["valueUri"] == bundled)
+            .map(|parameter| parameter["part"][2]["valueUri"].clone())
+            .unwrap()
+    };
+    assert_eq!(
+        link("resource:0"),
+        "https://refhir.example.org/fhir/Patient/p1"
+    );
+    assert_eq!(
+        link("resource:1"),
+        "https://refhir.example.org/fhir/Immunization/i1"
+    );
+
+    // A patient with nothing to put in a card gets no card, not an error.
+    let none = post_as(
+        app,
+        "admin",
+        "/Patient/p3/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(none.0, StatusCode::OK, "{}", none.1);
+    assert_eq!(none.1, json!({"resourceType": "Parameters"}));
+}
+
+async fn a_health_card_is_issued_to_the_patient_it_is_about_and_to_no_one_else(app: &axum::Router) {
+    let own = post_as(
+        app,
+        "p1-reader",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(own.0, StatusCode::OK, "{}", own.1);
+    let other = post_as(
+        app,
+        "p1-reader",
+        "/Patient/p2/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(other.0, StatusCode::FORBIDDEN, "{}", other.1);
+    let blind = post_as(
+        app,
+        "observations-only",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(blind.0, StatusCode::FORBIDDEN, "{}", blind.1);
+    let anonymous = send(
+        app,
+        "POST",
+        "/Patient/p1/$health-cards-issue",
+        Some(card_parameters(json!([]))),
+        None,
+    )
+    .await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+}
+
+async fn a_health_card_request_that_cannot_be_met_is_refused_and_says_why(app: &axum::Router) {
+    let refused = |parameters: Value| {
+        let app = app.clone();
+        async move {
+            let reply = post_as(
+                &app,
+                "admin",
+                "/Patient/p1/$health-cards-issue",
+                &parameters,
+            )
+            .await;
+            assert_eq!(reply.0, StatusCode::BAD_REQUEST, "{}", reply.1);
+            reply.1["issue"][0]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let since = refused(card_parameters(
+        json!([{"name": "_since", "valueString": "last week"}]),
+    ))
+    .await;
+    assert!(since.contains("_since is not a date"), "{since}");
+    let unknown = refused(json!({"resourceType": "Parameters", "parameter": [
+        {"name": "credentialType", "valueUri": "https://smarthealth.cards#covid19"}
+    ]}))
+    .await;
+    assert!(unknown.contains("covid19"), "{unknown}");
+    let nothing = refused(json!({"resourceType": "Parameters", "parameter": []})).await;
+    assert!(nothing.contains("credentialType is required"), "{nothing}");
+    let no_body = send_text(
+        app,
+        "POST",
+        "/Patient/p1/$health-cards-issue",
+        "",
+        &[
+            ("authorization", "Bearer admin"),
+            ("content-type", "application/fhir+json"),
+        ],
+    )
+    .await;
+    assert_eq!(no_body.0, StatusCode::BAD_REQUEST, "{}", no_body.1);
+    let wrong_type = post_as(
+        app,
+        "admin",
+        "/Immunization/i1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(wrong_type.0, StatusCode::BAD_REQUEST, "{}", wrong_type.1);
+    let unknown_patient = post_as(
+        app,
+        "admin",
+        "/Patient/nobody/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(
+        unknown_patient.0,
+        StatusCode::NOT_FOUND,
+        "{}",
+        unknown_patient.1
+    );
+}
+
+#[tokio::test]
+async fn a_server_without_a_signing_key_issues_no_cards_and_does_not_say_it_does() {
+    let app = cards_app(false);
+    let reply = post_as(
+        &app,
+        "admin",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(reply.0, StatusCode::NOT_IMPLEMENTED, "{}", reply.1);
+    assert!(reply.1["issue"][0]["diagnostics"]
+        .as_str()
+        .unwrap()
+        .contains("no signing key"));
+    let keys = send(
+        &app,
+        "GET",
+        "/health-cards/.well-known/jwks.json",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(keys.status, StatusCode::NOT_FOUND);
+
+    let without = send(&app, "GET", "/metadata", None, None).await;
+    assert_eq!(patient_operations(&without.body), ["summary"]);
+    let capabilities = send(&app, "GET", "/.well-known/smart-configuration", None, None).await;
+    assert!(!capabilities.body["capabilities"]
+        .to_string()
+        .contains("health-cards"));
+}
+
+fn patient_operations(statement: &Value) -> Vec<String> {
+    statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Patient")
+        .unwrap()["operation"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|operation| operation["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn a_server_with_a_key_says_it_issues_cards(signing: &axum::Router) {
+    let with = send(signing, "GET", "/metadata", None, None).await;
+    assert_eq!(
+        patient_operations(&with.body),
+        ["summary", "health-cards-issue"]
+    );
+    let capabilities = send(
+        signing,
+        "GET",
+        "/.well-known/smart-configuration",
+        None,
+        None,
+    )
+    .await;
+    assert!(capabilities.body["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("health-cards")));
+}
+
+#[tokio::test]
+async fn over_http_a_resource_says_when_it_was_written_and_is_found_and_listed_by_it() {
+    let app = cards_app(false);
+    let read = get_as(&app, "admin", "/Patient/p1").await;
+    assert_eq!(read.0, StatusCode::OK, "{}", read.1);
+    let written = read.1["meta"]["lastUpdated"].as_str().unwrap().to_string();
+    assert!(written.ends_with('Z') && written.len() == 24, "{written}");
+
+    let found = |uri: String| {
+        let app = app.clone();
+        async move {
+            let reply = get_as(&app, "admin", &uri).await;
+            assert_eq!(reply.0, StatusCode::OK, "{uri}: {}", reply.1);
+            resource_ids(&reply.1)
+        }
+    };
+    // Searching by it.
+    assert_eq!(
+        found("/Patient?_lastUpdated=ge2000-01-01".into())
+            .await
+            .len(),
+        3
+    );
+    assert!(found(format!("/Patient?_lastUpdated=ge{written}"))
+        .await
+        .contains(&"p1".to_string()));
+    assert!(found("/Patient?_lastUpdated=gt2999-01-01".into())
+        .await
+        .is_empty());
+    assert!(found("/Patient?_lastUpdated=lt2000-01-01".into())
+        .await
+        .is_empty());
+    let nonsense = get_as(&app, "admin", "/Patient?_lastUpdated=notadate").await;
+    assert_eq!(nonsense.0, StatusCode::BAD_REQUEST, "{}", nonsense.1);
+
+    // Listing by it: of a type, and of the whole server.
+    assert!(found(format!("/Patient/_history?_since={written}"))
+        .await
+        .contains(&"p1".to_string()));
+    assert!(
+        found("/Patient/_history?_since=2999-01-01T00:00:00Z".into())
+            .await
+            .is_empty()
+    );
+    assert!(found("/_history?_since=2999-01-01T00:00:00Z".into())
+        .await
+        .is_empty());
+    assert!(!found("/_history?_since=2000-01-01".into()).await.is_empty());
+    let refused = get_as(&app, "admin", "/Patient/_history?_since=yesterday").await;
+    assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{}", refused.1);
+    assert!(refused.1["issue"][0]["diagnostics"]
+        .as_str()
+        .unwrap()
+        .contains("invalid _since"));
 }

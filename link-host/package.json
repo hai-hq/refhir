@@ -1,0 +1,42 @@
+{
+  "name": "@haihq/refhir-link-host",
+  "version": "0.0.1",
+  "description": "A SMART Health Links host: stores encrypted files and answers whoever opens a link",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hai-hq/refhir.git",
+    "directory": "link-host"
+  },
+  "homepage": "https://github.com/hai-hq/refhir/tree/main/link-host#readme",
+  "bugs": {
+    "url": "https://github.com/hai-hq/refhir/issues"
+  },
+  "keywords": [
+    "smart-health-links",
+    "fhir",
+    "hl7",
+    "healthcare",
+    "interoperability"
+  ],
+  "bin": {
+    "refhir-link-host": "./src/server.mjs"
+  },
+  "exports": {
+    ".": "./src/host.mjs"
+  },
+  "files": [
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

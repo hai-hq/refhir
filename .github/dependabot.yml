@@ -27,6 +27,11 @@ updates:
       site-minor-and-patch:
         update-types: [minor, patch]
 
+  - package-ecosystem: docker
+    directory: /link-host
+    schedule:
+      interval: weekly
+
   - package-ecosystem: gomod
     directory: /clients/go
     schedule:

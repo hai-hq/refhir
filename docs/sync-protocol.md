@@ -126,7 +126,7 @@ Names you may subscribe to (read-only):
 | `{Type}/read` | `id`. The value is the resource. |
 | `{Type}/search` | A flat object whose values are strings, such as `{"active": "true"}` or `{"_id": "o1", "_include": "Observation:subject"}`. A parameter that a URL would give more than once, which FHIR reads as AND, is an array of strings: `{"schedule.actor": ["HealthcareService/h1", "Location/l1"]}`. A comma inside one string is OR. The array must not be empty. The value is a `searchset` Bundle, and it is not paged unless the arguments say `_count`. |
 | `{Type}/vread` | `id`, `versionId` |
-| `{Type}/history`, `system/history` | `id` (optional), `_since`, `_count`, `_offset` as strings |
+| `{Type}/history`, `system/history` | `id` (optional), `_since`, `_count`, `_offset` as strings. `_since` is a version id (all digits) or a date and time, as on [REST](fhir-api.md#when-a-resource-was-written) |
 | `{Type}/$validate`, `$meta`, `$everything`, `$document` | `id`, or `resource` for `$validate` |
 | `{Type}/$expand`, `$expandability`, `$validate-code`, `$lookup`, `$translate`, `$subsumes` | Terminology operations. They read no documents, so their read set is empty and no write invalidates them. |
 | `{Type}/$populate`, `$assemble`, `$next-question`, `$behavior`, `$extract` | SDC operations. SMART treats them as reads. |

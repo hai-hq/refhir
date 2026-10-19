@@ -21,6 +21,8 @@ pub struct FileConfig {
     #[serde(default)]
     pub smart: SmartSection,
     #[serde(default)]
+    pub health_cards: HealthCardsSection,
+    #[serde(default)]
     pub export: ExportSection,
     #[serde(default)]
     pub terminology: TerminologySection,
@@ -133,6 +135,14 @@ pub struct ConformanceSection {
     /// Whether the server may download packages (from `package_registry`). Off unless set: the
     /// release's packages come from the prepared file.
     pub package_download: Option<bool>,
+}
+
+/// SMART Health Cards. The server issues them when it has a key to sign them with.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HealthCardsSection {
+    /// A PEM file holding the signing key: an unencrypted PKCS#8 private key on P-256.
+    /// `REFHIR_HEALTH_CARDS_KEY_FILE` sets it too.
+    pub key_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -329,6 +339,8 @@ pub struct ResolvedConfig {
     pub smart_dcr_token: Option<String>,
     pub smart_confidential_secret: Option<String>,
     pub smart_demo_login: bool,
+    /// The PEM file with the key that signs SMART Health Cards; `None` issues none.
+    pub health_cards_key_file: Option<String>,
     pub oidc: Option<refhir_server::OidcConfig>,
     pub export_dir: String,
     pub terminology_urls: Vec<String>,
@@ -366,6 +378,7 @@ impl ResolvedConfig {
             smart_dcr_token: None,
             smart_confidential_secret: None,
             smart_demo_login: false,
+            health_cards_key_file: None,
             oidc: None,
             export_dir: "export".to_string(),
             terminology_urls: Vec::new(),
@@ -498,6 +511,9 @@ impl ResolvedConfig {
         }
         if let Some(v) = file.smart.demo_login {
             self.smart_demo_login = v;
+        }
+        if file.health_cards.key_file.is_some() {
+            self.health_cards_key_file = file.health_cards.key_file.clone();
         }
         if let Some(section) = &file.smart.oidc {
             let oidc = self
@@ -884,6 +900,9 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     if let Some(secret) = env_value("REFHIR_SMART_CONFIDENTIAL_SECRET") {
         cfg.smart_confidential_secret = Some(secret);
     }
+    if let Some(path) = env_value("REFHIR_HEALTH_CARDS_KEY_FILE") {
+        cfg.health_cards_key_file = Some(path);
+    }
     let issuer = env_value("REFHIR_OIDC_ISSUER");
     let client_id = env_value("REFHIR_OIDC_CLIENT_ID");
     let client_secret = env_value("REFHIR_OIDC_CLIENT_SECRET");
@@ -947,6 +966,32 @@ mod tests {
 
     /// Tests that set or read process environment variables take turns.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_health_cards_key_file_comes_from_the_file_and_the_environment_overrides_it() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file: FileConfig =
+            toml::from_str("[health_cards]\nkey_file = \"/etc/refhir/cards.pem\"\n").unwrap();
+        assert!(
+            file.unknown.is_empty(),
+            "the section is one the server reads"
+        );
+        let mut cfg = ResolvedConfig::defaults();
+        assert_eq!(cfg.health_cards_key_file, None, "no key, no cards");
+        cfg.apply_file(&file).unwrap();
+        assert_eq!(
+            cfg.health_cards_key_file.as_deref(),
+            Some("/etc/refhir/cards.pem")
+        );
+        std::env::set_var("REFHIR_HEALTH_CARDS_KEY_FILE", "/run/secrets/cards.pem");
+        let applied = apply_env(&mut cfg);
+        std::env::remove_var("REFHIR_HEALTH_CARDS_KEY_FILE");
+        applied.unwrap();
+        assert_eq!(
+            cfg.health_cards_key_file.as_deref(),
+            Some("/run/secrets/cards.pem")
+        );
+    }
 
     #[test]
     fn env_overrides_file_values() {

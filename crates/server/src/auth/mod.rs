@@ -29,8 +29,8 @@ pub use store::SmartStore;
 pub(crate) use interact::patient_exists;
 pub(crate) use interact::{interact_get, interact_post, oidc_callback};
 pub(crate) use oauth::{
-    authorize, configuration, ehr_launch, introspect, issue, jwks, manage, parse_authorize_form,
-    register, revoke, security_extension, style,
+    authorize, configuration, ehr_launch, introspect, issue, issuer, jwks, manage,
+    parse_authorize_form, register, revoke, security_extension, style,
 };
 pub(crate) use scopes::http_interaction;
 pub(crate) use store::origin_allowed;
@@ -382,6 +382,13 @@ pub fn patient_http_operation(
     }
     let id = parts.next();
     let tail = parts.next();
+    // These two read the patient the path names. Their body is parameters, which belong to no
+    // patient's compartment, so it is not one of the resources the token's patient must hold.
+    if let (Some(id), Some("$summary" | "$health-cards-issue")) = (id, tail) {
+        if is_instance_id(id) {
+            return Ok(Some((format!("{resource}/read"), json!({"id": id}))));
+        }
+    }
     match (method, id, tail) {
         ("GET" | "HEAD", None, None) => Ok(None),
         ("POST", None, None) => {
