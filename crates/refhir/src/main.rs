@@ -996,6 +996,11 @@ fn install_packages(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PackagePlan::Bundled(release, extra) = plan;
     install_release_defaults(store, db, catalog, *release)?;
+    // What the release's packages refer to and none of them holds (ISO 4217 for `currencies`),
+    // for a database that had them before this server carried it, as well as for a new one.
+    if !skip_release_defaults() {
+        refhir_fhir::install_builtin_terminology(store, db, catalog)?;
+    }
     for spec in extra {
         refhir_fhir::install_package(store, db, catalog, spec)?;
     }

@@ -2,6 +2,7 @@
 //!
 //! Handlers are Rust functions on `Transaction`. Operation names look like `Patient/read`.
 
+mod builtin;
 mod bundle;
 mod catalog;
 mod compartment;
@@ -27,6 +28,7 @@ mod terms;
 #[cfg(test)]
 mod tests;
 
+pub use builtin::{install_builtin_terminology, BUILTIN_PACKAGE};
 pub use bundle::transaction;
 pub use catalog::{Catalog, CatalogClock, CatalogStamp, ReferencePolicy};
 pub use conform::{commit_operation, repair_conformance};

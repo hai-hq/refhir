@@ -1145,7 +1145,7 @@ fn fhir_version(manifest: &Value, definition_version: Option<String>) -> Result<
     definition_version.ok_or_else(|| FhirError::Invalid("package fhirVersion is required".into()))
 }
 
-fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
+pub(crate) fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
     Ok(NewTerminology {
         resource_type: required_str(resource, "resourceType")?,
         url: required_str(resource, "url")?,

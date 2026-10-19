@@ -749,7 +749,7 @@ fn terminology_urls(resources: &[Value]) -> Vec<String> {
 ///
 /// The change is applied to the live catalog in place under its write lock, together with the
 /// stored expansions, so two writers cannot each rebuild from what the other has not applied.
-fn apply_terminology(
+pub(crate) fn apply_terminology(
     store: &dyn ConformanceStore,
     catalog: &std::sync::RwLock<crate::catalog::Catalog>,
     local_id: i64,

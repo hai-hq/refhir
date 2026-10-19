@@ -7,8 +7,8 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
 use refhir_fhir::{
-    extra_dir, install_package_dir, minir4_dir, r4_dir, sdc_dir, Catalog, ConformanceStore,
-    MAX_OCC_FAILURES,
+    extra_dir, install_builtin_terminology, install_package_dir, minir4_dir, r4_dir, sdc_dir,
+    Catalog, ConformanceStore, MAX_OCC_FAILURES,
 };
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
@@ -1201,6 +1201,7 @@ async fn expand_is_a_get_as_well_as_a_post() {
     let db = Arc::new(Database::open(store.clone()).unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::empty()));
     install_package_dir(store.as_ref(), &db, &catalog, r4_dir()).unwrap();
+    install_builtin_terminology(store.as_ref(), &db, &catalog).unwrap();
     let app = app(db, catalog, store);
     let types = "http://hl7.org/fhir/ValueSet/organization-type";
 
@@ -1348,6 +1349,48 @@ async fn expand_is_a_get_as_well_as_a_post() {
     )
     .await;
     assert_eq!(posted.body, flagged.body);
+    // The currencies HL7 binds Money to come from the ISO 4217 codes the server carries.
+    let currencies = "http://hl7.org/fhir/ValueSet/currencies";
+    let naira = send(
+        &app,
+        "GET",
+        &format!("/ValueSet/$expand?url={currencies}&filter=naira"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(naira.status, StatusCode::OK, "{}", naira.body);
+    assert_eq!(expanded_codes(&naira), ["NGN"]);
+    let all = send(
+        &app,
+        "GET",
+        &format!("/ValueSet/$expand?url={currencies}"),
+        None,
+        None,
+    )
+    .await;
+    let codes = expanded_codes(&all);
+    assert_eq!(codes.len(), 178);
+    for code in ["NGN", "USD", "GBP"] {
+        assert!(codes.iter().any(|item| item == code), "{code}");
+    }
+    let currency = |code: &str| {
+        send(
+            &app,
+            "POST",
+            "/ValueSet/$validate-code",
+            Some(json!({"url": currencies, "system": "urn:iso:std:iso:4217", "code": code})),
+            None,
+        )
+    };
+    assert_eq!(
+        currency("NGN").await.body["parameter"][0]["valueBoolean"],
+        true
+    );
+    assert_eq!(
+        currency("ZZZ").await.body["parameter"][0]["valueBoolean"],
+        false
+    );
     let checked = |code: &str| {
         send(
             &app,

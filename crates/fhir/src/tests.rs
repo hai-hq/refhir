@@ -6916,6 +6916,146 @@ fn expansions_stored_under_other_rules_are_rebuilt_once_at_the_next_start() {
     assert!(!harness.catalog.read().unwrap().expansions_stale());
 }
 
+/// The error issues `Invoice/$validate` finds in an invoice whose net total is `value` in `currency`.
+fn currency_errors(harness: &Harness, currency: &str) -> Vec<String> {
+    let checked = apply(
+        harness,
+        "Invoice/$validate",
+        json!({"resource": {"resourceType": "Invoice", "status": "draft",
+                            "totalNet": {"value": 15000, "currency": currency}}}),
+    );
+    checked["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["severity"] == "error")
+        .map(|issue| issue["diagnostics"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+#[test]
+fn the_currencies_value_set_expands_over_the_iso_4217_codes_the_server_carries() {
+    let currencies = "http://hl7.org/fhir/ValueSet/currencies";
+    let iso = "urn:iso:std:iso:4217";
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+
+    // HL7 publishes no CodeSystem for ISO 4217, so with only its packages the value set cannot
+    // expand, and a Money cannot be checked.
+    let refused = unprocessable(run_op(
+        &harness,
+        "ValueSet/$expand",
+        &json!({"url": currencies}),
+    ));
+    let text = refused["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(
+        text.contains("code system urn:iso:std:iso:4217 is not installed"),
+        "{text}"
+    );
+    assert!(
+        currency_errors(&harness, "ZZZ").is_empty(),
+        "an unchecked code is not an error"
+    );
+
+    // The server installs the code system itself, and the value set that was waiting for it
+    // expands without any other package being touched.
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    let expanded = apply(&harness, "ValueSet/$expand", json!({"url": currencies}));
+    let (codes, parameters) = expansion_summary(&expanded);
+    assert_eq!(codes.len(), 178);
+    assert_eq!(expanded["expansion"]["total"], 178);
+    let unique: std::collections::BTreeSet<&String> = codes.iter().collect();
+    assert_eq!(unique.len(), codes.len(), "no duplicates");
+    for code in ["NGN", "USD", "GBP", "EUR", "GHS", "KES", "ZAR"] {
+        assert!(codes.contains(&format!("{iso}|{code}")), "{code}");
+    }
+    // The system is complete: nothing says the list is a sample.
+    assert!(parameters.is_empty(), "{parameters:?}");
+    let display = |expanded: &Value, code: &str| {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["code"] == code)
+            .map(|entry| entry["display"].as_str().unwrap().to_string())
+    };
+    assert_eq!(display(&expanded, "NGN").as_deref(), Some("Nigerian Naira"));
+    assert_eq!(display(&expanded, "USD").as_deref(), Some("US Dollar"));
+
+    // A filter finds a currency by what it is called, and by its code.
+    let naira = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": currencies, "filter": "naira"}),
+    );
+    assert_eq!(expansion_summary(&naira).0, [format!("{iso}|NGN")]);
+    let by_code = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": currencies, "filter": "ngn"}),
+    );
+    assert_eq!(expansion_summary(&by_code).0, [format!("{iso}|NGN")]);
+
+    // A real code is in the value set and an unknown one is not.
+    let check = |code: &str| {
+        validated(
+            &harness,
+            json!({"url": currencies, "system": iso, "code": code}),
+        )
+    };
+    assert_eq!(check("NGN"), (true, None));
+    assert_eq!(
+        check("ZZZ"),
+        (false, Some("code is not in the value set".to_string()))
+    );
+    let looked = apply(
+        &harness,
+        "CodeSystem/$validate-code",
+        json!({"url": iso, "code": "GHS"}),
+    );
+    assert_eq!(looked["parameter"][0]["valueBoolean"], true);
+
+    // So a Money that carries a currency is checked: a real one passes, an unknown one is refused.
+    assert!(currency_errors(&harness, "NGN").is_empty());
+    let refused = currency_errors(&harness, "ZZZ");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].contains("ZZZ") && refused[0].contains("currencies"),
+        "{refused:?}"
+    );
+
+    // A write is checked the same way.
+    let invoice = |currency: &str| {
+        json!({"resource": {"resourceType": "Invoice", "status": "draft",
+                            "totalNet": {"value": 15000, "currency": currency}}})
+    };
+    assert!(run_op(&harness, "Invoice/create", &invoice("NGN")).is_ok());
+    let rejected = run_op(&harness, "Invoice/create", &invoice("ZZZ"));
+    assert!(rejected.is_err(), "{rejected:?}");
+
+    // Installing it again is not a second copy, and the answer does not change.
+    let packages = harness.store.load_packages().unwrap();
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(harness.store.load_packages().unwrap().len(), packages.len());
+    assert_eq!(
+        packages
+            .iter()
+            .filter(
+                |package| format!("{}@{}", package.name, package.version) == crate::BUILTIN_PACKAGE
+            )
+            .count(),
+        1
+    );
+    let again = apply(&harness, "ValueSet/$expand", json!({"url": currencies}));
+    assert_eq!(expansion_summary(&again).0, codes);
+
+    // The expansion is stored, so a server that reads it back says the same.
+    publish(&harness.store, &harness.catalog).unwrap();
+    let reread = apply(&harness, "ValueSet/$expand", json!({"url": currencies}));
+    assert_eq!(expansion_summary(&reread).0, codes);
+    assert_expansions_match(&harness.store, "with the built-in terminology");
+}
+
 #[test]
 fn a_database_made_under_the_previous_rules_gains_the_value_sets_that_now_expand_at_its_next_start()
 {

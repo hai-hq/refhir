@@ -26,6 +26,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   message that says the list is only a sample, and the resource validator reports the code as one it
   cannot check, not as an error.
 
+- **ISO 4217 currency codes are built in.** HL7 publishes `ValueSet/currencies` (the required
+  binding of `Money.currency`) as an include of `urn:iso:std:iso:4217` and no CodeSystem for it, so
+  the value set could not be expanded and a currency could not be checked. The server now installs the
+  code system itself, at start, once: the 178 active alphabetic codes with their numeric codes and
+  English names. `$expand` of `currencies` lists them, `$validate-code` accepts a real code and
+  refuses an unknown one, and a `Money` with an unknown `currency` is rejected. A database that
+  already has the R4 packages gets it at its next start, as the package `refhir.builtin.terminology`.
+
 ### Changed
 
 - **Stored expansions are rebuilt once at the first start after this version**, so a database
