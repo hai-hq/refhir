@@ -20,14 +20,15 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   name and full birth date. Names ignore case, accents and order (a family name written as a given
   name matches), phone numbers ignore spacing and whether they have a country code (`+234`, or the
   `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
-  is not active, or that another replaced (`link` type `replaced-by`), is never returned.
-  `onlyCertainMatches` returns nothing when more than one Patient is a potential match. The
-  CapabilityStatement lists the operation on `Patient`. Each entry says what it was found by in
-  `match-evidence` extensions on `search` (the identifier, name, birth date, phone number or email
-  address that matched, the last three as the request wrote them), so that a caller can tell which
-  of its own phone numbers matched. A scope that may search Patients may use it; a token limited to
-  one patient may not. See
-  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
+  is not active is never returned, and a match on one that another replaced (`link` type
+  `replaced-by`) is the Patient that replaced it, followed through up to five links in the store,
+  `probable` at the most and never `certain`. `onlyCertainMatches` returns nothing when more than
+  one Patient is a potential match. Each entry says what it was found by in `match-evidence`
+  extensions on `search`: the name, birth date, identifier, phone number or email address that
+  matched (the last three as the request wrote them, so a caller can tell which of its own phone
+  numbers matched), and the replaced Patient a match came through. The CapabilityStatement lists
+  the operation on `Patient`. A scope that may search Patients may use it; a token limited to one
+  patient may not. See [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
   in a file, `refhir-packages.bundle`, that is made when they are built: the packages are

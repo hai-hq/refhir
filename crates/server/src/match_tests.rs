@@ -99,6 +99,7 @@ fn seed() -> axum::Router {
             json!([identifier("PRF-2002")]),
         ),
         // Records that are no longer in use: one switched off, two replaced, and what replaced them.
+        // `femi-old` and `femi-older` hold an identifier that `femi` does not.
         with(
             with(
                 person("obi", "Okeke", &["Obi"], "1980-02-02"),
@@ -131,6 +132,46 @@ fn seed() -> axum::Router {
             ),
             "link",
             replaced_by("femi"),
+        ),
+        // A chain of replacements, newest first (a reference needs its target to exist): `chain-a`
+        // was replaced by `chain-b`, which was replaced by `chain-c`, which is in use.
+        person("chain-c", "Balogun", &["Segun"], "1969-06-06"),
+        with(
+            person("chain-b", "Balogun", &["Segun"], "1969-06-06"),
+            "link",
+            replaced_by("chain-c"),
+        ),
+        with(
+            with(
+                with(
+                    person("chain-a", "Balogun", &["Segun"], "1969-06-06"),
+                    "active",
+                    json!(false),
+                ),
+                "identifier",
+                json!([identifier("PRF-4001")]),
+            ),
+            "link",
+            replaced_by("chain-b"),
+        ),
+        // A replacement that leads to a Patient that was switched off, with nothing after it.
+        with(
+            person("end-b", "Fashola", &["Kunle"], "1972-02-02"),
+            "active",
+            json!(false),
+        ),
+        with(
+            with(
+                with(
+                    person("end-a", "Fashola", &["Kunle"], "1972-02-02"),
+                    "active",
+                    json!(false),
+                ),
+                "identifier",
+                json!([identifier("PRF-5001")]),
+            ),
+            "link",
+            replaced_by("end-b"),
         ),
         // Three that no one could tell apart, for `count`.
         person("aisha-1", "Yusuf", &["Aisha"], "1999-09-09"),
@@ -448,6 +489,9 @@ fn evidence(entry: &Value) -> Vec<String> {
                 None => kind.to_string(),
                 Some(part) => {
                     assert_eq!(part["url"], "value");
+                    if let Some(reference) = part.get("valueReference") {
+                        return format!("{kind} {}", reference["reference"].as_str().unwrap());
+                    }
                     let value = part
                         .get("valueIdentifier")
                         .or_else(|| part.get("valueContactPoint"))
@@ -650,25 +694,138 @@ async fn count_limits_the_entries() {
 }
 
 #[tokio::test]
-async fn a_record_that_is_not_in_use_is_never_returned() {
-    // Switched off.
+async fn a_record_that_was_switched_off_is_never_returned() {
     let by_identifier = json!({"resourceType": "Patient", "identifier": [identifier("PRF-3001")]});
     assert!(matched(by_identifier, None, None).await.is_empty());
     let by_name = json!({"resourceType": "Patient", "birthDate": "1980-02-02",
         "name": [{"family": "Okeke", "given": ["Obi"]}]});
     assert!(matched(by_name, None, None).await.is_empty());
-    // Replaced, whether or not it was switched off: the record that replaced it is returned for
-    // what it matches itself, and the link is not followed to it. It is not certain, because it
-    // does not hold the identifier.
+}
+
+/// The entries, as `(id, grade, score, what it was found by)`.
+async fn found_by(
+    request: Value,
+    only_certain: Option<bool>,
+) -> Vec<(String, String, f64, Vec<String>)> {
+    let reply = post_match("reader", parameters(request, only_certain, None)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let grades = entries(&reply.body);
+    reply.body["entry"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .zip(grades)
+        .map(|(entry, (id, grade))| {
+            (
+                id,
+                grade,
+                entry["search"]["score"].as_f64().unwrap(),
+                evidence(entry),
+            )
+        })
+        .collect()
+}
+
+fn told(strings: &[&str]) -> Vec<String> {
+    strings.iter().map(|text| text.to_string()).collect()
+}
+
+#[tokio::test]
+async fn a_record_that_was_replaced_leads_to_the_one_that_replaced_it() {
+    // Two records that were replaced by `femi` hold the identifier, and `femi` does not. Each is
+    // certain by it, so `femi` is what is found, and it is not certain: no one compared `femi`
+    // with the request, and the link was made by whoever merged them.
+    let by_identifier = json!({"resourceType": "Patient", "identifier": [identifier("PRF-3002")]});
+    let found = found_by(by_identifier.clone(), None).await;
+    assert_eq!(
+        found,
+        [(
+            "femi".to_string(),
+            "probable".to_string(),
+            0.95,
+            told(&[
+                "replaced-record Patient/femi-old",
+                "replaced-record Patient/femi-older",
+                &format!("identifier {PROFILE}|PRF-3002"),
+            ])
+        )]
+    );
+    // It is the one record, and it is not what a request that will not be linked on a guess may
+    // be given.
+    assert!(found_by(by_identifier, Some(true)).await.is_empty());
+
+    // `femi` has the name and the birth date, which is possible on its own. Reached through the
+    // records that were replaced, which are better, it is probable, once.
     let request = json!({"resourceType": "Patient", "identifier": [identifier("PRF-3002")],
         "birthDate": "1983-04-04", "name": [{"family": "Johnson", "given": ["Femi"]}]});
+    let found = found_by(request, None).await;
+    assert_eq!(found.len(), 1);
     assert_eq!(
-        matched(request, None, None).await,
-        ids_and_grades(&[("femi", "possible")])
+        (found[0].0.as_str(), found[0].1.as_str(), found[0].2),
+        ("femi", "probable", 0.95)
     );
-    let only_the_identifier =
-        json!({"resourceType": "Patient", "identifier": [identifier("PRF-3002")]});
-    assert!(matched(only_the_identifier, None, None).await.is_empty());
+    assert_eq!(
+        found[0].3,
+        told(&[
+            "replaced-record Patient/femi-old",
+            "replaced-record Patient/femi-older",
+            &format!("identifier {PROFILE}|PRF-3002"),
+            "name",
+            "birth-date",
+        ])
+    );
+    // Without the identifier it is what the name and birth date make it: possible, and found
+    // itself and not through a replaced record.
+    let by_name = json!({"resourceType": "Patient", "birthDate": "1983-04-04",
+        "name": [{"family": "Johnson", "given": ["Femi"]}]});
+    let found = found_by(by_name, None).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        (found[0].0.as_str(), found[0].1.as_str()),
+        ("femi", "possible")
+    );
+    assert_eq!(found[0].3, told(&["name", "birth-date"]));
+}
+
+#[tokio::test]
+async fn a_chain_of_replacements_is_followed_to_the_end() {
+    // `chain-a` holds the identifier and was replaced by `chain-b`, which was replaced by
+    // `chain-c`, which is in use.
+    let by_identifier = json!({"resourceType": "Patient", "identifier": [identifier("PRF-4001")]});
+    let found = found_by(by_identifier, None).await;
+    assert_eq!(
+        found,
+        [(
+            "chain-c".to_string(),
+            "probable".to_string(),
+            0.95,
+            told(&[
+                "replaced-record Patient/chain-a",
+                &format!("identifier {PROFILE}|PRF-4001")
+            ])
+        )]
+    );
+    // All three have the name and the birth date, and lead to the same one: it is possible, once,
+    // and found by itself.
+    let by_name = json!({"resourceType": "Patient", "birthDate": "1969-06-06",
+        "name": [{"family": "Balogun", "given": ["Segun"]}]});
+    let found = found_by(by_name, None).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(
+        (found[0].0.as_str(), found[0].1.as_str()),
+        ("chain-c", "possible")
+    );
+    assert_eq!(found[0].3, told(&["name", "birth-date"]));
+}
+
+#[tokio::test]
+async fn a_replacement_that_leads_to_no_patient_in_use_is_not_a_match() {
+    // `end-a` was replaced by `end-b`, which was switched off.
+    let by_identifier = json!({"resourceType": "Patient", "identifier": [identifier("PRF-5001")]});
+    assert!(matched(by_identifier, None, None).await.is_empty());
+    let by_name = json!({"resourceType": "Patient", "birthDate": "1972-02-02",
+        "name": [{"family": "Fashola", "given": ["Kunle"]}]});
+    assert!(matched(by_name, None, None).await.is_empty());
 }
 
 #[tokio::test]

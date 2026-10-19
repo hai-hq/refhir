@@ -181,6 +181,7 @@ and some a `value`:
 | `kind` | Means | `value` |
 |--------|-------|---------|
 | `identifier` | An identifier of the request is on the Patient | `valueIdentifier`: the system and value as the request wrote them. One extension for each that matched |
+| `replaced-record` | The Patient is not what the request matched but what replaced it. Comes first | `valueReference`: the replaced Patient. One extension for each replaced Patient it was found through |
 | `name` | A name of the request is a name of the Patient | |
 | `name-reordered` | Said as well as `name` when the words are the same but not in the same places (a family name written as a given name) | |
 | `birth-date` | The same full birth date | |
@@ -228,10 +229,22 @@ How things are compared:
 - **Gender** only moves the score within its grade: a gender that agrees is a little higher, and
   one that differs is lower. It never decides a grade.
 
-A Patient with `active` false, and one that has a `link` of type `replaced-by`, is never returned,
-whatever it matches. The Patient that replaced it is returned if it matches in its own right, and
-the link is not followed to it: a merge should carry the identifiers across to the Patient that
-survives, and then that Patient is `certain` on them.
+A Patient with `active` false is never returned, and neither is one that another Patient replaced
+(it has a `link` of type `replaced-by`, with `active` false or not). A match on a replaced Patient is
+still a match on the person, so the server follows the link to the Patient that replaced it and
+returns that one:
+
+- Only a relative `Patient/id` in this store is followed, through up to five links, and never round a
+  cycle. It ends at a Patient that is in use and has not been replaced itself. A link to a Patient
+  that is gone, that was switched off, or that is on another server leads nowhere, and then nothing
+  is returned for that match.
+- The Patient it finds has the grade of the match on the replaced one, but at most `probable`: the
+  server compared the replaced Patient with the request, not this one, and the link was made by
+  whoever merged them. So it is never `certain`, and `onlyCertainMatches` never returns it.
+- The entry says so with `replaced-record` evidence, a `valueReference` to each replaced Patient it
+  was found through, so that a caller or the person looking can see where the match came from.
+- A Patient found both ways, itself and through a replaced one, is one entry: whichever scores
+  higher, and itself when they score the same.
 
 `onlyCertainMatches` is for linking without a person looking. When it is `true`, the server returns
 a match only if exactly one Patient is a potential match (one with any grade) and that one is

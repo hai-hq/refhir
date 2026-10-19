@@ -42,11 +42,17 @@
 //! phone number and the email address are the request's own, as it wrote them, so a caller that
 //! has verified one number among several can see whether that is the one that matched.
 //!
-//! **What is never returned.** A Patient with `active` false, and one with a `link` of type
-//! `replaced-by`, are not who a new record should be filed against, so they are left out whatever
-//! they match. The Patient that replaced one is returned when it matches on its own. The server
-//! does not follow the link to it: a merge carries the identifiers across, and a link followed on
-//! the server's word would say a person is someone nobody said they were.
+//! **Patients that are not in use.** A Patient with `active` false and no other that took its place
+//! is never returned: it is not who a new record should be filed against. One that another
+//! replaced (a `link` of type `replaced-by`, whether or not it was also switched off) is not
+//! returned either, but a match on it is a match on the person, so the server follows the link to
+//! the Patient that replaced it ([`ReplacedBy`]): through links to Patients in this store, no more
+//! than a few of them, never round a cycle, and only to a Patient that is in use and has no
+//! replacement of its own. What it finds there is that Patient, with the grade of the match on
+//! the replaced one but never above `probable`, which is what no one compared the Patient with the
+//! request for, and the evidence says `replaced-record` with the replaced one. A Patient that is
+//! found both ways is one match, the better of the two. A link that leads nowhere (the Patient is
+//! gone, switched off, or on another server) leaves nothing to return.
 //!
 //! **`onlyCertainMatches`.** FHIR says that when there is more than one potential match, nothing is
 //! returned for it, so that the caller never links on a guess. A potential match is any Patient
@@ -58,7 +64,7 @@
 //! an `identifier` search for each identifier of the request, and a `birthdate` search for its
 //! birth date. Everything else is compared in memory, on what those two found.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use refhir_database::Transaction;
 use serde_json::{json, Value};
@@ -67,6 +73,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::catalog::Catalog;
 use crate::error::FhirError;
+use crate::ops;
 use crate::search;
 
 /// The extension that carries a match's grade on `Bundle.entry.search`.
@@ -118,6 +125,17 @@ pub(crate) struct GradeRule {
     pub ceiling: i32,
 }
 
+/// What to do with a match on a Patient that another replaced (`link` of type `replaced-by`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReplacedBy {
+    /// How many `replaced-by` links to follow from the replaced Patient to one that is in use.
+    pub max_hops: usize,
+    /// The strongest grade the Patient that is reached may have. A match on a replaced Patient
+    /// is a match on the person, but the server did not compare that Patient with the request,
+    /// and the link was made by whoever merged the two, so it never has more than this.
+    pub cap: Grade,
+}
+
 /// Everything the algorithm decides, in one place.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Rules {
@@ -138,6 +156,9 @@ pub(crate) struct Rules {
     pub ignored_identifier_uses: &'static [&'static str],
     /// Telecom `use`s that are not the person's any more.
     pub ignored_contact_uses: &'static [&'static str],
+    /// Where a match on a replaced Patient goes: to the Patient that replaced it, within these
+    /// limits. `None` leaves a replaced Patient out and follows nothing.
+    pub replaced_by: Option<ReplacedBy>,
     /// How many Patients one page of candidates holds.
     pub page: usize,
     /// Most candidates one request may compare. More than this is refused: an answer that left
@@ -178,6 +199,10 @@ impl Rules {
         country_code: "234",
         ignored_identifier_uses: &["temp"],
         ignored_contact_uses: &["old"],
+        replaced_by: Some(ReplacedBy {
+            max_hops: 5,
+            cap: Grade::Probable,
+        }),
         page: 500,
         max_candidates: 20_000,
     };
@@ -196,6 +221,9 @@ struct Evidence {
     phones: Vec<String>,
     emails: Vec<String>,
     gender: Option<bool>,
+    /// The ids of the replaced Patients this was found on, when the Patient is the one that
+    /// replaced them, and not itself what the request matched.
+    replaced: Vec<String>,
 }
 
 /// How the words of two names that are the same line up.
@@ -217,7 +245,9 @@ impl Evidence {
         }
     }
 
-    /// What the match was found by, one extension for each thing: `identifier`, `name`,
+    /// What the match was found by, one extension for each thing: `replaced-record` first, when
+    /// the Patient is not what matched but what replaced it (the value is a `valueReference` to
+    /// the replaced one), then `identifier`, `name`,
     /// `name-reordered` (as well as `name`, when the words are the same in another arrangement),
     /// `birth-date`, `phone`, `email`, and for gender `gender` when it agrees and `gender-differs`
     /// when it does not. An identifier, a phone number and an email address carry the one of the
@@ -233,6 +263,10 @@ impl Evidence {
             json!({"url": MATCH_EVIDENCE, "extension": parts})
         };
         let mut items = Vec::new();
+        for id in &self.replaced {
+            let reference = json!({"reference": format!("Patient/{id}")});
+            items.push(item("replaced-record", Some(("valueReference", reference))));
+        }
         for (system, value) in &self.identifiers {
             let identifier = json!({"system": system, "value": value});
             items.push(item("identifier", Some(("valueIdentifier", identifier))));
@@ -262,6 +296,18 @@ impl Evidence {
 }
 
 impl Rules {
+    /// `grade` and `score`, brought down to `cap` when they are above it: the cap's grade, scored
+    /// as high as that grade goes.
+    fn capped(&self, grade: Grade, score: i32, cap: Grade) -> (Grade, i32) {
+        if grade <= cap {
+            return (grade, score);
+        }
+        match self.grades.iter().find(|rule| rule.grade == cap) {
+            Some(rule) => (cap, rule.ceiling),
+            None => (grade, score),
+        }
+    }
+
     /// The grade and score the evidence earns, or `None` when it is not a match.
     fn grade(&self, evidence: &Evidence) -> Option<(Grade, i32)> {
         let rule = self
@@ -749,27 +795,56 @@ fn find(
     request: &Request,
     rules: &Rules,
 ) -> Result<Value, FhirError> {
-    let mut matches = Vec::new();
+    // By id, so that a Patient reached in two ways is one match, the better of the two.
+    let mut found: BTreeMap<String, Match> = BTreeMap::new();
     if request.subject.can_match() {
         for (id, resource) in candidates(tx, catalog, &request.subject, rules)? {
-            if !is_target(&resource) {
+            let standing = standing(&resource);
+            if standing == Standing::Out
+                || (standing == Standing::Replaced && rules.replaced_by.is_none())
+            {
                 continue;
             }
             let Ok(stored) = Subject::read(&resource, rules) else {
                 continue;
             };
             let evidence = request.subject.compare(&stored, rules);
-            if let Some((grade, score)) = rules.grade(&evidence) {
-                matches.push(Match {
-                    id,
-                    resource,
-                    evidence,
-                    grade,
-                    score,
-                });
+            let Some((grade, score)) = rules.grade(&evidence) else {
+                continue;
+            };
+            let Some(follow) = rules.replaced_by.filter(|_| standing == Standing::Replaced) else {
+                keep(
+                    &mut found,
+                    Match {
+                        id,
+                        resource,
+                        evidence,
+                        grade,
+                        score,
+                    },
+                );
+                continue;
+            };
+            // What the request matched is a Patient that another took the place of: the match is
+            // the one that took its place, no stronger than the rules let a link make it.
+            let (grade, score) = rules.capped(grade, score, follow.cap);
+            for (survivor, resource) in survivors(tx, catalog, &id, &resource, follow.max_hops)? {
+                let mut evidence = evidence.clone();
+                evidence.replaced = vec![id.clone()];
+                keep(
+                    &mut found,
+                    Match {
+                        id: survivor,
+                        resource,
+                        evidence,
+                        grade,
+                        score,
+                    },
+                );
             }
         }
     }
+    let mut matches: Vec<Match> = found.into_values().collect();
     matches.sort_by(|left, right| {
         right
             .score
@@ -781,6 +856,27 @@ fn find(
     }
     matches.truncate(request.count.unwrap_or(usize::MAX));
     Ok(bundle(&matches))
+}
+
+/// Add `found` to the matches. A Patient already there is kept as the better of the two: the one
+/// with the higher score, and when the scores are the same, the one the request matched itself and
+/// not one it was reached through. Two replaced Patients that lead to it equally both stay named.
+fn keep(matches: &mut BTreeMap<String, Match>, found: Match) {
+    let Some(have) = matches.get_mut(&found.id) else {
+        matches.insert(found.id.clone(), found);
+        return;
+    };
+    let (have_via, found_via) = (
+        !have.evidence.replaced.is_empty(),
+        !found.evidence.replaced.is_empty(),
+    );
+    if found.score > have.score || (found.score == have.score && have_via && !found_via) {
+        *have = found;
+    } else if found.score == have.score && have_via && found_via {
+        have.evidence.replaced.extend(found.evidence.replaced);
+        have.evidence.replaced.sort();
+        have.evidence.replaced.dedup();
+    }
 }
 
 fn bundle(matches: &[Match]) -> Value {
@@ -811,20 +907,99 @@ fn bundle(matches: &[Match]) -> Value {
     bundle
 }
 
-/// Whether a stored Patient can be the one a new record is filed against: it is in use, and no
-/// other Patient replaced it.
-fn is_target(patient: &Value) -> bool {
-    if patient.get("active") == Some(&Value::Bool(false)) {
-        return false;
-    }
-    !patient
+/// Where a stored Patient stands as the answer to a match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    /// In use: it can be what a new record is filed against.
+    InUse,
+    /// Another Patient took its place (`link` of type `replaced-by`), whether or not it was also
+    /// switched off, and whatever the link points at.
+    Replaced,
+    /// Switched off (`active` false), and nothing took its place.
+    Out,
+}
+
+fn standing(patient: &Value) -> Standing {
+    let replaced = patient
         .get("link")
         .and_then(Value::as_array)
         .is_some_and(|links| {
             links
                 .iter()
-                .any(|link| link.get("type").and_then(Value::as_str) == Some("replaced-by"))
-        })
+                .any(|link| link_type(link) == Some("replaced-by"))
+        });
+    if replaced {
+        Standing::Replaced
+    } else if patient.get("active") == Some(&Value::Bool(false)) {
+        Standing::Out
+    } else {
+        Standing::InUse
+    }
+}
+
+fn link_type(link: &Value) -> Option<&str> {
+    link.get("type").and_then(Value::as_str)
+}
+
+/// The ids of the Patients in this store that `patient` says took its place. Only a relative
+/// `Patient/id` is a Patient in this store: an absolute URL, or an identifier, is not followed.
+fn replaced_by_ids(patient: &Value) -> Vec<String> {
+    patient
+        .get("link")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|link| link_type(link) == Some("replaced-by"))
+        .filter_map(|link| link.pointer("/other/reference").and_then(Value::as_str))
+        .filter_map(|reference| reference.strip_prefix("Patient/"))
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The Patients in use that `replaced` (the Patient with id `own_id`) leads to by `replaced-by`
+/// links, none further than `max_hops` links away. A link that leads nowhere ends there: to a
+/// Patient that is not stored here or was deleted, that is switched off, or that is not a
+/// relative `Patient/id`. A Patient is visited once, so a cycle ends where it began.
+fn survivors(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    own_id: &str,
+    replaced: &Value,
+    max_hops: usize,
+) -> Result<Vec<(String, Value)>, FhirError> {
+    let model = catalog.get("Patient")?;
+    let mut seen = BTreeSet::from([own_id.to_string()]);
+    let mut frontier = vec![replaced.clone()];
+    let mut survivors = Vec::new();
+    for _ in 0..max_hops {
+        let mut next = Vec::new();
+        for record in &frontier {
+            for id in replaced_by_ids(record) {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let patient = match ops::read(tx, model, &id) {
+                    Ok(patient) => patient,
+                    // A link to what is not there, or to what is not an id, leads nowhere.
+                    Err(FhirError::NotFound(_) | FhirError::Gone(_) | FhirError::Invalid(_)) => {
+                        continue
+                    }
+                    Err(err) => return Err(err),
+                };
+                match standing(&patient) {
+                    Standing::InUse => survivors.push((id, patient)),
+                    Standing::Replaced => next.push(patient),
+                    Standing::Out => {}
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok(survivors)
 }
 
 /// The stored Patients worth comparing with the subject, by id: those that have one of its
@@ -937,8 +1112,9 @@ pub(crate) fn annotate_capability(statement: &mut Value) {
                 `possible` when the name and the full birth date are the same. Each entry says what it \
                 was found by in `match-evidence` extensions on `search`. A name matches \
                 whatever its case, accents and order of words, and a phone number whatever its \
-                spacing and whether it has a country code. A Patient that is not active, or that \
-                another replaced (link type replaced-by), is never returned. With \
+                spacing and whether it has a country code. A Patient that is not active is never \
+                returned, and a match on one that another replaced (link type replaced-by) is the \
+                Patient that replaced it, probable at the most, with `replaced-record` evidence. With \
                 `onlyCertainMatches` true nothing is returned unless exactly one Patient is a \
                 potential match and it is certain. `count` limits the entries."
         });
@@ -1291,28 +1467,105 @@ mod tests {
     }
 
     #[test]
-    fn a_patient_that_is_not_in_use_is_not_a_target() {
-        assert!(is_target(&json!({"resourceType": "Patient"})));
-        assert!(is_target(
-            &json!({"resourceType": "Patient", "active": true})
-        ));
-        assert!(!is_target(
-            &json!({"resourceType": "Patient", "active": false})
-        ));
-        let link = |kind: &str| json!([{"other": {"reference": "Patient/b"}, "type": kind}]);
-        assert!(!is_target(
-            &json!({"resourceType": "Patient", "link": link("replaced-by")})
-        ));
-        // Whatever its `active` says. Systems forget to set it.
-        assert!(!is_target(
-            &json!({"resourceType": "Patient", "active": true, "link": link("replaced-by")})
-        ));
+    fn a_patient_is_in_use_replaced_or_switched_off() {
+        let standing_of = |extra: Value| {
+            let mut patient = json!({"resourceType": "Patient"});
+            for (field, value) in extra.as_object().unwrap() {
+                patient[field] = value.clone();
+            }
+            standing(&patient)
+        };
+        assert_eq!(standing_of(json!({})), Standing::InUse);
+        assert_eq!(standing_of(json!({"active": true})), Standing::InUse);
+        assert_eq!(standing_of(json!({"active": false})), Standing::Out);
+        let link = |kind: &str, other: Value| json!([{"other": other, "type": kind}]);
+        let local = json!({"reference": "Patient/b"});
+        assert_eq!(
+            standing_of(json!({"link": link("replaced-by", local.clone())})),
+            Standing::Replaced
+        );
+        // Whatever its `active` says (systems forget to set it), and whatever the link points at.
+        assert_eq!(
+            standing_of(json!({"active": true, "link": link("replaced-by", local.clone())})),
+            Standing::Replaced
+        );
+        assert_eq!(
+            standing_of(json!({"active": false, "link": link("replaced-by", local.clone())})),
+            Standing::Replaced
+        );
+        let elsewhere = json!({"reference": "https://other.example/fhir/Patient/b"});
+        assert_eq!(
+            standing_of(json!({"link": link("replaced-by", elsewhere)})),
+            Standing::Replaced
+        );
         for kind in ["replaces", "refer", "seealso"] {
-            assert!(
-                is_target(&json!({"resourceType": "Patient", "link": link(kind)})),
+            assert_eq!(
+                standing_of(json!({"link": link(kind, local.clone())})),
+                Standing::InUse,
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_relative_patient_reference_is_a_link_to_follow() {
+        let ids =
+            |links: Value| replaced_by_ids(&json!({"resourceType": "Patient", "link": links}));
+        let by = |kind: &str, reference: Value| json!({"type": kind, "other": reference});
+        assert_eq!(
+            ids(json!([
+                by("replaced-by", json!({"reference": "Patient/b"})),
+                by("replaced-by", json!({"reference": "Patient/c"})),
+                by("replaces", json!({"reference": "Patient/d"})),
+                by("refer", json!({"reference": "Patient/e"})),
+            ])),
+            ["b", "c"]
+        );
+        for not_followed in [
+            json!({"reference": "https://other.example/fhir/Patient/b"}),
+            json!({"reference": "Patient/"}),
+            json!({"reference": "Patient/b/_history/1"}),
+            json!({"reference": "RelatedPerson/b"}),
+            json!({"reference": "#b"}),
+            json!({"identifier": {"system": "urn:x", "value": "1"}}),
+            json!({}),
+        ] {
+            assert!(
+                ids(json!([by("replaced-by", not_followed.clone())])).is_empty(),
+                "{not_followed}"
+            );
+        }
+        assert!(replaced_by_ids(&json!({"resourceType": "Patient"})).is_empty());
+    }
+
+    #[test]
+    fn a_grade_is_brought_down_to_the_cap_and_no_further() {
+        // Certain becomes probable, as high as probable goes. The rest is as it was.
+        assert_eq!(
+            RULES.capped(Grade::Certain, 100, Grade::Probable),
+            (Grade::Probable, 95)
+        );
+        assert_eq!(
+            RULES.capped(Grade::Probable, 85, Grade::Probable),
+            (Grade::Probable, 85)
+        );
+        assert_eq!(
+            RULES.capped(Grade::Possible, 55, Grade::Probable),
+            (Grade::Possible, 55)
+        );
+        assert_eq!(
+            RULES.capped(Grade::Probable, 85, Grade::Possible),
+            (Grade::Possible, 70)
+        );
+        // A grade the rules do not have cannot be capped to.
+        let none = Rules {
+            grades: &[],
+            ..RULES
+        };
+        assert_eq!(
+            none.capped(Grade::Certain, 100, Grade::Probable),
+            (Grade::Certain, 100)
+        );
     }
 
     #[test]
@@ -1765,5 +2018,296 @@ mod tests {
     fn with_gender(mut patient: Value, gender: &str) -> Value {
         patient["gender"] = json!(gender);
         patient
+    }
+
+    // Patients that replace one another. They all have one name and birth date.
+
+    fn segun(id: &str) -> Value {
+        json!({
+            "resourceType": "Patient", "id": id,
+            "name": [{"family": "Balogun", "given": ["Segun"]}], "birthDate": "1969-06-06"
+        })
+    }
+
+    /// `segun(id)` with the identifier `BC-9`, and `replaced_by` and `active` as asked.
+    fn old_segun(id: &str, replaced_by: Option<&str>, active: bool) -> Value {
+        let mut patient = segun(id);
+        patient["active"] = json!(active);
+        patient["identifier"] = json!([{"system": "urn:example:id", "value": "BC-9"}]);
+        if let Some(other) = replaced_by {
+            patient["link"] = json!([{"other": {"reference": other}, "type": "replaced-by"}]);
+        }
+        patient
+    }
+
+    /// A store of these Patients, created in order (a reference needs its target to be there).
+    fn store_with(
+        policy: crate::catalog::ReferencePolicy,
+        patients: &[Value],
+    ) -> (refhir_database::Database, Catalog) {
+        let (db, mut catalog) = store_of(0);
+        catalog.set_reference_policy(policy);
+        for patient in patients {
+            crate::run::import_resource(&db, &catalog, patient)
+                .unwrap_or_else(|err| panic!("{patient}: {err}"));
+        }
+        (db, catalog)
+    }
+
+    fn replacing(patients: &[Value]) -> (refhir_database::Database, Catalog) {
+        store_with(crate::catalog::ReferencePolicy::Strict, patients)
+    }
+
+    /// `$match` for the identifier `BC-9` alone, as the answer's entries: the id, the grade, the
+    /// score and what each says it was found by.
+    fn by_old_identifier(
+        db: &refhir_database::Database,
+        catalog: &Catalog,
+        rules: &Rules,
+        only_certain: bool,
+    ) -> Vec<(String, String, f64, Vec<String>)> {
+        let args = json!({"onlyCertainMatches": only_certain, "resource": {
+            "resourceType": "Patient",
+            "identifier": [{"system": "urn:example:id", "value": "BC-9"}]
+        }});
+        let request = Request::from_args(&args, rules).unwrap();
+        let answer = find(&mut db.begin(), catalog, &request, rules).unwrap();
+        answer["entry"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| {
+                let extensions = entry["search"]["extension"].as_array().unwrap();
+                let grade = extensions[0]["valueCode"].as_str().unwrap().to_string();
+                let evidence = extensions[1..]
+                    .iter()
+                    .map(|item| {
+                        let parts = item["extension"].as_array().unwrap();
+                        let kind = parts[0]["valueCode"].as_str().unwrap();
+                        match parts.get(1).and_then(|part| part.get("valueReference")) {
+                            Some(reference) => {
+                                format!("{kind} {}", reference["reference"].as_str().unwrap())
+                            }
+                            None => kind.to_string(),
+                        }
+                    })
+                    .collect();
+                (
+                    entry["resource"]["id"].as_str().unwrap().to_string(),
+                    grade,
+                    entry["search"]["score"].as_f64().unwrap(),
+                    evidence,
+                )
+            })
+            .collect()
+    }
+
+    fn ids(found: &[(String, String, f64, Vec<String>)]) -> Vec<&str> {
+        found.iter().map(|entry| entry.0.as_str()).collect()
+    }
+
+    #[test]
+    fn a_match_on_a_replaced_patient_is_the_patient_that_replaced_it_and_never_certain() {
+        let (db, catalog) =
+            replacing(&[segun("new"), old_segun("old", Some("Patient/new"), false)]);
+        let found = by_old_identifier(&db, &catalog, &RULES, false);
+        // The old record holds the identifier, so it is certain. It is not the record in use, and
+        // what is found is the one that is: probable at the most, and it says which it came from.
+        assert_eq!(
+            found,
+            [(
+                "new".to_string(),
+                "probable".to_string(),
+                0.95,
+                vec![
+                    "replaced-record Patient/old".to_string(),
+                    "identifier".to_string()
+                ]
+            )]
+        );
+        // A match that no one compared with the record that is returned is not one to link on.
+        assert!(by_old_identifier(&db, &catalog, &RULES, true).is_empty());
+        // Replaced and not switched off is replaced all the same.
+        let (db, catalog) = replacing(&[segun("new"), old_segun("old", Some("Patient/new"), true)]);
+        assert_eq!(
+            ids(&by_old_identifier(&db, &catalog, &RULES, false)),
+            ["new"]
+        );
+    }
+
+    #[test]
+    fn what_is_found_through_a_replaced_patient_is_graded_by_the_match_on_it() {
+        let (db, catalog) =
+            replacing(&[segun("new"), old_segun("old", Some("Patient/new"), false)]);
+        let args = |resource: Value| json!({"resource": resource});
+        let ask = |resource: Value, rules: &Rules| {
+            let request = Request::from_args(&args(resource), rules).unwrap();
+            let answer = find(&mut db.begin(), &catalog, &request, rules).unwrap();
+            answer["entry"].as_array().cloned().unwrap_or_default()
+        };
+        // The name and the birth date alone are possible on the old record, and on the new one:
+        // the grade the cap allows is not given to a match that did not earn it.
+        let by_name = segun("ignored");
+        let entries = ask(by_name.clone(), &RULES);
+        let new: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["resource"]["id"] == "new")
+            .collect();
+        assert_eq!(new.len(), 1, "one entry for a Patient reached two ways");
+        assert_eq!(new[0]["search"]["extension"][0]["valueCode"], "possible");
+        assert_eq!(new[0]["search"]["score"], 0.55);
+        // A cap of possible brings a certain match down to it.
+        let low = Rules {
+            replaced_by: Some(ReplacedBy {
+                max_hops: 5,
+                cap: Grade::Possible,
+            }),
+            ..RULES
+        };
+        let by_id = json!({"resourceType": "Patient",
+            "identifier": [{"system": "urn:example:id", "value": "BC-9"}]});
+        let entries = ask(by_id, &low);
+        assert_eq!(
+            entries[0]["search"]["extension"][0]["valueCode"],
+            "possible"
+        );
+        assert_eq!(entries[0]["search"]["score"], 0.7);
+    }
+
+    #[test]
+    fn the_better_of_two_ways_to_a_patient_is_the_one_kept() {
+        // The record in use holds the identifier itself: it is certain, and not through the old one.
+        let (db, catalog) = replacing(&[
+            old_segun("new", None, true),
+            old_segun("old", Some("Patient/new"), false),
+        ]);
+        let found = by_old_identifier(&db, &catalog, &RULES, false);
+        assert_eq!(
+            found,
+            [(
+                "new".to_string(),
+                "certain".to_string(),
+                1.0,
+                vec!["identifier".to_string()]
+            )]
+        );
+        // The same Patient is what two replaced ones lead to: it is one match, and says both.
+        let (db, catalog) = replacing(&[
+            segun("new"),
+            old_segun("old-b", Some("Patient/new"), false),
+            old_segun("old-a", Some("Patient/new"), false),
+        ]);
+        let found = by_old_identifier(&db, &catalog, &RULES, false);
+        assert_eq!(
+            found,
+            [(
+                "new".to_string(),
+                "probable".to_string(),
+                0.95,
+                vec![
+                    "replaced-record Patient/old-a".to_string(),
+                    "replaced-record Patient/old-b".to_string(),
+                    "identifier".to_string()
+                ]
+            )]
+        );
+    }
+
+    #[test]
+    fn a_chain_of_replacements_is_followed_as_far_as_the_rules_say() {
+        let (db, catalog) = replacing(&[
+            segun("c"),
+            with_link(segun("b"), "Patient/c"),
+            old_segun("a", Some("Patient/b"), false),
+        ]);
+        let within = |max_hops| Rules {
+            replaced_by: Some(ReplacedBy {
+                max_hops,
+                cap: Grade::Probable,
+            }),
+            ..RULES
+        };
+        // `a` is replaced by `b`, which is replaced by `c`, which is in use: two links.
+        assert_eq!(
+            ids(&by_old_identifier(&db, &catalog, &within(2), false)),
+            ["c"]
+        );
+        assert_eq!(ids(&by_old_identifier(&db, &catalog, &RULES, false)), ["c"]);
+        assert!(by_old_identifier(&db, &catalog, &within(1), false).is_empty());
+        assert!(by_old_identifier(&db, &catalog, &within(0), false).is_empty());
+        // The Patient the name and birth date find is `b`, and is followed to `c` too.
+        let found = by_old_identifier(&db, &catalog, &RULES, false);
+        assert_eq!(found[0].3[0], "replaced-record Patient/a");
+    }
+
+    fn with_link(mut patient: Value, other: &str) -> Value {
+        patient["link"] = json!([{"other": {"reference": other}, "type": "replaced-by"}]);
+        patient
+    }
+
+    #[test]
+    fn a_replacement_that_comes_back_to_where_it_began_leads_nowhere() {
+        let (db, catalog) = replacing(&[segun("y"), old_segun("x", Some("Patient/y"), false)]);
+        // Now `y` is replaced by `x`.
+        let mut y = with_link(segun("y"), "Patient/x");
+        y["active"] = json!(false);
+        crate::run::run(
+            &db,
+            &catalog,
+            "Patient/update",
+            &json!({"id": "y", "resource": y}),
+        )
+        .unwrap();
+        assert!(by_old_identifier(&db, &catalog, &RULES, false).is_empty());
+        // And a Patient that replaces itself.
+        let (db, catalog) = replacing(&[old_segun("z", None, false)]);
+        crate::run::run(
+            &db,
+            &catalog,
+            "Patient/update",
+            &json!({"id": "z", "resource": old_segun("z", Some("Patient/z"), false)}),
+        )
+        .unwrap();
+        assert!(by_old_identifier(&db, &catalog, &RULES, false).is_empty());
+    }
+
+    #[test]
+    fn a_replacement_that_leads_to_no_patient_in_use_is_not_a_match() {
+        // To a Patient that was switched off, without another to take its place.
+        let (db, catalog) = replacing(&[
+            old_segun("off", None, false),
+            old_segun("old", Some("Patient/off"), false),
+        ]);
+        assert!(by_old_identifier(&db, &catalog, &RULES, false).is_empty());
+        // To a Patient that was deleted.
+        let (db, catalog) =
+            replacing(&[segun("gone"), old_segun("old", Some("Patient/gone"), false)]);
+        crate::run::run(&db, &catalog, "Patient/delete", &json!({"id": "gone"})).unwrap();
+        assert!(by_old_identifier(&db, &catalog, &RULES, false).is_empty());
+        // To a Patient on another server, or to one that is only an identifier.
+        let (db, catalog) = store_with(
+            crate::catalog::ReferencePolicy::Fhir,
+            &[
+                old_segun("far", Some("https://other.example/fhir/Patient/new"), false),
+                {
+                    let mut patient = old_segun("named", None, false);
+                    patient["link"] = json!([{"type": "replaced-by",
+                        "other": {"identifier": {"system": "urn:x", "value": "1"}}}]);
+                    patient
+                },
+            ],
+        );
+        assert!(by_old_identifier(&db, &catalog, &RULES, false).is_empty());
+    }
+
+    #[test]
+    fn a_rule_that_does_not_follow_leaves_a_replaced_patient_out() {
+        let (db, catalog) =
+            replacing(&[segun("new"), old_segun("old", Some("Patient/new"), false)]);
+        let none = Rules {
+            replaced_by: None,
+            ..RULES
+        };
+        assert!(by_old_identifier(&db, &catalog, &none, false).is_empty());
     }
 }
