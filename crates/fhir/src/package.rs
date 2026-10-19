@@ -1092,17 +1092,7 @@ pub(crate) fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     }
     // Read for the release the package is for, as the catalog and a rebuild read it, so that what a
     // rebuild gives is what is stored here.
-    expanded.set_release(Some(fhir_version.as_str()));
-    let expansions = expanded
-        .expansion_documents()
-        .filter_map(|document| {
-            let url = document.get("url")?.as_str()?.to_string();
-            Some(NewExpansion {
-                url,
-                json: document.to_string(),
-            })
-        })
-        .collect();
+    let expansions = expansion_rows(expanded, &fhir_version);
     Ok(NewPackage {
         name,
         version,
@@ -1112,6 +1102,25 @@ pub(crate) fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         terminology: terminology_rows,
         expansions,
     })
+}
+
+/// The stored expansion of every value set that `expanded` holds and can expand, for the release
+/// the package is for.
+pub(crate) fn expansion_rows(
+    mut expanded: TerminologyBuilder,
+    fhir_version: &str,
+) -> Vec<NewExpansion> {
+    expanded.set_release(Some(fhir_version));
+    expanded
+        .expansion_documents()
+        .filter_map(|document| {
+            let url = document.get("url")?.as_str()?.to_string();
+            Some(NewExpansion {
+                url,
+                json: document.to_string(),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn package_root(path: &Path) -> Result<PathBuf, FhirError> {
@@ -1145,7 +1154,7 @@ fn fhir_version(manifest: &Value, definition_version: Option<String>) -> Result<
     definition_version.ok_or_else(|| FhirError::Invalid("package fhirVersion is required".into()))
 }
 
-fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
+pub(crate) fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
     Ok(NewTerminology {
         resource_type: required_str(resource, "resourceType")?,
         url: required_str(resource, "url")?,

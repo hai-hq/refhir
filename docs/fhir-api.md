@@ -242,6 +242,8 @@ is written:
 | `strict` (default) | The reference must be a relative `Type/id`, and its target must exist in the snapshot the write sees. Inside a transaction Bundle, an entry may refer to another entry by `fullUrl` |
 | `fhir` | Absolute URLs and targets that are not on this server are allowed. A type outside the element's `targetProfile` is still rejected |
 
+Every element that can hold a reference is checked, the ones that may hold something else instead as well: `ChargeItem.productReference`, `Invoice.lineItem.chargeItemReference` and `MedicationRequest.medicationReference` are refused when what they name does not exist, and an element that holds a `CodeableConcept` (`productCodeableConcept`) or nothing is not asked for a reference.
+
 ## Resource ids
 
 The server assigns the id of every resource it creates. `POST [type]` ignores an `id`, and a `meta.versionId` or `meta.lastUpdated`, in the body (FHIR R4 create) and answers `201` with the new id in `Location`. GraphQL and `/sync` `create` do the same.
@@ -253,6 +255,8 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 ## Terminology
 
 `ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
+
+**Currencies.** `Money.currency` is bound to ISO 4217, whose codes the R4 core package does not carry, so ReFHIR stores them itself: the alphabetic codes of the list SIX Group (ISO's maintenance agency) published on 2026-09-17, as the code system `urn:iso:std:iso:4217`, and R4's own value set of currencies beside it. A start that finds them missing stores them (a moment's work, and nothing to download), and every later start finds them there. `NGN` is accepted without a warning, and an amount whose `currency` is not one of the codes (`NRA`, `ngn`, a withdrawn code such as `DEM`) is refused with an `OperationOutcome` that names the element, for example `ClaimResponse.item[0].adjudication[0].amount.currency`. A deployment that wants another list installs a package that carries `urn:iso:std:iso:4217` with a `version` of its own, and that one is used when it is the newest. Before this, a currency that was not one was only a warning that the value set could not be expanded.
 
 A code system can be installed in several versions, and each is kept. Name a version with `system|version` (or `include.version`) and the expansion uses exactly that one. A version that is not installed is refused, and the error lists the versions that are. With no version named, a value set from a package uses the versions its own package holds, and a value set you write through the API, or one whose package does not hold the system, uses the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed, and the latest installed version otherwise. The expansion records the version it read. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
 

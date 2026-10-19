@@ -996,6 +996,14 @@ fn install_packages(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PackagePlan::Bundled(release, extra) = plan;
     install_release_defaults(store, db, catalog, *release)?;
+    // The code systems FHIR binds to and its packages do not carry (ISO 4217, for currencies). A
+    // database that has the release's packages is given them once, at the first start that knows
+    // them, and every other start finds them stored and does nothing. They come after the
+    // release's packages so that a replica, which starts serving once any package is stored, is
+    // never left with only these.
+    if !skip_release_defaults() {
+        refhir_fhir::install_builtin_terminology(store, db, catalog)?;
+    }
     for spec in extra {
         refhir_fhir::install_package(store, db, catalog, spec)?;
     }

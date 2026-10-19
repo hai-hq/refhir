@@ -10,6 +10,31 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **ISO 4217 currency codes.** A currency that is not a code of ISO 4217 is now refused where it is
+  written (`Money.currency`, which FHIR binds to ISO 4217 and the R4 core package does not carry).
+  `PUT ClaimResponse/z` with an adjudication `amount.currency` of `NRA` answers with an
+  `OperationOutcome` that names `ClaimResponse.item[0].adjudication[0].amount.currency`, and `NGN`
+  is accepted and no longer warns that the value set of currencies cannot be expanded. ReFHIR
+  stores the code system (178 codes, from the list SIX Group published on 2026-09-17) and R4's
+  value set of currencies itself, once, at the first start that knows them: no download and no
+  prepared file are involved, and a server that already has its packages stores them at its next
+  start. A package that carries a newer `urn:iso:std:iso:4217` is used in preference. See
+  [FHIR API](docs/fhir-api.md#terminology).
+
+### Fixed
+
+- **A reference inside a choice element is checked like every other.** `--references strict` (the
+  default) refused a missing target for `Invoice.account` or `Observation.focus`, and saved
+  `Invoice.lineItem.chargeItemReference` = `ChargeItem/nope` and `ChargeItem.productReference` =
+  `Medication/nope`, because an element that FHIR lets hold a reference or something else
+  (`xxx[x]`) was never looked at. Every such element is now checked: the target must exist (or, in a
+  transaction Bundle, be named by the `fullUrl` of an entry), and be a type the element allows.
+  `--references fhir` stays lenient. A resource that already holds a dangling reference of this
+  kind is not changed, but a later update that keeps it is refused. See
+  [FHIR API](docs/fhir-api.md#reference-checking).
+
 ## [0.0.2] - 2026-10-19
 
 ### Added
