@@ -236,7 +236,7 @@ pub fn app_parts(
         .route("/:resource_type/$behavior", post(behavior_type))
         .route("/:resource_type/$extract", post(extract_type))
         .route("/:resource_type/$install", post(install_op))
-        .route("/:resource_type/$expand", post(expand_op))
+        .route("/:resource_type/$expand", post(expand_op).get(expand_get))
         .route("/:resource_type/$expandability", post(expandability_op))
         .route("/:resource_type/$validate-code", post(validate_code_op))
         .route("/:resource_type/$lookup", post(lookup_op))
@@ -1043,6 +1043,21 @@ async fn expand_op(
     terminology_op(app, resource_type, "$expand", body).await
 }
 
+/// `$expand` has no side effects, so R4 allows it as a `GET` with its parameters in the query
+/// string. They are the arguments a `POST` body of plain JSON would hold, and a parameter given
+/// twice counts once, as its first value.
+async fn expand_get(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let mut args = serde_json::Map::new();
+    for (name, value) in params {
+        args.entry(name).or_insert(Value::String(value));
+    }
+    terminology_call(app, resource_type, "$expand", Value::Object(args)).await
+}
+
 async fn expandability_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
@@ -1080,6 +1095,10 @@ async fn terminology_op(app: AppState, resource_type: String, op: &str, body: By
         Ok(value) => value,
         Err(response) => return response,
     };
+    terminology_call(app, resource_type, op, args).await
+}
+
+async fn terminology_call(app: AppState, resource_type: String, op: &str, args: Value) -> Response {
     match execute(
         &app.db,
         &app.catalog,

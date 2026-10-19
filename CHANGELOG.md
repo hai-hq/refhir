@@ -10,6 +10,28 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /ValueSet/$expand`.** R4 allows `$expand` as a `GET` because it changes nothing, and it was
+  a `POST` only (a `GET` answered `405`). `url`, `filter`, `count` and `offset` go in the query
+  string, and the answer is the one the `POST` gives. With SMART the `GET` needs the `read`
+  permission. See [FHIR API](docs/fhir-api.md#terminology).
+- **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
+  and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include
+  of a code system whose `content` is `example`, and were refused for that. They now expand to the
+  concepts the server holds, and the expansion says it is only a sample with an `expansion.parameter`
+  named `<system>|<version>#CodeSystem.content` whose value is `example`, as R4 describes. A filter on
+  such a system, an exclusion of one, one with no concepts installed, and a `fragment` are still
+  refused. `$validate-code` agrees with `$expand`; a code outside the sample is `false` with a
+  message that says the list is only a sample, and the resource validator reports the code as one it
+  cannot check, not as an error.
+
+### Changed
+
+- **Stored expansions are rebuilt once at the first start after this version**, so a database
+  that holds the R4 packages gains the expansions above. It is the same one-time rebuild an upgrade
+  has done before, and the next start finds nothing to do.
+
 ## [0.0.2] - 2026-10-19
 
 ### Added

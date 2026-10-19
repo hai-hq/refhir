@@ -1008,5 +1008,7 @@ mod tests {
             http_interaction("POST", "/ImplementationGuide/$install"),
             "install"
         );
+        // `$expand` changes nothing, so as a GET it is a read.
+        assert_eq!(http_interaction("GET", "/ValueSet/$expand"), "read");
     }
 }

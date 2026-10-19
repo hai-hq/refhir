@@ -132,7 +132,7 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 | `$validate` | type, instance | Validates against the installed StructureDefinitions |
 | `$meta`, `$meta-add`, `$meta-delete` | instance | |
 | `$document` | `Composition/[id]` | |
-| `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology) |
+| `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology). `ValueSet/$expand` also answers a `GET` |
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
@@ -252,7 +252,27 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 
 ## Terminology
 
-`ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
+`ValueSet/$expand` takes `url`, and optionally `filter`, `count` and `offset`, as a `POST` (a JSON body or a Parameters resource) or as a `GET` with the same names in the query string:
+
+```bash
+curl 'http://localhost:8080/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/organization-type&filter=hospital&count=10'
+```
+
+It returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned without saying so, because a client cannot tell it from a complete one.
+
+One partial case is expanded, and says so. A code system whose `content` is `example` holds a few representative concepts, and HL7 publishes value sets that are nothing but a whole-system include of one (`service-category` and `service-type`, which offer choices for `HealthcareService`). Such a value set expands to the concepts the server holds for the system, and the expansion names each system that is only a sample in an `expansion.parameter` called `<system>|<version>#CodeSystem.content`, as R4 describes, with the content mode as its value:
+
+```json
+"expansion": {
+  "parameter": [{
+    "name": "http://terminology.hl7.org/CodeSystem/service-category|4.0.1#CodeSystem.content",
+    "valueCode": "example"
+  }],
+  "total": 38, "offset": 0, "contains": ["…"]
+}
+```
+
+A client that needs a closed list checks for such a parameter. Only an include of the whole system is expanded this way: a filter on a sample, an exclusion of one, a sample that holds no concepts, and a `fragment` are still refused. `$validate-code` against such a value set answers from the same list, with `result` false and a `message` that says the list is only a sample for a code outside it. A resource whose binding is to one is not rejected for a code the sample lacks: the validator reports that the code cannot be checked.
 
 A code system can be installed in several versions, and each is kept. Name a version with `system|version` (or `include.version`) and the expansion uses exactly that one. A version that is not installed is refused, and the error lists the versions that are. With no version named, a value set from a package uses the versions its own package holds, and a value set you write through the API, or one whose package does not hold the system, uses the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed, and the latest installed version otherwise. The expansion records the version it read. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
 

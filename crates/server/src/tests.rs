@@ -7,7 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use refhir_database::Database;
 use refhir_fhir::{
-    extra_dir, install_package_dir, minir4_dir, sdc_dir, Catalog, ConformanceStore,
+    extra_dir, install_package_dir, minir4_dir, r4_dir, sdc_dir, Catalog, ConformanceStore,
     MAX_OCC_FAILURES,
 };
 use refhir_sqlite::SqlitePersistence;
@@ -1087,7 +1087,7 @@ async fn a_value_set_that_cannot_expand_is_a_422_that_says_why() {
     .unwrap();
     std::fs::write(
         dir.join("CodeSystem-sample.json"),
-        r#"{"resourceType":"CodeSystem","url":"http://example.org/sample","content":"example","concept":[{"code":"a"}]}"#,
+        r#"{"resourceType":"CodeSystem","url":"http://example.org/sample","content":"fragment","concept":[{"code":"a"}]}"#,
     )
     .unwrap();
     std::fs::write(
@@ -1122,7 +1122,7 @@ async fn a_value_set_that_cannot_expand_is_a_422_that_says_why() {
     assert_eq!(issue["expression"][0], "ValueSet.compose.include[0]");
     let text = issue["diagnostics"].as_str().unwrap();
     assert!(
-        text.contains("http://example.org/sample") && text.contains("'example'"),
+        text.contains("http://example.org/sample") && text.contains("'fragment'"),
         "{text}"
     );
 
@@ -1183,6 +1183,189 @@ async fn a_value_set_that_cannot_expand_is_a_422_that_says_why() {
         .map(|entry| entry["part"][0]["valueUri"].as_str().unwrap())
         .collect();
     assert_eq!(urls, ["http://example.org/whole"]);
+}
+
+/// The codes of an expansion, in the order they come.
+fn expanded_codes(reply: &Reply) -> Vec<String> {
+    reply.body["expansion"]["contains"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{}", reply.body))
+        .iter()
+        .map(|entry| entry["code"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn expand_is_a_get_as_well_as_a_post() {
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, r4_dir()).unwrap();
+    let app = app(db, catalog, store);
+    let types = "http://hl7.org/fhir/ValueSet/organization-type";
+
+    // The query string says what the body of a POST does, and the answer is the same.
+    let posted = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": types})),
+        None,
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::OK, "{}", posted.body);
+    assert_eq!(expanded_codes(&posted).len(), 12);
+    let got = send(
+        &app,
+        "GET",
+        &format!("/ValueSet/$expand?url={types}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, StatusCode::OK, "{}", got.body);
+    assert_eq!(got.body, posted.body);
+    assert_eq!(got.body["expansion"]["total"], 12);
+
+    // `filter`, `count` and `offset` work as they do in a body.
+    let all = expanded_codes(&got);
+    let filtered = send(
+        &app,
+        "GET",
+        &format!("/ValueSet/$expand?url={types}&filter=hospital"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(filtered.status, StatusCode::OK, "{}", filtered.body);
+    assert!(!expanded_codes(&filtered).is_empty());
+    assert!(expanded_codes(&filtered).len() < all.len());
+    assert_eq!(
+        filtered.body["expansion"]["total"],
+        expanded_codes(&filtered).len()
+    );
+    for entry in filtered.body["expansion"]["contains"].as_array().unwrap() {
+        let text = format!("{} {}", entry["code"], entry["display"]).to_lowercase();
+        assert!(text.contains("hospital"), "{text}");
+    }
+    let page = send(
+        &app,
+        "GET",
+        &format!("/ValueSet/$expand?url={types}&count=3&offset=2"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert_eq!(expanded_codes(&page), all[2..5]);
+    assert_eq!(page.body["expansion"]["total"], 12);
+    assert_eq!(page.body["expansion"]["offset"], 2);
+    let paged_post = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"url": types, "count": 3, "offset": 2})),
+        None,
+    )
+    .await;
+    assert_eq!(page.body, paged_post.body);
+
+    // The url may be percent-encoded, and a parameter given twice counts once.
+    let encoded = send(
+        &app,
+        "GET",
+        "/ValueSet/$expand?url=http%3A%2F%2Fhl7.org%2Ffhir%2FValueSet%2Forganization-type&url=http%3A%2F%2Fexample.org%2Fnone",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(encoded.body, posted.body);
+
+    // The value sets that cannot be expanded say why, as a POST does.
+    let refused = send(
+        &app,
+        "GET",
+        "/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/insuranceplan-type",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(refused.body["issue"][0]["diagnostics"]
+        .as_str()
+        .unwrap()
+        .contains("'fragment'"));
+    let unsupported = send(
+        &app,
+        "GET",
+        "/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/practitioner-role",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(unsupported.status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // No url is a bad request, and `$expand` is still only for value sets.
+    let none = send(&app, "GET", "/ValueSet/$expand", None, None).await;
+    assert_eq!(none.status, StatusCode::BAD_REQUEST);
+    let wrong = send(
+        &app,
+        "GET",
+        &format!("/Patient/$expand?url={types}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
+
+    // A value set over a whole `example` code system lists its concepts and says so, in either form.
+    let category = "http://hl7.org/fhir/ValueSet/service-category";
+    let flagged = send(
+        &app,
+        "GET",
+        &format!("/ValueSet/$expand?url={category}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(flagged.status, StatusCode::OK, "{}", flagged.body);
+    assert_eq!(expanded_codes(&flagged).len(), 38);
+    assert_eq!(
+        flagged.body["expansion"]["parameter"],
+        json!([{
+            "name": "http://terminology.hl7.org/CodeSystem/service-category|4.0.1#CodeSystem.content",
+            "valueCode": "example"
+        }])
+    );
+    let posted = send(
+        &app,
+        "POST",
+        "/ValueSet/$expand",
+        Some(json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": category}
+        ]})),
+        None,
+    )
+    .await;
+    assert_eq!(posted.body, flagged.body);
+    let checked = |code: &str| {
+        send(
+            &app,
+            "POST",
+            "/ValueSet/$validate-code",
+            Some(json!({"url": category,
+                "system": "http://terminology.hl7.org/CodeSystem/service-category", "code": code})),
+            None,
+        )
+    };
+    assert_eq!(
+        checked("17").await.body["parameter"][0]["valueBoolean"],
+        true
+    );
+    assert_eq!(
+        checked("999").await.body["parameter"][0]["valueBoolean"],
+        false
+    );
 }
 
 #[tokio::test]

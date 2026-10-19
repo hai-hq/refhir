@@ -5827,24 +5827,40 @@ fn value_sets_that_cannot_expand_say_why() {
         assert!(text.contains(part), "{part} missing from {text}");
     }
 
-    // The service categories live in a CodeSystem whose content is `example`.
-    let categories = unprocessable(run_op(
+    // The insurance plan types live in a CodeSystem whose content is `fragment`: there is no
+    // telling which concepts it lacks, so including it whole is refused.
+    let plans = unprocessable(run_op(
         &harness,
         "ValueSet/$expand",
-        &json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+        &json!({"url": "http://hl7.org/fhir/ValueSet/insuranceplan-type"}),
     ));
-    let text = categories["issue"][0]["diagnostics"].as_str().unwrap();
+    let text = plans["issue"][0]["diagnostics"].as_str().unwrap();
     for part in [
-        "http://terminology.hl7.org/CodeSystem/service-category",
-        "'example'",
+        "http://hl7.org/fhir/ValueSet/insuranceplan-type expansion is not supported",
+        "http://terminology.hl7.org/CodeSystem/insurance-plan-type",
+        "'fragment'",
         "cannot be included whole",
     ] {
         assert!(text.contains(part), "{part} missing from {text}");
     }
     assert_eq!(
-        categories["issue"][0]["expression"][0],
+        plans["issue"][0]["expression"][0],
         "ValueSet.compose.include[0]"
     );
+
+    // BCP-47 is not installed, so there is nothing to list.
+    let languages = unprocessable(run_op(
+        &harness,
+        "ValueSet/$expand",
+        &json!({"url": "http://hl7.org/fhir/ValueSet/all-languages"}),
+    ));
+    let text = languages["issue"][0]["diagnostics"].as_str().unwrap();
+    for part in [
+        "http://hl7.org/fhir/ValueSet/all-languages expansion is not supported",
+        "code system urn:ietf:bcp:47 is not installed",
+    ] {
+        assert!(text.contains(part), "{part} missing from {text}");
+    }
 
     // Expansion that works is untouched.
     let gender = apply(
@@ -5859,7 +5875,183 @@ fn value_sets_that_cannot_expand_say_why() {
     let report = catalog.terms().unexpandable();
     let urls: Vec<&str> = report.iter().map(|(url, _)| url.as_str()).collect();
     assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/practitioner-role"));
-    assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/service-category"));
+    assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/insuranceplan-type"));
+    assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/all-languages"));
+    // The service categories expand, flagged, so they are not among those that cannot.
+    assert!(!urls.contains(&"http://hl7.org/fhir/ValueSet/service-category"));
+}
+
+/// The codes of an expansion as `system|code`, and the `expansion.parameter` entries it carries
+/// as `name = value`.
+fn expansion_summary(expanded: &Value) -> (Vec<String>, Vec<String>) {
+    let codes = expanded["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}|{}",
+                entry["system"].as_str().unwrap_or(""),
+                entry["code"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let parameters = expanded["expansion"]["parameter"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} = {}",
+                        item["name"].as_str().unwrap(),
+                        item["valueCode"].as_str().unwrap()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (codes, parameters)
+}
+
+fn validated(harness: &Harness, args: Value) -> (bool, Option<String>) {
+    let checked = apply(harness, "ValueSet/$validate-code", args);
+    let parameter = |name: &str| {
+        checked["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == name)
+            .cloned()
+    };
+    (
+        parameter("result").unwrap()["valueBoolean"]
+            .as_bool()
+            .unwrap(),
+        parameter("message").map(|item| item["valueString"].as_str().unwrap().to_string()),
+    )
+}
+
+#[test]
+fn a_value_set_over_a_whole_example_system_expands_and_says_it_is_not_complete() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let categories = "http://terminology.hl7.org/CodeSystem/service-category";
+    let types = "http://terminology.hl7.org/CodeSystem/service-type";
+
+    // HL7's service categories hold the 38 concepts the code system carries, and the expansion
+    // names the system that is only a sample, with the content mode that says so.
+    let expanded = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+    );
+    let (codes, parameters) = expansion_summary(&expanded);
+    assert_eq!(codes.len(), 38);
+    assert_eq!(expanded["expansion"]["total"], 38);
+    assert_eq!(
+        parameters,
+        [format!("{categories}|4.0.1#CodeSystem.content = example")]
+    );
+    let display = |code: &str| {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["code"] == code)
+            .map(|entry| entry["display"].as_str().unwrap().to_string())
+    };
+    assert_eq!(display("17").as_deref(), Some("General Practice"));
+    assert_eq!(display("22").as_deref(), Some("Mental Health"));
+    assert!(codes.iter().all(|code| code.starts_with(categories)));
+
+    // So do the service types, and the other value sets that are only such an include.
+    let expanded = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-type"}),
+    );
+    let (codes, parameters) = expansion_summary(&expanded);
+    assert_eq!(codes.len(), 596);
+    assert!(codes.iter().all(|code| code.starts_with(types)));
+    assert_eq!(
+        parameters,
+        [format!("{types}|4.0.1#CodeSystem.content = example")]
+    );
+    for url in [
+        "http://hl7.org/fhir/ValueSet/program",
+        "http://hl7.org/fhir/ValueSet/appointment-cancellation-reason",
+    ] {
+        let (codes, parameters) =
+            expansion_summary(&apply(&harness, "ValueSet/$expand", json!({"url": url})));
+        assert!(!codes.is_empty(), "{url}");
+        assert_eq!(parameters.len(), 1, "{url}");
+    }
+
+    // A page of it carries the flag too, and a filter narrows what is listed.
+    let page = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category", "filter": "health", "count": 2}),
+    );
+    assert_eq!(page["expansion"]["contains"].as_array().unwrap().len(), 2);
+    assert_eq!(page["expansion"]["total"], 3);
+    assert_eq!(expansion_summary(&page).1.len(), 1);
+
+    // A value set whose code systems are complete carries no such flag.
+    let complete = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/organization-type"}),
+    );
+    assert_eq!(complete["expansion"]["total"], 12);
+    assert!(complete["expansion"].get("parameter").is_none());
+
+    // `$validate-code` agrees with `$expand`: a code it lists is in, and one it does not is out.
+    let in_set = |code: &str| {
+        validated(
+            &harness,
+            json!({"url": "http://hl7.org/fhir/ValueSet/service-category", "system": categories, "code": code}),
+        )
+    };
+    assert_eq!(in_set("17"), (true, None));
+    let (found, message) = in_set("999");
+    assert!(!found);
+    // It says that the sample is the reason, not that 999 is known to be wrong.
+    let message = message.unwrap();
+    assert!(
+        message.contains("not among the concepts listed") && message.contains("only some"),
+        "{message}"
+    );
+    // A code that is in another system is not among its codes either.
+    let (found, _) = validated(
+        &harness,
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category", "system": types, "code": "17"}),
+    );
+    assert!(!found);
+    // A value set that is complete says nothing of the kind about a code outside it.
+    let (found, message) = validated(
+        &harness,
+        json!({"url": "http://hl7.org/fhir/ValueSet/organization-type",
+               "system": "http://terminology.hl7.org/CodeSystem/organization-type", "code": "nope"}),
+    );
+    assert!(!found);
+    assert_eq!(message.as_deref(), Some("code is not in the value set"));
+
+    // The expansion was stored with its flag, so a server that reads it back says the same.
+    let before = expansion_summary(&apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+    ));
+    publish(&harness.store, &harness.catalog).unwrap();
+    let after = expansion_summary(&apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+    ));
+    assert_eq!(before, after);
+    assert_eq!(after.1.len(), 1);
 }
 
 #[test]
@@ -6716,10 +6908,62 @@ fn expansions_stored_under_other_rules_are_rebuilt_once_at_the_next_start() {
     assert_eq!(rows[0].package_id, core);
     assert_eq!(
         serde_json::from_str::<Value>(&rows[0].json).unwrap()["rules"],
-        2
+        3
     );
     assert_expansions_match(&harness.store, "after the repair");
     // A second start finds nothing to do: the repair is not repeated.
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(!harness.catalog.read().unwrap().expansions_stale());
+}
+
+#[test]
+fn a_database_made_under_the_previous_rules_gains_the_value_sets_that_now_expand_at_its_next_start()
+{
+    // The previous version could not expand HL7's service categories, so it stored no expansion
+    // for them, and stored the rest under rules 2. Nothing else would ever add them: a start
+    // that finds expansions made under other rules rebuilds them all, once.
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let (categories, types) = (
+        "http://hl7.org/fhir/ValueSet/service-category",
+        "http://hl7.org/fhir/ValueSet/organization-type",
+    );
+    let change =
+        |package_id, url: &str, json: Option<String>| refhir_persistence::ExpansionChange {
+            package_id,
+            url: url.to_string(),
+            json,
+        };
+    let mut changes: Vec<_> = stored_rows(&harness, categories)
+        .iter()
+        .map(|row| change(row.package_id, categories, None))
+        .collect();
+    assert!(!changes.is_empty());
+    for row in stored_rows(&harness, types) {
+        let mut previous: Value = serde_json::from_str(&row.json).unwrap();
+        previous["rules"] = json!(2);
+        changes.push(change(row.package_id, types, Some(previous.to_string())));
+    }
+    harness.store.apply_expansions(&changes).unwrap();
+
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(harness.catalog.read().unwrap().expansions_stale());
+    unprocessable(run_op(
+        &harness,
+        "ValueSet/$expand",
+        &json!({"url": categories}),
+    ));
+
+    repair_conformance(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert!(!harness.catalog.read().unwrap().expansions_stale());
+    let expanded = apply(&harness, "ValueSet/$expand", json!({"url": categories}));
+    assert_eq!(expanded["expansion"]["total"], 38);
+    assert_eq!(expansion_summary(&expanded).1.len(), 1);
+    assert_expansions_match(&harness.store, "after the repair");
+    // The rows it wrote say so, and a second start finds nothing to repeat.
+    let stored: Value = serde_json::from_str(&stored_rows(&harness, categories)[0].json).unwrap();
+    assert_eq!(stored["rules"], 3);
+    assert_eq!(stored["incomplete"][0]["content"], "example");
     publish(&harness.store, &harness.catalog).unwrap();
     assert!(!harness.catalog.read().unwrap().expansions_stale());
 }
