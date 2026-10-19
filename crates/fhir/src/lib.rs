@@ -23,6 +23,7 @@ mod run;
 mod s3;
 mod sdc;
 mod search;
+mod submit;
 mod terms;
 
 #[cfg(test)]
@@ -55,3 +56,4 @@ pub use search::{
     add_param, join_repeated, resource_in_compartment, AND, DEFAULT_COUNT, HANDLING,
     PATIENT_COMPARTMENT,
 };
+pub use submit::submission_writes;

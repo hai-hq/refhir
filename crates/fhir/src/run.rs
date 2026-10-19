@@ -379,6 +379,7 @@ pub fn dispatch(
             crate::meta::everything(tx, catalog, model, &id_arg(args)?)
         }
         "$document" => crate::meta::document(tx, catalog, model, &id_arg(args)?),
+        "$submit" => crate::submit::operation(tx, catalog, type_name, args),
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"
         ))),

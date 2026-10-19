@@ -12,6 +12,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **`POST [base]/Claim/$submit` and `POST [base]/CoverageEligibilityRequest/$submit`.** Both answered
+  `405`. They now take FHIR R4's `Parameters` with a `resource`, a `Claim` or `CoverageEligibilityRequest`
+  or a `Bundle` of them (or that resource as the body), store them with whatever the Bundle brings
+  (entries refer to each other by `fullUrl`, as in a transaction), and answer with a `ClaimResponse` or
+  `CoverageEligibilityResponse` that has `outcome` `queued`, `status` `active`, `request` pointing at the
+  stored request, and `patient`, `insurer` and `use` (or `purpose`) copied from it. FHIR leaves the
+  deciding to the payer, and a server is not one, so this is the choice made here: the response is stored
+  and announced like any other create, a Subscription on `ClaimResponse?outcome=queued` tells whoever
+  adjudicates, and they update the response with the decision. A submission is one transaction, so a
+  request that is invalid, or names something that does not exist, stores nothing and is answered with the
+  validator's errors. The token needs to be able to create every type the submission writes. The
+  CapabilityStatement lists the operations. See
+  [FHIR API](docs/fhir-api.md#submitting-a-claim-or-an-eligibility-request).
 - **ISO 4217 currency codes.** A currency that is not a code of ISO 4217 is now refused where it is
   written (`Money.currency`, which FHIR binds to ISO 4217 and the R4 core package does not carry).
   `PUT ClaimResponse/z` with an adjudication `amount.currency` of `NRA` answers with an

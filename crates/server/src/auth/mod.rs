@@ -135,6 +135,44 @@ pub fn check(
     None
 }
 
+/// Refuse the request unless the token may do each of `needs` (a resource type and an
+/// interaction), for an operation that reads or writes more than the type in its path. Nothing is
+/// refused when authorization is off. The token itself was checked by [`check`] before the handler
+/// ran, so one that is missing or unknown is refused here as well, and not allowed through.
+pub(crate) fn require_scopes(
+    app: &AppState,
+    headers: &HeaderMap,
+    needs: &[(String, &str)],
+) -> Option<Response> {
+    if !app.config.auth {
+        return None;
+    }
+    let scopes = token_scopes(app, headers, None).unwrap_or_default();
+    for (resource_type, interaction) in needs {
+        if !scopes
+            .iter()
+            .any(|scope| scope_allows(scope, resource_type, interaction))
+        {
+            return Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "resourceType": "OperationOutcome",
+                        "issue": [{
+                            "severity": "error", "code": "forbidden",
+                            "diagnostics": format!(
+                                "scope does not allow {interaction} of {resource_type}, which this request does"
+                            )
+                        }]
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
 pub fn patient_compartment(
     app: &AppState,
     headers: &HeaderMap,

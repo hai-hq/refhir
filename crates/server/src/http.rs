@@ -242,6 +242,7 @@ pub fn app_parts(
         .route("/:resource_type/$lookup", post(lookup_op))
         .route("/:resource_type/$translate", post(translate_op))
         .route("/:resource_type/$subsumes", post(subsumes_op))
+        .route("/:resource_type/$submit", post(submit_op))
         .route("/:resource_type/$export", post(export_type))
         .route("/:resource_type/:id/_history/:vid", get(vread))
         .route("/:resource_type/:id/_history", get(instance_history))
@@ -1073,6 +1074,45 @@ async fn translate_op(
     body: Bytes,
 ) -> Response {
     terminology_op(app, resource_type, "$translate", body).await
+}
+
+/// `POST [base]/Claim/$submit` (and `CoverageEligibilityRequest/$submit`): the body is the
+/// `Parameters` with a `resource`, or the Claim or Bundle itself, as R4 allows when that is the
+/// only input. It writes the request, whatever it came with and the response, so the token needs
+/// to be allowed to create each of them, not only the type in the path.
+async fn submit_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let update_creates = app.catalog.read().expect("catalog").update_create();
+    let writes = refhir_fhir::submission_writes(&resource_type, &resource, update_creates);
+    if let Some(response) = crate::auth::require_scopes(&app, &headers, &writes) {
+        return response;
+    }
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/$submit"),
+        json!({"resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => resource_response(
+            StatusCode::OK,
+            result.value,
+            None,
+            prefer_xml(&headers, &params),
+        ),
+        Err(err) => error_response(err),
+    }
 }
 
 async fn terminology_op(app: AppState, resource_type: String, op: &str, body: Bytes) -> Response {

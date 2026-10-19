@@ -3261,7 +3261,7 @@ fn subscription_app() -> axum::Router {
 
 /// A rest-hook receiver on a local port. It answers every request with `status` (for example
 /// `204 No Content`) and sends the text of each request it gets down the channel.
-fn hook_receiver(status: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
+pub(crate) fn hook_receiver(status: &'static str) -> (u16, std::sync::mpsc::Receiver<String>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = std::sync::mpsc::channel();

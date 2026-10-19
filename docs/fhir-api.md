@@ -136,6 +136,46 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
+| `$submit` | `Claim`, `CoverageEligibilityRequest` | Stores a claim, pre-authorisation or eligibility request and answers with a response that says it is queued. See [Submitting a claim](#submitting-a-claim-or-an-eligibility-request) |
+
+### Submitting a claim or an eligibility request
+
+`POST [base]/Claim/$submit` takes FHIR R4's `Parameters` with one `resource`: a `Claim`, or a `Bundle` of
+them. (A Claim, or a Bundle, as the body itself is accepted too, as R4 allows when the resource is the
+only input.) A Claim says in `use` whether it is a claim, a pre-authorisation (`preauthorization`) or a
+pre-determination (`predetermination`). `POST [base]/CoverageEligibilityRequest/$submit` is the same for
+eligibility requests.
+
+A server that stores records is not the payer that decides them, so the operation does what a server can:
+it checks and stores what was submitted, as a transaction would, and answers with a response that says it
+was received and is waiting. The response is a `ClaimResponse` (or a `CoverageEligibilityResponse`) with
+
+- `outcome` `queued`, and `status` `active`;
+- `request`, a reference to the stored Claim (`Claim/[id]`);
+- `patient`, `insurer` and, as R4 gives them, `use`, `type` and `subType` of a Claim, or `purpose` and
+  `servicedDate` or `servicedPeriod` of an eligibility request, copied from the request, and `requestor`
+  from its `provider`;
+- `created`, the time of the request, and a `disposition` that says it is waiting.
+
+The response is stored like any other resource, and creating it is announced like any other create: a
+[Subscription](#subscriptions) on `ClaimResponse?outcome=queued` tells whoever adjudicates that a claim
+has come, and `GET [base]/ClaimResponse?request=Claim/[id]` finds the response to a claim. The
+adjudicator decides by updating the response (`outcome` `complete`, the `item`s and their `adjudication`,
+`preAuthRef` for an approval).
+
+A `Bundle` may hold Claims, Bundles that each hold a Claim, and the resources they refer to (a
+`Patient`, a `Coverage`). Each is stored as a new resource, and an entry refers to another by its
+`fullUrl` (`urn:uuid:...`), as in a transaction; an entry with its own `request` (`POST` with
+`ifNoneExist`, or `PUT`) is stored as it says, which keeps a `Patient` from being made again each time.
+What comes back follows what went in: a Claim gets its `ClaimResponse`, and a Bundle gets a `collection`
+Bundle with one response for each Claim, in the order they were submitted. A submission is one
+transaction: if anything in it is invalid, a reference names something that does not exist, or the token
+may not write it, nothing is stored, and the answer says why (`400` with the validator's `OperationOutcome`
+and, in a Bundle, the position of the entry).
+
+With SMART, the token needs to be able to create everything the submission writes: the Claim, the response
+type, and every other type in the Bundle (or to update it, for a `PUT` entry). A token that is limited to
+one patient cannot submit. `$submit` is not available over `/sync`.
 
 Beyond REST:
 

@@ -597,6 +597,7 @@ impl Catalog {
         });
         refhir_sdc::annotate_capability(&mut statement);
         annotate_install(&mut statement);
+        crate::submit::annotate_capability(&mut statement);
         statement
     }
 }
