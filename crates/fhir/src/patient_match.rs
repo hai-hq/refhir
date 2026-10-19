@@ -50,7 +50,8 @@
 //! than a few of them, never round a cycle, and only to a Patient that is in use and has no
 //! replacement of its own. What it finds there is that Patient, with the grade of the match on
 //! the replaced one but never above `probable`, which is what no one compared the Patient with the
-//! request for, and the evidence says `replaced-record` with the replaced one. A Patient that is
+//! request for. The evidence says `replaced-record` with the replaced one, and then only what the
+//! Patient returned itself shares with the request, which can be less than the replaced one had. A Patient that is
 //! found both ways is one match, the better of the two. A link that leads nowhere (the Patient is
 //! gone, switched off, or on another server) leaves nothing to return.
 //!
@@ -159,6 +160,10 @@ pub(crate) struct Rules {
     /// Where a match on a replaced Patient goes: to the Patient that replaced it, within these
     /// limits. `None` leaves a replaced Patient out and follows nothing.
     pub replaced_by: Option<ReplacedBy>,
+    /// Most identifiers, names or telecoms a request may carry. Each identifier is a search of its
+    /// own, and every name and telecom is compared with every candidate, so a request is refused
+    /// that has more of them than a registration has.
+    pub max_elements: usize,
     /// How many Patients one page of candidates holds.
     pub page: usize,
     /// Most candidates one request may compare. More than this is refused: an answer that left
@@ -203,6 +208,7 @@ impl Rules {
             max_hops: 5,
             cap: Grade::Probable,
         }),
+        max_elements: 50,
         page: 500,
         max_candidates: 20_000,
     };
@@ -403,9 +409,10 @@ impl Subject {
         }
         if let Some(date) = text(patient, "birthDate", "Patient")? {
             if !is_date(date) {
-                return Err(invalid(format!(
-                    "Patient.birthDate {date:?} is not a date (YYYY, YYYY-MM or YYYY-MM-DD)"
-                )));
+                // Not the value: it is a person's date of birth, and error text is logged.
+                return Err(invalid(
+                    "Patient.birthDate is not a date (YYYY, YYYY-MM or YYYY-MM-DD)",
+                ));
             }
             if date.len() == 10 {
                 subject.birth_date = Some(date.to_string());
@@ -494,7 +501,9 @@ impl Subject {
                 }
             }
         }
-        if let (Some(ours), Some(theirs)) = (&self.gender, &stored.gender) {
+        // `unknown` says that nobody knows, which neither agrees with a gender nor differs from it.
+        let known = |gender: &Option<String>| gender.clone().filter(|gender| gender != "unknown");
+        if let (Some(ours), Some(theirs)) = (known(&self.gender), known(&stored.gender)) {
             evidence.gender = Some(ours == theirs);
         }
         evidence
@@ -623,7 +632,8 @@ fn email_key(raw: &str) -> Option<String> {
     Some(address.to_lowercase())
 }
 
-/// A FHIR date: `YYYY`, `YYYY-MM` or a real `YYYY-MM-DD`.
+/// A FHIR date: `YYYY`, `YYYY-MM` or a real `YYYY-MM-DD`. A date and a time is not one: that is a
+/// `dateTime`, and a birth date is a day.
 fn is_date(text: &str) -> bool {
     let number = |part: &str, width: usize| {
         (part.len() == width && part.bytes().all(|b| b.is_ascii_digit()))
@@ -643,14 +653,26 @@ fn is_date(text: &str) -> bool {
     let Some(day) = parts.next() else {
         return true;
     };
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let longest = match month {
-        2 if leap => 29,
-        2 => 28,
-        4 | 6 | 9 | 11 => 30,
-        _ => 31,
-    };
+    let longest = u32::from(refhir_fhirpath::days_in_month(year as i32, month as u8));
     parts.next().is_none() && number(day, 2).is_some_and(|day| (1..=longest).contains(&day))
+}
+
+/// A request with more identifiers, names or telecoms than `rules` allow is refused, before any of
+/// them is read.
+fn limit_elements(patient: &Value, rules: &Rules) -> Result<(), FhirError> {
+    for field in ["identifier", "name", "telecom"] {
+        let count = patient
+            .get(field)
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if count > rules.max_elements {
+            return Err(invalid(format!(
+                "Patient.{field} has {count} entries, and $match compares at most {}",
+                rules.max_elements
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The request, read.
@@ -753,6 +775,7 @@ impl Request {
                     .ok_or_else(|| invalid("count must be a whole number, 0 or more"))?,
             ),
         };
+        limit_elements(&resource, rules)?;
         let subject = Subject::read(&resource, rules)?;
         Ok(Request {
             subject,
@@ -798,49 +821,59 @@ fn find(
     // By id, so that a Patient reached in two ways is one match, the better of the two.
     let mut found: BTreeMap<String, Match> = BTreeMap::new();
     if request.subject.can_match() {
-        for (id, resource) in candidates(tx, catalog, &request.subject, rules)? {
-            let standing = standing(&resource);
-            if standing == Standing::Out
-                || (standing == Standing::Replaced && rules.replaced_by.is_none())
-            {
-                continue;
-            }
-            let Ok(stored) = Subject::read(&resource, rules) else {
-                continue;
-            };
-            let evidence = request.subject.compare(&stored, rules);
-            let Some((grade, score)) = rules.grade(&evidence) else {
-                continue;
-            };
-            let Some(follow) = rules.replaced_by.filter(|_| standing == Standing::Replaced) else {
-                keep(
-                    &mut found,
-                    Match {
-                        id,
-                        resource,
-                        evidence,
-                        grade,
-                        score,
-                    },
-                );
-                continue;
-            };
-            // What the request matched is a Patient that another took the place of: the match is
-            // the one that took its place, no stronger than the rules let a link make it.
-            let (grade, score) = rules.capped(grade, score, follow.cap);
-            for (survivor, resource) in survivors(tx, catalog, &id, &resource, follow.max_hops)? {
-                let mut evidence = evidence.clone();
-                evidence.replaced = vec![id.clone()];
-                keep(
-                    &mut found,
-                    Match {
-                        id: survivor,
-                        resource,
-                        evidence,
-                        grade,
-                        score,
-                    },
-                );
+        let mut candidates = Candidates::of(&request.subject);
+        while let Some(page) = candidates.next_page(tx, catalog, rules)? {
+            for (id, resource) in page {
+                let standing = standing(&resource);
+                if standing == Standing::Out
+                    || (standing == Standing::Replaced && rules.replaced_by.is_none())
+                {
+                    continue;
+                }
+                let Ok(stored) = Subject::read(&resource, rules) else {
+                    continue;
+                };
+                let evidence = request.subject.compare(&stored, rules);
+                let Some((grade, score)) = rules.grade(&evidence) else {
+                    continue;
+                };
+                let Some(follow) = rules.replaced_by.filter(|_| standing == Standing::Replaced)
+                else {
+                    keep(
+                        &mut found,
+                        Match {
+                            id,
+                            resource,
+                            evidence,
+                            grade,
+                            score,
+                        },
+                    );
+                    continue;
+                };
+                // What the request matched is a Patient that another took the place of: the match is
+                // the one that took its place, no stronger than the rules let a link make it.
+                let (grade, score) = rules.capped(grade, score, follow.cap);
+                for (survivor, resource) in survivors(tx, catalog, &id, &resource, follow.max_hops)?
+                {
+                    // What the Patient that is returned shares with the request, which is not what the
+                    // replaced one did: the entry says only what it can vouch for.
+                    let mut evidence = match Subject::read(&resource, rules) {
+                        Ok(own) => request.subject.compare(&own, rules),
+                        Err(_) => Evidence::default(),
+                    };
+                    evidence.replaced = vec![id.clone()];
+                    keep(
+                        &mut found,
+                        Match {
+                            id: survivor,
+                            resource,
+                            evidence,
+                            grade,
+                            score,
+                        },
+                    );
+                }
             }
         }
     }
@@ -1002,34 +1035,56 @@ fn survivors(
     Ok(survivors)
 }
 
-/// The stored Patients worth comparing with the subject, by id: those that have one of its
-/// identifiers, and those born on its birth date when it has a name to compare.
-fn candidates(
-    tx: &mut Transaction,
-    catalog: &Catalog,
-    subject: &Subject,
-    rules: &Rules,
-) -> Result<BTreeMap<String, Value>, FhirError> {
-    let model = catalog.get("Patient")?;
-    let mut queries: Vec<(&str, String)> = subject
-        .identifiers
-        .iter()
-        .filter_map(|(system, value)| Some(("identifier", token(system, value)?)))
-        .collect();
-    if let (true, Some(date)) = (subject.can_match_by_name(), &subject.birth_date) {
-        queries.push(("birthdate", date.clone()));
+/// The stored Patients worth comparing with the subject: those that have one of its identifiers,
+/// and those born on its birth date when it has a name to compare. They are read a page at a time
+/// and each is given once, so no more than a page of them is held, whatever the search finds.
+struct Candidates {
+    /// `(search parameter, value)`, one search each.
+    queries: Vec<(&'static str, String)>,
+    /// The search being read, and how far into it.
+    at: usize,
+    offset: usize,
+    /// The ids already given, which is also how many there are.
+    seen: BTreeSet<String>,
+}
+
+impl Candidates {
+    fn of(subject: &Subject) -> Candidates {
+        let mut queries: Vec<(&'static str, String)> = subject
+            .identifiers
+            .iter()
+            .filter_map(|(system, value)| Some(("identifier", token(system, value)?)))
+            .collect();
+        if let (true, Some(date)) = (subject.can_match_by_name(), &subject.birth_date) {
+            queries.push(("birthdate", date.clone()));
+        }
+        Candidates {
+            queries,
+            at: 0,
+            offset: 0,
+            seen: BTreeSet::new(),
+        }
     }
-    let mut found = BTreeMap::new();
-    for (parameter, value) in queries {
-        let mut offset = 0;
-        loop {
+
+    /// The next Patients not given before, `(id, resource)`, or `None` when there are no more.
+    fn next_page(
+        &mut self,
+        tx: &mut Transaction,
+        catalog: &Catalog,
+        rules: &Rules,
+    ) -> Result<Option<Vec<(String, Value)>>, FhirError> {
+        let model = catalog.get("Patient")?;
+        // A page of nothing would never reach the end of a search.
+        let size = rules.page.max(1);
+        while let Some((parameter, value)) = self.queries.get(self.at).cloned() {
             let params = BTreeMap::from([
-                (parameter.to_string(), value.clone()),
-                ("_count".to_string(), rules.page.to_string()),
-                ("_offset".to_string(), offset.to_string()),
+                (parameter.to_string(), value),
+                ("_count".to_string(), size.to_string()),
+                ("_offset".to_string(), self.offset.to_string()),
             ]);
             let page = search::search(tx, catalog, model, &params)?;
             let mut read = 0;
+            let mut fresh = Vec::new();
             for entry in page
                 .get("entry")
                 .and_then(Value::as_array)
@@ -1044,33 +1099,41 @@ fn candidates(
                     continue;
                 };
                 if let Some(id) = resource.get("id").and_then(Value::as_str) {
-                    found
-                        .entry(id.to_string())
-                        .or_insert_with(|| resource.clone());
+                    if self.seen.insert(id.to_string()) {
+                        fresh.push((id.to_string(), resource.clone()));
+                    }
                 }
             }
-            if found.len() > rules.max_candidates {
-                return Err(FhirError::Unprocessable(json!({
-                    "resourceType": "OperationOutcome",
-                    "issue": [{
-                        "severity": "error",
-                        "code": "too-costly",
-                        "diagnostics": format!(
-                            "more than {} Patients share an identifier or a birth date with the \
-                             resource, which is more than $match compares; the answer would not \
-                             be complete",
-                            rules.max_candidates
-                        )
-                    }]
-                })));
+            if self.seen.len() > rules.max_candidates {
+                return Err(too_costly(rules));
             }
-            if read < rules.page {
-                break;
+            if read < size {
+                self.at += 1;
+                self.offset = 0;
+            } else {
+                self.offset += read;
             }
-            offset += read;
+            if !fresh.is_empty() {
+                return Ok(Some(fresh));
+            }
         }
+        Ok(None)
     }
-    Ok(found)
+}
+
+fn too_costly(rules: &Rules) -> FhirError {
+    FhirError::Unprocessable(json!({
+        "resourceType": "OperationOutcome",
+        "issue": [{
+            "severity": "error",
+            "code": "too-costly",
+            "diagnostics": format!(
+                "more than {} Patients share an identifier or a birth date with the resource, \
+                 which is more than $match compares; the answer would not be complete",
+                rules.max_candidates
+            )
+        }]
+    }))
 }
 
 /// `system|value` as a token search reads it, or `None` for one it cannot say. A comma in a
@@ -2113,16 +2176,14 @@ mod tests {
         let found = by_old_identifier(&db, &catalog, &RULES, false);
         // The old record holds the identifier, so it is certain. It is not the record in use, and
         // what is found is the one that is: probable at the most, and it says which it came from.
+        // It does not say `identifier`: that is on the old record, and this one has none.
         assert_eq!(
             found,
             [(
                 "new".to_string(),
                 "probable".to_string(),
                 0.95,
-                vec![
-                    "replaced-record Patient/old".to_string(),
-                    "identifier".to_string()
-                ]
+                vec!["replaced-record Patient/old".to_string()]
             )]
         );
         // A match that no one compared with the record that is returned is not one to link on.
@@ -2207,10 +2268,41 @@ mod tests {
                 vec![
                     "replaced-record Patient/old-a".to_string(),
                     "replaced-record Patient/old-b".to_string(),
-                    "identifier".to_string()
                 ]
             )]
         );
+    }
+
+    #[test]
+    fn a_followed_entry_says_only_what_the_patient_it_returns_shares_with_the_request() {
+        // The old record has the name, the birth date and the phone number of the request. It was
+        // replaced by one that has the name, and another birth date and no phone number: a merge
+        // that was wrong, or has since gone stale.
+        let mut new = segun("new");
+        new["birthDate"] = json!("1970-07-07");
+        let mut old = old_segun("old", Some("Patient/new"), false);
+        old["telecom"] = json!([{"system": "phone", "value": "0803 123 4567"}]);
+        let (db, catalog) = replacing(&[new, old]);
+        let request = json!({"resource": {
+            "resourceType": "Patient", "birthDate": "1969-06-06",
+            "name": [{"family": "Balogun", "given": ["Segun"]}],
+            "telecom": [{"system": "phone", "value": "+234 803 123 4567"}]
+        }});
+        let request = Request::from_args(&request, &RULES).unwrap();
+        let answer = find(&mut db.begin(), &catalog, &request, &RULES).unwrap();
+        let entry = &answer["entry"][0];
+        assert_eq!(entry["resource"]["id"], "new");
+        // Probable by the old record, which had all three.
+        assert_eq!(entry["search"]["extension"][0]["valueCode"], "probable");
+        let kinds: Vec<&str> = entry["search"]["extension"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|item| item["extension"][0]["valueCode"].as_str().unwrap())
+            .collect();
+        // But the entry does not say that this Patient has the birth date or the phone number.
+        assert_eq!(kinds, ["replaced-record", "name"]);
     }
 
     #[test]
@@ -2309,5 +2401,121 @@ mod tests {
             ..RULES
         };
         assert!(by_old_identifier(&db, &catalog, &none, false).is_empty());
+    }
+
+    #[test]
+    fn a_request_with_more_identifiers_names_or_telecoms_than_allowed_is_refused() {
+        let many = |field: &str, count: usize| {
+            let element = match field {
+                "identifier" => |n: usize| json!({"system": "urn:x", "value": n.to_string()}),
+                "name" => |n: usize| json!({"family": format!("Family{n}"), "given": ["Ada"]}),
+                _ => |n: usize| json!({"system": "phone", "value": format!("0803{n:07}")}),
+            };
+            let items: Vec<Value> = (0..count).map(element).collect();
+            json!({"resource": {"resourceType": "Patient", field: items}})
+        };
+        let limit = RULES.max_elements;
+        for field in ["identifier", "name", "telecom"] {
+            assert!(
+                Request::from_args(&many(field, limit), &RULES).is_ok(),
+                "{field}"
+            );
+            match Request::from_args(&many(field, limit + 1), &RULES) {
+                Err(FhirError::Invalid(message)) => {
+                    assert!(
+                        message.contains(field) && message.contains("at most"),
+                        "{message}"
+                    )
+                }
+                other => panic!("{field}: {:?}", other.map(|request| request.count)),
+            }
+        }
+    }
+
+    #[test]
+    fn a_birth_date_that_is_not_a_date_is_refused_without_saying_what_it_was() {
+        let patient = json!({"resource": {"resourceType": "Patient", "birthDate": "02/03/1985"}});
+        match Request::from_args(&patient, &RULES) {
+            Err(FhirError::Invalid(message)) => {
+                assert!(message.contains("birthDate"), "{message}");
+                assert!(
+                    !message.contains("1985") && !message.contains("02/03"),
+                    "{message}"
+                );
+            }
+            other => panic!("{:?}", other.map(|request| request.count)),
+        }
+    }
+
+    #[test]
+    fn a_gender_that_nobody_knows_is_no_evidence_either_way() {
+        let with_gender = |gender: &str| {
+            let mut patient = person(json!([]));
+            patient["gender"] = json!(gender);
+            subject(patient)
+        };
+        let evidence = |ours: &str, theirs: &str| {
+            with_gender(ours)
+                .compare(&with_gender(theirs), &RULES)
+                .gender
+        };
+        assert_eq!(evidence("female", "female"), Some(true));
+        assert_eq!(evidence("female", "male"), Some(false));
+        assert_eq!(evidence("female", "other"), Some(false));
+        assert_eq!(evidence("other", "other"), Some(true));
+        // Unknown on either side, or on both, says nothing.
+        assert_eq!(evidence("female", "unknown"), None);
+        assert_eq!(evidence("unknown", "female"), None);
+        assert_eq!(evidence("unknown", "unknown"), None);
+        // So it does not lower the score, and is not said to differ.
+        let (_, score) = RULES
+            .grade(&with_gender("female").compare(&with_gender("unknown"), &RULES))
+            .unwrap();
+        let (_, without) = graded(person(json!([])), person(json!([]))).unwrap();
+        assert_eq!(score, without);
+    }
+
+    #[test]
+    fn a_page_of_nothing_still_reaches_the_end() {
+        let (db, catalog) = store_of(3);
+        let empty = Rules { page: 0, ..RULES };
+        // As one at a time: the search is asked for pages of one.
+        let one = Rules { page: 1, ..RULES };
+        assert_eq!(
+            ask(&db, &catalog, &empty).unwrap(),
+            ask(&db, &catalog, &one).unwrap()
+        );
+        assert_eq!(ask(&db, &catalog, &empty).unwrap()["total"], 3);
+    }
+
+    #[test]
+    fn the_fixture_search_parameters_are_the_ones_the_other_packages_have() {
+        // They are copies, so that this package stands alone, and are kept the same as the
+        // originals so that these tests do not run against other definitions than the rest.
+        let pairs = [
+            (
+                crate::package::minir4_dir(),
+                "SearchParameter-Patient-identifier.json",
+            ),
+            (
+                crate::package::minir4_dir(),
+                "SearchParameter-Patient-name.json",
+            ),
+            (
+                crate::package::minir4_dir(),
+                "SearchParameter-Patient-active.json",
+            ),
+            (
+                crate::package::extra_dir(),
+                "SearchParameter-Patient-birthdate.json",
+            ),
+        ];
+        for (original, file) in pairs {
+            assert_eq!(
+                std::fs::read_to_string(crate::package::patient_match_dir().join(file)).unwrap(),
+                std::fs::read_to_string(original.join(file)).unwrap(),
+                "{file}"
+            );
+        }
     }
 }

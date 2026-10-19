@@ -6,7 +6,9 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
             return "install";
         }
         // It looks for Patients, whatever it is sent with: a token that may search them may match.
-        if op == "$match" {
+        // Only a POST is the operation; any other method on the path is not one, and is judged as
+        // what the method is.
+        if op == "$match" && method == "POST" {
             return "search";
         }
         if matches!(
@@ -199,6 +201,16 @@ fn letters_allow(letters: &str, interaction: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_match_is_a_search_only_as_a_post() {
+        assert_eq!(http_interaction("POST", "/Patient/$match"), "search");
+        // Any other method on the path is judged as what it is.
+        assert_eq!(http_interaction("PUT", "/Patient/$match"), "update");
+        assert_eq!(http_interaction("PATCH", "/Patient/$match"), "update");
+        assert_eq!(http_interaction("DELETE", "/Patient/$match"), "delete");
+        assert_eq!(http_interaction("GET", "/Patient/$match"), "read");
+    }
 
     #[test]
     fn v1_read_covers_search() {

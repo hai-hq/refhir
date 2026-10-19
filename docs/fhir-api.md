@@ -181,7 +181,7 @@ and some a `value`:
 | `kind` | Means | `value` |
 |--------|-------|---------|
 | `identifier` | An identifier of the request is on the Patient | `valueIdentifier`: the system and value as the request wrote them. One extension for each that matched |
-| `replaced-record` | The Patient is not what the request matched but what replaced it. Comes first | `valueReference`: the replaced Patient. One extension for each replaced Patient it was found through |
+| `replaced-record` | The Patient is not what the request matched but what replaced it. Comes first. The other evidence on the entry is what this Patient itself shares with the request, which can be less than the replaced one had | `valueReference`: the replaced Patient. One extension for each replaced Patient it was found through |
 | `name` | A name of the request is a name of the Patient | |
 | `name-reordered` | Said as well as `name` when the words are the same but not in the same places (a family name written as a given name) | |
 | `birth-date` | The same full birth date | |
@@ -227,7 +227,8 @@ How things are compared:
   as an email address if it has an `@`, and as a phone number otherwise.
 - **Identifiers** count only with both a `system` and a `value`, and not when `use` is `temp`.
 - **Gender** only moves the score within its grade: a gender that agrees is a little higher, and
-  one that differs is lower. It never decides a grade.
+  one that differs is lower. It never decides a grade. `unknown` is no gender: it neither agrees
+  nor differs.
 
 A Patient with `active` false is never returned, and neither is one that another Patient replaced
 (it has a `link` of type `replaced-by`, with `active` false or not). A match on a replaced Patient is
@@ -242,7 +243,10 @@ returns that one:
   server compared the replaced Patient with the request, not this one, and the link was made by
   whoever merged them. So it is never `certain`, and `onlyCertainMatches` never returns it.
 - The entry says so with `replaced-record` evidence, a `valueReference` to each replaced Patient it
-  was found through, so that a caller or the person looking can see where the match came from.
+  was found through, so that a caller or the person looking can see where the match came from. The
+  rest of its evidence is what the Patient it returns shares with the request, and nothing the
+  replaced one had that it does not: if the replaced Patient had the birth date or the phone number
+  and this one has not, the entry does not say `birth-date` or `phone`.
 - A Patient found both ways, itself and through a replaced one, is one entry: whichever scores
   higher, and itself when they score the same.
 
@@ -256,6 +260,8 @@ turns many potential matches into one.
 A Patient with nothing to look up (no identifier with a system and a value, and no name with a full
 birth date) matches nothing, and the Bundle is empty. More than 20,000 Patients sharing an
 identifier or the birth date is a `422` (`too-costly`) rather than an answer that left some out.
+A resource with more than 50 identifiers, names or telecoms is a `400`. The body is JSON: an XML
+body is a `415`.
 
 Only the store the request is made to is searched. The caller needs a scope that may search
 Patients (`user/Patient.read` or `user/Patient.rs`). A token limited to one patient is refused,

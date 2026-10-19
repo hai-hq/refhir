@@ -343,19 +343,10 @@ async fn the_same_value_in_another_system_or_another_case_is_not_the_identifier(
 #[tokio::test]
 async fn name_birth_date_and_phone_or_email_is_probable_in_any_format() {
     let request = |telecom: Value| {
-        with(
-            person("", "Okafor", &["Ada", "Chinwe"], "1985-03-02"),
-            "telecom",
-            telecom,
-        )
-        .as_object()
-        .map(|object| {
-            let mut object = object.clone();
-            object.remove("id");
-            object.remove("active");
-            Value::Object(object)
+        json!({
+            "resourceType": "Patient", "birthDate": "1985-03-02", "telecom": telecom,
+            "name": [{"family": "Okafor", "given": ["Ada", "Chinwe"]}]
         })
-        .unwrap()
     };
     for telecom in [
         json!([phone("+234 803 123 4567")]),
@@ -743,10 +734,10 @@ async fn a_record_that_was_replaced_leads_to_the_one_that_replaced_it() {
             "femi".to_string(),
             "probable".to_string(),
             0.95,
+            // The identifier is on the replaced records, and `femi` has none, so it is not said.
             told(&[
                 "replaced-record Patient/femi-old",
                 "replaced-record Patient/femi-older",
-                &format!("identifier {PROFILE}|PRF-3002"),
             ])
         )]
     );
@@ -769,7 +760,6 @@ async fn a_record_that_was_replaced_leads_to_the_one_that_replaced_it() {
         told(&[
             "replaced-record Patient/femi-old",
             "replaced-record Patient/femi-older",
-            &format!("identifier {PROFILE}|PRF-3002"),
             "name",
             "birth-date",
         ])
@@ -799,10 +789,7 @@ async fn a_chain_of_replacements_is_followed_to_the_end() {
             "chain-c".to_string(),
             "probable".to_string(),
             0.95,
-            told(&[
-                "replaced-record Patient/chain-a",
-                &format!("identifier {PROFILE}|PRF-4001")
-            ])
+            told(&["replaced-record Patient/chain-a"])
         )]
     );
     // All three have the name and the birth date, and lead to the same one: it is possible, once,
@@ -891,6 +878,28 @@ async fn a_request_that_cannot_be_read_is_a_400_with_an_operation_outcome() {
             "{what}: {text}"
         );
     }
+}
+
+#[tokio::test]
+async fn an_xml_body_is_refused_for_what_it_is() {
+    // The standard XML form of the request. It is not read, and it is not answered as if it had no
+    // resource in it.
+    let xml = r#"<Parameters xmlns="http://hl7.org/fhir"><parameter><name value="resource"/><resource><Patient><identifier><system value="https://id.example.org/profile"/><value value="PRF-1001"/></identifier></Patient></resource></parameter></Parameters>"#;
+    let (status, text) = send_text(
+        &seeded(),
+        "POST",
+        "/Patient/$match?access_token=reader",
+        xml,
+        &[("content-type", "application/fhir+xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{text}");
+    let outcome: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(outcome["resourceType"], "OperationOutcome");
+    assert!(outcome["issue"][0]["diagnostics"]
+        .as_str()
+        .unwrap()
+        .contains("XML"));
 }
 
 #[tokio::test]

@@ -26,7 +26,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   one Patient is a potential match. Each entry says what it was found by in `match-evidence`
   extensions on `search`: the name, birth date, identifier, phone number or email address that
   matched (the last three as the request wrote them, so a caller can tell which of its own phone
-  numbers matched), and the replaced Patient a match came through. The CapabilityStatement lists
+  numbers matched), and the replaced Patient a match came through. The request is JSON: an XML body
+  is refused with a `415`. The CapabilityStatement lists
   the operation on `Patient`. A scope that may search Patients may use it; a token limited to one
   patient may not. See [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
 - **A first start installs prepared packages, with no registry and little memory.** Release archives

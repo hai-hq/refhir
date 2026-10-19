@@ -1077,12 +1077,21 @@ async fn translate_op(
 }
 
 /// `POST [base]/Patient/$match`: the body is the operation's `Parameters`, and what the engine makes
-/// of them (and refuses in them) is its answer. It reads, so a replica answers it itself.
+/// of them (and refuses in them) is its answer. It reads, so a replica answers it itself. The body
+/// is JSON: the XML that `parse_body` can read does not make the Parameters this needs, and a
+/// request it answered with "resource is required" would send its sender looking in the wrong place.
 async fn match_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
     body: Bytes,
 ) -> Response {
+    if body.first() == Some(&b'<') {
+        return outcome(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "not-supported",
+            "$match takes its Parameters as JSON; XML is not supported",
+        );
+    }
     terminology_op(app, resource_type, "$match", body).await
 }
 
