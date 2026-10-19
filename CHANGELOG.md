@@ -51,6 +51,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Fixed
 
+- **An `_include` or `_revinclude` that cannot follow anything is refused, and no longer echoed as if it
+  had been applied.** `GET /HealthcareService?_id=gp&_revinclude=ChargeItemDefinition:context`, where
+  `context` is a token parameter, answered `200` with nothing included and the rule in the Bundle's
+  `self` link. A rule has to name a reference parameter of a resource type the server has: otherwise
+  the search is a `400` that names the rule and why, and with `Prefer: handling=lenient` the rule is set
+  aside, left out of `self`, and reported in the Bundle's `OperationOutcome` entry, as a value that cannot
+  be read already was. `_include=*`, the `:iterate` forms and every rule that follows a reference work as
+  before. See [FHIR API](docs/fhir-api.md#search).
 - **A reference inside a choice element is checked like every other.** `--references strict` (the
   default) refused a missing target for `Invoice.account` or `Observation.focus`, and saved
   `Invoice.lineItem.chargeItemReference` = `ChargeItem/nope` and `ChargeItem.productReference` =

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
 use crate::error::FhirError;
-use crate::extract::{Probe, ReferenceId};
+use crate::extract::{Probe, ReferenceId, SearchKind};
 use crate::ops::decorate;
 use crate::resolve::TxHost;
 
@@ -336,7 +336,8 @@ pub(crate) fn search_counted(
     if let Some(query) = params.get("_query") {
         return Err(FhirError::Invalid(format!("unknown query {query}")));
     }
-    let (clauses, ignored) = clauses_from(catalog, model, params, handling)?;
+    let (clauses, mut ignored) = clauses_from(catalog, model, params, handling)?;
+    ignored.extend(control_issues(catalog, model, params, handling)?);
     // The links, and the cursor in them, describe the search that ran, so a parameter that was set
     // aside is in neither, and a `_cursor` is checked against the same parameters it was made from.
     let ran = without_ignored(params, &ignored);
@@ -391,15 +392,17 @@ fn without_ignored<'a>(
         let Some(value) = ran.get(&item.key) else {
             continue;
         };
-        // Only that occurrence goes: the others of the same parameter are clauses that were read.
-        let mut kept: Vec<&str> = value.split(AND).collect();
+        // Only that occurrence goes: the others of the same parameter are clauses that were read,
+        // or the other terms of a list (`_sort=name,-bogus`).
+        let separator = if is_list_control(&item.key) { ',' } else { AND };
+        let mut kept: Vec<&str> = value.split(separator).collect();
         if let Some(at) = kept.iter().position(|text| *text == item.occurrence) {
             kept.remove(at);
         }
         if kept.is_empty() {
             ran.remove(&item.key);
         } else {
-            let joined = kept.join(&AND.to_string());
+            let joined = kept.join(&separator.to_string());
             ran.insert(item.key.clone(), joined);
         }
     }
@@ -819,6 +822,16 @@ fn parse_include(text: &str, iterate: bool) -> Option<IncludeSpec> {
 /// Most characters of a value an error message repeats.
 const ECHO_LIMIT: usize = 64;
 
+/// A value as an error message repeats it. A long one is not echoed whole: the message goes into
+/// the response, a live query's error and the logs.
+fn shown(value: &str) -> String {
+    let mut shown: String = value.chars().take(ECHO_LIMIT).collect();
+    if shown.len() < value.len() {
+        shown.push('…');
+    }
+    shown
+}
+
 /// The clauses of a search, and the parameters a lenient search set aside.
 ///
 /// A value is read here, before any row is, so whether it is well formed never depends on what
@@ -838,12 +851,7 @@ fn clauses_from(
         let Err((value, reason)) = verdict else {
             return Ok(true);
         };
-        // A long value is not echoed whole: the message goes into the response, a live query's
-        // error and the logs.
-        let mut shown: String = value.chars().take(ECHO_LIMIT).collect();
-        if shown.len() < value.len() {
-            shown.push('…');
-        }
+        let shown = shown(&value);
         let message = format!(
             "invalid value {shown:?} for search parameter {key} on {}: {reason}",
             model.name
@@ -983,6 +991,82 @@ fn reads_on<'a>(
         }
     }
     Ok(())
+}
+
+/// The values of the result controls that the server cannot apply, and so leaves out if the search
+/// is lenient, and refuses if it is strict. A search that ignored one would still show it in its
+/// `self` link, as if it had applied it, and FHIR says that link holds what the server used.
+///
+/// For now the controls are `_include` and `_revinclude`: a rule must name a reference parameter
+/// of a resource type the server has, because only a reference can be followed.
+fn control_issues(
+    catalog: &Catalog,
+    model: &ResourceModel,
+    params: &BTreeMap<String, String>,
+    handling: Handling,
+) -> Result<Vec<Ignored>, FhirError> {
+    let mut issues = Vec::new();
+    let mut note = |key: &str, occurrence: &str, reason: String| {
+        let message = format!(
+            "invalid value {:?} for {key} on {}: {reason}",
+            shown(occurrence),
+            model.name
+        );
+        match handling {
+            Handling::Strict => Err(FhirError::Invalid(message)),
+            Handling::Lenient => {
+                issues.push(Ignored {
+                    key: key.to_string(),
+                    occurrence: occurrence.to_string(),
+                    message,
+                });
+                Ok(())
+            }
+        }
+    };
+    for name in [
+        "_include",
+        "_include:iterate",
+        "_revinclude",
+        "_revinclude:iterate",
+    ] {
+        let Some(rules) = params.get(name) else {
+            continue;
+        };
+        for rule in rules.split(',').filter(|rule| !rule.is_empty()) {
+            // A rule that cannot be read is skipped by the search, as it always was.
+            let Some(spec) = parse_include(rule, name.ends_with(":iterate")) else {
+                continue;
+            };
+            if let Some(reason) = include_problem(catalog, &spec) {
+                note(name, rule, reason)?;
+            }
+        }
+    }
+    Ok(issues)
+}
+
+/// Why a rule of `_include` or `_revinclude` can never follow a reference, or `None` when it names
+/// a reference parameter of a resource type the server has (or names none, which is a rule for
+/// any type). A type that is not the one searched is fine: an `:iterate` rule follows the
+/// resources others have added.
+fn include_problem(catalog: &Catalog, spec: &IncludeSpec) -> Option<String> {
+    let source = spec.source.as_deref().filter(|source| *source != "*")?;
+    if spec.param == "*" {
+        return None;
+    }
+    let Ok(model) = catalog.get(source) else {
+        return Some(format!("{source} is not a resource type"));
+    };
+    match model.ready_param(&spec.param) {
+        None => Some(format!("{source} has no search parameter {}", spec.param)),
+        Some(param) if param.kind != SearchKind::Reference => Some(format!(
+            "{} of {source} is a {} parameter, and only a reference can be followed",
+            spec.param,
+            param.kind.fhir_type()
+        )),
+        Some(_) => None,
+    }
 }
 
 fn clause_from(model: &ResourceModel, name: &str, value: &str) -> Result<Clause, FhirError> {

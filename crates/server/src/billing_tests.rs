@@ -1194,3 +1194,165 @@ async fn applying_a_definition_needs_to_read_the_charge_item_and_nothing_more() 
         StatusCode::FORBIDDEN
     );
 }
+
+// `_include` and `_revinclude` follow references, and a rule that cannot is not echoed as applied.
+
+async fn get_preferring(uri: &str, prefer: Option<&str>) -> (StatusCode, Value) {
+    let mut headers = Vec::new();
+    if let Some(prefer) = prefer {
+        headers.push(("prefer", prefer));
+    }
+    let (status, text) = crate::tests::send_text(&billing(), "GET", uri, "", &headers).await;
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn self_link(bundle: &Value) -> String {
+    bundle["link"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["relation"] == "self")
+        .unwrap()["url"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+#[tokio::test]
+async fn an_include_of_a_parameter_that_is_not_a_reference_is_refused_or_left_out() {
+    let service = put(json!({"resourceType": "HealthcareService", "id": "gp"})).await;
+    assert!(service.status.is_success(), "{}", service.body);
+    // `context` of a ChargeItemDefinition is a token: there is nothing in it to follow. It used to
+    // be a `200` with nothing included and the rule in `self`, as if it had been applied.
+    let uri = "/HealthcareService?_id=gp&_revinclude=ChargeItemDefinition:context";
+    for prefer in [None, Some("handling=strict")] {
+        let (status, body) = get_preferring(uri, prefer).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{prefer:?}: {body}");
+        assert_eq!(body["resourceType"], "OperationOutcome");
+        let text = issues(&body);
+        assert!(
+            text.contains("_revinclude")
+                && text.contains("ChargeItemDefinition:context")
+                && text.contains("token"),
+            "{prefer:?}: {text}"
+        );
+    }
+    // Lenient leaves the rule out of what it says it did, and says so.
+    let (status, body) = get_preferring(uri, Some("handling=lenient")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let link = self_link(&body);
+    assert!(
+        link.contains("_id=gp") && !link.contains("_revinclude"),
+        "{link}"
+    );
+    let entries = body["entry"].as_array().unwrap();
+    let matched: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry["search"]["mode"] == "match")
+        .collect();
+    assert_eq!(matched.len(), 1);
+    assert!(entries
+        .iter()
+        .all(|entry| entry["search"]["mode"] != "include"));
+    let outcome = entries
+        .iter()
+        .find(|entry| entry["search"]["mode"] == "outcome")
+        .expect("an OperationOutcome entry that says what was left out");
+    let text = issues(&outcome["resource"]);
+    assert!(
+        text.contains("ChargeItemDefinition:context") && text.contains("handling=lenient"),
+        "{text}"
+    );
+    assert_eq!(body["total"], 1);
+
+    // Every way a rule can name something that cannot be followed.
+    for rule in [
+        "_include=Nope:subject",
+        "_include=ClaimResponse:nope",
+        "_include=ClaimResponse:disposition",
+        "_include:iterate=Claim:status",
+        "_revinclude=ClaimResponse:outcome",
+    ] {
+        let (status, body) = get_preferring(&format!("/Claim?{rule}"), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{rule}: {body}");
+        assert!(
+            issues(&body).contains(rule.split_once('=').unwrap().1),
+            "{rule}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_include_of_a_reference_parameter_still_follows_it() {
+    seed().await;
+    let submitted = post("/Claim/$submit", parameters(claim("claim"))).await;
+    assert_eq!(submitted.status, StatusCode::OK, "{}", submitted.body);
+    let response = submitted.body["id"].as_str().unwrap();
+    let claim_id = submitted.body["request"]["reference"].as_str().unwrap();
+
+    let kinds = |bundle: &Value| -> Vec<(String, String)> {
+        let mut found: Vec<_> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["search"]["mode"].as_str().unwrap().to_string(),
+                    entry["resource"]["resourceType"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        found.sort();
+        found
+    };
+    // Forward: the response and the claim it answers.
+    let uri = format!("/ClaimResponse?_id={response}&_include=ClaimResponse:request");
+    let (status, body) = get_preferring(&uri, Some("handling=strict")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        kinds(&body),
+        [
+            ("include".into(), "Claim".into()),
+            ("match".into(), "ClaimResponse".into())
+        ]
+    );
+    assert!(self_link(&body).contains("_include=ClaimResponse:request"));
+    // Reverse: the claim and the response to it.
+    let claim_search = format!(
+        "/Claim?_id={}&_revinclude=ClaimResponse:request",
+        claim_id.trim_start_matches("Claim/")
+    );
+    let (status, body) = get_preferring(&claim_search, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        kinds(&body),
+        [
+            ("include".into(), "ClaimResponse".into()),
+            ("match".into(), "Claim".into())
+        ]
+    );
+    assert!(self_link(&body).contains("_revinclude=ClaimResponse:request"));
+    // A rule for any parameter, and one that iterates, are not the server's to refuse.
+    for rule in ["_include=*", "_include:iterate=ClaimResponse:request"] {
+        let (status, body) =
+            get_preferring(&format!("/ClaimResponse?_id={response}&{rule}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{rule}: {body}");
+    }
+
+    // Lenient drops only the rule that cannot be followed, and keeps the one that can.
+    let uri = format!(
+        "/ClaimResponse?_id={response}&_include=ClaimResponse:request,ClaimResponse:disposition"
+    );
+    let (status, body) = get_preferring(&uri, Some("handling=lenient")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let link = self_link(&body);
+    assert!(link.contains("_include=ClaimResponse:request"), "{link}");
+    assert!(!link.contains("disposition"), "{link}");
+    assert!(
+        kinds(&body).contains(&("include".into(), "Claim".into())),
+        "{body}"
+    );
+}

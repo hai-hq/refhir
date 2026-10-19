@@ -82,6 +82,11 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
   every resource the rules have added, until none is added. A search that would add more than
   1000 resources that way is a `400`; name the parameters to follow instead of `*`, or search for
   fewer resources.
+- A rule has to name a parameter that holds a reference, of a resource type the server has: only a
+  reference can be followed. `_revinclude=ChargeItemDefinition:context` (a token), `_include=Nope:subject`
+  (no such type) and `_include=Claim:nope` (no such parameter) are a `400` that names the rule and says
+  why. The `*` rules and the `:iterate` forms are not refused. The `self` link of a search lists only
+  the rules the search followed.
 - Under a patient-scoped token, `_include` and `_revinclude` leave out the resources of other
   patients, as a search does. Resource types that are in no patient's compartment (a Practitioner,
   an Organization) are still included.
@@ -115,7 +120,9 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
   a value it cannot read is set aside whole. The
   response carries `Preference-Applied: handling=lenient`, and every search response has `Vary:
   Prefer`, since the answer depends on it. `handling=strict` is the default, and any other value of
-  `handling` is read as that. Lenient is for the value of a search parameter only: an unknown
+  `handling` is read as that. A rule of `_include` or `_revinclude` that cannot be followed is set
+  aside in the same way (the others of its list stay). Lenient is for the value of a search parameter
+  only: an unknown
   parameter name, a bare id that a reference parameter cannot place, a `_filter` that does not
   parse, `_count`, `_offset` and `_cursor` are a `400` either way.
   It is not available to a conditional create, update or delete (a clause set aside widens what
