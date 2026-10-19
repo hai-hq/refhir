@@ -2284,6 +2284,10 @@ impl TerminologyChange {
 #[derive(Clone, Debug)]
 pub struct ExpansionUpdate {
     pub url: String,
+    /// The package whose definition of the value set the expansion is of, which is the package it
+    /// is stored under, when the update is one that can say (see
+    /// [`MemoryTerminology::expand_waiting`]).
+    pub scope: Option<Scope>,
     /// The expansion document to store, or `None` when the value set has no expansion now.
     pub document: Option<Json>,
 }
@@ -2480,6 +2484,7 @@ impl MemoryTerminology {
                 Ok(expansion) => {
                     updates.push(ExpansionUpdate {
                         url: url.clone(),
+                        scope: expansion.scope,
                         document: Some(expansion_document(&url, &expansion)),
                     });
                     self.expansions.insert(url, Answer::held(expansion));
@@ -2495,6 +2500,7 @@ impl MemoryTerminology {
                     }
                     updates.push(ExpansionUpdate {
                         url,
+                        scope: None,
                         document: None,
                     });
                 }
@@ -2503,8 +2509,61 @@ impl MemoryTerminology {
         for url in gone {
             updates.push(ExpansionUpdate {
                 url,
+                scope: None,
                 document: None,
             });
+        }
+        updates
+    }
+
+    /// Try again the value sets that have no expansion, against the terminology as it is now.
+    ///
+    /// Installing a package stores the expansions of its own value sets, made from its own
+    /// resources. A value set that waits on a code system (or a value set) that another package
+    /// carries is left without one, and a package that arrives later does not give it one: nothing
+    /// asks the value sets that were waiting. This does. It costs one attempt for each value set
+    /// that still has no expansion, which is some of the value sets the packages hold, and not
+    /// more for a larger package than for a small one. The value sets that can be expanded now are
+    /// expanded and are no longer waiting; the update of each says which package's definition it
+    /// is of, so that it can be stored there. The ones that still cannot are left as they were.
+    pub fn expand_waiting(&mut self) -> Vec<ExpansionUpdate> {
+        if self.unexpanded.is_empty() {
+            return Vec::new();
+        }
+        let results: Vec<(String, Result<Expansion, Failures>)> = {
+            let pool = UnexpandedPool(self);
+            let mut expander = Expander {
+                systems: &self.systems,
+                value_sets: &pool,
+                scope: None,
+                strict: false,
+                known: self,
+                cache: BTreeMap::new(),
+                stack: Vec::new(),
+            };
+            self.unexpanded
+                .keys()
+                .map(|url| (url.clone(), expander.expand_in_use(url)))
+                .collect()
+        };
+        let mut updates = Vec::new();
+        for (url, result) in results {
+            match result {
+                Ok(expansion) => {
+                    updates.push(ExpansionUpdate {
+                        url: url.clone(),
+                        scope: expansion.scope,
+                        document: Some(expansion_document(&url, &expansion)),
+                    });
+                    self.unexpanded.remove(&url);
+                    self.reasons.remove(&url);
+                    self.expansions.insert(url, Answer::held(expansion));
+                }
+                // Why it still cannot be is now what was just found, not what it was before.
+                Err(failures) => {
+                    self.reasons.insert(url, failures);
+                }
+            }
         }
         updates
     }
@@ -4609,6 +4668,81 @@ mod tests {
     }
 
     #[test]
+    fn value_sets_that_were_waiting_are_expanded_when_asked_again_and_the_rest_stay() {
+        let (arrived, fragment) = ("http://example.org/arrived", "http://example.org/fragment");
+        let resources = [
+            code_system(arrived, "complete", &["a", "b"]),
+            code_system(fragment, "fragment", &["a"]),
+            value_set(
+                "http://example.org/waits",
+                json!({"include": [{"system": arrived}]}),
+            ),
+            // Waits on a value set that is waiting.
+            value_set(
+                "http://example.org/nested",
+                json!({"include": [{"valueSet": ["http://example.org/waits"]}]}),
+            ),
+            value_set(
+                "http://example.org/blocked",
+                json!({"include": [{"system": fragment}]}),
+            ),
+        ];
+        // What a catalog holds when the store had no expansion for any of them: the code systems
+        // are there, and the value sets are not expanded.
+        let mut terms = MemoryTerminology::from_stored(&resources, &[]);
+        assert_eq!(
+            terms.unexpandable_urls(),
+            [
+                "http://example.org/blocked",
+                "http://example.org/nested",
+                "http://example.org/waits"
+            ]
+        );
+        assert!(terms.expand("http://example.org/waits", None).is_none());
+
+        let updates = terms.expand_waiting();
+        let mut urls: Vec<&str> = updates.iter().map(|update| update.url.as_str()).collect();
+        urls.sort();
+        assert_eq!(
+            urls,
+            ["http://example.org/nested", "http://example.org/waits"]
+        );
+        // Each says which package's definition it is of, and carries what a rebuild would store.
+        let rebuilt = MemoryTerminology::expansion_documents(&resources);
+        for update in &updates {
+            assert!(update.scope.is_some(), "{}", update.url);
+            let document = update.document.as_ref().expect("an expansion");
+            assert_eq!(
+                Some(document),
+                rebuilt
+                    .iter()
+                    .find(|item| item["url"] == update.url.as_str()),
+                "{}",
+                update.url
+            );
+        }
+        for url in ["http://example.org/waits", "http://example.org/nested"] {
+            let expanded = terms.expand(url, None).expect(url);
+            assert_eq!(
+                expanded["expansion"]["contains"].as_array().unwrap().len(),
+                2
+            );
+        }
+        // The one that cannot be expanded is still waiting, with its reason, and asking again
+        // finds nothing more to do.
+        assert_eq!(terms.unexpandable_urls(), ["http://example.org/blocked"]);
+        let why = terms
+            .why_not_expanded("http://example.org/blocked")
+            .unwrap();
+        assert_eq!(why[0].reason(), "code-system-incomplete");
+        assert!(terms.expand_waiting().is_empty());
+        // Nothing waiting is nothing to do.
+        let mut complete = MemoryTerminology::from_resources(&resources[..3]);
+        assert!(complete.unexpandable_urls().is_empty());
+        assert!(complete.expand_waiting().is_empty());
+    }
+
+    #[test]
     fn cycles_and_unsupported_filters_are_named() {
         let terms = MemoryTerminology::from_resources(&[
             code_system("http://example.org/sys", "complete", &["a"]),
@@ -5890,7 +6024,7 @@ mod tests {
             .into_iter()
             .map(|document| (url_of(&document), document))
             .collect();
-        for ExpansionUpdate { url, document } in updates {
+        for ExpansionUpdate { url, document, .. } in updates {
             match document {
                 Some(document) => rows.insert(url, document),
                 None => rows.remove(&url),

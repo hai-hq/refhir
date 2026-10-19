@@ -49,6 +49,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `_ActProgramTypeCode`, and no other entry. `ValueSet/$validate-code` takes R4's `abstract` input:
   `false` refuses an abstract code, `true` accepts it, and without it the code is valid and the
   `message` says it is a grouping concept.
+- **A value set that waits on another package's code system is expanded when that package
+  arrives.** A package stores the expansions of its own value sets, made from its own resources,
+  so a value set that includes a code system (or a value set) that another package carries was
+  left with no expansion, and installing that other package later, or earlier, did not give it
+  one until the next rebuild. After any install, the value sets that have no expansion are tried
+  again, and the ones that can now be expanded are expanded and stored under the package whose
+  definition they are of. It is one attempt at each value set that has none (94 for the R4 and SDC
+  packages, about a sixth of a second) and not a rebuild.
 - **ISO 4217 currency codes are built in.** HL7 publishes `ValueSet/currencies` (the required
   binding of `Money.currency`) as an include of `urn:iso:std:iso:4217` and no CodeSystem for it, so
   the value set could not be expanded and a currency could not be checked. The server now installs the

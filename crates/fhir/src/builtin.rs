@@ -7,9 +7,11 @@
 //! a client that expands every value set a form binds is left with an error.
 //!
 //! These are installed like a package: stored under their own name and version, so that they are
-//! there for a database that already had the R4 packages, and installed once. They are installed
-//! after the packages that refer to them, because installing a package expands only the value sets
-//! it holds, and what was waiting for them is expanded when they arrive.
+//! there for a database that already had the R4 packages, and installed once. The value sets that
+//! were waiting for them are expanded as they arrive, by the incremental path a code system that
+//! is written uses, which reads only those value sets and does not load the catalog again. (Any
+//! package, installed before or after, is also followed by a pass over the value sets that have
+//! no expansion; see `package::expand_waiting`. This one need not wait for that.)
 //! Changing what they hold is a new version, which a database takes in addition to the old one.
 
 use std::sync::RwLock;
@@ -92,8 +94,8 @@ pub fn install_builtin_terminology(
         "read",
         false,
     )?;
-    // Installing a package stores the expansions of its own value sets. The ones that were
-    // waiting for what it carries are in other packages, and are expanded now.
+    // The value sets that were waiting for what this carries are in other packages, and are
+    // expanded now, without the catalog being loaded again.
     let package_id = store
         .load_packages()?
         .into_iter()

@@ -17,9 +17,9 @@ use crate::error::FhirError;
 use crate::extract::ReferenceId;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
-    cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
-    minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir, run_backfills, sdc_dir,
-    stage_package_deferred, stage_package_dir, version_clash_dir,
+    cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, finish_install,
+    install_package_dir, minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir,
+    run_backfills, sdc_dir, stage_package_deferred, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
 
@@ -7435,6 +7435,129 @@ fn a_database_made_under_the_previous_rules_gains_the_value_sets_that_now_expand
     assert_eq!(stored["incomplete"][0]["content"], "example");
     publish(&harness.store, &harness.catalog).unwrap();
     assert!(!harness.catalog.read().unwrap().expansions_stale());
+}
+
+/// A package of value sets that include a code system it does not carry (one of them through
+/// another value set), and a package of that code system.
+fn waiting_packages() -> (PathBuf, PathBuf) {
+    let system = "http://example.org/arrived";
+    let sets = dep_package("example.waiting.sets", "1.0.0", &[]);
+    let value_set = |file: &str, url: &str, include: Value| {
+        std::fs::write(
+            sets.join(file),
+            json!({"resourceType": "ValueSet", "url": url, "status": "active",
+                   "compose": {"include": [include]}})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    value_set(
+        "ValueSet-waits.json",
+        "http://example.org/ValueSet/waits",
+        json!({"system": system}),
+    );
+    value_set(
+        "ValueSet-nested.json",
+        "http://example.org/ValueSet/nested",
+        json!({"valueSet": ["http://example.org/ValueSet/waits"]}),
+    );
+    // What no package carries stays as it was.
+    value_set(
+        "ValueSet-absent.json",
+        "http://example.org/ValueSet/absent",
+        json!({"system": "http://example.org/nobody-has-this"}),
+    );
+    let code_system = dep_package("example.waiting.system", "1.0.0", &[]);
+    std::fs::write(
+        code_system.join("CodeSystem-arrived.json"),
+        json!({"resourceType": "CodeSystem", "url": system, "status": "active",
+               "content": "complete", "concept": [{"code": "x"}, {"code": "y"}]})
+        .to_string(),
+    )
+    .unwrap();
+    (sets, code_system)
+}
+
+fn assert_waiting_value_sets_follow_what_arrived(harness: &Harness, when: &str) {
+    for url in [
+        "http://example.org/ValueSet/waits",
+        "http://example.org/ValueSet/nested",
+    ] {
+        let codes: Vec<_> = expansion_of(harness, url)
+            .iter()
+            .filter_map(|item| item["code"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(codes, ["x", "y"], "{url} {when}");
+    }
+    unprocessable(run_op(
+        harness,
+        "ValueSet/$expand",
+        &json!({"url": "http://example.org/ValueSet/absent"}),
+    ));
+}
+
+#[test]
+fn a_value_set_waiting_for_another_packages_code_system_is_expanded_when_the_two_are_together() {
+    // Installing a package stores the expansions of its own value sets, so the value sets here
+    // were stored with none; whichever package came first, the one that came second finds them.
+    for code_system_first in [false, true] {
+        let harness = empty();
+        let (sets, code_system) = waiting_packages();
+        let order = if code_system_first {
+            [&code_system, &sets]
+        } else {
+            [&sets, &code_system]
+        };
+        for dir in order {
+            install_package_dir(&harness.store, &harness.db, &harness.catalog, dir).unwrap();
+        }
+        let order = if code_system_first { "after" } else { "before" };
+        assert_waiting_value_sets_follow_what_arrived(
+            &harness,
+            &format!("the code system came {order} the value sets"),
+        );
+        // The expansions are stored, under the package whose value set it is, so a catalog loaded
+        // again from the store has them, and they are what a full rebuild would make.
+        publish(&harness.store, &harness.catalog).unwrap();
+        assert_waiting_value_sets_follow_what_arrived(&harness, "after the catalog was loaded");
+        let holder = package_id(&harness, "example.waiting.sets");
+        let rows = stored_rows(&harness, "http://example.org/ValueSet/waits");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].package_id, holder);
+        assert_expansions_match(&harness.store, "with value sets that waited");
+        assert!(harness
+            .catalog
+            .read()
+            .unwrap()
+            .terms()
+            .unexpandable_urls()
+            .iter()
+            .all(|url| url == "http://example.org/ValueSet/absent"));
+    }
+}
+
+#[test]
+fn packages_installed_together_are_followed_by_the_same_pass() {
+    // The install that stores several packages and loads the catalog once (a bundle, the
+    // packages an IG depends on) goes through the same pass afterwards.
+    let harness = empty();
+    let (sets, code_system) = waiting_packages();
+    let pending: Vec<_> = [&sets, &code_system]
+        .into_iter()
+        .filter_map(|dir| {
+            stage_package_deferred(&harness.store, &harness.db, &harness.catalog, dir).unwrap()
+        })
+        .collect();
+    finish_install(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        &pending,
+        Ok(()),
+    )
+    .unwrap();
+    assert_waiting_value_sets_follow_what_arrived(&harness, "installed together");
+    assert_expansions_match(&harness.store, "installed together");
 }
 
 #[test]
