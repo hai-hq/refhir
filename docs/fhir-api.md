@@ -174,6 +174,39 @@ the person is left out. A birth date that differs is not a match, however much e
 Whether a `probable` match may be treated as the person is for the caller to decide: the server
 does not know whether a phone number or an email address was ever checked.
 
+Each entry also says what it was found by, in `match-evidence` extensions on `search`
+(`https://refhir.dev/StructureDefinition/match-evidence`), one for each thing. Each has a `kind`,
+and some a `value`:
+
+| `kind` | Means | `value` |
+|--------|-------|---------|
+| `identifier` | An identifier of the request is on the Patient | `valueIdentifier`: the system and value as the request wrote them. One extension for each that matched |
+| `name` | A name of the request is a name of the Patient | |
+| `name-reordered` | Said as well as `name` when the words are the same but not in the same places (a family name written as a given name) | |
+| `birth-date` | The same full birth date | |
+| `phone`, `email` | A phone number or an email address of the request is the Patient's | `valueContactPoint`: the number or address **as the request wrote it**, not the Patient's copy. One extension for each that matched |
+| `gender`, `gender-differs` | Both have a gender, and it is the same, or is not | |
+
+```json
+"search": {
+  "mode": "match",
+  "score": 0.85,
+  "extension": [
+    {"url": "http://hl7.org/fhir/StructureDefinition/match-grade", "valueCode": "probable"},
+    {"url": "https://refhir.dev/StructureDefinition/match-evidence",
+     "extension": [{"url": "kind", "valueCode": "phone"},
+                   {"url": "value", "valueContactPoint": {"system": "phone", "value": "0803 123 4567"}}]},
+    {"url": "https://refhir.dev/StructureDefinition/match-evidence",
+     "extension": [{"url": "kind", "valueCode": "name"}]}
+  ]
+}
+```
+
+This is what a caller needs to decide whether a `probable` match may be treated as the person. If it
+sends a phone number it has verified, the `phone` evidence with that number shows that it is the
+one the Patient has, and an email address that matched but was not verified shows as `email`. Only
+what matched is said: a phone number of the request that the Patient does not have is not there.
+
 How things are compared:
 
 - **Names** are compared by their words. Case, accents (including the dots and tone marks of Yoruba

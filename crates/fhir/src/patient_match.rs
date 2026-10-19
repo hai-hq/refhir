@@ -37,6 +37,11 @@
 //! The server returns `certain`, `probable` and `possible`. It never returns `certainly-not`: a
 //! Patient that cannot be the person is left out.
 //!
+//! **What it says matched.** Each entry carries the grade and, as well, one `match-evidence`
+//! extension for each thing the match was found by ([`Evidence::extensions`]). The identifier, the
+//! phone number and the email address are the request's own, as it wrote them, so a caller that
+//! has verified one number among several can see whether that is the one that matched.
+//!
 //! **What is never returned.** A Patient with `active` false, and one with a `link` of type
 //! `replaced-by`, are not who a new record should be filed against, so they are left out whatever
 //! they match. The Patient that replaced one is returned when it matches on its own. The server
@@ -53,7 +58,7 @@
 //! an `identifier` search for each identifier of the request, and a `birthdate` search for its
 //! birth date. Everything else is compared in memory, on what those two found.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use refhir_database::Transaction;
 use serde_json::{json, Value};
@@ -66,6 +71,9 @@ use crate::search;
 
 /// The extension that carries a match's grade on `Bundle.entry.search`.
 const MATCH_GRADE: &str = "http://hl7.org/fhir/StructureDefinition/match-grade";
+
+/// The extension, repeated on `Bundle.entry.search`, that says what a match was found by.
+const MATCH_EVIDENCE: &str = "https://refhir.dev/StructureDefinition/match-evidence";
 
 /// The core definition of the operation, for the CapabilityStatement.
 const DEFINITION: &str = "http://hl7.org/fhir/OperationDefinition/Patient-match";
@@ -175,13 +183,18 @@ impl Rules {
     };
 }
 
-/// What two Patients have in common.
-#[derive(Clone, Copy, Debug, Default)]
+/// What two Patients have in common. What the request says it has in common, in the words the
+/// request used: the caller knows which of its own identifiers and numbers it can vouch for.
+#[derive(Clone, Debug, Default)]
 struct Evidence {
-    identifier: bool,
+    /// The identifiers of the request, `(system, value)`, that the Patient has too.
+    identifiers: Vec<(String, String)>,
     name: Option<NameOrder>,
     birth_date: bool,
-    contact: bool,
+    /// The phone numbers and the email addresses of the request, as it wrote them, that the
+    /// Patient has too.
+    phones: Vec<String>,
+    emails: Vec<String>,
     gender: Option<bool>,
 }
 
@@ -197,11 +210,54 @@ enum NameOrder {
 impl Evidence {
     fn has(&self, need: Need) -> bool {
         match need {
-            Need::Identifier => self.identifier,
+            Need::Identifier => !self.identifiers.is_empty(),
             Need::Name => self.name.is_some(),
             Need::BirthDate => self.birth_date,
-            Need::Contact => self.contact,
+            Need::Contact => !self.phones.is_empty() || !self.emails.is_empty(),
         }
+    }
+
+    /// What the match was found by, one extension for each thing: `identifier`, `name`,
+    /// `name-reordered` (as well as `name`, when the words are the same in another arrangement),
+    /// `birth-date`, `phone`, `email`, and for gender `gender` when it agrees and `gender-differs`
+    /// when it does not. An identifier, a phone number and an email address carry the one of the
+    /// request that matched.
+    fn extensions(&self) -> Vec<Value> {
+        let item = |kind: &str, value: Option<(&str, Value)>| {
+            let mut parts = vec![json!({"url": "kind", "valueCode": kind})];
+            if let Some((key, value)) = value {
+                let mut part = json!({"url": "value"});
+                part[key] = value;
+                parts.push(part);
+            }
+            json!({"url": MATCH_EVIDENCE, "extension": parts})
+        };
+        let mut items = Vec::new();
+        for (system, value) in &self.identifiers {
+            let identifier = json!({"system": system, "value": value});
+            items.push(item("identifier", Some(("valueIdentifier", identifier))));
+        }
+        if self.name.is_some() {
+            items.push(item("name", None));
+        }
+        if self.name == Some(NameOrder::Swapped) {
+            items.push(item("name-reordered", None));
+        }
+        if self.birth_date {
+            items.push(item("birth-date", None));
+        }
+        for (kind, values) in [("phone", &self.phones), ("email", &self.emails)] {
+            for value in values {
+                let point = json!({"system": kind, "value": value});
+                items.push(item(kind, Some(("valueContactPoint", point))));
+            }
+        }
+        match self.gender {
+            Some(true) => items.push(item("gender", None)),
+            Some(false) => items.push(item("gender-differs", None)),
+            None => {}
+        }
+        items
     }
 }
 
@@ -234,8 +290,9 @@ struct Subject {
     names: Vec<Name>,
     /// A full `YYYY-MM-DD` date.
     birth_date: Option<String>,
-    phones: BTreeSet<String>,
-    emails: BTreeSet<String>,
+    /// What each number dials or each address is, and how it was written.
+    phones: BTreeMap<String, String>,
+    emails: BTreeMap<String, String>,
     gender: Option<String>,
 }
 
@@ -326,8 +383,22 @@ impl Subject {
                 None => Some(value.contains('@')),
             };
             match kind {
-                Some(true) => subject.emails.extend(email_key(value)),
-                Some(false) => subject.phones.extend(phone_key(value, rules.country_code)),
+                Some(true) => {
+                    if let Some(key) = email_key(value) {
+                        subject
+                            .emails
+                            .entry(key)
+                            .or_insert_with(|| value.to_string());
+                    }
+                }
+                Some(false) => {
+                    if let Some(key) = phone_key(value, rules.country_code) {
+                        subject
+                            .phones
+                            .entry(key)
+                            .or_insert_with(|| value.to_string());
+                    }
+                }
                 None => {}
             }
         }
@@ -346,14 +417,23 @@ impl Subject {
     }
 
     fn compare(&self, stored: &Subject, rules: &Rules) -> Evidence {
+        // What of ours the stored Patient has, written as we wrote it.
+        let shared = |ours: &BTreeMap<String, String>, theirs: &BTreeMap<String, String>| {
+            ours.iter()
+                .filter(|(key, _)| theirs.contains_key(*key))
+                .map(|(_, written)| written.clone())
+                .collect()
+        };
         let mut evidence = Evidence {
-            identifier: self
+            identifiers: self
                 .identifiers
                 .iter()
-                .any(|pair| stored.identifiers.contains(pair)),
+                .filter(|pair| stored.identifiers.contains(pair))
+                .cloned()
+                .collect(),
             birth_date: self.birth_date.is_some() && self.birth_date == stored.birth_date,
-            contact: !self.phones.is_disjoint(&stored.phones)
-                || !self.emails.is_disjoint(&stored.emails),
+            phones: shared(&self.phones, &stored.phones),
+            emails: shared(&self.emails, &stored.emails),
             ..Evidence::default()
         };
         for ours in &self.names {
@@ -657,6 +737,7 @@ pub(crate) fn operation(
 struct Match {
     id: String,
     resource: Value,
+    evidence: Evidence,
     grade: Grade,
     /// In hundredths.
     score: i32,
@@ -682,6 +763,7 @@ fn find(
                 matches.push(Match {
                     id,
                     resource,
+                    evidence,
                     grade,
                     score,
                 });
@@ -705,10 +787,12 @@ fn bundle(matches: &[Match]) -> Value {
     let entries: Vec<Value> = matches
         .iter()
         .map(|found| {
+            let mut extensions = vec![json!({"url": MATCH_GRADE, "valueCode": found.grade.code()})];
+            extensions.extend(found.evidence.extensions());
             json!({
                 "resource": found.resource,
                 "search": {
-                    "extension": [{"url": MATCH_GRADE, "valueCode": found.grade.code()}],
+                    "extension": extensions,
                     "mode": "match",
                     "score": f64::from(found.score) / 100.0
                 }
@@ -850,7 +934,8 @@ pub(crate) fn annotate_capability(statement: &mut Value) {
                 `search.score` (0 to 1) and the `match-grade` extension: `certain` when an \
                 identifier has the same system and value; `probable` when the name, the full \
                 birth date and a phone number or email address (Patient.telecom) are the same; \
-                `possible` when the name and the full birth date are the same. A name matches \
+                `possible` when the name and the full birth date are the same. Each entry says what it \
+                was found by in `match-evidence` extensions on `search`. A name matches \
                 whatever its case, accents and order of words, and a phone number whatever its \
                 spacing and whether it has a country code. A Patient that is not active, or that \
                 another replaced (link type replaced-by), is never returned. With \
@@ -1583,5 +1668,102 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(operation(&mut db.begin(), &catalog, "Patient", &args).is_ok());
+    }
+
+    /// The `(kind, value)` of each evidence extension, the value as `type: text` or `system|value`.
+    fn said(evidence: &Evidence) -> Vec<(String, Option<String>)> {
+        evidence
+            .extensions()
+            .iter()
+            .map(|item| {
+                assert_eq!(item["url"], MATCH_EVIDENCE);
+                let parts = item["extension"].as_array().unwrap();
+                assert_eq!(parts[0]["url"], "kind");
+                let value = parts.get(1).map(|part| {
+                    assert_eq!(part["url"], "value");
+                    if let Some(identifier) = part.get("valueIdentifier") {
+                        format!("{}|{}", identifier["system"], identifier["value"])
+                    } else {
+                        let point = &part["valueContactPoint"];
+                        format!("{}:{}", point["system"], point["value"])
+                    }
+                });
+                (parts[0]["valueCode"].as_str().unwrap().to_string(), value)
+            })
+            .collect()
+    }
+
+    fn told(kind: &str, value: Option<&str>) -> (String, Option<String>) {
+        (kind.to_string(), value.map(str::to_string))
+    }
+
+    #[test]
+    fn what_matched_is_said_in_the_words_of_the_request() {
+        let stored = json!({
+            "resourceType": "Patient", "gender": "female", "birthDate": "1985-03-02",
+            "identifier": [
+                {"system": "urn:example:id", "value": "BC-1"},
+                {"system": "urn:example:mrn", "value": "77"}
+            ],
+            "name": [{"family": "Okafor", "given": ["Ada"]}],
+            "telecom": [
+                {"system": "phone", "value": "+234 803 123 4567"},
+                {"system": "email", "value": "ada@example.org"}
+            ]
+        });
+        // Written another way, and with things that are not hers among them.
+        let input = json!({
+            "resourceType": "Patient", "gender": "male", "birthDate": "1985-03-02",
+            "identifier": [
+                {"system": "urn:example:id", "value": "BC-1"},
+                {"system": "urn:example:id", "value": "BC-2"}
+            ],
+            "name": [{"family": "Ada", "given": ["OKAFOR"]}],
+            "telecom": [
+                {"system": "phone", "value": "0701 000 0000"},
+                {"system": "phone", "value": "0803 123 4567"},
+                {"system": "email", "value": "ADA@example.org"},
+                {"system": "email", "value": "other@example.org"}
+            ]
+        });
+        let evidence = subject(input).compare(&subject(stored), &RULES);
+        assert_eq!(
+            said(&evidence),
+            [
+                told("identifier", Some("\"urn:example:id\"|\"BC-1\"")),
+                told("name", None),
+                told("name-reordered", None),
+                told("birth-date", None),
+                told("phone", Some("\"phone\":\"0803 123 4567\"")),
+                told("email", Some("\"email\":\"ADA@example.org\"")),
+                told("gender-differs", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_is_said_of_what_did_not_match() {
+        let stored = person(json!([{"system": "phone", "value": "0803 123 4567"}]));
+        let input = with_gender(
+            person(json!([{"system": "phone", "value": "0803 123 4568"}])),
+            "female",
+        );
+        let evidence = subject(input).compare(&subject(stored), &RULES);
+        // The name and the birth date, and no phone: this is a possible match.
+        assert_eq!(
+            said(&evidence),
+            [told("name", None), told("birth-date", None)]
+        );
+        let none = Evidence::default();
+        assert!(none.extensions().is_empty());
+        // Gender that agrees is said, when both have one.
+        let both = subject(with_gender(person(json!([])), "female"))
+            .compare(&subject(with_gender(person(json!([])), "female")), &RULES);
+        assert_eq!(said(&both).last().unwrap(), &told("gender", None));
+    }
+
+    fn with_gender(mut patient: Value, gender: &str) -> Value {
+        patient["gender"] = json!(gender);
+        patient
     }
 }

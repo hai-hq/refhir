@@ -22,8 +22,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
   is not active, or that another replaced (`link` type `replaced-by`), is never returned.
   `onlyCertainMatches` returns nothing when more than one Patient is a potential match. The
-  CapabilityStatement lists the operation on `Patient`. A scope that may search Patients may use
-  it; a token limited to one patient may not. See
+  CapabilityStatement lists the operation on `Patient`. Each entry says what it was found by in
+  `match-evidence` extensions on `search` (the identifier, name, birth date, phone number or email
+  address that matched, the last three as the request wrote them), so that a caller can tell which
+  of its own phone numbers matched. A scope that may search Patients may use it; a token limited to
+  one patient may not. See
   [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)

@@ -20,6 +20,7 @@ use crate::{app_with, ServerConfig};
 
 const PROFILE: &str = "https://id.example.org/profile";
 const MATCH_GRADE: &str = "http://hl7.org/fhir/StructureDefinition/match-grade";
+const MATCH_EVIDENCE: &str = "https://refhir.dev/StructureDefinition/match-evidence";
 
 fn person(id: &str, family: &str, given: &[&str], born: &str) -> Value {
     json!({
@@ -225,9 +226,13 @@ fn entries(bundle: &Value) -> Vec<(String, String)> {
             assert!((0.0..=1.0).contains(&score), "{score}");
             assert!(score <= last, "not best first: {bundle}");
             last = score;
-            let grades = search["extension"].as_array().expect("extension");
-            assert_eq!(grades.len(), 1);
-            assert_eq!(grades[0]["url"], MATCH_GRADE);
+            let grades: Vec<&Value> = search["extension"]
+                .as_array()
+                .expect("extension")
+                .iter()
+                .filter(|extension| extension["url"] == MATCH_GRADE)
+                .collect();
+            assert_eq!(grades.len(), 1, "{entry}");
             (
                 entry["resource"]["id"].as_str().unwrap().to_string(),
                 grades[0]["valueCode"].as_str().unwrap().to_string(),
@@ -427,6 +432,116 @@ async fn the_same_name_with_a_different_birth_date_is_not_a_match() {
     let request = json!({"resourceType": "Patient", "birthDate": "1992-05-05",
         "name": [{"family": "Eze"}]});
     assert!(matched(request, None, None).await.is_empty());
+}
+
+/// What an entry says it was found by: each kind, and the value it carries, if it carries one.
+fn evidence(entry: &Value) -> Vec<String> {
+    entry["search"]["extension"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|extension| extension["url"] == MATCH_EVIDENCE)
+        .map(|extension| {
+            let parts = extension["extension"].as_array().unwrap();
+            let kind = parts[0]["valueCode"].as_str().unwrap();
+            match parts.get(1) {
+                None => kind.to_string(),
+                Some(part) => {
+                    assert_eq!(part["url"], "value");
+                    let value = part
+                        .get("valueIdentifier")
+                        .or_else(|| part.get("valueContactPoint"))
+                        .unwrap_or_else(|| panic!("{part}"));
+                    match value.get("system").and_then(Value::as_str) {
+                        Some(system) if kind == "identifier" => {
+                            format!("{kind} {system}|{}", value["value"].as_str().unwrap())
+                        }
+                        _ => format!("{kind} {}", value["value"].as_str().unwrap()),
+                    }
+                }
+            }
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn each_entry_says_what_it_was_found_by() {
+    let by_grade = |reply: &Reply| -> Vec<Vec<String>> {
+        reply.body["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(evidence)
+            .collect()
+    };
+    // An identifier: which one, as the request wrote it. The name and birth date are the
+    // request's too, and so they are said as well.
+    let request = json!({"resourceType": "Patient", "gender": "female",
+        "identifier": [identifier("PRF-1001"), {"system": "urn:example:mrn", "value": "99"}],
+        "birthDate": "1985-03-02", "name": [{"family": "Okafor", "given": ["Ada", "Chinwe"]}]});
+    let reply = post_match("reader", parameters(request, None, None)).await;
+    assert_eq!(
+        by_grade(&reply),
+        [[
+            "identifier https://id.example.org/profile|PRF-1001",
+            "name",
+            "birth-date",
+            "gender"
+        ]]
+    );
+
+    // A probable match by a phone number, written the way the request wrote it and not the way
+    // the record has it, and by an email address, and by both.
+    let person = |telecom: Value| {
+        json!({"resourceType": "Patient", "birthDate": "1985-03-02", "telecom": telecom,
+            "name": [{"family": "Okafor", "given": ["Ada", "Chinwe"]}]})
+    };
+    for (telecom, expected) in [
+        (
+            json!([phone("0803 123 4567")]),
+            vec!["name", "birth-date", "phone 0803 123 4567"],
+        ),
+        (
+            json!([{"system": "email", "value": "ADA.Okafor@example.org"}]),
+            vec!["name", "birth-date", "email ADA.Okafor@example.org"],
+        ),
+        (
+            json!([phone("0701 000 0000"), phone("08031234567"),
+                {"system": "email", "value": "ada.okafor@example.org"}]),
+            vec![
+                "name",
+                "birth-date",
+                "phone 08031234567",
+                "email ada.okafor@example.org",
+            ],
+        ),
+    ] {
+        let reply = post_match("reader", parameters(person(telecom.clone()), None, None)).await;
+        assert_eq!(
+            entries(&reply.body),
+            ids_and_grades(&[("ada", "probable")]),
+            "{telecom}"
+        );
+        assert_eq!(by_grade(&reply), [expected], "{telecom}");
+    }
+
+    // A possible match has no phone or email in what it was found by, though the request had them.
+    let reply = post_match(
+        "reader",
+        parameters(person(json!([phone("0803 123 4568")])), None, None),
+    )
+    .await;
+    assert_eq!(by_grade(&reply), [["name", "birth-date"]]);
+
+    // The name in another arrangement is a name, and is said to be reordered. A gender that
+    // differs is said, so that someone looking at the match sees it.
+    let reordered = json!({"resourceType": "Patient", "birthDate": "1985-03-02", "gender": "male",
+        "name": [{"family": "Ada", "given": ["Okafor", "Chinwe"]}]});
+    let reply = post_match("reader", parameters(reordered, None, None)).await;
+    assert_eq!(
+        by_grade(&reply),
+        [["name", "name-reordered", "birth-date", "gender-differs"]]
+    );
 }
 
 #[tokio::test]
