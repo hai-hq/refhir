@@ -132,12 +132,15 @@ pub fn document(
         ));
     }
     let composition = ops::read(tx, model, id)?;
+    // A caller limited to one patient gets that patient's document: what the Composition reaches
+    // that is another patient's stays out, and so does what it would reach through that.
+    let own = document::limited_to(args);
     let resources = document::gather(
         tx,
         catalog,
         vec![composition],
         &document::may_read(args),
-        &|_| true,
+        &|resource| own.is_none_or(|patient| document::within_patient(resource, patient)),
     )?;
     Ok(document::package(resources))
 }

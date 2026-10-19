@@ -1,2 +1,4 @@
-shl-data/
 node_modules/
+dist/
+*.log
+.env

@@ -1,0 +1,83 @@
+{
+  "resourceType": "StructureDefinition",
+  "url": "http://hl7.org/fhir/StructureDefinition/Composition",
+  "name": "Composition",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Composition",
+  "fhirVersion": "4.0.1",
+  "derivation": "specialization",
+  "snapshot": {
+    "element": [
+      {
+        "path": "Composition",
+        "min": 0,
+        "max": "*"
+      },
+      {
+        "path": "Composition.meta",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "Meta"
+          }
+        ]
+      },
+      {
+        "path": "Composition.status",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "code"
+          }
+        ]
+      },
+      {
+        "path": "Composition.type",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "CodeableConcept"
+          }
+        ]
+      },
+      {
+        "path": "Composition.subject",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "Reference",
+            "targetProfile": [
+              "http://hl7.org/fhir/StructureDefinition/Patient"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "Composition.date",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "dateTime"
+          }
+        ]
+      },
+      {
+        "path": "Composition.title",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "string"
+          }
+        ]
+      }
+    ]
+  }
+}

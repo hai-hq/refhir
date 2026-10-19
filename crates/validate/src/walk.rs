@@ -1,12 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use refhir_fhirpath::{Error, ErrorKind, Host, Value};
 use serde_json::{Map, Value as Json};
 
 use crate::outcome::{Issue, Outcome, Severity};
 use crate::primitive::{check_primitive, is_primitive, type_suffix};
-use crate::schema::{Cardinality, ElementDef, Schema, Structure};
+use crate::schema::{Cardinality, DiscriminatorKind, ElementDef, Schema, Structure};
 use crate::slice::{self, pattern_match};
 use crate::terminology::{TermAnswer, Terminology};
 
@@ -312,7 +312,11 @@ impl State<'_> {
                 None,
                 underscore,
             ),
-            None => self.cardinality(element, 0, &element.path),
+            None => {
+                self.cardinality(element, 0, &element.path);
+                // With no value at all, a slice a profile requires is missing too.
+                self.slice_cardinalities(element, structure, &HashMap::new());
+            }
         }
     }
 
@@ -357,6 +361,8 @@ impl State<'_> {
             .as_ref()
             .is_some_and(|slicing| slicing.ordered);
         let mut seen_order: Option<usize> = None;
+        // How many items each slice took, by its index in the structure.
+        let mut taken: HashMap<usize, usize> = HashMap::new();
         let name = child_name(&element.path);
         let key = match &choice_type {
             Some(code) => format!("{}{}", name.trim_end_matches("[x]"), type_suffix(code)),
@@ -379,6 +385,7 @@ impl State<'_> {
             }
             if element.slicing.is_some() {
                 if let Some((index, slice)) = slice::assign(item, structure, element) {
+                    *taken.entry(index).or_default() += 1;
                     if ordered {
                         if let Some(previous) = seen_order {
                             if index < previous {
@@ -424,6 +431,56 @@ impl State<'_> {
                 choice_type.clone(),
             );
             self.primitive_extensions(extra, &element.path, root, resource);
+        }
+        self.slice_cardinalities(element, structure, &taken);
+    }
+
+    /// What a profile asks of each slice of `element`: how many items it must have, and may have.
+    /// `taken` says how many each got, by its index in the structure; a slice that got none is
+    /// missing, which is how a required one is found.
+    fn slice_cardinalities(
+        &self,
+        element: &ElementDef,
+        structure: &Structure,
+        taken: &HashMap<usize, usize>,
+    ) {
+        let Some(slicing) = &element.slicing else {
+            return;
+        };
+        // A slice is told apart by what its discriminators name, and only some can be decided from
+        // the content alone: a value, a pattern, a type, whether it exists. One that goes by a
+        // profile (which this validator reads as what the resource says of itself, where the
+        // profile asks what it conforms to) or by a function (`resolve()`) cannot be counted, and
+        // says nothing rather than that a slice is missing which is there.
+        if slicing.discriminators.is_empty()
+            || slicing.discriminators.iter().any(|item| {
+                item.path.contains('(') || matches!(item.kind, DiscriminatorKind::Profile)
+            })
+        {
+            return;
+        }
+        for (index, slice) in structure.slices_of(element) {
+            let found = taken.get(&index).copied().unwrap_or(0);
+            let name = slice.slice_name.as_deref().unwrap_or_default();
+            if found < slice.min as usize {
+                self.issue(
+                    Severity::Error,
+                    "required",
+                    format!(
+                        "{} slice {name} requires at least {}",
+                        element.path, slice.min
+                    ),
+                    &element.path,
+                );
+            }
+            if !slice.max.allows(found) {
+                self.issue(
+                    Severity::Error,
+                    "structure",
+                    format!("{} slice {name} has too many values", element.path),
+                    &element.path,
+                );
+            }
         }
     }
 

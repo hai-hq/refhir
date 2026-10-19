@@ -1465,8 +1465,12 @@ fn date_match(op: &str, stored: &str, expected: &str) -> bool {
     match prefix {
         "eq" | "ap" => stored.0 < query.1 && stored.1 > query.0,
         "ne" => !(stored.0 < query.1 && stored.1 > query.0),
-        "gt" | "sa" => stored.0 >= query.1,
-        "lt" | "eb" => stored.1 <= query.0,
+        // FHIR: `gt` and `lt` take what reaches above or below the query (a year holds days after
+        // a day of it), where `sa` and `eb` take only what lies wholly beyond it.
+        "gt" => stored.1 > query.1,
+        "sa" => stored.0 >= query.1,
+        "lt" => stored.0 < query.0,
+        "eb" => stored.1 <= query.0,
         "ge" => stored.1 > query.0,
         "le" => stored.0 < query.1,
         _ => false,
@@ -2624,6 +2628,31 @@ mod tests {
         assert!(!date_probe_reads("2026-13-45", "2026-10-18"));
         assert!(date_probe_reads("ne2026-10-18", "2000-01-01"));
         assert!(date_probe_reads("ap2026-10-18", "2000-01-01"));
+    }
+
+    #[test]
+    fn gt_and_lt_take_what_reaches_beyond_the_query_and_sa_and_eb_what_lies_wholly_beyond_it() {
+        let matches = |prefix: &str, stored: &str, query: &str| {
+            date_match("eq", stored, &format!("{prefix}{query}"))
+        };
+        // A year holds days after a day of it, and days before.
+        assert!(matches("gt", "2026", "2026-10-18"));
+        assert!(matches("lt", "2026", "2026-10-18"));
+        assert!(!matches("sa", "2026", "2026-10-18"));
+        assert!(!matches("eb", "2026", "2026-10-18"));
+        // The same year lies wholly after the year before, and wholly before the year after.
+        assert!(matches("sa", "2026", "2025") && matches("gt", "2026", "2025"));
+        assert!(matches("eb", "2026", "2027") && matches("lt", "2026", "2027"));
+        // The day itself reaches neither above nor below it.
+        assert!(!matches("gt", "2026-10-18", "2026-10-18"));
+        assert!(!matches("lt", "2026-10-18", "2026-10-18"));
+        // And one after it is above it in both senses.
+        assert!(
+            matches("gt", "2026-10-19", "2026-10-18") && matches("sa", "2026-10-19", "2026-10-18")
+        );
+        assert!(
+            matches("lt", "2026-10-17", "2026-10-18") && matches("eb", "2026-10-17", "2026-10-18")
+        );
     }
 
     #[test]

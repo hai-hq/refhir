@@ -45,6 +45,9 @@ The first three sections are required by the IPS profile. When one has nothing t
 there and says so: its text reads that no information is available, and its `emptyReason` is
 `unavailable`. The other three are left out when they are empty.
 
+A patient with a very long record gets the latest of it: a section holds the 100 resources most
+recently written, chosen from the 2,000 most recently written of that kind.
+
 Each section carries a table in its `text`, so a person can read the summary without opening a
 single resource. A medication that points at a `Medication` resource is shown by that resource's
 code.
@@ -70,7 +73,8 @@ token that is tied to one patient asks by the patient's id; asking for another p
 identifier, is a `403`. See [SMART on FHIR](smart.md).
 
 `$everything` and `$document` follow the same rule: they hold only what the caller's scopes let
-them read.
+them read. A token that is tied to one patient also gets a `$document` that holds nothing of another
+patient: a resource that points at a different patient is left out.
 
 ## Check it against the IPS profiles
 

@@ -42,7 +42,8 @@ an entry of a history shows when that version was written.
   `_lastUpdated=ge2026-10-01&_lastUpdated=lt2026-11-01`.
 - **List by it** with `_since` on a history: `GET [type]/_history?_since=2026-10-18T04:45:36Z`, or
   `GET /_history?_since=...` for the whole server, lists the versions written at or after that time.
-  A value that is all digits is read as it always was, as a version of the server's log. A deletion
+  A value that is all digits is read as it always was, as a version of the server's log, so write
+  a date with its month and day (`2026-01-01`), never as a year alone. A deletion
   has no time of its own, so the list starts at the last change before the time and holds any
   deletion since then: a deletion from just before the time may be listed, and one after it is never
   missed.

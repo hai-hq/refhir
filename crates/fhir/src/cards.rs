@@ -42,6 +42,20 @@ const DEFAULT_CLAIMS: &[&str] = &["name", "birthDate"];
 /// Most resources one card may hold. A card is read off a screen or a printout.
 const MAX_RESOURCES: usize = 500;
 
+/// The kinds of resource a card may be asked to hold: the clinical records of a patient. Not the
+/// Patient, which the card holds as its identity claims, and not what the patient compartment lists
+/// beside these (another patient who links to this one, an audit event, a consent).
+const CLINICAL: &[&str] = &[
+    "AllergyIntolerance",
+    "Condition",
+    "DiagnosticReport",
+    "Immunization",
+    "MedicationRequest",
+    "MedicationStatement",
+    "Observation",
+    "Procedure",
+];
+
 /// One kind of resource a credential is asked to hold.
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct Want {
@@ -78,9 +92,14 @@ pub fn issue(
     let mut seen = BTreeSet::new();
     for want in &wanted {
         let mut matching = Vec::new();
-        for resource in
-            summary::compartment_resources(tx, catalog, id, &want.resource_type, &may_read)?
-        {
+        for resource in summary::compartment_resources(
+            tx,
+            catalog,
+            id,
+            &want.resource_type,
+            &may_read,
+            summary::READ_LIMIT,
+        )? {
             if believed(&resource)
                 && is_new(&resource, since)
                 && (!want.laboratory_only || summary::category_has(&resource, "laboratory"))
@@ -191,15 +210,16 @@ fn credential_types(catalog: &Catalog, args: &Value) -> Result<Vec<Want>, FhirEr
                 laboratory_only: true,
             },
             other => {
-                let held = catalog
-                    .compartment("Patient")
-                    .and_then(|compartment| compartment.params_for(other))
-                    .is_some()
+                let held = CLINICAL.contains(&other)
+                    && catalog
+                        .compartment("Patient")
+                        .and_then(|compartment| compartment.params_for(other))
+                        .is_some()
                     && catalog.get(other).is_ok();
                 if !held {
                     return Err(FhirError::Invalid(format!(
-                        "credentialType {other} is not supported: name a resource type of a \
-                         patient's record, such as Immunization or Observation"
+                        "credentialType {other} is not supported: name one of {}",
+                        CLINICAL.join(", ")
                     )));
                 }
                 Want {

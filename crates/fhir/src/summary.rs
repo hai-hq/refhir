@@ -41,6 +41,14 @@ const SHARED: &[&str] = &[
     "Specimen",
 ];
 
+/// The most resources of one kind read to fill a patient's sections or cards: the most recently
+/// written. A record with more is read to this many, so a request costs what it can hold and not
+/// what the record does.
+pub(crate) const READ_LIMIT: usize = 2_000;
+
+/// The most resources one section holds: the most recently written of those its rules keep.
+const SECTION_LIMIT: usize = 100;
+
 struct Section {
     title: &'static str,
     code: &'static str,
@@ -130,11 +138,18 @@ pub fn summary(
     for section in SECTIONS {
         let mut found = Vec::new();
         for type_name in section.types {
-            for resource in compartment_resources(tx, catalog, &patient_id, type_name, &may_read)? {
+            for resource in
+                compartment_resources(tx, catalog, &patient_id, type_name, &may_read, READ_LIMIT)?
+            {
                 if keep(type_name, &resource) {
                     found.push(resource);
                 }
             }
+        }
+        // A section holds the latest of what there is, so a long record is a summary and not an error.
+        if found.len() > SECTION_LIMIT {
+            found.sort_by(|left, right| written(right).cmp(written(left)));
+            found.truncate(SECTION_LIMIT);
         }
         matched.push(found);
     }
@@ -259,15 +274,25 @@ fn requested_identifier(args: &Value) -> Option<String> {
         })
 }
 
+/// When a resource was written, as the text FHIR gives it, which sorts in time order. A resource
+/// from before the server kept times has none, and sorts first.
+fn written(resource: &Value) -> &str {
+    resource
+        .pointer("/meta/lastUpdated")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
 /// The patient's resources of one type, through the compartment link the Patient compartment
-/// names for it. A type this server does not hold, or that the caller's token may not read, has
-/// none.
+/// names for it: the most recently written `limit` of them. A type this server does not hold, or
+/// that the caller's token may not read, has none.
 pub(crate) fn compartment_resources(
     tx: &mut Transaction,
     catalog: &Catalog,
     patient_id: &str,
     type_name: &str,
     may_read: &dyn Fn(&str) -> bool,
+    limit: usize,
 ) -> Result<Vec<Value>, FhirError> {
     if !may_read(type_name) || catalog.deny_response_read(type_name).is_err() {
         return Ok(Vec::new());
@@ -284,6 +309,9 @@ pub(crate) fn compartment_resources(
     };
     let mut query = BTreeMap::new();
     query.insert(param.clone(), format!("Patient/{patient_id}"));
+    // Newest first, and no more than `limit`: a sorted search keeps only the page it is asked for.
+    query.insert("_sort".to_string(), "-_lastUpdated".to_string());
+    query.insert("_count".to_string(), limit.to_string());
     let found = search::search(tx, catalog, model, &query)?;
     Ok(found
         .get("entry")

@@ -36,7 +36,9 @@ A key in the older `EC PRIVATE KEY` form is refused with the command that conver
 says why.
 
 A card says where its public key is, so the server has to know the address it is reached at. Set
-`public_url`, which on a bind that is not loopback is required. Verifiers accept only an `https`
+`public_url`, which on a bind that is not loopback is required, and which a server behind a proxy
+on the same machine needs too: without it a card names `http://127.0.0.1`, and the server says so
+when it starts. Verifiers accept only an `https`
 address.
 
 With a key, the server:
@@ -80,7 +82,7 @@ When the patient has nothing to put in the card, the answer is an empty `Paramet
 
 | Parameter | |
 |---|---|
-| `credentialType` | Required, repeatable. The kind of resource the card holds: a resource type of the patient's record, such as `Immunization`, `Observation` or `Condition`. The older `https://smarthealth.cards#immunization` and `https://smarthealth.cards#laboratory` mean `Immunization` and `Observation`, and the second keeps only laboratory results. A type the server cannot make a card of is a `400`. Two or more types are "and": one card holds all of them, and if the patient has none of one of them there is no card. |
+| `credentialType` | Required, repeatable. The kind of resource the card holds: one of `AllergyIntolerance`, `Condition`, `DiagnosticReport`, `Immunization`, `MedicationRequest`, `MedicationStatement`, `Observation` and `Procedure`. The older `https://smarthealth.cards#immunization` and `https://smarthealth.cards#laboratory` mean `Immunization` and `Observation`, and the second keeps only laboratory results. A type the server cannot make a card of is a `400`. Two or more types are "and": one card holds all of them, and if the patient has none of one of them there is no card. |
 | `includeIdentityClaim` | Repeatable. The `Patient` elements that say who the card is about: `Patient.name`, `Patient.birthDate`, `Patient.gender`, `Patient.identifier`, `Patient.telecom` or `Patient.address`. Without it a card says the name (family and given) and the birth date. |
 | `credentialValueSet` | Accepted and ignored, which the specification allows. |
 | `_since` | Only what was written at or after this time goes in the card. It is a date (the start of that day, in UTC) or a date and time (a time with no zone is UTC), and is given once. A resource from before the server kept times has no time of its own and is left out. When nothing is new there is no card. See [When a resource was written](fhir-api.md#when-a-resource-was-written). |

@@ -9876,6 +9876,112 @@ fn an_ips_summary_that_breaks_the_profile_is_refused() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
+#[test]
+fn the_same_finding_in_each_item_of_a_list_is_reported_for_each_item() {
+    // The validator says a finding once when it reaches it twice, and an item of a list is not the
+    // same place as the one before it.
+    let harness = summary_ready();
+    let outcome = apply(
+        harness,
+        "Patient/$validate",
+        json!({"resource": {
+            "resourceType": "Patient",
+            "telecom": [
+                {"system": "bogus", "value": "1"},
+                {"system": "bogus", "value": "1"},
+                {"system": "bogus", "value": "1"}
+            ]
+        }}),
+    );
+    let places: Vec<String> = errors_of(&outcome)
+        .iter()
+        .map(|issue| issue["expression"][0].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        places,
+        [
+            "Patient.telecom[0].system",
+            "Patient.telecom[1].system",
+            "Patient.telecom[2].system"
+        ],
+        "{outcome}"
+    );
+}
+
+#[test]
+fn an_ips_summary_without_a_section_the_profile_requires_is_refused() {
+    const COMPOSITION_PROFILE: &str =
+        "http://hl7.org/fhir/uv/ips/StructureDefinition/Composition-uv-ips";
+    let harness = summary_ready();
+    let (scratch, package) = unpacked_ips();
+    let text = std::fs::read_to_string(package.join("example/Bundle-bundle-minimal.json")).unwrap();
+    let mut bundle: Value = serde_json::from_str(&text).unwrap();
+    // The IPS Composition requires its problems section (11450-4), whatever else it has.
+    let mut composition = bundle["entry"][0]["resource"].clone();
+    let sections = composition["section"].as_array().unwrap().clone();
+    assert_eq!(
+        sections.len(),
+        3,
+        "the example has the three required sections"
+    );
+    let without = |codes: &[&str]| -> Vec<Value> {
+        sections
+            .iter()
+            .filter(|section| {
+                let code = section["code"]["coding"][0]["code"].as_str().unwrap_or("");
+                !codes.contains(&code)
+            })
+            .cloned()
+            .collect()
+    };
+    let missing_slice = |outcome: &Value, name: &str| {
+        errors_of(outcome).iter().any(|issue| {
+            issue["diagnostics"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("slice {name} requires at least 1")))
+        })
+    };
+
+    // Checked on its own against the profile, a Composition is refused for each required section it
+    // lacks, and by name.
+    composition["section"] = Value::Array(without(&["11450-4"]));
+    let outcome = apply(
+        harness,
+        "Composition/$validate",
+        json!({"resource": composition, "profile": COMPOSITION_PROFILE}),
+    );
+    assert!(missing_slice(&outcome, "sectionProblems"), "{outcome}");
+    assert!(!missing_slice(&outcome, "sectionAllergies"), "{outcome}");
+    composition["section"] = Value::Array(without(&["11450-4", "10160-0"]));
+    let outcome = apply(
+        harness,
+        "Composition/$validate",
+        json!({"resource": composition, "profile": COMPOSITION_PROFILE}),
+    );
+    assert!(missing_slice(&outcome, "sectionProblems"), "{outcome}");
+    assert!(missing_slice(&outcome, "sectionMedications"), "{outcome}");
+
+    // A slice that was there is not missing: the example's own Composition is whole.
+    let whole = apply(
+        harness,
+        "Composition/$validate",
+        json!({"resource": bundle["entry"][0]["resource"], "profile": COMPOSITION_PROFILE}),
+    );
+    assert!(errors_of(&whole).is_empty(), "{whole}");
+
+    // And in a summary that says it is one, as a Bundle entry.
+    composition["section"] = Value::Array(without(&["11450-4"]));
+    composition["meta"] = json!({"profile": [COMPOSITION_PROFILE]});
+    bundle["entry"][0]["resource"] = composition;
+    let outcome = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": bundle, "profile": IPS_BUNDLE_PROFILE}),
+    );
+    assert!(missing_slice(&outcome, "sectionProblems"), "{outcome}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
 /// A harness with the whole R4 release and the IPS package, holding a patient with a record, a
 /// second patient whose record must stay out of the first's summary, and one with no record. It is
 /// built once and shared, so a test that uses it must only read.
@@ -10840,13 +10946,184 @@ fn a_date_to_the_year_or_the_month_is_found_by_a_search_for_a_day_inside_it_or_a
     assert_eq!(found("2026-10-18"), ["b", "c", "d"]);
     assert_eq!(found("eq2026-10-19"), ["b", "c", "e", "f", "g"]);
     assert_eq!(found("ge2026-10-19"), ["b", "c", "e", "f", "g", "h"]);
-    assert_eq!(found("gt2026-10-18"), ["e", "f", "g", "h"]);
+    // `gt` and `lt` take what reaches above or below the day, so a year or a month that holds days
+    // after it (or before it) is in; `sa` and `eb` take only what lies wholly beyond it.
+    assert_eq!(found("gt2026-10-18"), ["b", "c", "e", "f", "g", "h"]);
+    assert_eq!(found("sa2026-10-18"), ["e", "f", "g", "h"]);
     assert_eq!(found("le2026-10-18"), ["a", "b", "c", "d"]);
-    assert_eq!(found("lt2026-10-18"), ["a"]);
-    assert_eq!(found("lt2026-10-19T04:00:00Z"), ["a", "d", "g"]);
+    assert_eq!(found("lt2026-10-18"), ["a", "b", "c"]);
+    assert_eq!(found("eb2026-10-18"), ["a"]);
+    assert_eq!(
+        found("lt2026-10-19T04:00:00Z"),
+        ["a", "b", "c", "d", "e", "g"]
+    );
     assert_eq!(found("ge2026-10-19T04:00:00Z"), ["b", "c", "e", "f", "h"]);
     assert_eq!(found("2026-10-19T03:30:00Z"), ["b", "c", "e", "g"]);
     assert_eq!(found("2026-10-18T23:30:00-05:00"), ["b", "c", "e", "f"]);
+}
+
+fn cards_harness() -> Harness {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, cards_dir()).unwrap();
+    harness
+}
+
+fn seeded(harness: &Harness, resource: Value) {
+    apply(
+        harness,
+        &format!("{}/create", resource["resourceType"].as_str().unwrap()),
+        json!({"resource": resource}),
+    );
+}
+
+fn resource_keys(bundle: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = bundle["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}/{}",
+                entry["resource"]["resourceType"].as_str().unwrap(),
+                entry["resource"]["id"].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn a_document_for_a_caller_limited_to_one_patient_leaves_other_patients_out() {
+    let harness = cards_harness();
+    // A links to B, as a merged or duplicate record does. B is made first: a reference has a target.
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "pb", "name": [{"family": "Bee"}]}),
+    );
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "pa", "name": [{"family": "A"}],
+            "link": [{"other": {"reference": "Patient/pb"}, "type": "seealso"}]}),
+    );
+    seeded(
+        &harness,
+        json!({"resourceType": "Composition", "id": "ca", "status": "final",
+            "type": {"text": "Summary"}, "subject": {"reference": "Patient/pa"},
+            "date": "2026-10-18", "title": "A"}),
+    );
+    let everyone = apply(&harness, "Composition/$document", json!({"id": "ca"}));
+    assert_eq!(
+        resource_keys(&everyone),
+        ["Composition/ca", "Patient/pa", "Patient/pb"],
+        "without a limit the document follows the link"
+    );
+    let limited = apply(
+        &harness,
+        "Composition/$document",
+        json!({"id": "ca", "_patientCompartment": "Patient/pa"}),
+    );
+    assert_eq!(
+        resource_keys(&limited),
+        ["Composition/ca", "Patient/pa"],
+        "a caller limited to A does not get B"
+    );
+    assert!(
+        !limited.to_string().contains("Bee"),
+        "nothing of B is in it: {limited}"
+    );
+}
+
+#[test]
+fn a_card_is_asked_for_a_clinical_type_and_for_nothing_else_the_compartment_lists() {
+    // This catalog's Patient compartment lists Patient (by `link`), Immunization and Composition, as
+    // R4's does Patient, and much besides.
+    let harness = cards_harness();
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]}),
+    );
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "p2", "name": [{"family": "Two"}],
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+    );
+    let asked = |kind: &str| {
+        run_op(
+            &harness,
+            "Patient/$health-cards-issue",
+            &card_args("p1", json!([credential_type(kind)])),
+        )
+    };
+    for kind in ["Patient", "Composition"] {
+        match asked(kind) {
+            Err(RunError::Fhir(FhirError::Invalid(message))) => {
+                assert!(
+                    message.contains(kind) && message.contains("name one of"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("Immunization"),
+                    "it says what is allowed: {message}"
+                );
+            }
+            other => panic!("{kind} is not a thing a card holds: {other:?}"),
+        }
+    }
+    let none = asked("Immunization").expect("a clinical type is taken");
+    assert_eq!(
+        none.value,
+        json!({"credentials": []}),
+        "and with none of it, there is no card"
+    );
+}
+
+#[test]
+fn a_section_holds_the_latest_of_what_there_is_and_a_read_is_bounded_and_newest_first() {
+    let harness = cards_harness();
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]}),
+    );
+    let vaccine = |id: &str| {
+        json!({"resourceType": "Immunization", "id": id, "status": "completed",
+            "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "140"}]},
+            "patient": {"reference": "Patient/p1"}, "occurrenceDateTime": "2024-01-01"})
+    };
+    for number in 0..105 {
+        seeded(&harness, vaccine(&format!("i{number:03}")));
+    }
+    pause();
+    seeded(&harness, vaccine("newest"));
+
+    let summary = apply(&harness, "Patient/$summary", json!({"id": "p1"}));
+    let shots: Vec<String> = resource_keys(&summary)
+        .into_iter()
+        .filter(|key| key.starts_with("Immunization/"))
+        .collect();
+    assert_eq!(
+        shots.len(),
+        100,
+        "a long record is a summary, and not an error"
+    );
+    assert!(
+        shots.contains(&"Immunization/newest".to_string()),
+        "the latest is kept"
+    );
+
+    let catalog = harness.catalog.read().unwrap();
+    let mut tx = harness.db.begin();
+    let three = crate::summary::compartment_resources(
+        &mut tx,
+        &catalog,
+        "p1",
+        "Immunization",
+        &|_| true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(three.len(), 3, "no more than the limit is read");
+    assert_eq!(three[0]["id"], "newest", "and the newest come first");
 }
 
 /// `method url` of each entry of a history, newest first.

@@ -57,7 +57,7 @@ export const synced = [
     source: 'link-host/README.md',
     slug: 'docs/guides/link-host',
     label: 'Link host',
-    description: 'A SMART Health Links host to run or deploy: the settings, the requests it answers and how to keep it safe.',
+    description: 'A SMART Health Links host to run or deploy: a Hono server on Postgres or SQLite, HTTPS with Docker Compose, the settings, limits, who may make links and how to change what it does.',
   },
   {
     source: 'docs/governance.md',

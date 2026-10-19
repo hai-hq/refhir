@@ -7369,8 +7369,14 @@ fn cards_app(signing: bool) -> axum::Router {
     {
         let loaded = catalog.read().expect("catalog");
         for resource in [
+            // p1 links to p5, as a merged or duplicate record does: a document that follows
+            // references from p1's Composition reaches p5.
+            json!({"resourceType": "Patient", "id": "p5", "name": [{"family": "Linked"}]}),
             json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "Lovelace", "given": ["Ada"]}],
-                "birthDate": "1815-12-10", "gender": "female"}),
+                "birthDate": "1815-12-10", "gender": "female",
+                "link": [{"other": {"reference": "Patient/p5"}, "type": "seealso"}]}),
+            json!({"resourceType": "Composition", "id": "c1", "status": "final", "type": {"text": "Summary"},
+                "subject": {"reference": "Patient/p1"}, "date": "2026-10-18", "title": "Lovelace"}),
             json!({"resourceType": "Patient", "id": "p2", "name": [{"family": "Other"}], "birthDate": "1990-01-01"}),
             json!({"resourceType": "Patient", "id": "p3", "name": [{"family": "Empty"}], "birthDate": "2000-01-01"}),
             json!({"resourceType": "Immunization", "id": "i1", "status": "completed",
@@ -7447,6 +7453,34 @@ fn checked_claims(card: &str, jwks: &Value) -> Value {
 
 /// Loading the R4 release is most of what a card test costs, so the tests of a server with a
 /// signing key are the steps of one test, over one server.
+#[tokio::test]
+async fn a_patients_document_follows_references_to_their_own_record_and_no_further() {
+    let app = cards_app(false);
+    // p1's Composition reaches p1, and p1 links to p5, another patient's record.
+    let own = get_as(&app, "p1-reader", "/Composition/c1/$document").await;
+    assert_eq!(own.0, StatusCode::OK, "{}", own.1);
+    assert_eq!(own.1["type"], "document");
+    let ids = resource_ids(&own.1);
+    assert!(
+        ids.contains(&"c1".to_string()) && ids.contains(&"p1".to_string()),
+        "{ids:?}"
+    );
+    assert!(
+        !ids.contains(&"p5".to_string()),
+        "another patient's record is not in it: {ids:?}"
+    );
+    assert!(
+        !own.1.to_string().contains("Linked"),
+        "nothing of it is: {}",
+        own.1
+    );
+
+    // A caller who is not limited to a patient follows the reference.
+    let admin = get_as(&app, "admin", "/Composition/c1/$document").await;
+    assert_eq!(admin.0, StatusCode::OK, "{}", admin.1);
+    assert!(resource_ids(&admin.1).contains(&"p5".to_string()));
+}
+
 #[tokio::test]
 async fn a_server_with_a_signing_key_issues_cards_that_its_published_key_checks() {
     let app = cards_app(true);

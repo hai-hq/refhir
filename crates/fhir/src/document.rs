@@ -18,10 +18,16 @@ use crate::ops::decorate;
 /// turn, so a densely linked record would otherwise be read whole.
 pub const MAX_RESOURCES: usize = 1000;
 
-/// The type and id a reference names, whatever form it is written in (`Patient/1`, an absolute
-/// URL, one with a version). A contained, `urn:` or search-style reference names none.
+/// The type and id a reference names on this server (`Patient/1`, with or without a version). A
+/// contained, `urn:` or search-style reference names none, and neither does an absolute URL: it
+/// names a resource wherever that address is, as a write takes it, and a `Patient/123` of another
+/// server is not this server's.
 pub(crate) fn split_reference(reference: &str) -> Option<(String, String)> {
-    if reference.starts_with('#') || reference.starts_with("urn:") || reference.contains('?') {
+    if reference.starts_with('#')
+        || reference.starts_with("urn:")
+        || reference.contains('?')
+        || reference.contains("://")
+    {
         return None;
     }
     let path = match reference.find("/_history/") {
@@ -59,6 +65,29 @@ pub(crate) fn may_read(args: &Value) -> impl Fn(&str) -> bool {
         None => true,
         Some(scopes) => refhir_sdc::scope_allows(scopes, type_name),
     }
+}
+
+/// The patient a caller is limited to, if they are: the server puts it on the arguments
+/// (`PATIENT_COMPARTMENT`, as `Patient/id`) for a token that belongs to one patient.
+pub(crate) fn limited_to(args: &Value) -> Option<&str> {
+    args.get(crate::search::PATIENT_COMPARTMENT)
+        .and_then(|value| value.as_str())
+}
+
+/// Whether a resource reached through a reference may go in a document for a caller limited to
+/// `patient`: that patient, and what is not another's. Another patient is out, and so is whatever
+/// refers to one (a related person, a record about someone else), since a document follows
+/// references on and would otherwise carry that patient's record to this one's caller.
+pub(crate) fn within_patient(resource: &Value, patient: &str) -> bool {
+    if resource.get("resourceType").and_then(|name| name.as_str()) == Some("Patient") {
+        return identity(resource).is_some_and(|(kind, id)| format!("{kind}/{id}") == patient);
+    }
+    let mut references = Vec::new();
+    collect_references(resource, &mut references);
+    references
+        .iter()
+        .filter_map(|reference| split_reference(reference))
+        .all(|(kind, id)| kind != "Patient" || format!("{kind}/{id}") == patient)
 }
 
 /// `start` and every stored resource they reference, and those reference, in the order they are
@@ -214,12 +243,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_reference_names_a_type_and_id_in_any_form() {
+    fn a_reference_names_a_type_and_id_on_this_server() {
         let key = |reference| split_reference(reference);
         let expected = Some(("Patient".to_string(), "p1".to_string()));
         assert_eq!(key("Patient/p1"), expected);
-        assert_eq!(key("https://example.org/fhir/Patient/p1"), expected);
         assert_eq!(key("Patient/p1/_history/3"), expected);
+        assert_eq!(
+            key("https://example.org/fhir/Patient/p1"),
+            None,
+            "another server's Patient/p1 is not this server's"
+        );
         assert_eq!(key("#contained"), None);
         assert_eq!(key("urn:uuid:7b0c"), None);
         assert_eq!(key("Patient?identifier=a|b"), None);

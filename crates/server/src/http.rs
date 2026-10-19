@@ -1589,6 +1589,11 @@ async fn document_op(
 ) -> Response {
     let mut args = json!({"id": id});
     stamp_sdc(&app, &headers, &mut args);
+    // A token that belongs to one patient is held to that patient's record by what the engine
+    // follows from the Composition, as it is by what a search finds.
+    if let Some(map) = args.as_object_mut() {
+        limit_to_patient(&app, &headers, None, map);
+    }
     run_read(&app, &format!("{resource_type}/$document"), args).await
 }
 

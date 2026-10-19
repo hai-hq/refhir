@@ -41,28 +41,37 @@ receiver (a clinician's app, a viewer)
 ## Run a host
 
 The [link host](../link-host/README.md) stores the encrypted files and answers whoever opens a link.
-Run it from a checkout, in the `link-host` directory:
+It is a TypeScript server that keeps its links in Postgres, or in a SQLite file when it is one machine
+and wants no database server. The quickest way to run one that is ready for the internet is Docker
+Compose, which starts the host, a Postgres for it, and Caddy, which gets and renews an HTTPS
+certificate (`compose.sqlite.yaml` is the same without the Postgres). In the `link-host/deploy` directory, with a DNS name pointed at the
+machine and ports 80 and 443 open:
 
 ```bash
-ADMIN_TOKEN=<a secret of 16 characters or more> \
-PUBLIC_URL=https://links.example.org \
-DATA_DIR=/var/lib/shl \
-node src/server.mjs
+printf 'DOMAIN=links.example.org\nADMIN_TOKEN=%s\nPOSTGRES_PASSWORD=%s\n' \
+  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
+docker compose up -d
 ```
 
-or as a container, built from the same directory:
+The host is also a container of its own, to run against a Postgres you have:
 
 ```bash
 docker build -t refhir-link-host link-host
-docker run -d -p 8090:8090 -v shl-data:/data \
+docker run -d -p 8090:8090 \
+  -e DATABASE_URL=postgres://user:password@db.example:5432/links \
   -e ADMIN_TOKEN=<a secret of 16 characters or more> \
   -e PUBLIC_URL=https://links.example.org \
+  -e TRUST_PROXY=1 \
   refhir-link-host
 ```
 
-`PUBLIC_URL` is the address the host is reached at, and is what the links it makes point to; put
-the host behind a reverse proxy that serves it over HTTPS. Its README lists the settings, every
-request it answers, and what to know before deploying it.
+`PUBLIC_URL` is the address the host is reached at, and is what the links it makes point to; it has to
+be `https`, so put the host behind a proxy that serves it. Its README lists the settings, every
+request it answers, and what it does for you: it limits how often it may be asked, shuts out a caller
+who keeps getting a token wrong, deletes the files of a link when it ends, logs without logging
+anything that opens a link, says whether it is ready, and can be tied to the addresses your senders
+use. It keeps nothing on its own disk, so any number of copies can run against the one database. It
+is meant to be left running.
 
 A host has to follow the manifest protocol of the specification, and any that does works the same
 way for the receiver. How a sender puts a file on a host and gets a link address is up to the
@@ -188,5 +197,7 @@ curl -s -X POST "<manifestUrl>" -d '{"recipient": "me", "passcode": "open sesame
   ask the patient for the scopes that match what they want to share.
 - **Switch links off** when they are no longer needed, with `DELETE /shl/{id}`. A link that is gone
   stops working at once; a copy of the data that was already opened is out of everyone's hands.
-- **Read the access list** (`GET /shl/{id}/access`) for a link that matters, and rate-limit the
-  host's manifest URL, whose passcode attempts are the only thing between a guesser and the data.
+- **Read the access list** (`GET /shl/{id}/access`) for a link that matters. It says who claimed to
+  ask, from where, and whether a passcode was wrong. A host limits how often a link may be asked of,
+  but a short passcode that is guessed in the attempts a link allows is still a guess that worked:
+  make it long, and send it another way.

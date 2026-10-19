@@ -34,10 +34,35 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   by date lists a deletion from just before the date, never leaves one out. See
   [When a resource was written](docs/fhir-api.md#when-a-resource-was-written).
 - **A guide to SMART Health Links**, with a script that fetches a summary, encrypts it and
-  makes the link, and a small link host (`docs/examples/link-host.mjs`, Node, no packages) that
-  stores the encrypted files and answers whoever opens a link. The server does not host links: a
+  makes the link, and a host for the links (`link-host`, below). The server does not host links: a
   separate host holds the encrypted files, so the key is never on a server that holds the record.
   See [SMART Health Links](docs/health-links.md).
+- **A link host to run, as a package of its own.** `link-host` is a [Hono](https://hono.dev) server in
+  TypeScript that stores the encrypted files of SMART Health Links in Postgres, or in a SQLite file for
+  one machine with no database server, and answers whoever opens a link. It never has a key, so a host
+  that is broken into holds nothing that can be read. `link-host/deploy` starts it with Caddy, which
+  gets and renews an HTTPS certificate, and Postgres (`compose.yaml`) or a SQLite volume
+  (`compose.sqlite.yaml`), from one `.env` file. The host:
+  - **Keeps nothing on its own disk** with Postgres, so any number of copies run against one
+    database, and a new one may start before the old one stops. With SQLite several copies share the
+    file on one machine, and `refhir-link-host backup` copies it while they run. Either way a guess at
+    a passcode is counted once whichever copy receives it: in a transaction on the link's row in
+    Postgres, and by running again a change that finds the link changed under it in SQLite. The schema
+    is made on first start.
+  - **Clears away what has ended.** The encrypted files of a link that expired, was switched off or ran
+    out of attempts are deleted, and the record is kept for 30 days so its owner can read who asked.
+    A link without an `expiresAt` lasts 30 days, and the answer says when.
+  - **Limits how often it is asked**: by address, by link, for owners, for making links, and a caller
+    who keeps getting a token wrong is shut out. Requests, headers, time and concurrency are bounded.
+  - **Says who may make links**: a clients file with a token (or its hash) and limits for each,
+    addresses the owner routes or a client are tied to, and `REQUIRE_PASSCODE`. Owner routes cannot
+    be called from another site's page unless it is named.
+  - **Says what it does**: a JSON line for each request and event, naming a link by its first eight
+    characters and logging nothing that opens one; the address, browser and outcome of each caller in
+    the link's access list; `/readyz`, which fails when the database cannot be written; `/metrics`;
+    and a stop that tells the balancer first and then finishes what it is answering.
+  - **Can be changed in code**: `authenticate`, `authorizeCreate`, `authorizeManifest` (to check who a
+    recipient is), `onEvent`, and a `store` that another database can stand in for.
 
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
@@ -84,6 +109,22 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an
   hour or more away from where it is. A value that is a date, or that has no fraction, still
   stands for all of the day or the second it names.
+- **`gt` and `lt` on a date follow FHIR.** `gt2026-10-18` found a resource that ended after the
+  day's end, and `lt` one that began before the day's start, as `sa` and `eb` did: a period or a
+  day that straddles the value was left out. `gt` and `lt` now take what reaches beyond the value;
+  `sa` and `eb` take only what lies wholly beyond it.
+- **A slice's minimum and maximum are checked.** A profile that asks for at least one value in a
+  slice (an IPS section a summary must have, say) now fails a resource that has none, and one that
+  allows a slice once fails a resource that has it twice. A slice that is told apart by a profile
+  is still not checked.
+- **A health card's `iss` is an address a verifier can reach.** The server refuses to start with a
+  signing key on a non-loopback address when no `public_url` is set, and says so when `public_url`
+  is not `https`. `credentialType` takes the clinical types the summary holds, and no other.
+- **`Patient/$summary` and `$health-cards-issue` read a bounded part of a record.** Each kind is
+  read newest first, up to 2,000 resources, and a section holds the 100 most recently written.
+- **`$document` for a token tied to one patient holds nothing of another patient.** A reference
+  that names a host (`http://other.example/Patient/1`) is no longer taken as a resource of this
+  server.
 - **A date search no longer misses a time because of how the time is written.** The index was
   read in the order of the text, which is not the order of time: `ge2026-10-18T04:45:53Z` found
   nothing where a time was stored as `...:53.065Z` (a `.` sorts before a `Z`), and a time in another
