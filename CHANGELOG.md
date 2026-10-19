@@ -10,8 +10,6 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
-## [0.0.2] - 2026-10-19
-
 ### Added
 
 - **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
@@ -29,9 +27,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   extensions on `search`: the name, birth date, identifier, phone number or email address that
   matched (the last three as the request wrote them, so a caller can tell which of its own phone
   numbers matched), and the replaced Patient a match came through. The request is JSON: an XML body
-  is refused with a `415`. The CapabilityStatement lists
-  the operation on `Patient`. A scope that may search Patients may use it; a token limited to one
-  patient may not. See [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
+  is refused with a `415`. The CapabilityStatement lists the operation on `Patient`. A scope that
+  may search Patients may use it; a token limited to one patient may not. See
+  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
+
+## [0.0.2] - 2026-10-19
+
+### Added
+
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
   in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
