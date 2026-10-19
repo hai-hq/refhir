@@ -7744,7 +7744,7 @@ async fn a_server_without_a_signing_key_issues_no_cards_and_does_not_say_it_does
     assert_eq!(keys.status, StatusCode::NOT_FOUND);
 
     let without = send(&app, "GET", "/metadata", None, None).await;
-    assert_eq!(patient_operations(&without.body), ["summary"]);
+    assert_eq!(patient_operations(&without.body), ["summary", "match"]);
     let capabilities = send(&app, "GET", "/.well-known/smart-configuration", None, None).await;
     assert!(!capabilities.body["capabilities"]
         .to_string()
@@ -7769,7 +7769,7 @@ async fn a_server_with_a_key_says_it_issues_cards(signing: &axum::Router) {
     let with = send(signing, "GET", "/metadata", None, None).await;
     assert_eq!(
         patient_operations(&with.body),
-        ["summary", "health-cards-issue"]
+        ["summary", "match", "health-cards-issue"]
     );
     let capabilities = send(
         signing,
@@ -7806,7 +7806,7 @@ async fn over_http_a_resource_says_when_it_was_written_and_is_found_and_listed_b
         found("/Patient?_lastUpdated=ge2000-01-01".into())
             .await
             .len(),
-        3
+        4
     );
     assert!(found(format!("/Patient?_lastUpdated=ge{written}"))
         .await
