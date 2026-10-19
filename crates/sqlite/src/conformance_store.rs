@@ -1,9 +1,10 @@
 use refhir_persistence::{
-    plan_search_parameter, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
-    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
-    NewTerminology, PackageRows, ParamPlan, ParamStatus, PendingParam, PersistError,
-    PersistenceGlobalKey, StoredBackfill, StoredExpansion, StoredPackage, StoredSearchParameter,
-    StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
+    compare_versions, plan_search_parameter, ConformanceStore, ExpansionChange, InstallError,
+    InstallOutcome, InstalledParam, NewExpansion, NewPackage, NewSearchParameter,
+    NewStructureDefinition, NewTerminology, PackageRows, ParamPlan, ParamStatus, PendingParam,
+    PersistError, PersistenceGlobalKey, RetiredParam, StoredBackfill, StoredExpansion,
+    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    CONFORMANCE_PAGE_ROWS,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -888,7 +889,8 @@ fn install_in_tx(
 /// A package the store already has (same name and version) takes only terminology, which is
 /// added to what it has, and expansions, which replace what it has. A package it does not have
 /// gets its definitions and search parameters too, and the search parameters are checked against
-/// the ones installed.
+/// the ones installed, except those of older versions of the same package: it replaces them, and
+/// they are removed when it is stored whole.
 struct Installer<'a, 'c> {
     tx: &'a Transaction<'c>,
     package_id: i64,
@@ -897,6 +899,9 @@ struct Installer<'a, 'c> {
     newly_pending: Vec<PendingParam>,
     /// Whether the package's earlier expansions have been cleared for this install's.
     expansions_cleared: bool,
+    /// The older versions of this package that are stored, whose search parameters this install
+    /// replaces. Empty for a package that was there before.
+    superseded: Vec<i64>,
 }
 
 impl<'a, 'c> Installer<'a, 'c> {
@@ -921,6 +926,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 existing: true,
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
+                superseded: Vec::new(),
             });
         }
         let current: Option<String> = tx
@@ -937,6 +943,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 });
             }
         }
+        let superseded = older_versions(tx, name, version)?;
         tx.execute(
             "INSERT INTO packages (name, version, fhir_version) VALUES (?1, ?2, ?3)",
             params![name, version, fhir_version],
@@ -948,7 +955,50 @@ impl<'a, 'c> Installer<'a, 'c> {
             existing: false,
             newly_pending: Vec::new(),
             expansions_cleared: false,
+            superseded,
         })
+    }
+
+    /// Remove the search parameters of the older versions of the package, whichever the new
+    /// version has carried over: the ones it defines again are stored under it. Says which of
+    /// them nothing defines now.
+    fn retire_superseded(&self) -> Result<Vec<RetiredParam>, InstallError> {
+        let mut gone = std::collections::BTreeSet::new();
+        for package_id in &self.superseded {
+            let mut stmt = self
+                .tx
+                .prepare("SELECT DISTINCT base, code FROM search_parameters WHERE package_id = ?1")
+                .map_err(definite)?;
+            let rows = stmt
+                .query_map(params![package_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(definite)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(definite)?;
+            gone.extend(rows);
+            self.tx
+                .execute(
+                    "DELETE FROM search_parameters WHERE package_id = ?1",
+                    params![package_id],
+                )
+                .map_err(definite)?;
+        }
+        let mut retired = Vec::new();
+        for (base, code) in gone {
+            let defined: bool = self
+                .tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM search_parameters WHERE base = ?1 AND code = ?2)",
+                    params![base, code],
+                    |row| row.get(0),
+                )
+                .map_err(definite)?;
+            if !defined {
+                retired.push(RetiredParam { base, code });
+            }
+        }
+        Ok(retired)
     }
 
     fn clear_expansions(&mut self) -> Result<(), InstallError> {
@@ -967,13 +1017,39 @@ impl<'a, 'c> Installer<'a, 'c> {
     fn finish(mut self) -> Result<InstallOutcome, InstallError> {
         // A package that is installed again and brings no expansions has none afterwards.
         self.clear_expansions()?;
+        let retired = self.retire_superseded()?;
         Ok(InstallOutcome {
             package_id: self.package_id,
             inserted: !self.existing,
             newly_pending: self.newly_pending,
+            retired,
             shared: false,
         })
     }
+}
+
+/// The ids of the stored packages named `name` at a version older than `version`: the ones a
+/// package of that version replaces.
+fn older_versions(
+    tx: &Transaction<'_>,
+    name: &str,
+    version: &str,
+) -> Result<Vec<i64>, InstallError> {
+    let mut stmt = tx
+        .prepare("SELECT id, version FROM packages WHERE name = ?1")
+        .map_err(definite)?;
+    let rows = stmt
+        .query_map(params![name], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(definite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(definite)?;
+    Ok(rows
+        .into_iter()
+        .filter(|(_, held)| compare_versions(held, version).is_lt())
+        .map(|(id, _)| id)
+        .collect())
 }
 
 impl PackageRows for Installer<'_, '_> {
@@ -1013,17 +1089,20 @@ impl PackageRows for Installer<'_, '_> {
         for param in rows {
             let installed = tx
                 .prepare(
-                    "SELECT package_id, url, COALESCE(expression, ''), status, json \
+                    "SELECT package_id, url, COALESCE(expression, ''), param_type, status, json \
                      FROM search_parameters WHERE base = ?1 AND code = ?2",
                 )
                 .map_err(definite)?
                 .query_map(params![param.base, param.code], |row| {
+                    let package_id: i64 = row.get(0)?;
                     Ok(InstalledParam {
-                        package_id: row.get(0)?,
+                        package_id,
                         url: row.get(1)?,
                         expression: row.get(2)?,
-                        status: row.get(3)?,
-                        json: row.get(4)?,
+                        param_type: row.get(3)?,
+                        status: row.get(4)?,
+                        json: row.get(5)?,
+                        superseded: self.superseded.contains(&package_id),
                     })
                 })
                 .map_err(definite)?
@@ -1145,5 +1224,11 @@ mod tests {
     fn parameters_from_different_packages_resolve_clashes() {
         let store = SqlitePersistence::open_in_memory().unwrap();
         refhir_persistence::conformance::exercise_parameter_clashes(&store, "sqlite");
+    }
+
+    #[test]
+    fn a_newer_version_of_a_package_replaces_the_search_parameters_of_the_older_ones() {
+        let store = SqlitePersistence::open_in_memory().unwrap();
+        refhir_persistence::conformance::exercise_package_versions(&store, "sqlite");
     }
 }

@@ -2011,4 +2011,14 @@ mod tests {
         refhir_persistence::conformance::exercise_parameter_clashes(&persistence, &tag);
         refhir_persistence::conformance::exercise_terminology_changes(&persistence, &tag);
     }
+
+    #[test]
+    fn postgres_package_versions_when_configured() {
+        let Some(url) = test_url("postgres package versions") else {
+            return;
+        };
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let tag = format!("pgver{}", std::process::id());
+        refhir_persistence::conformance::exercise_package_versions(&persistence, &tag);
+    }
 }

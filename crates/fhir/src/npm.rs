@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::package::{
-    finish_install, package_identity, package_root, read_manifest, run_backfills,
-    stage_package_deferred,
+    finish_install, newer_version, note_newer_installed, package_identity, package_root,
+    read_manifest, run_backfills, stage_package_deferred,
 };
 use crate::run::RunResult;
 use crate::s3::S3Source;
@@ -195,11 +195,17 @@ pub fn install_operation(
     let spec = format!("{name}@{version}");
     let fetcher = NpmRegistry::from_env()?;
     let before = unexpandable_value_sets(catalog);
+    let newer = newer_installed(store, &name, &version)?;
     install_with(store, db, catalog, &spec, &fetcher, &fetcher.cache_dir)?;
     let mut issues = vec![json!({
         "severity": "information",
         "code": "informational",
-        "diagnostics": format!("installed {spec}")
+        "diagnostics": match &newer {
+            Some(newer) => format!(
+                "{spec} was not installed: {name}@{newer}, a newer version of it, is installed"
+            ),
+            None => format!("installed {spec}"),
+        }
     })];
     // A package can bring a ValueSet that includes content nothing here can supply. Say so now,
     // rather than when a client first asks for the expansion.
@@ -300,6 +306,11 @@ fn npm_spec_from_args(args: &Value) -> Result<(String, String), FhirError> {
 ///
 /// The whole tree is resolved before anything is installed, so a conflict stops the install
 /// with nothing half-applied. See [`Resolver`] for the rules.
+///
+/// A package that is installed already, or of which a newer version is, has nothing to install:
+/// the newest version of a package is the one in force, and a server started again on an older
+/// release of its package stays on what it has. Installing a newer version replaces the search
+/// parameters of the older ones (see `ConformanceStore::install_package`).
 fn install_tree(
     store: &dyn ConformanceStore,
     db: &Database,
@@ -309,13 +320,13 @@ fn install_tree(
     cache: &Path,
 ) -> Result<(), FhirError> {
     if let PackageSpec::Npm { name, version } = &spec {
-        if already_installed(store, name, version)? {
+        if nothing_to_install(store, name, version)? {
             return run_backfills(store, db, catalog);
         }
     }
     let root = materialize(&spec, fetcher, cache)?;
     let (name, version) = package_identity(&root.dir)?;
-    if already_installed(store, &name, &version)? {
+    if nothing_to_install(store, &name, &version)? {
         return run_backfills(store, db, catalog);
     }
     let installed = store
@@ -680,63 +691,7 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Order two package versions: `major.minor.patch` (missing parts count as 0), then
-/// pre-release (`5.3.0-ballot` sorts before `5.3.0` and after `5.2.0`). A version that is not
-/// numeric, like `current` or `dev`, means "the newest" and sorts after every numeric one.
-pub(crate) fn compare_versions(left: &str, right: &str) -> Ordering {
-    let parse = |text: &str| -> Option<([u64; 3], Option<String>)> {
-        let text = text.split('+').next().unwrap_or(text);
-        let (core, pre) = match text.split_once('-') {
-            Some((core, pre)) => (core, Some(pre.to_string())),
-            None => (text, None),
-        };
-        let mut numbers = [0u64; 3];
-        let mut parts = core.split('.');
-        for slot in &mut numbers {
-            match parts.next() {
-                Some(part) => *slot = part.parse().ok()?,
-                None => break,
-            }
-        }
-        parts.next().is_none().then_some((numbers, pre))
-    };
-    match (parse(left), parse(right)) {
-        (Some((left_core, left_pre)), Some((right_core, right_pre))) => left_core
-            .cmp(&right_core)
-            .then_with(|| match (&left_pre, &right_pre) {
-                (None, None) => Ordering::Equal,
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => compare_prerelease(a, b),
-            }),
-        (None, None) => left.cmp(right),
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-    }
-}
-
-fn compare_prerelease(left: &str, right: &str) -> Ordering {
-    let mut right_parts = right.split('.');
-    for a in left.split('.') {
-        let Some(b) = right_parts.next() else {
-            return Ordering::Greater;
-        };
-        let order = match (a.parse::<u64>(), b.parse::<u64>()) {
-            (Ok(x), Ok(y)) => x.cmp(&y),
-            (Ok(_), Err(_)) => Ordering::Less,
-            (Err(_), Ok(_)) => Ordering::Greater,
-            (Err(_), Err(_)) => a.cmp(b),
-        };
-        if order != Ordering::Equal {
-            return order;
-        }
-    }
-    if right_parts.next().is_some() {
-        Ordering::Less
-    } else {
-        Ordering::Equal
-    }
-}
+pub(crate) use refhir_persistence::compare_versions;
 
 pub(crate) struct Staged {
     pub(crate) dir: PathBuf,
@@ -831,6 +786,33 @@ fn dependencies_of(path: &Path) -> Result<Vec<(String, String)>, FhirError> {
         rows.push((name.clone(), version.to_string()));
     }
     Ok(rows)
+}
+
+/// The newest installed version of `name` when it is newer than `version`.
+fn newer_installed(
+    store: &dyn ConformanceStore,
+    name: &str,
+    version: &str,
+) -> Result<Option<String>, FhirError> {
+    let installed = store.load_packages().map_err(FhirError::from)?;
+    Ok(newer_version(&installed, name, version).map(str::to_string))
+}
+
+/// Whether installing `name@version` has nothing to do: it is installed, or a newer version of the
+/// package is, which says so in the log.
+fn nothing_to_install(
+    store: &dyn ConformanceStore,
+    name: &str,
+    version: &str,
+) -> Result<bool, FhirError> {
+    if already_installed(store, name, version)? {
+        return Ok(true);
+    }
+    let Some(newer) = newer_installed(store, name, version)? else {
+        return Ok(false);
+    };
+    note_newer_installed(name, version, &newer);
+    Ok(true)
 }
 
 fn already_installed(
@@ -1192,20 +1174,6 @@ mod tests {
             "registry": "http://127.0.0.1"
         }))
         .is_err());
-    }
-
-    #[test]
-    fn versions_order_like_semver() {
-        let less = |a: &str, b: &str| compare_versions(a, b) == Ordering::Less;
-        assert!(less("5.2.0", "5.3.0-ballot-tc1"));
-        assert!(less("5.3.0-ballot-tc1", "5.3.0"));
-        assert!(less("6.5.0", "7.1.0"));
-        assert!(less("1.0.0-rc.2", "1.0.0-rc.10"));
-        assert!(less("1.0.0-alpha", "1.0.0-alpha.1"));
-        assert_eq!(compare_versions("4.0.1", "4.0.1"), Ordering::Equal);
-        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
-        assert_eq!(compare_versions("current", "4.0.1"), Ordering::Greater);
-        assert_eq!(compare_versions("4.0.1", "dev"), Ordering::Less);
     }
 
     /// Serve one request with `body`; returns the base URL and the raw request it received.

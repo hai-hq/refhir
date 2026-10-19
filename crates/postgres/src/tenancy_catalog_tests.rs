@@ -124,6 +124,99 @@ fn terminology(store: &PostgresPersistence) -> Vec<(i64, String)> {
         .collect()
 }
 
+/// A newer version of a package that tenants share replaces the search parameters of the tenant
+/// that installs it, and of no other: another tenant keeps the version it has until it installs the
+/// newer one, which it is given from the copy that was built.
+#[test]
+fn a_newer_version_of_a_shared_package_replaces_the_search_parameters_of_the_tenant_that_installs_it(
+) {
+    let Some(admin) = test_url("shared package versions") else {
+        return;
+    };
+    let url = shared(&admin, "tver", &["a", "b"]);
+    let (a, b) = (open(&url, "a"), open(&url, "b"));
+    let rows = |store: &PostgresPersistence| -> Vec<(String, String, ParamStatus, i64)> {
+        let mut rows: Vec<_> = store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.code.starts_with("versioned-"))
+            .map(|row| {
+                (
+                    row.code,
+                    row.expression.unwrap_or_default(),
+                    row.status,
+                    row.package_id,
+                )
+            })
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    };
+    let codes = |list: &[refhir_persistence::PendingParam]| -> Vec<String> {
+        list.iter().map(|param| param.code.clone()).collect()
+    };
+    let first = demo("versioned", "4.0.1");
+    let (one_a, _) = install(&a, &first, "one").unwrap();
+    a.mark_base_ready(one_a.package_id, "Patient").unwrap();
+    let (one_b, _) = install(&b, &first, "one").unwrap();
+    assert_eq!(rows(&a).len(), 3);
+    assert_eq!(rows(&b).len(), 3);
+
+    // 2.0.0 keeps one parameter, changes another, and leaves the third out.
+    let mut second = demo("versioned", "4.0.1");
+    second.version = "2.0.0".into();
+    second.search_parameters.truncate(2);
+    second.search_parameters[1].expression = Some("Patient.changed".into());
+    let (two_a, reads) = install(&a, &second, "two").unwrap();
+    assert_eq!(reads, 1);
+    assert_eq!(codes(&two_a.newly_pending), ["versioned-code1"]);
+    assert_eq!(
+        two_a
+            .retired
+            .iter()
+            .map(|param| param.code.as_str())
+            .collect::<Vec<_>>(),
+        ["versioned-code2"]
+    );
+    let held = rows(&a);
+    assert_eq!(
+        held,
+        [
+            (
+                "versioned-code0".to_string(),
+                "Patient.extension0".to_string(),
+                ParamStatus::Ready,
+                two_a.package_id
+            ),
+            (
+                "versioned-code1".to_string(),
+                "Patient.changed".to_string(),
+                ParamStatus::Pending,
+                two_a.package_id
+            ),
+        ]
+    );
+    // The other tenant is as it was.
+    let untouched = rows(&b);
+    assert_eq!(untouched.len(), 3);
+    assert!(untouched.iter().all(|row| row.3 == one_b.package_id));
+
+    // It is given the newer version from the copy, and has not marked any of its own parameters
+    // ready, so each of the two it keeps is waiting for its index.
+    let (two_b, reads) = install(&b, &second, "two").unwrap();
+    assert_eq!(reads, 0);
+    assert!(two_b.shared);
+    assert_eq!(
+        codes(&two_b.newly_pending),
+        ["versioned-code0", "versioned-code1"]
+    );
+    assert_eq!(two_b.retired.len(), 1);
+    assert_eq!(rows(&b).len(), 2);
+    // And the first is not disturbed by it.
+    assert_eq!(rows(&a), held);
+}
+
 #[test]
 fn tenants_share_one_copy_of_a_package_and_the_second_never_reads_it() {
     let Some(admin) = test_url("shared catalog") else {

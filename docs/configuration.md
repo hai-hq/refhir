@@ -10,6 +10,22 @@ Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or 
 
 `[server].default_page_size` (or `REFHIR_DEFAULT_PAGE_SIZE`, and it has no CLI flag) is how many matches a search `GET` returns on a page when it names no `_count`: 100 by default, and `0` returns every match in one response. See [FHIR API](fhir-api.md#search).
 
+## Upgrading a package
+
+Start the server with a newer version of a package it already holds (`--package ./ig-0.2.0`, `name@0.2.0`, or `[conformance].packages`) and it serves what that version defines. The newest version of a package is the one in force, so the same `--package` can stay on every start and moving to a new release is a change to it.
+
+For the package's search parameters:
+
+- One that the new version defines again takes the new definition. If its expression changed, the resources already stored are indexed again for it before the server answers requests (or, for `$install`, before it returns), and every resource written after is indexed with it. One whose type, expression and targets did not change is not indexed again.
+- One whose `code` changed is searched by the new code only. A search that names the old code is refused like any parameter the server does not have (`400`, with the default strict handling), and the CapabilityStatement lists the new code.
+- One that the new version leaves out is no longer accepted or listed.
+- Parameters of other packages are never replaced. If a parameter of the new version has the same resource type and code as a parameter of another package but another expression, the install is refused and the database stays as it was.
+- The same holds for a package that another package depends on: installing one that needs a newer version of it replaces the older version's parameters.
+
+Installing the same version again, or a version older than the one the server holds, changes nothing, so a server that is started again on an earlier release of its package keeps what it has. A new version that cannot be installed leaves the database on the version it had, and the server can be started again with either.
+
+Only search parameters are replaced. The profiles, value sets and code systems of an older version stay in the database beside those of the newer one.
+
 ## CLI reference
 
 | Flag | Purpose |

@@ -930,7 +930,7 @@ fn sync_expansions(store: &dyn ConformanceStore) -> Result<(), FhirError> {
     Ok(())
 }
 
-fn tombstone_index(db: &Database, base: &str, code: &str) -> Result<(), FhirError> {
+pub(crate) fn tombstone_index(db: &Database, base: &str, code: &str) -> Result<(), FhirError> {
     for _ in 0..=MAX_OCC_FAILURES {
         match tombstone_once(db, base, code) {
             Ok(()) => return Ok(()),

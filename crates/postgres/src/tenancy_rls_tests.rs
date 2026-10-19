@@ -47,6 +47,7 @@ fn fill(url: &str, tag: &str) {
     conformance::exercise_package_install(&a, &format!("{tag}bulk"));
     conformance::exercise_backfill_batches(&a, &format!("{tag}bulk"));
     conformance::exercise_parameter_clashes(&a, &format!("{tag}clash"));
+    conformance::exercise_package_versions(&a, &format!("{tag}ver"));
 }
 
 #[test]

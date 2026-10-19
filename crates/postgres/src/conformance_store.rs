@@ -1,10 +1,11 @@
 use postgres::Transaction;
 use refhir_persistence::{
-    plan_package_parameters, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
-    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
-    NewTerminology, PackageRows, ParamStatus, PendingParam, PersistError, PersistenceGlobalKey,
-    PoolGuard, StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow,
-    StoredSearchParameter, StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
+    compare_versions, plan_package_parameters, ConformanceStore, ExpansionChange, InstallError,
+    InstallOutcome, InstalledParam, NewExpansion, NewPackage, NewSearchParameter,
+    NewStructureDefinition, NewTerminology, PackageRows, ParamStatus, PendingParam, PersistError,
+    PersistenceGlobalKey, PoolGuard, RetiredParam, StoredBackfill, StoredExpansion, StoredPackage,
+    StoredParameterRow, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
+    CONFORMANCE_PAGE_ROWS,
 };
 
 use crate::scope::Scope;
@@ -147,6 +148,17 @@ fn sql_find_package(scope: Scope) -> String {
         Scope::Tenant(id) => format!(
             "SELECT p.id, t.owner FROM tenant_packages t JOIN packages p ON p.id = t.package_id \
              WHERE t.instance_id = {id} AND p.name = $1 AND p.version = $2"
+        ),
+    }
+}
+
+/// The id and version of each package named `$1` that the tenant has.
+fn sql_package_versions(scope: Scope) -> String {
+    match scope {
+        Scope::Classic => "SELECT id, version FROM packages WHERE name = $1".into(),
+        Scope::Tenant(id) => format!(
+            "SELECT p.id, p.version FROM tenant_packages t JOIN packages p ON p.id = t.package_id \
+             WHERE t.instance_id = {id} AND p.name = $1"
         ),
     }
 }
@@ -404,6 +416,8 @@ impl PostgresPersistence {
                 });
             }
         }
+        // Read before the package is linked, so that the package is not among them.
+        let superseded = older_versions(&mut tx, scope, name, version)?;
         link_package(&mut tx, tenant, package_id, 0)?;
         // The tenant's own search parameters, planned against what it has as an install would.
         let rows = tx
@@ -425,7 +439,9 @@ impl PostgresPersistence {
                 json: row.get(6),
             });
         }
-        let newly_pending = insert_search_parameters(&mut tx, scope, package_id, &parameters)?;
+        let newly_pending =
+            insert_search_parameters(&mut tx, scope, package_id, &parameters, &superseded)?;
+        let retired = retire_superseded(&mut tx, scope, &superseded)?;
         tx.execute(
             &format!(
                 "INSERT INTO value_set_expansion ({}package_id, url, json) \
@@ -441,6 +457,7 @@ impl PostgresPersistence {
             package_id,
             inserted: true,
             newly_pending,
+            retired,
             shared: true,
         }))
     }
@@ -1653,8 +1670,9 @@ fn install_in_tx(
 /// A package the store already has (same name and version) takes only terminology, which is added
 /// to what it has, and expansions, which replace what it has. A package it does not have gets its
 /// definitions and search parameters too, and the search parameters are checked against the ones
-/// installed. Each call stores the rows it is given in statements of its own, so what is held at
-/// once is the rows of one call, however large the package.
+/// installed, except those of older versions of the same package: it replaces them, and they are
+/// removed when it is stored whole. Each call stores the rows it is given in statements of its
+/// own, so what is held at once is the rows of one call, however large the package.
 struct Installer<'a, 'c> {
     tx: &'a mut Transaction<'c>,
     scope: Scope,
@@ -1669,6 +1687,9 @@ struct Installer<'a, 'c> {
     expansions_cleared: bool,
     /// The most JSON text any one call was given.
     heaviest: usize,
+    /// The older versions of this package that the tenant has, whose search parameters this
+    /// install replaces. Empty for a package that was there before.
+    superseded: Vec<i64>,
 }
 
 impl<'a, 'c> Installer<'a, 'c> {
@@ -1698,6 +1719,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
                 heaviest: 0,
+                superseded: Vec::new(),
             });
         }
         let current = tx
@@ -1712,6 +1734,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 });
             }
         }
+        let superseded = older_versions(tx, scope, name, version)?;
         let inserted = tx
             .query_one(
                 &format!(
@@ -1736,6 +1759,7 @@ impl<'a, 'c> Installer<'a, 'c> {
             newly_pending: Vec::new(),
             expansions_cleared: false,
             heaviest: 0,
+            superseded,
         })
     }
 
@@ -1763,11 +1787,13 @@ impl<'a, 'c> Installer<'a, 'c> {
     fn finish(mut self) -> Result<(InstallOutcome, usize), InstallError> {
         // A package that is installed again and brings no expansions has none afterwards.
         self.clear_expansions()?;
+        let retired = retire_superseded(self.tx, self.scope, &self.superseded)?;
         Ok((
             InstallOutcome {
                 package_id: self.package_id,
                 inserted: !self.existing,
                 newly_pending: self.newly_pending,
+                retired,
                 shared: false,
             },
             self.heaviest,
@@ -1792,7 +1818,8 @@ impl PackageRows for Installer<'_, '_> {
             return Ok(());
         }
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        let pending = insert_search_parameters(self.tx, self.scope, self.package_id, rows)?;
+        let pending =
+            insert_search_parameters(self.tx, self.scope, self.package_id, rows, &self.superseded)?;
         self.newly_pending.extend(pending);
         Ok(())
     }
@@ -1897,12 +1924,14 @@ fn insert_structure_definitions(
 
 /// Store the search parameters of a package, and say which of them wait for a backfill. What the
 /// rows already stored decide about each one (see [`plan_package_parameters`]) is read in one
-/// query for all of them, not one per parameter.
+/// query for all of them, not one per parameter. The rows of `superseded` packages are read as the
+/// ones the package replaces.
 fn insert_search_parameters(
     tx: &mut Transaction<'_>,
     scope: Scope,
     package_id: i64,
     parameters: &[NewSearchParameter],
+    superseded: &[i64],
 ) -> Result<Vec<refhir_persistence::PendingParam>, InstallError> {
     if parameters.is_empty() {
         return Ok(Vec::new());
@@ -1912,7 +1941,8 @@ fn insert_search_parameters(
     let stored = tx
         .query(
             &format!(
-                "SELECT base, code, package_id, url, COALESCE(expression, ''), status, json \
+                "SELECT base, code, package_id, url, COALESCE(expression, ''), param_type, status, \
+                        json \
                  FROM search_parameters \
                  WHERE {}(base, code) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
                 scope.and()
@@ -1921,16 +1951,21 @@ fn insert_search_parameters(
         )
         .map_err(definite)?
         .iter()
-        .map(|row| StoredParameterRow {
-            base: row.get(0),
-            code: row.get(1),
-            row: InstalledParam {
-                package_id: row.get(2),
-                url: row.get(3),
-                expression: row.get(4),
-                status: row.get(5),
-                json: row.get(6),
-            },
+        .map(|row| {
+            let package_id: i64 = row.get(2);
+            StoredParameterRow {
+                base: row.get(0),
+                code: row.get(1),
+                row: InstalledParam {
+                    package_id,
+                    url: row.get(3),
+                    expression: row.get(4),
+                    param_type: row.get(5),
+                    status: row.get(6),
+                    json: row.get(7),
+                    superseded: superseded.contains(&package_id),
+                },
+            }
         })
         .collect();
     let plan = plan_package_parameters(package_id, parameters, stored)?;
@@ -1960,6 +1995,65 @@ fn insert_search_parameters(
         insert_parameters(tx, ParameterTable::Own(scope), package_id, &rows)?;
     }
     Ok(plan.newly_pending)
+}
+
+/// The ids of the packages named `name` at a version older than `version` that the tenant has: the
+/// ones a package of that version replaces.
+fn older_versions(
+    tx: &mut Transaction<'_>,
+    scope: Scope,
+    name: &str,
+    version: &str,
+) -> Result<Vec<i64>, InstallError> {
+    Ok(tx
+        .query(&sql_package_versions(scope), &[&name])
+        .map_err(definite)?
+        .iter()
+        .filter(|row| compare_versions(&row.get::<_, String>(1), version).is_lt())
+        .map(|row| row.get(0))
+        .collect())
+}
+
+/// Remove the search parameters of the older versions of a package from the tenant, whichever the
+/// new version has carried over: the ones it defines again are stored under it. Says which of
+/// them nothing defines now.
+fn retire_superseded(
+    tx: &mut Transaction<'_>,
+    scope: Scope,
+    superseded: &[i64],
+) -> Result<Vec<RetiredParam>, InstallError> {
+    if superseded.is_empty() {
+        return Ok(Vec::new());
+    }
+    let removed = tx
+        .query(
+            &format!(
+                "DELETE FROM search_parameters WHERE {}package_id = ANY($1) RETURNING base, code",
+                scope.and()
+            ),
+            &[&superseded],
+        )
+        .map_err(definite)?;
+    let gone: std::collections::BTreeSet<(String, String)> =
+        removed.iter().map(|row| (row.get(0), row.get(1))).collect();
+    let mut retired = Vec::new();
+    for (base, code) in gone {
+        let defined: bool = tx
+            .query_one(
+                &format!(
+                    "SELECT EXISTS (SELECT 1 FROM search_parameters \
+                     WHERE {}base = $1 AND code = $2)",
+                    scope.and()
+                ),
+                &[&base, &code],
+            )
+            .map_err(definite)?
+            .get(0);
+        if !defined {
+            retired.push(RetiredParam { base, code });
+        }
+    }
+    Ok(retired)
 }
 
 /// Where a run of search parameters goes: a tenant's (or a classic database's) own table, or the

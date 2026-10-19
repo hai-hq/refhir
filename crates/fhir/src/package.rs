@@ -8,8 +8,9 @@ use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    same_expression, ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage,
-    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamStatus,
+    compare_versions, same_expression, ConformanceStore, InstallError, InstallOutcome,
+    NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology,
+    PackageRows, ParamStatus, RetiredParam, StoredPackage,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::TerminologyBuilder;
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 use crate::catalog::{pending_index_keys, Catalog};
 use crate::catalog::{CatalogClock, CatalogStamp};
+use crate::conform::tombstone_index;
 use crate::error::FhirError;
 use crate::extract;
 use crate::run::MAX_OCC_FAILURES;
@@ -135,16 +137,20 @@ pub fn stage_package_dir(
     stage_package(store, db, catalog, path, true).map(|_| ())
 }
 
-/// Backfill work for a package whose search parameters are stored but not yet searchable.
+/// What is left to do for a package that is stored: backfill the search parameters that are stored
+/// but not yet searchable, and clear the index of the ones an older version had and nothing has now.
 pub(crate) struct PendingBackfill {
     package_id: i64,
     bases: BTreeSet<String>,
+    retired: Vec<RetiredParam>,
 }
 
 impl PendingBackfill {
     /// Queue the backfill jobs. Call this after the catalog that writers use has been
     /// published: the watermark is read here, and backfill leaves documents newer than it to
-    /// writers, which only index a parameter once the catalog knows it.
+    /// writers, which only index a parameter once the catalog knows it. The same goes for clearing
+    /// the index of a parameter that is gone, since a writer that still has the old catalog would
+    /// write to it again.
     pub(crate) fn create(
         &self,
         store: &dyn ConformanceStore,
@@ -158,8 +164,45 @@ impl PendingBackfill {
         store
             .insert_backfills(self.package_id, watermark, &bases)
             .map_err(FhirError::from)?;
+        for RetiredParam { base, code } in &self.retired {
+            // What is left under a parameter that no longer exists is never read, and a parameter
+            // added under that code later is backfilled over it, so a failure here is not worth
+            // stopping for.
+            if let Err(err) = tombstone_index(db, base, code) {
+                tracing::warn!(
+                    target: "refhir_engine",
+                    "could not clear the index of search parameter {base}.{code}, which is no longer \
+                     defined: {err}"
+                );
+            }
+        }
         Ok(())
     }
+}
+
+/// The newest version of `name` in `installed` that is newer than `version`, if there is one.
+/// The newest version of a package is the one in force, so installing an older one changes
+/// nothing.
+pub(crate) fn newer_version<'a>(
+    installed: &'a [StoredPackage],
+    name: &str,
+    version: &str,
+) -> Option<&'a str> {
+    installed
+        .iter()
+        .filter(|package| package.name == name)
+        .map(|package| package.version.as_str())
+        .filter(|held| compare_versions(held, version).is_gt())
+        .max_by(|left, right| compare_versions(left, right))
+}
+
+/// What is said when a package is not installed because a newer version of it is.
+pub(crate) fn note_newer_installed(name: &str, version: &str, newer: &str) {
+    tracing::warn!(
+        target: "refhir_engine",
+        "not installing {name}@{version}: {name}@{newer} is installed, and the newest version of a \
+         package is the one in force"
+    );
 }
 
 /// Store a package without rebuilding the catalog, for installing several in a row. The caller
@@ -187,6 +230,13 @@ fn stage_package(
         .find(|package| package.name == name && package.version == version)
     {
         reopen_unsupported(store, db, package.id)?;
+        if publish_now {
+            publish(store, catalog)?;
+        }
+        return Ok(None);
+    }
+    if let Some(newer) = newer_version(&installed, &name, &version) {
+        note_newer_installed(&name, &version, newer);
         if publish_now {
             publish(store, catalog)?;
         }
@@ -399,6 +449,7 @@ fn finish_staging(
             .iter()
             .map(|param| param.base.clone())
             .collect(),
+        retired: outcome.retired,
     };
     if publish_now {
         pending.create(store, db)?;

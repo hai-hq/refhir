@@ -1851,6 +1851,443 @@ fn an_experimental_parameter_yields_to_a_real_one_from_another_package() {
     }
 }
 
+/// A package `name` at `version` that depends on `deps` and holds string search parameters on
+/// Patient, each as (name, code, expression). The name makes the parameter's URL, so a later
+/// version that gives the same name defines the same canonical again.
+fn parameter_package(
+    name: &str,
+    version: &str,
+    deps: &[(&str, &str)],
+    parameters: &[(&str, &str, &str)],
+) -> PathBuf {
+    let dir = dep_package(name, version, deps);
+    for (parameter, code, expression) in parameters {
+        std::fs::write(
+            dir.join(format!("SearchParameter-{parameter}.json")),
+            json!({
+                "resourceType": "SearchParameter",
+                "url": format!("http://example.org/SearchParameter/{parameter}"),
+                "name": parameter,
+                "status": "active",
+                "description": parameter,
+                "code": code,
+                "base": ["Patient"],
+                "type": "string",
+                "expression": expression
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+fn upgrade_package(version: &str, parameters: &[(&str, &str, &str)]) -> PathBuf {
+    parameter_package("example.upgrade", version, &[], parameters)
+}
+
+fn install_dir(harness: &Harness, dir: &Path) -> Result<(), FhirError> {
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, dir)
+}
+
+/// The search parameters the example packages hold, as (code, expression, version of the package
+/// that holds it), and whether each is ready to be searched.
+fn upgrade_parameters(harness: &Harness) -> Vec<(String, String, String)> {
+    let versions: BTreeMap<i64, String> = harness
+        .store
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .map(|package| (package.id, format!("{}@{}", package.name, package.version)))
+        .collect();
+    let mut rows: Vec<_> = harness
+        .store
+        .load_search_parameters()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.url.starts_with("http://example.org/SearchParameter/"))
+        .map(|row| {
+            assert_eq!(
+                row.status,
+                refhir_persistence::ParamStatus::Ready,
+                "{} is not ready",
+                row.code
+            );
+            (
+                row.code,
+                row.expression.unwrap_or_default(),
+                versions[&row.package_id].clone(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn upgrade_row(code: &str, expression: &str, version: &str) -> (String, String, String) {
+    (
+        code.to_string(),
+        expression.to_string(),
+        format!("example.upgrade@{version}"),
+    )
+}
+
+fn search_total(harness: &Harness, code: &str, value: &str) -> u64 {
+    run_op(harness, "Patient/search", &json!({ code: value }))
+        .map(|result| result.value["total"].as_u64().unwrap())
+        .unwrap_or_else(|err| panic!("{code}={value}: {err:?}"))
+}
+
+/// What a search for `code` is refused with.
+fn refusal(harness: &Harness, code: &str) -> String {
+    match run_op(harness, "Patient/search", &json!({ code: "x" })).map(|result| result.value) {
+        Err(RunError::Fhir(FhirError::Invalid(message))) => message,
+        other => panic!("{code} should be refused, got {other:?}"),
+    }
+}
+
+/// The search parameters of Patient that the CapabilityStatement lists.
+fn advertised(harness: &Harness) -> Vec<String> {
+    let statement = harness.catalog.read().unwrap().capability_statement();
+    statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Patient")
+        .unwrap()["searchParam"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// How many index entries there are under `index`.
+fn index_entries(harness: &Harness, index: &str) -> usize {
+    harness
+        .db
+        .reader()
+        .index_scan(
+            &IndexId::new(index),
+            harness.db.latest_ts(),
+            &refhir_types::Interval::all(),
+            Order::Asc,
+        )
+        .unwrap()
+        .len()
+}
+
+fn remove_dirs(dirs: &[&Path]) {
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A patient with a family name and a birth date, the two things the small R4 package lets a
+/// string search parameter read.
+fn born(id: &str, family: &str, birth_date: &str) -> Value {
+    let mut resource = patient(id, true, family);
+    resource["birthDate"] = json!(birth_date);
+    resource
+}
+
+#[test]
+fn a_newer_package_version_gives_a_search_parameter_its_new_expression() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    assert_eq!(search_total(&harness, "label", "1990"), 0);
+
+    // The same URL and code, another expression: the server takes it, and serves that one.
+    let v2 = upgrade_package("0.2.0", &[("label", "label", "Patient.birthDate")]);
+    install_dir(&harness, &v2).unwrap();
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("label", "Patient.birthDate", "0.2.0")]
+    );
+    // A resource that was there is indexed for it, and no longer found by what the old one made.
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 0);
+    // A resource created after is indexed for it, and one that is updated is again.
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p2", "Jones", "2001-02-03")}),
+    );
+    assert_eq!(search_total(&harness, "label", "2001"), 1);
+    apply(
+        &harness,
+        "Patient/update",
+        json!({"id": "p1", "resource": born("p1", "Brown", "1985-01-01")}),
+    );
+    assert_eq!(search_total(&harness, "label", "1985"), 1);
+    assert_eq!(search_total(&harness, "label", "1990"), 0);
+    assert_eq!(search_total(&harness, "label", "Brown"), 0);
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_package_version_that_gives_a_search_parameter_another_code_is_searched_by_that_code() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    assert!(advertised(&harness).contains(&"label".to_string()));
+    let entries = index_entries(&harness, "Patient/label");
+    assert!(entries > 0);
+
+    let v2 = upgrade_package("0.2.0", &[("label", "alias", "Patient.name")]);
+    install_dir(&harness, &v2).unwrap();
+    // The old code is refused, as any parameter the server does not have, and the new one finds
+    // what was there.
+    let message = refusal(&harness, "label");
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+    assert_eq!(search_total(&harness, "alias", "Smith"), 1);
+    // Only the new code is advertised, and nothing is left under the old one.
+    let names = advertised(&harness);
+    assert!(names.contains(&"alias".to_string()), "{names:?}");
+    assert!(!names.contains(&"label".to_string()), "{names:?}");
+    assert_eq!(index_entries(&harness, "Patient/label"), 0);
+    assert_eq!(index_entries(&harness, "Patient/alias"), entries);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("alias", "Patient.name", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_search_parameter_that_a_newer_package_version_leaves_out_is_gone() {
+    let harness = ready();
+    let kept = ("label", "label", "Patient.name");
+    let v1 = upgrade_package("0.1.0", &[kept, ("nick", "nick", "Patient.birthDate")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    assert!(index_entries(&harness, "Patient/nick") > 0);
+    let jobs = harness.store.load_backfills().unwrap().len();
+
+    let v2 = upgrade_package("0.2.0", &[kept]);
+    install_dir(&harness, &v2).unwrap();
+    let message = refusal(&harness, "nick");
+    assert!(
+        message.contains("unsupported search parameter nick"),
+        "{message}"
+    );
+    assert!(!advertised(&harness).contains(&"nick".to_string()));
+    assert_eq!(index_entries(&harness, "Patient/nick"), 0);
+    // The one it kept is as it was: nothing was indexed again for it.
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    assert_eq!(harness.store.load_backfills().unwrap().len(), jobs);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("label", "Patient.name", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn installing_an_older_package_version_again_changes_nothing() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    let v2 = upgrade_package("0.2.0", &[("label", "alias", "Patient.birthDate")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    install_dir(&harness, &v2).unwrap();
+    let before = installed_packages(&harness);
+
+    // Once it is installed already (a server started on its first release again), and through
+    // the registry, which is never asked for it.
+    install_dir(&harness, &v1).unwrap();
+    let cache = temp_dir("upgrade-again");
+    install_with(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        "example.upgrade@0.1.0",
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    install_with(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        v1.to_str().unwrap(),
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(installed_packages(&harness), before);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("alias", "Patient.birthDate", "0.2.0")]
+    );
+    let message = refusal(&harness, "label");
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+    assert_eq!(search_total(&harness, "alias", "1990"), 1);
+
+    // And a database that never had the older version does not take it.
+    let fresh = ready();
+    install_dir(&fresh, &v2).unwrap();
+    install_dir(&fresh, &v1).unwrap();
+    install_with(
+        &fresh.store,
+        &fresh.db,
+        &fresh.catalog,
+        "example.upgrade@0.1.0",
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    assert!(!installed_packages(&fresh).contains(&"example.upgrade@0.1.0".to_string()));
+    assert_eq!(
+        upgrade_parameters(&fresh),
+        [upgrade_row("alias", "Patient.birthDate", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2, &cache]);
+}
+
+#[test]
+fn a_package_version_that_cannot_be_installed_leaves_the_database_on_the_one_it_has() {
+    let harness = ready();
+    let v1 = upgrade_package(
+        "0.1.0",
+        &[
+            ("label", "label", "Patient.name"),
+            ("nick", "nick", "Patient.birthDate"),
+        ],
+    );
+    let other = parameter_package(
+        "example.other",
+        "1.0.0",
+        &[],
+        &[("other", "other", "Patient.identifier")],
+    );
+    install_dir(&harness, &v1).unwrap();
+    install_dir(&harness, &other).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    let held = upgrade_parameters(&harness);
+    let packages = installed_packages(&harness);
+
+    // It disagrees with itself, and it disagrees with another package.
+    let within = upgrade_package(
+        "0.2.0",
+        &[
+            ("label", "label", "Patient.birthDate"),
+            ("one", "nick", "Patient.name"),
+            ("two", "nick", "Patient.identifier"),
+        ],
+    );
+    let against = upgrade_package(
+        "0.2.0",
+        &[
+            ("label", "label", "Patient.birthDate"),
+            ("other", "other", "Patient.name"),
+        ],
+    );
+    for broken in [&within, &against] {
+        let err = install_dir(&harness, broken).unwrap_err().to_string();
+        assert!(
+            err.contains("conflicts") || err.contains("different expressions"),
+            "{err}"
+        );
+        assert_eq!(installed_packages(&harness), packages);
+        assert_eq!(upgrade_parameters(&harness), held);
+        assert_eq!(search_total(&harness, "label", "Smith"), 1);
+        assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    }
+
+    // A server that starts again reads what is there, and either release of the package starts it.
+    let reopened = Catalog::open(&harness.store).unwrap();
+    let found = run(
+        &harness.db,
+        &reopened,
+        "Patient/search",
+        &json!({"label": "Smith"}),
+    )
+    .unwrap();
+    assert_eq!(found.value["total"], 1);
+    install_dir(&harness, &v1).unwrap();
+    assert_eq!(upgrade_parameters(&harness), held);
+    let fixed = upgrade_package("0.2.0", &[("label", "label", "Patient.birthDate")]);
+    install_dir(&harness, &fixed).unwrap();
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    let message = refusal(&harness, "nick");
+    assert!(
+        message.contains("unsupported search parameter nick"),
+        "{message}"
+    );
+    remove_dirs(&[&v1, &other, &within, &against, &fixed]);
+}
+
+#[test]
+fn a_newer_version_of_a_dependency_replaces_the_search_parameters_of_the_installed_one() {
+    let harness = ready();
+    let lib1 = parameter_package(
+        "example.lib",
+        "1.0.0",
+        &[],
+        &[("label", "label", "Patient.name")],
+    );
+    let lib2 = parameter_package(
+        "example.lib",
+        "2.0.0",
+        &[],
+        &[("label", "label", "Patient.birthDate")],
+    );
+    let app = dep_package("example.app", "1.0.0", &[("example.lib", "2.0.0")]);
+    install_dir(&harness, &lib1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    let cache = temp_dir("upgrade-dependency");
+    install_with(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        app.to_str().unwrap(),
+        &registry(&[("example.lib", "2.0.0", &lib2)]),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 0);
+    remove_dirs(&[&lib1, &lib2, &app, &cache]);
+}
+
 fn write_terms_package(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
