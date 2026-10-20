@@ -1552,6 +1552,18 @@ fn date_period(text: &str) -> Option<(i64, i64)> {
     Some((start, start + width))
 }
 
+/// What a date is ordered by under `_sort`: the moment it starts, as a number written to a fixed
+/// width, so that the order of the text is the order of time. The text of a date is not: it is in
+/// the zone it was written in, and `T23:30:00+01:00` is earlier than `T23:00:00Z`. `None` for text
+/// that is no date.
+pub(crate) fn date_sort_key(text: &str) -> Option<String> {
+    // The year is four digits, so a moment is within 2.6e14 ms of 1970; this puts every one above
+    // zero and below sixteen digits.
+    const SHIFT: i64 = 1_000_000_000_000_000;
+    let (start, _) = date_period(text)?;
+    Some(format!("{:016}", start + SHIFT))
+}
+
 /// How far ahead of UTC a zone (`Z`, `+01:00`, `-05`) is, in milliseconds.
 fn zone_offset(zone: &str) -> Option<i64> {
     if zone == "Z" {
@@ -2628,6 +2640,67 @@ mod tests {
         assert!(!date_probe_reads("2026-13-45", "2026-10-18"));
         assert!(date_probe_reads("ne2026-10-18", "2000-01-01"));
         assert!(date_probe_reads("ap2026-10-18", "2000-01-01"));
+    }
+
+    /// The index holds the text of a date, so what a window reads from it has to reach the text of
+    /// the same moment in any zone: the one that is on the other side of a day or a month in
+    /// the text from where it is in time.
+    #[test]
+    fn the_index_ranges_of_a_window_reach_the_same_moment_in_every_zone() {
+        // The window 2026-09-30T23:00:00Z up to 2026-10-31T23:00:00Z, and 2026-10-31T22:30:00Z
+        // written the ways a clinic might.
+        for stored in [
+            "2026-10-31T22:30:00Z",
+            "2026-10-31T23:30:00+01:00",
+            "2026-10-31T17:30:00-05:00",
+            "2026-11-01T04:00:00+05:30",
+            "2026-11-01T12:30:00+14:00",
+            "2026-10-31T10:30:00-12:00",
+        ] {
+            for query in [
+                "ge2026-09-30T23:00:00Z",
+                "ge2026-10-01T00:00:00+01:00",
+                "ge2026-09-30T11:00:00-12:00",
+                "lt2026-10-31T23:00:00Z",
+                "lt2026-11-01T00:00:00+01:00",
+                "lt2026-11-01T13:00:00+14:00",
+            ] {
+                assert!(
+                    date_probe_reads(query, stored),
+                    "{query} does not read {stored}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dates_are_ordered_by_the_moment_they_start() {
+        let key = |text: &str| super::date_sort_key(text).unwrap_or_else(|| panic!("{text}"));
+        // In the order of time, though not of the text.
+        let in_time = [
+            "2026-10-31T10:30:00-12:00", // 22:30Z
+            "2026-10-31T22:30:00Z",
+            "2026-10-31T23:30:00+01:00", // the same moment as the one before
+            "2026-10-31T22:30:00.001Z",
+            "2026-10-31T22:30:01Z",
+            "2026-11-01T04:00:00+05:30", // 22:30Z on the 31st, again
+        ];
+        assert_eq!(key(in_time[0]), key(in_time[1]));
+        assert_eq!(key(in_time[1]), key(in_time[2]));
+        assert!(key(in_time[2]) < key(in_time[3]));
+        assert!(key(in_time[3]) < key(in_time[4]));
+        assert_eq!(key(in_time[1]), key(in_time[5]));
+        // A date is where it starts, and one that begins first sorts first.
+        assert!(key("2026") < key("2026-10"));
+        assert_eq!(key("2026-10-31"), key("2026-10-31T00:00:00Z"));
+        assert!(key("2026-10-31T23:59:59Z") < key("2026-11-01"));
+        // Far from 1970 either way, and the text of the key is as wide as the text of another.
+        assert!(key("0001-01-01") < key("1969-12-31T23:59:59Z"));
+        assert!(key("1969-12-31T23:59:59Z") < key("1970-01-01"));
+        assert!(key("1970-01-01") < key("9999-12-31T23:59:59Z"));
+        assert_eq!(key("0001-01-01").len(), key("9999-12-31").len());
+        assert_eq!(super::date_sort_key("not a date"), None);
+        assert_eq!(super::date_sort_key(""), None);
     }
 
     #[test]

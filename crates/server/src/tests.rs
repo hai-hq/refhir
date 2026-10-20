@@ -106,6 +106,91 @@ pub(crate) fn patient(id: &str) -> Value {
     })
 }
 
+/// A window of time asked for in one zone finds what was written in another, over HTTP and the way
+/// a billing client sends it: `date` twice, an offset written `%2B01:00`. The same moment is found
+/// whatever zone it was stored in and whatever zone the window is written in, and a moment whose
+/// clock reads inside the window but is outside it is not.
+#[tokio::test]
+async fn http_date_window_compares_moments_whatever_zone_they_are_written_in() {
+    let (db, catalog, store) = memory();
+    let app = app(db, catalog, store);
+    let created = put(&app, patient("p1")).await;
+    assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+    for (id, written) in [
+        ("z", "2026-10-31T22:30:00Z"),
+        ("plus01", "2026-10-31T23:30:00+01:00"),
+        // 2026-11-01T03:30:00Z, though its clock reads 22:30 on the 31st.
+        ("late", "2026-10-31T22:30:00-05:00"),
+        // 2026-09-30T10:30:00Z, though its clock reads the 1st of October.
+        ("early", "2026-10-01T00:30:00+14:00"),
+    ] {
+        let made = put(
+            &app,
+            json!({"resourceType": "Observation", "id": id, "status": "final",
+                "code": {"text": "visit"}, "subject": {"reference": "Patient/p1"},
+                "effectiveDateTime": written}),
+        )
+        .await;
+        assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
+    }
+    let ids = |reply: &Reply| -> Vec<String> {
+        let mut found: Vec<String> = reply.body["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        found.sort();
+        found
+    };
+    // The window 2026-09-30T23:00:00Z up to 2026-10-31T23:00:00Z, in UTC and in other zones.
+    for uri in [
+        "/Observation?date=ge2026-09-30T23:00:00Z&date=lt2026-10-31T23:00:00Z",
+        "/Observation?date=ge2026-10-01T00:00:00%2B01:00&date=lt2026-11-01T00:00:00%2B01:00",
+        "/Observation?date=ge2026-09-30T18:00:00-05:00&date=lt2026-10-31T18:00:00-05:00",
+        "/Observation?date=ge2026-10-01T04:30:00%2B05:30&date=lt2026-10-31T23:00:00Z",
+    ] {
+        let reply = send(&app, "GET", uri, None, None).await;
+        assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.body);
+        assert_eq!(ids(&reply), ["plus01", "z"], "{uri}");
+    }
+    // The clinic's day, 2026-11-01 at +01:00, holds only the moment that is in it.
+    let day = send(
+        &app,
+        "GET",
+        "/Observation?date=ge2026-11-01T00:00:00%2B01:00&date=lt2026-11-02T00:00:00%2B01:00",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(ids(&day), ["late"]);
+    // A `+` that is not encoded reads as a space, and the answer says so instead of finding
+    // nothing.
+    let plain = send(
+        &app,
+        "GET",
+        "/Observation?date=ge2026-10-01T00:00:00+01:00",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(plain.status, StatusCode::BAD_REQUEST);
+    assert!(plain.body.to_string().contains("%2B"), "{}", plain.body);
+    // Newest first, by the moment and not by the clock in the text.
+    let sorted = send(&app, "GET", "/Observation?_sort=-date", None, None).await;
+    let order: Vec<&str> = sorted.body["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["resource"]["id"].as_str().unwrap())
+        .collect();
+    // The two that are the same moment are in the order of their ids.
+    assert_eq!(order, ["late", "plus01", "z", "early"]);
+}
+
 /// The searches a booking client sends: a comma between values is OR, a parameter given twice is
 /// AND, and `_include:iterate` is a control of the search, not an unknown parameter.
 #[tokio::test]

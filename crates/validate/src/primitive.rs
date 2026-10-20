@@ -61,7 +61,9 @@ const PATTERNS: &[Pattern] = &[
     },
     Pattern {
         code: "dateTime",
-        regex: r"^-?[0-9]{4}(-(0[1-9]|1[0-2])(-(0[0-9]|[1-2][0-9]|3[0-1])(T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|(\+|-)((0[0-9]|1[0-3]):[0-5][0-9]|14:00))?)?)?)?$",
+        // As in R4: a time has seconds and a zone. A time with no zone names no moment, and a
+        // search by date compares moments, so it is refused rather than read as some zone.
+        regex: r"^-?[0-9]{4}(-(0[1-9]|1[0-2])(-(0[0-9]|[1-2][0-9]|3[0-1])(T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|(\+|-)((0[0-9]|1[0-3]):[0-5][0-9]|14:00)))?)?)?$",
     },
     Pattern {
         code: "instant",

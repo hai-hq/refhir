@@ -73,6 +73,8 @@ fn unprocessable<T: std::fmt::Debug>(result: Result<T, RunError>) -> Value {
     }
 }
 
+mod date_search;
+
 fn patient(id: &str, active: bool, family: &str) -> Value {
     json!({
         "resourceType": "Patient",

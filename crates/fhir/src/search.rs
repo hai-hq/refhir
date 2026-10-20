@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
 use crate::error::FhirError;
-use crate::extract::{Probe, ReferenceId};
+use crate::extract::{date_sort_key, Probe, ReferenceId, SearchKind};
 use crate::ops::decorate;
 use crate::resolve::TxHost;
 
@@ -1716,13 +1716,20 @@ fn sort_key(catalog: &Catalog, model: &ResourceModel, resource: &Value, name: &s
         return String::new();
     };
     let host = SortHost;
-    param
+    let first = param
         .extractor
         .indexed(resource, catalog.path_model(), &host)
         .into_iter()
         .next()
-        .unwrap_or_default()
-        .to_lowercase()
+        .unwrap_or_default();
+    // A date is ordered by the moment it names, not by its text, which is in the zone it was
+    // written in.
+    if param.extractor.kind() == SearchKind::Date {
+        if let Some(key) = date_sort_key(&first) {
+            return key;
+        }
+    }
+    first.to_lowercase()
 }
 
 /// The sort keys of a resource, one for each `_sort` term.

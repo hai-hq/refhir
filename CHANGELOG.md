@@ -85,6 +85,15 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **A time with no zone is refused when it is stored.** `"effectiveDateTime": "2026-10-31T22:30:00"`
+  was accepted, though FHIR asks for a zone with every time in a `dateTime`, and a search by a date
+  read it as UTC whatever zone its writer meant. It is now a `400` that names the element. A date
+  with no time (`2026-10-31`) still needs no zone, and a search value with no zone is still read as
+  UTC. A system that sends times with no zone has to say which zone they are in.
+- **`_sort` on a date orders by the moment, not by the text.** `_sort=date` put
+  `2026-10-31T22:30:00-05:00` (a time on 1 November, UTC) among the times of 31 October, and
+  `…T23:30:00+01:00` after `…T23:00:00Z` though it is earlier. It now orders by when each date
+  starts, so the order is the same whatever zone the times were written in.
 - **A date search compares to the millisecond and in the zone a time is written in.** It compared
   in whole seconds, so two times in one second could not be told apart (`lt` on a time missed a time
   33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an

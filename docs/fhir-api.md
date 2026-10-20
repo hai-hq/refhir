@@ -49,11 +49,8 @@ an entry of a history shows when that version was written.
   missed.
 - **Cards** for what is new: `_since` on [`$health-cards-issue`](health-cards.md).
 
-A date, or a time that stops short, stands for the start of what it names, and a time with no zone
-is UTC. Dates and times are compared to the millisecond and in the zone they are written in, so
-`2026-10-18T06:00:00+01:00` and `2026-10-18T05:00:00Z` are the same moment. A value such as
-`2026-10-18T04:45:36.5` stands for a tenth of a second, and one with no fraction for the whole
-second.
+How a date and a time are compared, in this and in any other search by a date, is under [Searching
+by a date or a time](#searching-by-a-date-or-a-time).
 
 Versions written before the server kept times have none. A search by time does not find them, and a
 history by time lists them only when the time is earlier than the first version that has one. A
@@ -153,6 +150,48 @@ resource gets its time the next time it is written.
   they match, and a conditional delete must not delete a different resource than the one the
   client described), nor to a `batch` or `transaction` entry, GraphQL or a live query. A
   `_handling` in the query string does nothing.
+
+### Searching by a date or a time
+
+A `date` parameter finds a resource by the moment it names, not by the text it was written as. That
+is every parameter of the type: `date` on an `Encounter` or an `Observation`, `created` on a
+`Claim`, a `ClaimResponse` and a `PaymentReconciliation`, `birthdate` on a `Patient`, and
+`_lastUpdated`.
+
+- **A time with a zone is a moment, whatever zone it is written in.** `2026-10-31T23:30:00+01:00`
+  and `2026-10-31T22:30:00Z` are the same moment, so these two searches find the same resources, and
+  both find an Encounter stored with either:
+
+  ```
+  GET /Encounter?date=ge2026-09-30T23:00:00Z&date=lt2026-10-31T23:00:00Z
+  GET /Encounter?date=ge2026-10-01T00:00:00%2B01:00&date=lt2026-11-01T00:00:00%2B01:00
+  ```
+
+  Give `date` twice for a window (a parameter given twice is AND). Write the `+` of a zone as `%2B`
+  in a URL: an unencoded `+` reads as a space, and the search is refused with a message that says
+  so.
+- **A value says how much it names.** `2026` is the year, `2026-10` the month, `2026-10-31` the
+  day, `2026-10-31T22:30` the minute, `2026-10-31T22:30:00` the second and `2026-10-31T22:30:00.5`
+  the tenth of a second. A stored value says the same of itself, so a stored `2026-10-31` is the
+  whole of that day. Times are compared to the millisecond.
+- **A date has no zone, and is read as UTC.** `2026-10-31` is the day that starts at
+  `2026-10-31T00:00:00Z`. Ask for a day in another zone with its two times:
+  `date=ge2026-11-01T00:00:00%2B01:00&date=lt2026-11-02T00:00:00%2B01:00`.
+- **The prefixes compare periods.** `eq` (the default, and `ap`, which is read as `eq`) finds what
+  overlaps the period the value names, and `ne` what does not. `gt` and `lt` take what reaches above
+  or below the value, so a year that holds days after a day is above that day; `sa` and `eb`
+  take only what lies wholly after or before it. `ge` and `le` are those and equal. A value to the
+  second is a period of one second, so `gt2026-10-31T22:30:00Z` does not find a time stored as
+  `2026-10-31T23:30:00+01:00`, which is the same second.
+- **A time with no zone** is read as UTC when it is a search value. A stored one is refused: FHIR
+  asks for a zone with every time in a `dateTime`, a time with no zone names no moment, and a search
+  by a moment could only guess. Writing `"effectiveDateTime": "2026-10-31T22:30:00"` is a `400`
+  that names the element. A date with no time (`2026-10-31`) needs no zone.
+- **A period is searched at both ends**, each in the zone it was written in: an Encounter is found
+  by its `period.start` and by its `period.end`. A period with no end is found by its start.
+- **`_sort`** on a date, `_sort=date` or `_sort=-date`, orders by the moment each one starts, so the
+  order is the same whatever zones were written. Dates that start at the same moment are in the
+  order of their ids.
 
 ## Operations
 
