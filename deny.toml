@@ -7,6 +7,7 @@
 yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2023-0071", reason = "Marvin timing attack on the rsa crate's private-key operations; no fixed release exists. ReFHIR uses rsa only to generate, encode and decode the SMART signing key and to read its public parameters for the JWKS. Tokens are signed by jsonwebtoken through ring, and nothing calls an rsa sign or decrypt function. Revisit if that changes." },
+    { id = "RUSTSEC-2026-0381", reason = "A bundled emSign root, removed in webpki-roots 1.0.10. The lockfile has webpki-roots 1.0.10, and that is the only copy of the root list: webpki-roots 0.26.11, which ureq 2 pins and which this advisory still names because its patched range starts at 1.0.10, holds no roots of its own and only re-exports webpki-roots 1. Remove this when ureq moves to webpki-roots 1. Until then keep the lockfile's webpki-roots 1.x at 1.0.10 or later: this entry would not show an older one." },
 ]
 
 [licenses]
