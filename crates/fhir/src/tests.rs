@@ -2480,6 +2480,46 @@ fn a_search_parameter_that_a_newer_package_version_adds_finds_the_resources_alre
     remove_dirs(&[&v1, &v2]);
 }
 
+#[test]
+fn a_changed_parameter_whose_install_stopped_before_its_backfill_was_queued_is_indexed_at_the_next_run(
+) {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+
+    // The install stores 0.2.0 and publishes its catalog, and the process stops before it queues
+    // the backfill: the old parameter is gone, the new one waits for an index nothing will build.
+    let v2 = upgrade_package("0.2.0", &[("label", "label", "Patient.birthDate")]);
+    let follow_up = stage_package_deferred(&harness.store, &harness.db, &harness.catalog, &v2)
+        .unwrap()
+        .expect("the changed parameter waits for its index");
+    publish(&harness.store, &harness.catalog).unwrap();
+    drop(follow_up);
+    assert!(harness
+        .store
+        .load_backfills()
+        .unwrap()
+        .iter()
+        .all(|job| job.done));
+    let message = refusal(&harness, "label");
+    assert!(!message.is_empty());
+
+    // The next start queues the job, and the parameter is searched by the new expression.
+    run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 0);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("label", "Patient.birthDate", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
 /// Version `version` of a package of one resource type, `Widget`, unless `defined` is false, and
 /// then of nothing at all.
 fn widget_package(version: &str, defined: bool) -> PathBuf {

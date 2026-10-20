@@ -50,8 +50,12 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   another package depends on. Other packages are never replaced, and a clash between a parameter
   and one of theirs still refuses the install. Installing the same version again, or a version
   older than the one the database holds, changes nothing, so a server can be started again on an
-  earlier release of its package. An install that fails leaves the database on the version it had.
-  Resources of a type that only the older version defined stay in the database but are not served.
+  earlier release of its package. An install that fails leaves the database on the version it had,
+  and a search parameter that an install left waiting for its index (it stopped before the
+  backfill was queued) is queued at the next start. A version written differently but meaning the
+  same, such as `0.10` for `0.10.0`, replaces the one installed. A replica keeps answering from its
+  previous catalog until the primary has finished indexing. Resources of a type that only the older
+  version defined stay in the database but are not served.
   See [Upgrading a package](docs/configuration.md#upgrading-a-package).
 
 ## [0.0.2] - 2026-10-19

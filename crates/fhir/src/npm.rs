@@ -808,13 +808,17 @@ fn nothing_to_install(
     name: &str,
     version: &str,
 ) -> Result<bool, FhirError> {
-    if already_installed(store, name, version)? {
+    let installed = store.load_packages().map_err(FhirError::from)?;
+    if installed
+        .iter()
+        .any(|package| package.name == name && package.version == version)
+    {
         return Ok(true);
     }
-    let Some(newer) = newer_installed(store, name, version)? else {
+    let Some(newer) = newer_version(&installed, name, version) else {
         return Ok(false);
     };
-    note_newer_installed(name, version, &newer);
+    note_newer_installed(name, version, newer);
     Ok(true)
 }
 

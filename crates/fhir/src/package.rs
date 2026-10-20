@@ -10,7 +10,7 @@ use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
     compare_versions, same_expression, ConformanceStore, InstallError, InstallOutcome,
     NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology,
-    PackageRows, ParamStatus, RetiredParam, StoredPackage,
+    PackageRows, ParamStatus, RetiredParam, StoredBackfill, StoredPackage,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::TerminologyBuilder;
@@ -137,20 +137,24 @@ pub fn stage_package_dir(
     stage_package(store, db, catalog, path, true).map(|_| ())
 }
 
-/// What is left to do for a package that is stored: backfill the search parameters that are stored
-/// but not yet searchable, and clear the index of the ones an older version had and nothing has now.
-pub(crate) struct PendingBackfill {
+/// What is left to do once a package is stored, and the catalog is published: queue the backfills
+/// of its search parameters that are stored but not yet searchable, and clear the index of the ones
+/// an older version had and nothing has now. Neither can be part of storing the package: the
+/// watermark of a backfill, and the point after which no writer uses an index that is going, are
+/// known only once the new catalog is in use.
+pub(crate) struct InstallFollowUp {
     package_id: i64,
     bases: BTreeSet<String>,
     retired: Vec<RetiredParam>,
 }
 
-impl PendingBackfill {
-    /// Queue the backfill jobs. Call this after the catalog that writers use has been
-    /// published: the watermark is read here, and backfill leaves documents newer than it to
-    /// writers, which only index a parameter once the catalog knows it. The same goes for clearing
-    /// the index of a parameter that is gone, since a writer that still has the old catalog would
-    /// write to it again.
+impl InstallFollowUp {
+    /// Queue the backfill jobs and clear the retired indexes. Call this after the catalog that
+    /// writers use has been published: the watermark is read here, and backfill leaves documents
+    /// newer than it to writers, which only index a parameter once the catalog knows it. The same
+    /// goes for clearing the index of a parameter that is gone, since a writer that still has the
+    /// old catalog would write to it again. A process that stops before this leaves parameters
+    /// pending without a job, which [`run_backfills`] queues at the next start.
     pub(crate) fn create(
         &self,
         store: &dyn ConformanceStore,
@@ -196,6 +200,13 @@ pub(crate) fn newer_version<'a>(
         .max_by(|left, right| compare_versions(left, right))
 }
 
+/// Whether `installed` holds `name` at `version` or a newer one, so that installing it adds nothing.
+pub(crate) fn held_at_least(installed: &[StoredPackage], name: &str, version: &str) -> bool {
+    installed
+        .iter()
+        .any(|package| package.name == name && compare_versions(&package.version, version).is_ge())
+}
+
 /// What is said when a package is not installed because a newer version of it is.
 pub(crate) fn note_newer_installed(name: &str, version: &str, newer: &str) {
     tracing::warn!(
@@ -206,13 +217,13 @@ pub(crate) fn note_newer_installed(name: &str, version: &str, newer: &str) {
 }
 
 /// Store a package without rebuilding the catalog, for installing several in a row. The caller
-/// must [`publish`], then [`PendingBackfill::create`] each returned item and run the backfills.
+/// must [`publish`], then [`InstallFollowUp::create`] each returned item and run the backfills.
 pub(crate) fn stage_package_deferred(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
     path: &Path,
-) -> Result<Option<PendingBackfill>, FhirError> {
+) -> Result<Option<InstallFollowUp>, FhirError> {
     stage_package(store, db, catalog, path, false)
 }
 
@@ -222,7 +233,7 @@ fn stage_package(
     catalog: &RwLock<Catalog>,
     path: &Path,
     publish_now: bool,
-) -> Result<Option<PendingBackfill>, FhirError> {
+) -> Result<Option<InstallFollowUp>, FhirError> {
     let (name, version) = package_identity(path)?;
     let installed = store.load_packages().map_err(FhirError::from)?;
     if let Some(package) = installed
@@ -266,7 +277,7 @@ pub(crate) fn stage_new_package(
     read_time: std::time::Duration,
     read_label: &str,
     publish_now: bool,
-) -> Result<Option<PendingBackfill>, FhirError> {
+) -> Result<Option<InstallFollowUp>, FhirError> {
     let started = std::time::Instant::now();
     let name = package.name.clone();
     let version = package.version.clone();
@@ -350,7 +361,7 @@ pub(crate) fn stage_package_in_pieces(
     content: Option<&str>,
     feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
     publish_now: bool,
-) -> Result<Option<PendingBackfill>, FhirError> {
+) -> Result<Option<InstallFollowUp>, FhirError> {
     let started = std::time::Instant::now();
     let mut counts = (0, 0, 0);
     let mut counting_feed = |rows: &mut dyn PackageRows| {
@@ -412,7 +423,7 @@ fn finish_staging(
     (started, stored): (std::time::Instant, std::time::Duration),
     outcome: InstallOutcome,
     publish_now: bool,
-) -> Result<Option<PendingBackfill>, FhirError> {
+) -> Result<Option<InstallFollowUp>, FhirError> {
     if publish_now {
         publish(store, catalog)?;
     }
@@ -442,7 +453,7 @@ fn finish_staging(
     if !outcome.inserted {
         return Ok(None);
     }
-    let pending = PendingBackfill {
+    let pending = InstallFollowUp {
         package_id: outcome.package_id,
         bases: outcome
             .newly_pending
@@ -463,7 +474,10 @@ pub fn run_backfills(
     db: &Database,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let jobs = store.load_backfills().map_err(FhirError::from)?;
+    let mut jobs = store.load_backfills().map_err(FhirError::from)?;
+    if requeue_stranded_backfills(store, db, &jobs)? {
+        jobs = store.load_backfills().map_err(FhirError::from)?;
+    }
     let mut refreshed = false;
     // A resource type with no document has nothing to index, and installing a package into a
     // database that holds no resources yet leaves a job for every type it adds parameters to.
@@ -533,6 +547,53 @@ pub fn run_backfills(
     Ok(())
 }
 
+/// Queue a backfill for each search parameter that is pending and has no unfinished job, and say
+/// whether any was queued. An install stores a package before it queues the jobs (they follow the
+/// publish), so one that stopped in between, killed while the catalog was rebuilt, leaves its
+/// parameters pending for good: the package is there, so installing it again does nothing. Where
+/// the old parameter was replaced by a new one, as when an expression changed, the parameter would
+/// not be searchable at all.
+fn requeue_stranded_backfills(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    jobs: &[StoredBackfill],
+) -> Result<bool, FhirError> {
+    let mut stranded: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for parameter in store.load_search_parameters().map_err(FhirError::from)? {
+        if parameter.status != ParamStatus::Pending {
+            continue;
+        }
+        let covered = jobs.iter().any(|job| {
+            !job.done && job.package_id == parameter.package_id && job.tablet == parameter.base
+        });
+        if !covered {
+            stranded
+                .entry(parameter.package_id)
+                .or_default()
+                .insert(parameter.base);
+        }
+    }
+    if stranded.is_empty() {
+        return Ok(false);
+    }
+    let watermark = db
+        .latest_ts()
+        .to_i64()
+        .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
+    for (package_id, bases) in stranded {
+        let bases: Vec<String> = bases.into_iter().collect();
+        tracing::warn!(
+            target: "refhir_engine",
+            "search parameters of package {package_id} on {} were waiting for an index with no job to build it; queueing one",
+            bases.join(", ")
+        );
+        store
+            .insert_backfills(package_id, watermark, &bases)
+            .map_err(FhirError::from)?;
+    }
+    Ok(true)
+}
+
 /// [`publish`] for a change that only moved search parameters from pending to ready, which is all
 /// a backfill changes: the parameters are read and compiled again, and the rest of the catalog,
 /// which is what takes the time to build, is kept.
@@ -571,7 +632,7 @@ pub(crate) fn finish_install(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
-    pending: &[PendingBackfill],
+    pending: &[InstallFollowUp],
     result: Result<(), FhirError>,
 ) -> Result<(), FhirError> {
     let finish = || -> Result<(), FhirError> {

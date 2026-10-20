@@ -1997,7 +1997,8 @@ fn insert_search_parameters(
     Ok(plan.newly_pending)
 }
 
-/// The ids of the packages named `name` at a version older than `version` that the tenant has: the
+/// The ids of the packages named `name` at a version older than `version`, or ordering the same (a
+/// package of that exact version is not among them: it was found before), that the tenant has: the
 /// ones a package of that version replaces.
 fn older_versions(
     tx: &mut Transaction<'_>,
@@ -2009,7 +2010,7 @@ fn older_versions(
         .query(&sql_package_versions(scope), &[&name])
         .map_err(definite)?
         .iter()
-        .filter(|row| compare_versions(&row.get::<_, String>(1), version).is_lt())
+        .filter(|row| compare_versions(&row.get::<_, String>(1), version).is_le())
         .map(|row| row.get(0))
         .collect())
 }
@@ -2049,8 +2050,6 @@ fn remove_superseded(
         ),
         format!("DELETE FROM index_backfills WHERE {and}package_id = ANY($1)"),
         format!("DELETE FROM value_set_expansion WHERE {and}package_id = ANY($1)"),
-        format!("DELETE FROM structure_definitions WHERE {and}package_id = ANY($1)"),
-        format!("DELETE FROM terminology WHERE {and}package_id = ANY($1)"),
     ] {
         tx.execute(&statement, &[&superseded]).map_err(definite)?;
     }
@@ -2063,42 +2062,64 @@ fn remove_superseded(
         )
         .map_err(definite)?;
     }
-    let delete_rows = format!("DELETE FROM packages WHERE {and}id = ANY($1)");
+    // The package's own rows go together with its row in the list of packages.
+    let own = [
+        format!("DELETE FROM structure_definitions WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM terminology WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM packages WHERE {and}id = ANY($1)"),
+    ];
     match scope {
         Scope::Classic => {
-            tx.execute(&delete_rows, &[&superseded]).map_err(definite)?;
+            for statement in &own {
+                tx.execute(statement, &[&superseded]).map_err(definite)?;
+            }
         }
         Scope::Tenant(_) => {
-            // The row goes unless a link of another tenant still names it, which this crate never
-            // makes but the database permits and a tenant cannot see through its row policy: that
-            // tenant keeps its package, and the statement is undone alone. (A shared package's row
-            // is instance 0's, which the filter leaves alone.)
+            // Unless a link of another tenant still names the package, which this crate never
+            // makes but the database permits and a tenant cannot see through its row policy: then
+            // the package stays whole for that tenant, and everything above this is undone.
             let mut attempt = tx.savepoint("drop_superseded").map_err(definite)?;
-            match attempt.execute(&delete_rows, &[&superseded]) {
-                Ok(_) => attempt.commit().map_err(definite)?,
-                Err(err)
-                    if err.code() == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {}
-                Err(err) => return Err(InstallError::Persist(definite(err))),
+            let mut kept = false;
+            for statement in &own {
+                match attempt.execute(statement, &[&superseded]) {
+                    Ok(_) => {}
+                    Err(err)
+                        if err.code()
+                            == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) =>
+                    {
+                        kept = true;
+                        break;
+                    }
+                    Err(err) => return Err(InstallError::Persist(definite(err))),
+                }
+            }
+            if !kept {
+                attempt.commit().map_err(definite)?;
             }
         }
     }
-    let mut retired = Vec::new();
-    for (base, code) in gone {
-        let defined: bool = tx
-            .query_one(
-                &format!(
-                    "SELECT EXISTS (SELECT 1 FROM search_parameters \
-                     WHERE {and}base = $1 AND code = $2)"
-                ),
-                &[&base, &code],
-            )
-            .map_err(definite)?
-            .get(0);
-        if !defined {
-            retired.push(RetiredParam { base, code });
-        }
+    if gone.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(retired)
+    // What nothing defines now, from all the removed pairs at once.
+    let (bases, codes): (Vec<String>, Vec<String>) = gone.into_iter().unzip();
+    let defined = scope.and_in("s");
+    Ok(tx
+        .query(
+            &format!(
+                "SELECT g.base, g.code FROM UNNEST($1::text[], $2::text[]) AS g(base, code) \
+                 WHERE NOT EXISTS (SELECT 1 FROM search_parameters s \
+                                   WHERE {defined}s.base = g.base AND s.code = g.code)"
+            ),
+            &[&bases, &codes],
+        )
+        .map_err(definite)?
+        .iter()
+        .map(|row| RetiredParam {
+            base: row.get(0),
+            code: row.get(1),
+        })
+        .collect())
 }
 
 /// Where a run of search parameters goes: a tenant's (or a classic database's) own table, or the

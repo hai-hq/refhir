@@ -585,7 +585,9 @@ pub enum ParamPlan {
 /// Whether `row` indexes a document as `param` would, so that what it already indexed holds for
 /// `param`: the same type and expression, and the same `target` and `component`, which are the
 /// other parts of a definition that an index is made from. When this cannot be told apart the
-/// answer is no, which costs a backfill that finds nothing to change.
+/// answer is no, which costs a backfill that finds nothing to change. A composite is never the
+/// same: its keys also depend on the types of the parameters its components name, which a row
+/// does not say.
 fn indexes_the_same(param: &NewSearchParameter, row: &InstalledParam) -> bool {
     let incoming = param.expression.clone().unwrap_or_default();
     // The parts of a definition besides its type and expression that decide what is indexed: the
@@ -601,7 +603,8 @@ fn indexes_the_same(param: &NewSearchParameter, row: &InstalledParam) -> bool {
             .collect();
         (targets, value.get("component").cloned())
     };
-    param.param_type == row.param_type
+    param.param_type != "composite"
+        && param.param_type == row.param_type
         && same_expression(&param.base, &row.expression, &incoming)
         && shape(&param.json) == shape(&row.json)
 }
@@ -817,12 +820,9 @@ pub struct PendingParam {
     pub code: String,
 }
 
-/// A search parameter that an older version of a package had and no search parameter has now.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetiredParam {
-    pub base: String,
-    pub code: String,
-}
+/// A search parameter that an older version of a package had and no search parameter has now,
+/// named like a pending one by its base and code.
+pub type RetiredParam = PendingParam;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallOutcome {
@@ -1093,7 +1093,8 @@ pub trait ConformanceStore: Send + Sync {
     /// transaction, so it is there whole or not at all.
     ///
     /// The newest version of a package is the one in force. A package that is stored replaces the
-    /// older versions of the same name (ordered by [`compare_versions`]) in that transaction: each
+    /// older versions of the same name (ordered by [`compare_versions`], so `0.10` replaces `0.10.0`
+    /// as well, a version that orders the same and is written another way) in that transaction: each
     /// is removed with everything it holds, its definitions, search parameters, terminology and
     /// expansions, and so is its row in the list of packages, so what the store holds is one version
     /// of each package. What the new version defines again takes the place of what it defined
@@ -1300,6 +1301,30 @@ mod clash_tests {
             plan_search_parameter(&param("Patient.b", false), &clash).unwrap(),
             ParamPlan::Conflict
         );
+    }
+
+    #[test]
+    fn a_superseded_composite_is_indexed_again_and_a_plain_parameter_is_not() {
+        let superseded = |param_type: &str| InstalledParam {
+            superseded: true,
+            param_type: param_type.into(),
+            ..row(1, "Patient.same", false)
+        };
+        let incoming = |param_type: &str| NewSearchParameter {
+            param_type: param_type.into(),
+            ..param("Patient.same", false)
+        };
+        let status = |param_type: &str| match plan_search_parameter(
+            &incoming(param_type),
+            &[superseded(param_type)],
+        )
+        .unwrap()
+        {
+            ParamPlan::Insert { status, .. } => status,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(status("string"), Some(ParamStatus::Ready));
+        assert_eq!(status("composite"), None);
     }
 
     #[test]
@@ -3461,8 +3486,15 @@ pub mod conformance {
                 .filter(|job| job.package_id == package_id)
                 .count()
         };
+        // The first names the parameters it may mark ready, which is a row of its own to remove
+        // with it; the other leaves the choice to the parameters that are pending.
         store
-            .insert_backfill(first.package_id, 1, "Patient", &[])
+            .insert_backfill(
+                first.package_id,
+                1,
+                "Patient",
+                &[format!("http://example.org/sp/{tag}/keep")],
+            )
             .unwrap();
         store
             .insert_backfill(other.package_id, 1, "Patient", &[])
@@ -3646,16 +3678,19 @@ pub mod conformance {
         assert!(rows()
             .iter()
             .all(|(short, _, _, id)| { short == "bystander" || *id == fifth.package_id }));
-        // `0.10` is the same version as `0.10.0`, and a version is not replaced by one that is not
-        // newer: it clashes with it, as parameters of two packages do.
-        let err = store
+        // `0.10` is `0.10.0` written another way, and replaces it all the same, so the two are
+        // never held side by side, where a changed parameter would clash with itself.
+        let sixth = store
             .install_package(&package(
                 &name,
                 "0.10",
                 vec![param("keep", "Patient.other")],
             ))
-            .unwrap_err();
-        assert!(matches!(err, InstallError::Expression { .. }), "{err}");
+            .unwrap();
+        assert!(sixth.inserted);
+        assert_eq!(shorts(&sixth.newly_pending), ["keep"]);
+        assert_eq!(package_id("0.10.0"), None);
+        assert_eq!(package_id("0.10"), Some(sixth.package_id));
     }
     use refhir_types::TabletId;
 

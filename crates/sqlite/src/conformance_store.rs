@@ -1037,8 +1037,9 @@ impl<'a, 'c> Installer<'a, 'c> {
     }
 }
 
-/// The ids of the stored packages named `name` at a version older than `version`: the ones a
-/// package of that version replaces.
+/// The ids of the stored packages named `name` at a version older than `version`, or ordering the
+/// same (a package of that exact version is not among them: it was found before), which a package
+/// of that version replaces.
 fn older_versions(
     tx: &Transaction<'_>,
     name: &str,
@@ -1056,7 +1057,7 @@ fn older_versions(
         .map_err(definite)?;
     Ok(rows
         .into_iter()
-        .filter(|(_, held)| compare_versions(held, version).is_lt())
+        .filter(|(_, held)| compare_versions(held, version).is_le())
         .map(|(id, _)| id)
         .collect())
 }
