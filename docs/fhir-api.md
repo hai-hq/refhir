@@ -21,12 +21,43 @@ Every resource type gets the same set:
 | System | `transaction` and `batch` (`POST /`), `history`, `search` |
 
 Every resource is versioned, and the server sets `meta.versionId` to the commit timestamp of the
-write. A version conflict (`If-Match`) is a `409`, after the server has retried optimistic
+write, and `meta.lastUpdated` to the time it received it (see [When a resource was
+written](#when-a-resource-was-written)). A version conflict (`If-Match`) is a `409`, after the server has retried optimistic
 concurrency conflicts. A `transaction` Bundle is one atomic commit, which is what lets
 [live queries](sync-protocol.md) move from one consistent snapshot to the next.
 
 `PUT` does not create a resource under an id the client chooses unless you opt in; see
 [Resource ids](#resource-ids).
+
+### When a resource was written
+
+The server sets `meta.lastUpdated` on every version it writes, to the time it received the write: a
+FHIR instant in UTC, to the millisecond (`2026-10-18T04:45:36.123Z`). A value in the body of a
+create or an update is replaced, never kept. A patch, a change of tags with `$meta-add`, and each
+entry of a transaction are writes like any other. Each version keeps its own time, so a `vread` or
+an entry of a history shows when that version was written.
+
+- **Search by it** with `_lastUpdated` and the usual prefixes:
+  `GET [type]?_lastUpdated=ge2026-10-18T04:45:36Z`. Give it twice for a window:
+  `_lastUpdated=ge2026-10-01&_lastUpdated=lt2026-11-01`.
+- **List by it** with `_since` on a history: `GET [type]/_history?_since=2026-10-18T04:45:36Z`, or
+  `GET /_history?_since=...` for the whole server, lists the versions written at or after that time.
+  A value that is all digits is read as it always was, as a version of the server's log, so write
+  a date with its month and day (`2026-01-01`), never as a year alone. A deletion
+  has no time of its own, so the list starts at the last change before the time and holds any
+  deletion since then: a deletion from just before the time may be listed, and one after it is never
+  missed.
+- **Cards** for what is new: `_since` on [`$health-cards-issue`](health-cards.md).
+
+A date, or a time that stops short, stands for the start of what it names, and a time with no zone
+is UTC. Dates and times are compared to the millisecond and in the zone they are written in, so
+`2026-10-18T06:00:00+01:00` and `2026-10-18T05:00:00Z` are the same moment. A value such as
+`2026-10-18T04:45:36.5` stands for a tenth of a second, and one with no fraction for the whole
+second.
+
+Versions written before the server kept times have none. A search by time does not find them, and a
+history by time lists them only when the time is earlier than the first version that has one. A
+resource gets its time the next time it is written.
 
 ## Search
 
@@ -127,16 +158,33 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 
 | Operation | Where | Notes |
 |-----------|-------|-------|
-| `$everything` | `Patient/[id]` | |
+| `$everything` | `Patient/[id]` | Holds only the kinds of resource the caller's scopes let them read |
 | `$export` | system, type, instance | Asynchronous (`202`, then `GET /export/{job}` and `GET /export/{job}/file`). Jobs are durable; see [Operations](operations.md#export-jobs) |
 | `$validate` | type, instance | Validates against the installed StructureDefinitions |
 | `$match` | `Patient` | Finds the Patients that may be the person a Patient resource describes. See [Finding a patient](#finding-a-patient-patientmatch) |
 | `$meta`, `$meta-add`, `$meta-delete` | instance | |
-| `$document` | `Composition/[id]` | |
-| `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology) |
+| `$document` | `Composition/[id]` | A document Bundle of the Composition and what it references; see [Documents](#documents) |
+| `$summary` | `Patient`, `Patient/[id]` | An International Patient Summary. See [Patient summary](patient-summary.md) |
+| `$health-cards-issue` | `Patient/[id]` | A SMART Health Card, where the server has a signing key. See [SMART Health Cards](health-cards.md) |
+| `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology). Each also answers a `GET`, and with SMART needs only `read` |
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
+
+### Documents
+
+`Composition/[id]/$document` returns a Bundle of type `document`. The Composition is its first entry,
+followed by every resource it references, and every resource those reference in turn, each once.
+The Bundle has an `identifier` and a `timestamp`, every entry has a `urn:uuid` `fullUrl`, and each
+reference to a resource in the document points at that `fullUrl`, so the document stands on its own.
+A resource the caller's scopes do not let them read is left out. A document of more than 1000
+resources is refused with a `422`.
+
+Resources are validated entry by entry. A Bundle's `entry.resource`, and any other element that
+holds a whole resource, is checked as the resource it holds, against the profiles the element
+names and the ones the resource states in `meta.profile`. A narrative (`text.div`) is checked for
+what FHIR allows in one: a single `div` in the XHTML namespace, only the basic formatting
+elements, no script, and some text.
 
 ### Finding a patient: `Patient/$match`
 
@@ -383,8 +431,40 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 
 ## Terminology
 
-`ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
+`ValueSet/$expand` takes `url`, and optionally `filter`, `count`, `offset` and `activeOnly`, as a `POST` (a JSON body or a Parameters resource) or as a `GET` with the same names in the query string:
+
+```bash
+curl 'http://localhost:8080/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/organization-type&filter=hospital&count=10'
+```
+
+The other terminology operations (`$validate-code`, `$lookup`, `$subsumes`, `$translate`) take their parameters the same way: as a `POST`, or as a `GET` with plain names in the query string (`system`, `code`, `display`, `url`, `version`, `codeA`, `codeB`, `targetsystem`, `abstract`). A parameter that is not a plain value, a `coding` or a `codeableConcept`, is sent as a `POST`. R4 also defines `$expand` and `$validate-code` on a value set, `$validate-code` and `$subsumes` on a code system, and `$translate` on a concept map at the instance level: `POST` or `GET /ValueSet/[id]/$expand`, `/ValueSet/[id]/$validate-code`, `/CodeSystem/[id]/$validate-code`, `/CodeSystem/[id]/$subsumes`, `/ConceptMap/[id]/$translate`. The instance is a resource the server stores, one written through the API, and what is asked of it is asked of the value set, code system (at its `version`) or concept map its `url` names, so no `url` or `system` is given. The body may be empty. An id the server does not store is `404`, and one whose `url` a package defines too is `409` (the terminology holds one definition of a url, and cannot tell which is meant: ask by `url`); a value set that came from a package has no id to ask for, and is expanded by `url`. (`CodeSystem/$lookup` is defined on the type only.)
+
+These operations change nothing, so with SMART they need only the `read` permission, whichever way they are sent, and a client that may only create is refused.
+
+It returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned without saying so, because a client cannot tell it from a complete one.
+
+One partial case is expanded, and says so. A code system whose `content` is `example` holds a few representative concepts, and HL7 publishes value sets that are nothing but a whole-system include of one (`service-category` and `service-type`, which offer choices for `HealthcareService`). Such a value set expands to the concepts the server holds for the system, and the expansion names each system that is only a sample in an `expansion.parameter` called `<system>|<version>#CodeSystem.content`, as R4 describes, with the content mode as its value:
+
+```json
+"expansion": {
+  "parameter": [{
+    "name": "http://terminology.hl7.org/CodeSystem/service-category|4.0.1#CodeSystem.content",
+    "valueCode": "example"
+  }],
+  "total": 38, "offset": 0, "contains": ["…"]
+}
+```
+
+A client that needs a closed list checks for such a parameter. Only an include of the whole system is expanded this way: a filter on a sample, an exclusion of one, a sample that holds no concepts, and a `fragment` are still refused. `$validate-code` against such a value set answers from the same list, with `result` false and a `message` that says the list is only a sample for a code outside it. A resource whose binding is to one is not rejected for a code the sample lacks: the validator reports that the code cannot be checked.
+
+The ValueSet an expansion comes in has the `status` of the value set it was expanded from (`active` when that says nothing), and the expansion carries the `timestamp` R4 requires, the time the server produced it for the request, and an `identifier` (a `urn:uuid` made from what the expansion says, so the same for two answers that say the same). What was asked that shaped it is listed in `expansion.parameter`: `filter`, `count`, `offset` and `activeOnly`. An entry says `"inactive": true` when its code system says the concept is inactive (no longer to be used, but kept to make sense of old data); it is still listed, unless the request said `activeOnly=true`, which leaves such codes out (and the `total` counts what is left).
+
+An expansion marks an entry `"abstract": true` when its code system says the concept is not to be selected as a value (the `notSelectable` property, which HL7's v3 code systems use for their grouping concepts: `_ActCoverageTypeCode`, `_ActInsuranceTypeCode` and so on in `coverage-type`). The entry is still listed, for navigation, so a picker leaves out the entries that carry the flag. `$validate-code` takes R4's `abstract` input: with `abstract=false` an abstract code is not valid (`result` false, and the `message` says why), with `abstract=true` it is valid, and without the input it is valid and the `message` says it is a grouping concept.
+
+HL7 publishes `ValueSet/currencies` (the binding of `Money.currency`) as an include of ISO 4217 and no CodeSystem for it, so ReFHIR installs one itself at start: the active alphabetic currency codes (178, with their numeric codes and English names, for example `NGN` Nigerian Naira). `$expand` of `currencies` lists them, `filter=naira` finds `NGN`, `$validate-code` accepts a real code and refuses an unknown one, and a `Money` with an unknown `currency` is refused by `$validate` and on write. It is installed once, as the package `refhir.builtin.terminology`, after the packages the server installs, so it works with packages you add with `--package` too. A server that has no package has nothing to use it, and gets it at the first start after it has one.
 
 A code system can be installed in several versions, and each is kept. Name a version with `system|version` (or `include.version`) and the expansion uses exactly that one. A version that is not installed is refused, and the error lists the versions that are. With no version named, a value set from a package uses the versions its own package holds, and a value set you write through the API, or one whose package does not hold the system, uses the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed, and the latest installed version otherwise. The expansion records the version it read. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
+
+A value set that includes a code system, or a value set, that another package carries is expanded when both are installed, whichever came first: after any install the server tries again the value sets that have no expansion (see `$expandability` for the ones that still have none), and it stores what it can now expand.
 
 `POST /ValueSet/$expandability` reports, for the value sets named in `url` (a string, an array, or `url` parameters of a Parameters resource), whether each can be expanded and why not; with none named it lists every loaded value set that cannot. Use it as a deployment check for the value sets a UI depends on. `POST /ImplementationGuide/$install` adds a warning to its response for any value set the package made unexpandable, and the server logs how many there are at start-up.

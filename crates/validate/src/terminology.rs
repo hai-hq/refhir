@@ -393,17 +393,42 @@ struct Expansion {
     /// The package whose definition of the value set this was expanded from, when known. It says
     /// which content of a code system version two packages hold differently the codes came from.
     scope: Option<Scope>,
+    /// The code systems this expansion includes whole although they hold only some of their
+    /// concepts, by `(url, version)`, each with the `content` mode that says so (`example`). The
+    /// expansion lists the concepts that are installed, which a client must not read as all
+    /// there are.
+    incomplete: BTreeMap<(String, String), String>,
+    /// The codes the expansion lists for navigation and that cannot be selected as a value:
+    /// their code system marks them `notSelectable`. R4 calls them `abstract`.
+    abstract_codes: BTreeSet<(String, String)>,
+    /// The codes the expansion lists that their code system says are inactive: no longer to be
+    /// used, but kept to make sense of old data.
+    inactive_codes: BTreeSet<(String, String)>,
+    /// The `status` of the value set definition it was expanded from, which R4 requires of the
+    /// ValueSet an expansion is returned in.
+    status: Option<String>,
 }
 
 impl Expansion {
     /// Bytes this expansion takes, roughly: what a cache weighs it by.
     fn approx_bytes(&self) -> usize {
-        self.codes
+        self.incomplete
             .iter()
-            .map(|((system, code), display)| {
-                96 + system.len() + code.len() + display.as_ref().map_or(0, String::len)
-            })
+            .map(|((system, version), content)| 72 + system.len() + version.len() + content.len())
             .sum::<usize>()
+            + self
+                .abstract_codes
+                .iter()
+                .chain(&self.inactive_codes)
+                .map(|(system, code)| 48 + system.len() + code.len())
+                .sum::<usize>()
+            + self
+                .codes
+                .iter()
+                .map(|((system, code), display)| {
+                    96 + system.len() + code.len() + display.as_ref().map_or(0, String::len)
+                })
+                .sum::<usize>()
             + self
                 .systems
                 .iter()
@@ -1067,8 +1092,16 @@ fn order_held(
 /// it. A value set is held until every code system is in, and for good when it cannot be
 /// expanded, so everything else (the narrative, the descriptions, contacts and usage notes) is
 /// left out of what is held: the narrative alone is more than half the text of the value sets in
-/// the R4 packages.
-const VALUE_SET_FIELDS: [&str; 5] = ["resourceType", "url", "version", "compose", "expansion"];
+/// the R4 packages. What is kept is what an expansion is made from, and what it says of the value
+/// set it came from (its `status`, which R4 requires of the ValueSet an expansion is returned in).
+const VALUE_SET_FIELDS: [&str; 6] = [
+    "resourceType",
+    "url",
+    "version",
+    "status",
+    "compose",
+    "expansion",
+];
 
 fn slim_value_set(mut value_set: Json) -> Json {
     if let Json::Object(fields) = &mut value_set {
@@ -1465,9 +1498,28 @@ impl MemoryTerminology {
     }
 
     pub fn expand(&self, url: &str, text_filter: Option<&str>) -> Option<Json> {
+        self.expand_with(url, text_filter, false)
+    }
+
+    /// The expansion of `url`, as a ValueSet. With `active_only` the codes their code system calls
+    /// inactive are left out, which R4's `activeOnly` asks for.
+    pub fn expand_with(
+        &self,
+        url: &str,
+        text_filter: Option<&str>,
+        active_only: bool,
+    ) -> Option<Json> {
         let expansion = self.expansion_of(canonical(url))?;
         let mut contains = Vec::new();
         for ((system, code), display) in &expansion.codes {
+            if active_only
+                && !expansion.inactive_codes.is_empty()
+                && expansion
+                    .inactive_codes
+                    .contains(&(system.clone(), code.clone()))
+            {
+                continue;
+            }
             if let Some(filter) = text_filter {
                 let display_text = display.as_deref().unwrap_or("");
                 let needle = filter.to_ascii_lowercase();
@@ -1484,13 +1536,111 @@ impl MemoryTerminology {
             if let Some(display) = display {
                 entry["display"] = json!(display);
             }
+            flag_entry(&expansion, system, code, &mut entry);
             contains.push(entry);
+        }
+        let mut body = json!({"contains": contains});
+        // R4 has an expansion say which code systems it drew on only in part: a parameter named
+        // `[canonical]#CodeSystem.content` whose value is the system's content mode.
+        let parameters: Vec<Json> = expansion
+            .incomplete
+            .iter()
+            .map(|((system, version), content)| {
+                json!({
+                    "name": format!("{}#CodeSystem.content", versioned_url(system, version)),
+                    "valueCode": content
+                })
+            })
+            .collect();
+        if !parameters.is_empty() {
+            body["parameter"] = Json::Array(parameters);
         }
         Some(json!({
             "resourceType": "ValueSet",
             "url": canonical(url),
-            "expansion": {"contains": contains}
+            // R4 requires a status. The definition's own, when the expansion recorded one.
+            "status": expansion.status.as_deref().unwrap_or("active"),
+            "expansion": body
         }))
+    }
+
+    /// Whether `code` is among the codes `value_set` expands to. `None` when it has no expansion.
+    fn membership(&self, value_set: &str, system: Option<&str>, code: &str) -> Option<Membership> {
+        let expansion = self.expansion_of(canonical(value_set))?;
+        let system = system.map(canonical);
+        let found = match system {
+            Some(system) => {
+                expansion
+                    .codes
+                    .contains_key(&(system.to_string(), code.to_string()))
+                    || expansion
+                        .codes
+                        .contains_key(&("".to_string(), code.to_string()))
+            }
+            None => expansion.codes.keys().any(|(_, item)| item == code),
+        };
+        Some(if found {
+            Membership::In
+        } else if expansion
+            .incomplete
+            .keys()
+            .any(|(incomplete, _)| system.is_none_or(|system| system == incomplete))
+        {
+            Membership::NotListed
+        } else {
+            Membership::Out
+        })
+    }
+
+    /// Whether the expansion of `value_set` lists `code` as abstract.
+    fn is_abstract_in(&self, value_set: &str, system: Option<&str>, code: &str) -> bool {
+        let Some(expansion) = self.expansion_of(canonical(value_set)) else {
+            return false;
+        };
+        if expansion.abstract_codes.is_empty() {
+            return false;
+        }
+        let flagged = |listed: &str| {
+            expansion
+                .abstract_codes
+                .contains(&(listed.to_string(), code.to_string()))
+        };
+        match system.map(canonical) {
+            Some(system) => flagged(system) || flagged(""),
+            // With no system, a code that is listed under several is abstract only if each of
+            // them says so: one of them may be the one that is meant.
+            None => {
+                let mut listed = expansion
+                    .codes
+                    .keys()
+                    .filter(|(_, item)| item == code)
+                    .map(|(listed, _)| listed.as_str())
+                    .peekable();
+                let any = listed.peek().is_some();
+                any && listed.all(flagged)
+            }
+        }
+    }
+
+    /// What an expansion that lists only some of a code system's concepts leaves unsaid, for
+    /// `value_set`; `None` when its expansion is complete or there is none.
+    fn incompleteness(&self, value_set: &str) -> Option<String> {
+        let expansion = self.expansion_of(canonical(value_set))?;
+        if expansion.incomplete.is_empty() {
+            return None;
+        }
+        let systems: Vec<String> = expansion
+            .incomplete
+            .iter()
+            .map(|((system, version), content)| {
+                format!("{} (content '{content}')", versioned_url(system, version))
+            })
+            .collect();
+        Some(format!(
+            "only some of the concepts of code system {} are installed, so a code that is not \
+             among them cannot be ruled out",
+            systems.join(", ")
+        ))
     }
 
     /// `version` is the version of the code system, when the caller names one; `system|version`
@@ -1502,6 +1652,23 @@ impl MemoryTerminology {
         version: Option<&str>,
         code: &str,
         display: Option<&str>,
+    ) -> Json {
+        self.validate_code_as(value_set, system, version, code, display, None)
+    }
+
+    /// [`Self::validate_code`] with R4's `abstract` input: `Some(true)` says the caller is in a
+    /// context where a code that is only a grouping concept (`notSelectable` in its code system)
+    /// may be used, and `Some(false)` says it is not, which makes such a code invalid. Without it
+    /// the code is valid, as it is a member of the value set, and the answer's `message` says
+    /// that it is abstract, which R4 allows a valid answer to carry as a hint.
+    pub fn validate_code_as(
+        &self,
+        value_set: Option<&str>,
+        system: Option<&str>,
+        version: Option<&str>,
+        code: &str,
+        display: Option<&str>,
+        abstract_allowed: Option<bool>,
     ) -> Json {
         if let Some(url) = value_set {
             if let (Some(system), Some(requested)) =
@@ -1516,16 +1683,46 @@ impl MemoryTerminology {
                     return self.system_not_loaded(base, Some(requested));
                 }
             }
-            return match self.contains(url, system, code) {
-                TermAnswer::Yes => code_parameters(
+            return match self.membership(url, system, code) {
+                Some(Membership::In) if self.is_abstract_in(url, system, code) => {
+                    match abstract_allowed {
+                        Some(false) => abstract_refused(code),
+                        allowed => {
+                            let answer = code_parameters(
+                                true,
+                                display_of_bound(self, url, system, code, display),
+                                None,
+                            );
+                            // Said unless the caller has said it is where such a code belongs.
+                            if allowed.is_none() {
+                                with_abstract_hint(answer, code)
+                            } else {
+                                answer
+                            }
+                        }
+                    }
+                }
+                Some(Membership::In) => code_parameters(
                     true,
                     display_of_bound(self, url, system, code, display),
                     None,
                 ),
-                TermAnswer::No => {
+                Some(Membership::Out) => {
                     code_parameters(false, None, Some("code is not in the value set"))
                 }
-                TermAnswer::Unknown => json!({
+                // The answer agrees with `$expand`: the code is not among the ones it lists. It
+                // says why that is not the end of it.
+                Some(Membership::NotListed) => {
+                    let why = self.incompleteness(url).unwrap_or_default();
+                    code_parameters(
+                        false,
+                        None,
+                        Some(&format!(
+                            "code is not among the concepts listed for the value set: {why}"
+                        )),
+                    )
+                }
+                None => json!({
                     "resourceType": "OperationOutcome",
                     "issue": [{
                         "severity": "warning",
@@ -1545,11 +1742,23 @@ impl MemoryTerminology {
         let url = canonical(url);
         let requested = version.or(suffix).filter(|version| !version.is_empty());
         match self.systems.resolve(url, requested) {
-            Some((_, index)) if index.codes.contains_key(code) => code_parameters(
-                true,
-                display_message(describe_index(&index, code), display),
-                None,
-            ),
+            Some((_, index)) if index.codes.contains_key(code) => {
+                let answer = code_parameters(
+                    true,
+                    display_message(describe_index(&index, code), display),
+                    None,
+                );
+                if !index.codes.get(code).is_some_and(concept_not_selectable) {
+                    answer
+                } else {
+                    // R4 gives `abstract` to this operation as it does to the value set's.
+                    match abstract_allowed {
+                        Some(false) => abstract_refused(code),
+                        Some(true) => answer,
+                        None => with_abstract_hint(answer, code),
+                    }
+                }
+            }
             Some((_, index)) if index.closed => {
                 code_parameters(false, None, Some("code is not in the code system"))
             }
@@ -1607,7 +1816,19 @@ impl MemoryTerminology {
         offset: usize,
         count: Option<usize>,
     ) -> Option<Json> {
-        let mut expanded = self.expand(url, text_filter)?;
+        self.expand_page_with(url, text_filter, false, offset, count)
+    }
+
+    /// [`Self::expand_page`] with [`Self::expand_with`]'s `active_only`.
+    pub fn expand_page_with(
+        &self,
+        url: &str,
+        text_filter: Option<&str>,
+        active_only: bool,
+        offset: usize,
+        count: Option<usize>,
+    ) -> Option<Json> {
+        let mut expanded = self.expand_with(url, text_filter, active_only)?;
         let Some(contains) = expanded
             .pointer_mut("/expansion/contains")
             .and_then(|value| value.as_array_mut())
@@ -1751,28 +1972,20 @@ impl MemoryTerminology {
 
 impl Terminology for MemoryTerminology {
     fn contains(&self, value_set: &str, system: Option<&str>, code: &str) -> TermAnswer {
-        let Some(expansion) = self.expansion_of(canonical(value_set)) else {
-            return TermAnswer::Unknown;
-        };
-        let found = match system.map(canonical) {
-            Some(system) => {
-                expansion
-                    .codes
-                    .contains_key(&(system.to_string(), code.to_string()))
-                    || expansion
-                        .codes
-                        .contains_key(&("".to_string(), code.to_string()))
-            }
-            None => expansion.codes.keys().any(|(_, item)| item == code),
-        };
-        if found {
-            TermAnswer::Yes
-        } else {
-            TermAnswer::No
+        match self.membership(value_set, system, code) {
+            None => TermAnswer::Unknown,
+            Some(Membership::In) => TermAnswer::Yes,
+            Some(Membership::Out) => TermAnswer::No,
+            // A code missing from a sample says nothing about the system it was taken from, and
+            // `No` would have a `required` binding reject real codes.
+            Some(Membership::NotListed) => TermAnswer::Unknown,
         }
     }
 
     fn expansion_problem(&self, value_set: &str) -> Option<String> {
+        if let Some(reason) = self.incompleteness(value_set) {
+            return Some(reason);
+        }
         let failures = self.why_not_expanded(value_set)?;
         // A value set that is simply absent has nothing to explain.
         if matches!(failures.as_slice(), [ExpansionFailure::NotLoaded { .. }]) {
@@ -1892,6 +2105,8 @@ pub enum ExpansionFailure {
         system: String,
         version: Option<String>,
         content: String,
+        /// How many of its concepts are installed.
+        concepts: usize,
         filter: Option<String>,
     },
     /// The system is installed, but not at the version the include names.
@@ -1971,11 +2186,13 @@ impl ExpansionFailure {
                 system,
                 version,
                 content,
+                concepts,
                 filter,
             } => {
                 let system = versioned(system, version);
                 let held = match content.as_str() {
                     "not-present" => "none of its concepts are installed".to_string(),
+                    "example" if *concepts == 0 => "none of its concepts are installed".to_string(),
                     other => format!("its content is '{other}', not complete"),
                 };
                 match filter {
@@ -2067,6 +2284,10 @@ impl TerminologyChange {
 #[derive(Clone, Debug)]
 pub struct ExpansionUpdate {
     pub url: String,
+    /// The package whose definition of the value set the expansion is of, which is the package it
+    /// is stored under, when the update is one that can say (see
+    /// [`MemoryTerminology::expand_waiting`]).
+    pub scope: Option<Scope>,
     /// The expansion document to store, or `None` when the value set has no expansion now.
     pub document: Option<Json>,
 }
@@ -2263,6 +2484,7 @@ impl MemoryTerminology {
                 Ok(expansion) => {
                     updates.push(ExpansionUpdate {
                         url: url.clone(),
+                        scope: expansion.scope,
                         document: Some(expansion_document(&url, &expansion)),
                     });
                     self.expansions.insert(url, Answer::held(expansion));
@@ -2278,6 +2500,7 @@ impl MemoryTerminology {
                     }
                     updates.push(ExpansionUpdate {
                         url,
+                        scope: None,
                         document: None,
                     });
                 }
@@ -2286,14 +2509,86 @@ impl MemoryTerminology {
         for url in gone {
             updates.push(ExpansionUpdate {
                 url,
+                scope: None,
                 document: None,
             });
         }
         updates
     }
 
+    /// Try again the value sets that have no expansion, against the terminology as it is now.
+    ///
+    /// Installing a package stores the expansions of its own value sets, made from its own
+    /// resources. A value set that waits on a code system (or a value set) that another package
+    /// carries is left without one, and a package that arrives later does not give it one: nothing
+    /// asks the value sets that were waiting. This does. It costs one attempt for each value set
+    /// that still has no expansion, which is some of the value sets the packages hold, and not
+    /// more for a larger package than for a small one. The value sets that can be expanded now are
+    /// expanded and are no longer waiting; the update of each says which package's definition it
+    /// is of, so that it can be stored there. The ones that still cannot are left as they were.
+    pub fn expand_waiting(&mut self) -> Vec<ExpansionUpdate> {
+        if self.unexpanded.is_empty() {
+            return Vec::new();
+        }
+        let results: Vec<(String, Result<Expansion, Failures>)> = {
+            let pool = UnexpandedPool(self);
+            let mut expander = Expander {
+                systems: &self.systems,
+                value_sets: &pool,
+                scope: None,
+                strict: false,
+                known: self,
+                cache: BTreeMap::new(),
+                stack: Vec::new(),
+            };
+            self.unexpanded
+                .keys()
+                .map(|url| (url.clone(), expander.expand_in_use(url)))
+                .collect()
+        };
+        let mut updates = Vec::new();
+        for (url, result) in results {
+            match result {
+                Ok(expansion) => {
+                    updates.push(ExpansionUpdate {
+                        url: url.clone(),
+                        scope: expansion.scope,
+                        document: Some(expansion_document(&url, &expansion)),
+                    });
+                    self.unexpanded.remove(&url);
+                    self.reasons.remove(&url);
+                    self.expansions.insert(url, Answer::held(expansion));
+                }
+                // Why it still cannot be is now what was just found, not what it was before.
+                Err(failures) => {
+                    self.reasons.insert(url, failures);
+                }
+            }
+        }
+        updates
+    }
+
     fn remove_map(&mut self, map_url: &str) {
         self.maps.retain(|map| map.url != map_url);
+    }
+}
+
+/// Where `code` stands against an expansion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Membership {
+    In,
+    Out,
+    /// Not among the codes listed, but the expansion lists only some of what one of its code
+    /// systems holds, so the code may still belong.
+    NotListed,
+}
+
+/// `system|version`, or the system alone when the version is not known.
+fn versioned_url(system: &str, version: &str) -> String {
+    if version.is_empty() {
+        system.to_string()
+    } else {
+        format!("{system}|{version}")
     }
 }
 
@@ -2503,6 +2798,10 @@ impl Expander<'_> {
         self.stack.pop();
         if let Ok(expansion) = &mut expansion {
             expansion.scope = Some(owner);
+            expansion.status = value_set
+                .get("status")
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
         }
         self.cache.insert(key, expansion.clone());
         expansion
@@ -2555,6 +2854,8 @@ fn expand_value_set(
                 Ok(excluded) => {
                     for code in excluded.codes.keys() {
                         expansion.codes.remove(code);
+                        expansion.abstract_codes.remove(code);
+                        expansion.inactive_codes.remove(code);
                     }
                 }
                 Err(more) => failures.extend(more),
@@ -2643,6 +2944,11 @@ fn expand_include(
         .map(|value| value.to_string());
     if let Some(concepts) = include.get("concept").and_then(|value| value.as_array()) {
         let mut listed = Expansion::default();
+        let described = system.as_ref().and_then(|system| {
+            expander
+                .resolve(system, version.as_deref())
+                .map(|(_, index)| index)
+        });
         for concept in concepts {
             let Some(code) = concept.get("code").and_then(|value| value.as_str()) else {
                 continue;
@@ -2652,18 +2958,17 @@ fn expand_include(
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string())
                 .or_else(|| {
-                    system.as_ref().and_then(|system| {
-                        expander
-                            .resolve(system, version.as_deref())
-                            .and_then(|(_, index)| {
-                                index
-                                    .codes
-                                    .get(code)
-                                    .and_then(|concept| concept.display.clone())
-                            })
+                    described.as_ref().and_then(|index| {
+                        index
+                            .codes
+                            .get(code)
+                            .and_then(|concept| concept.display.clone())
                     })
                 });
             let system_name = system.clone().unwrap_or_default();
+            if let Some(concept) = described.as_ref().and_then(|index| index.codes.get(code)) {
+                note_concept(&mut listed, &system_name, code, concept);
+            }
             listed
                 .codes
                 .insert((system_name, code.to_string()), display);
@@ -2710,6 +3015,7 @@ fn expand_include(
             system: system.clone(),
             version: version.clone(),
             content: index.content.clone(),
+            concepts: index.codes.len(),
             filter,
         }]
     };
@@ -2729,6 +3035,9 @@ fn expand_include(
                     .codes
                     .get(&code)
                     .and_then(|concept| concept.display.clone());
+                if let Some(concept) = index.codes.get(&code) {
+                    note_concept(&mut expansion, &system, &code, concept);
+                }
                 expansion.codes.insert((system.clone(), code), display);
             }
         }
@@ -2738,14 +3047,93 @@ fn expand_include(
         return Ok(expansion);
     }
     if !index.closed {
-        return Err(incomplete(None));
+        // A whole `example` system lists the few concepts it holds, and says so: HL7 publishes
+        // value sets (`service-category`, `service-type`) that are nothing but that include,
+        // offered as choices. Only an include can be completed that way. A `fragment` has no
+        // telling which concepts are missing, an exclusion of a sample would leave what it could
+        // not name, and a system with no concepts would be an empty list that looks like an
+        // answer.
+        if at.section != "include" || index.content != "example" || index.codes.is_empty() {
+            return Err(incomplete(None));
+        }
+        let read = expander
+            .version_of(&system, version.as_deref())
+            .unwrap_or_else(|| version.clone().unwrap_or_default());
+        expansion
+            .incomplete
+            .insert((system.clone(), read), index.content.clone());
     }
     for (code, concept) in &index.codes {
+        note_concept(&mut expansion, &system, code, concept);
         expansion
             .codes
             .insert((system.clone(), code.clone()), concept.display.clone());
     }
     Ok(expansion)
+}
+
+/// Record what the code system says about a code the expansion lists: that it is not to be
+/// selected as a value (`notSelectable`, the concept property HL7 code systems use for grouping
+/// concepts), and that it is inactive.
+fn note_concept(expansion: &mut Expansion, system: &str, code: &str, concept: &Concept) {
+    let key = || (system.to_string(), code.to_string());
+    if concept_not_selectable(concept) {
+        expansion.abstract_codes.insert(key());
+    }
+    if concept.inactive {
+        expansion.inactive_codes.insert(key());
+    }
+}
+
+fn concept_not_selectable(concept: &Concept) -> bool {
+    concept
+        .properties
+        .iter()
+        .any(|(name, value)| name == "notSelectable" && value == "true")
+}
+
+/// The answer to an abstract code when the caller said it is not where such a code belongs.
+fn abstract_refused(code: &str) -> Json {
+    code_parameters(
+        false,
+        None,
+        Some(&format!(
+            "code {code} is abstract: a grouping concept that is not selectable as a value"
+        )),
+    )
+}
+
+/// A valid answer for an abstract code that says so in its `message`, which R4 allows on a valid
+/// answer. R4 allows one `message`, so the hint joins the one the answer has (a display that does
+/// not match) and does not make a second.
+fn with_abstract_hint(mut answer: Json, code: &str) -> Json {
+    let hint = format!(
+        "code {code} is abstract: a grouping concept that is not meant to be selected as a value"
+    );
+    let parameters = answer["parameter"].as_array_mut().expect("parameters");
+    match parameters.iter_mut().find(|item| item["name"] == "message") {
+        Some(message) => {
+            let existing = message["valueString"].as_str().unwrap_or("").to_string();
+            message["valueString"] = json!(format!("{existing}; {hint}"));
+        }
+        None => parameters.push(json!({"name": "message", "valueString": hint})),
+    }
+    answer
+}
+
+/// Say on an expansion entry what the expansion records about its code: R4's `abstract` and
+/// `inactive`. An entry that is neither carries neither.
+fn flag_entry(expansion: &Expansion, system: &str, code: &str, entry: &mut Json) {
+    if expansion.abstract_codes.is_empty() && expansion.inactive_codes.is_empty() {
+        return;
+    }
+    let key = (system.to_string(), code.to_string());
+    if expansion.abstract_codes.contains(&key) {
+        entry["abstract"] = json!(true);
+    }
+    if expansion.inactive_codes.contains(&key) {
+        entry["inactive"] = json!(true);
+    }
 }
 
 fn nested_present(include: &Json) -> bool {
@@ -2860,6 +3248,9 @@ fn is_a(index: &SystemIndex, code: &str, ancestor: &str) -> bool {
 fn merge_expansion(into: &mut Expansion, other: Expansion) {
     into.systems.extend(other.systems);
     into.codes.extend(other.codes);
+    into.incomplete.extend(other.incomplete);
+    into.abstract_codes.extend(other.abstract_codes);
+    into.inactive_codes.extend(other.inactive_codes);
 }
 
 /// Plain resources as one scope: terminology that does not track packages.
@@ -3339,6 +3730,14 @@ fn collect_expansion(contains: &[Json], expansion: &mut Expansion, note_systems:
                 .get("display")
                 .and_then(|value| value.as_str())
                 .map(|value| value.to_string());
+            for (name, flagged) in [
+                ("abstract", &mut expansion.abstract_codes),
+                ("inactive", &mut expansion.inactive_codes),
+            ] {
+                if item.get(name).and_then(|value| value.as_bool()) == Some(true) {
+                    flagged.insert((system.clone(), code.to_string()));
+                }
+            }
             expansion.codes.insert((system, code.to_string()), display);
         }
         if let Some(nested) = item.get("contains").and_then(|value| value.as_array()) {
@@ -3349,7 +3748,13 @@ fn collect_expansion(contains: &[Json], expansion: &mut Expansion, note_systems:
 
 fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
     let url = document.get("url").and_then(|value| value.as_str())?;
-    let mut expansion = Expansion::default();
+    let mut expansion = Expansion {
+        status: document
+            .get("status")
+            .and_then(|value| value.as_str())
+            .map(str::to_string),
+        ..Expansion::default()
+    };
     if let Some(systems) = document.get("systems").and_then(|value| value.as_array()) {
         for system in systems {
             let Some(system_url) = system.get("url").and_then(|value| value.as_str()) else {
@@ -3368,6 +3773,24 @@ fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
     // A document that lists its systems is read as it is, so that what is stored comes back
     // exactly as it was written; one that does not is worked out from its codes.
     let systems_listed = document.get("systems").is_some();
+    if let Some(incomplete) = document
+        .get("incomplete")
+        .and_then(|value| value.as_array())
+    {
+        for system in incomplete {
+            let text = |name: &str| system.get(name).and_then(|value| value.as_str());
+            let Some(url) = text("url") else {
+                continue;
+            };
+            expansion.incomplete.insert(
+                (
+                    canonical(url).to_string(),
+                    text("version").unwrap_or("").to_string(),
+                ),
+                text("content").unwrap_or("example").to_string(),
+            );
+        }
+    }
     if let Some(contains) = document.get("contains").and_then(|value| value.as_array()) {
         collect_expansion(contains, &mut expansion, !systems_listed);
     }
@@ -3376,8 +3799,12 @@ fn expansion_from_document(document: &Json) -> Option<(String, Expansion)> {
 
 /// The rules stored expansions are made under. A document without this number, or with another,
 /// was made by code that chose a code system version or a value set definition differently (one
-/// pool for every package, the package installed last), so it is rebuilt once rather than read.
-pub const EXPANSION_RULES: u32 = 2;
+/// pool for every package, the package installed last), or that refused a value set the current
+/// code expands (a whole `example` system, listed and flagged), or listed a code its system
+/// marks `notSelectable` or inactive without saying so, or kept no `status`, so it is rebuilt once
+/// rather than read. (3 was only ever a build of this change in progress, which had some of that
+/// and not all.)
+pub const EXPANSION_RULES: u32 = 4;
 
 /// Whether a stored expansion document was made under the current [`EXPANSION_RULES`].
 pub fn expansion_is_current(document: &Json) -> bool {
@@ -3401,10 +3828,25 @@ fn expansion_document(url: &str, expansion: &Expansion) -> Json {
             if let Some(display) = display {
                 entry["display"] = json!(display);
             }
+            flag_entry(expansion, system, code, &mut entry);
             entry
         })
         .collect();
-    json!({"url": url, "systems": systems, "contains": contains, "rules": EXPANSION_RULES})
+    let mut document =
+        json!({"url": url, "systems": systems, "contains": contains, "rules": EXPANSION_RULES});
+    if let Some(status) = &expansion.status {
+        document["status"] = json!(status);
+    }
+    if !expansion.incomplete.is_empty() {
+        document["incomplete"] = expansion
+            .incomplete
+            .iter()
+            .map(|((system, version), content)| {
+                json!({"url": system, "version": version, "content": content})
+            })
+            .collect();
+    }
+    document
 }
 
 fn display_of_bound(
@@ -3507,7 +3949,7 @@ mod tests {
             code_system("http://example.org/roles", "complete", &["doctor", "nurse"]),
             json!({"resourceType": "CodeSystem", "url": "http://example.org/sct",
                    "version": "2024", "content": "not-present"}),
-            code_system("http://example.org/examples", "example", &["a"]),
+            code_system("http://example.org/examples", "fragment", &["a"]),
             value_set(
                 "http://example.org/staff",
                 json!({"include": [
@@ -3541,7 +3983,7 @@ mod tests {
             "ValueSet.compose.include[2]"
         );
         assert!(
-            text[1].contains("'example'") && text[1].contains("included whole"),
+            text[1].contains("'fragment'") && text[1].contains("included whole"),
             "{text:?}"
         );
         assert_eq!(
@@ -3568,7 +4010,7 @@ mod tests {
     #[test]
     fn a_failing_dependency_is_named_and_carries_its_own_causes() {
         let terms = MemoryTerminology::from_resources(&[
-            code_system("http://example.org/examples", "example", &["a"]),
+            code_system("http://example.org/examples", "fragment", &["a"]),
             value_set(
                 "http://example.org/inner",
                 json!({"include": [{"system": "http://example.org/examples"}]}),
@@ -3596,11 +4038,708 @@ mod tests {
             text.contains("included value set http://example.org/inner"),
             "{text}"
         );
-        assert!(text.contains("'example'"), "{text}");
+        assert!(text.contains("'fragment'"), "{text}");
         let missing = terms
             .why_not_expanded("http://example.org/missing-dependency")
             .unwrap();
         assert!(messages(&missing)[0].contains("http://example.org/nowhere is not loaded"));
+    }
+
+    fn parameters_of(expanded: &serde_json::Value) -> Vec<String> {
+        expanded["expansion"]["parameter"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{} = {}",
+                            item["name"].as_str().unwrap(),
+                            item["valueCode"].as_str().unwrap()
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_whole_example_system_is_listed_and_flagged_and_a_miss_is_never_ruled_on() {
+        let (sample, full) = ("http://example.org/sample", "http://example.org/full");
+        let resources = [
+            code_system(sample, "example", &["a", "b"]),
+            code_system(full, "complete", &["x"]),
+            value_set(
+                "http://example.org/only",
+                json!({"include": [{"system": sample}]}),
+            ),
+            value_set(
+                "http://example.org/mixed",
+                json!({"include": [{"system": sample}, {"system": full}]}),
+            ),
+            value_set(
+                "http://example.org/nested",
+                json!({"include": [{"valueSet": ["http://example.org/only"]}]}),
+            ),
+            value_set(
+                "http://example.org/listed",
+                json!({"include": [{"system": sample, "concept": [{"code": "a"}]}]}),
+            ),
+        ];
+        let live = MemoryTerminology::from_resources(&resources);
+        // What a server reads back from the expansions it stored answers the same.
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        let stored = MemoryTerminology::from_stored(&resources, &documents);
+        for terms in [&live, &stored] {
+            let flag = format!("{sample}#CodeSystem.content = example");
+            let only = terms.expand("http://example.org/only", None).unwrap();
+            assert_eq!(only["expansion"]["contains"].as_array().unwrap().len(), 2);
+            assert_eq!(parameters_of(&only), [flag.clone()]);
+            // An include that names its concepts is complete, however sparse its system is, and
+            // an include of a value set that is not complete is not either.
+            let listed = terms.expand("http://example.org/listed", None).unwrap();
+            assert!(parameters_of(&listed).is_empty());
+            let nested = terms.expand("http://example.org/nested", None).unwrap();
+            assert_eq!(parameters_of(&nested), [flag.clone()]);
+            let mixed = terms.expand("http://example.org/mixed", None).unwrap();
+            assert_eq!(mixed["expansion"]["contains"].as_array().unwrap().len(), 3);
+            assert_eq!(parameters_of(&mixed), [flag]);
+
+            // A code the sample does not list may still be in the system, so the answer to a
+            // validator is "cannot say", while a complete system's miss is a no.
+            let ask = |value_set: &str, system: Option<&str>, code: &str| {
+                terms.contains(value_set, system, code)
+            };
+            assert_eq!(
+                ask("http://example.org/only", Some(sample), "a"),
+                TermAnswer::Yes
+            );
+            assert_eq!(
+                ask("http://example.org/only", Some(sample), "zz"),
+                TermAnswer::Unknown
+            );
+            assert_eq!(
+                ask("http://example.org/only", None, "zz"),
+                TermAnswer::Unknown
+            );
+            assert_eq!(
+                ask("http://example.org/mixed", Some(full), "zz"),
+                TermAnswer::No
+            );
+            assert_eq!(
+                ask("http://example.org/mixed", Some(sample), "zz"),
+                TermAnswer::Unknown
+            );
+            assert_eq!(
+                ask("http://example.org/mixed", Some(full), "x"),
+                TermAnswer::Yes
+            );
+            assert_eq!(
+                ask("http://example.org/nested", Some(sample), "zz"),
+                TermAnswer::Unknown
+            );
+            assert_eq!(
+                ask("http://example.org/listed", Some(sample), "b"),
+                TermAnswer::No
+            );
+            let reason = terms.expansion_problem("http://example.org/only").unwrap();
+            assert!(
+                reason.contains("only some of the concepts of code system")
+                    && reason.contains(sample)
+                    && reason.contains("'example'"),
+                "{reason}"
+            );
+            assert_eq!(terms.expansion_problem("http://example.org/listed"), None);
+
+            // `$validate-code` answers as `$expand` lists, and says why a miss is not final.
+            let validate = |value_set: &str, system: &str, code: &str| {
+                terms.validate_code(Some(value_set), Some(system), None, code, None)
+            };
+            let result = |outcome: &serde_json::Value| {
+                outcome["parameter"][0]["valueBoolean"].as_bool().unwrap()
+            };
+            assert!(result(&validate("http://example.org/only", sample, "a")));
+            let miss = validate("http://example.org/only", sample, "zz");
+            assert!(!result(&miss));
+            assert!(miss["parameter"][1]["valueString"]
+                .as_str()
+                .unwrap()
+                .contains("only some of the concepts"));
+            let miss = validate("http://example.org/mixed", full, "zz");
+            assert!(!result(&miss));
+            assert_eq!(
+                miss["parameter"][1]["valueString"],
+                "code is not in the value set"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_include_of_a_whole_example_system_with_concepts_is_listed() {
+        let (sample, fragment, bare) = (
+            "http://example.org/sample",
+            "http://example.org/fragment",
+            "http://example.org/bare",
+        );
+        let terms = MemoryTerminology::from_resources(&[
+            code_system(sample, "example", &["a"]),
+            code_system(fragment, "fragment", &["a"]),
+            code_system(bare, "example", &[]),
+            code_system("http://example.org/full", "complete", &["a"]),
+            value_set(
+                "http://example.org/fragment-whole",
+                json!({"include": [{"system": fragment}]}),
+            ),
+            value_set(
+                "http://example.org/bare-whole",
+                json!({"include": [{"system": bare}]}),
+            ),
+            value_set(
+                "http://example.org/sample-filtered",
+                json!({"include": [{"system": sample,
+                    "filter": [{"property": "concept", "op": "is-a", "value": "a"}]}]}),
+            ),
+            value_set(
+                "http://example.org/sample-excluded",
+                json!({"include": [{"system": "http://example.org/full"}],
+                       "exclude": [{"system": sample}]}),
+            ),
+        ]);
+        let refused = |url: &str| {
+            let failures = terms.why_not_expanded(url).expect(url);
+            assert_eq!(failures.len(), 1, "{failures:?}");
+            assert_eq!(failures[0].reason(), "code-system-incomplete");
+            (failures[0].message(), failures[0].expression().unwrap())
+        };
+        let (text, at) = refused("http://example.org/fragment-whole");
+        assert!(
+            text.contains("cannot be included whole: its content is 'fragment', not complete"),
+            "{text}"
+        );
+        assert_eq!(at, "ValueSet.compose.include[0]");
+        // An example system that holds no concept has nothing to list: an empty answer would look
+        // as complete as any other.
+        let (text, _) = refused("http://example.org/bare-whole");
+        assert!(
+            text.contains("cannot be included whole: none of its concepts are installed"),
+            "{text}"
+        );
+        // Which of its concepts a filter picks cannot be told from a sample.
+        let (text, _) = refused("http://example.org/sample-filtered");
+        assert!(
+            text.contains(
+                "cannot be filtered by concept is-a a: its content is 'example', not complete"
+            ),
+            "{text}"
+        );
+        // What an exclusion leaves out cannot either.
+        let (text, at) = refused("http://example.org/sample-excluded");
+        assert!(text.contains("cannot be included whole"), "{text}");
+        assert_eq!(at, "ValueSet.compose.exclude[0]");
+        for url in [
+            "http://example.org/fragment-whole",
+            "http://example.org/bare-whole",
+            "http://example.org/sample-filtered",
+            "http://example.org/sample-excluded",
+        ] {
+            assert!(terms.expand(url, None).is_none(), "{url}");
+        }
+    }
+
+    fn abstract_codes_of(expanded: &serde_json::Value) -> Vec<String> {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["abstract"] == true)
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_code_its_system_marks_not_selectable_is_listed_as_abstract() {
+        let (groups, plain) = ("http://example.org/groups", "http://example.org/plain");
+        let selectable = |value: bool| json!([{"code": "notSelectable", "valueBoolean": value}]);
+        let resources = [
+            // `_group` is a grouping concept with two selectable children, one of which says
+            // outright that it is selectable; `_other` is a second group, deeper down.
+            json!({"resourceType": "CodeSystem", "url": groups, "content": "complete",
+            "property": [{"code": "notSelectable", "type": "boolean"}],
+            "concept": [
+                {"code": "_group", "property": selectable(true), "concept": [
+                    {"code": "a"},
+                    {"code": "b", "property": selectable(false)},
+                    {"code": "_other", "property": selectable(true), "concept": [
+                        {"code": "c"}
+                    ]}
+                ]}
+            ]}),
+            code_system(plain, "complete", &["x", "y"]),
+            value_set(
+                "http://example.org/whole",
+                json!({"include": [{"system": groups}]}),
+            ),
+            value_set(
+                "http://example.org/filtered",
+                json!({"include": [{"system": groups,
+                    "filter": [{"property": "concept", "op": "is-a", "value": "_other"}]}]}),
+            ),
+            value_set(
+                "http://example.org/listed",
+                json!({"include": [{"system": groups,
+                    "concept": [{"code": "_group"}, {"code": "a"}]}]}),
+            ),
+            value_set(
+                "http://example.org/without",
+                json!({"include": [{"system": groups}],
+                       "exclude": [{"system": groups, "concept": [{"code": "_group"}]}]}),
+            ),
+            value_set(
+                "http://example.org/plain",
+                json!({"include": [{"system": plain}]}),
+            ),
+            value_set(
+                "http://example.org/nested",
+                json!({"include": [{"valueSet": ["http://example.org/filtered"]},
+                                   {"system": plain}]}),
+            ),
+        ];
+        let live = MemoryTerminology::from_resources(&resources);
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        let stored = MemoryTerminology::from_stored(&resources, &documents);
+        for terms in [&live, &stored] {
+            let abstract_of = |url: &str| {
+                abstract_codes_of(&terms.expand(url, None).unwrap_or_else(|| panic!("{url}")))
+            };
+            assert_eq!(
+                abstract_of("http://example.org/whole"),
+                ["_group", "_other"]
+            );
+            // A filter, an explicit list and an included value set carry it the same way.
+            assert_eq!(abstract_of("http://example.org/filtered"), ["_other"]);
+            assert_eq!(abstract_of("http://example.org/listed"), ["_group"]);
+            assert_eq!(abstract_of("http://example.org/nested"), ["_other"]);
+            // What is excluded is not there to be flagged.
+            assert_eq!(abstract_of("http://example.org/without"), ["_other"]);
+            // A system with no such property flags nothing, and says nothing of it.
+            assert!(abstract_of("http://example.org/plain").is_empty());
+            let plain_entry = terms.expand("http://example.org/plain", None).unwrap();
+            assert!(!plain_entry.to_string().contains("abstract"));
+            // `notSelectable` false is not abstract, and it is not listed as if it were.
+            let whole = terms.expand("http://example.org/whole", None).unwrap();
+            let entry = |code: &str| {
+                whole["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["code"] == code)
+                    .unwrap()
+                    .clone()
+            };
+            assert!(entry("b").get("abstract").is_none());
+            assert!(entry("a").get("abstract").is_none());
+
+            // `$validate-code` takes R4's `abstract`: without it the code is valid and says it is
+            // a grouping concept, with it true it is valid, with it false it is not.
+            let validate = |code: &str, allowed: Option<bool>| {
+                terms.validate_code_as(
+                    Some("http://example.org/whole"),
+                    Some(groups),
+                    None,
+                    code,
+                    None,
+                    allowed,
+                )
+            };
+            let result = |outcome: &serde_json::Value| {
+                outcome["parameter"][0]["valueBoolean"].as_bool().unwrap()
+            };
+            let message = |outcome: &serde_json::Value| {
+                outcome["parameter"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["name"] == "message")
+                    .map(|item| item["valueString"].as_str().unwrap().to_string())
+            };
+            let said_nothing = validate("_group", None);
+            assert!(result(&said_nothing));
+            assert!(message(&said_nothing)
+                .unwrap()
+                .contains("_group is abstract"));
+            let allowed = validate("_group", Some(true));
+            assert!(result(&allowed));
+            assert_eq!(message(&allowed), None);
+            let refused = validate("_group", Some(false));
+            assert!(!result(&refused));
+            assert!(message(&refused).unwrap().contains("_group is abstract"));
+            for allowed in [None, Some(true), Some(false)] {
+                let outcome = validate("a", allowed);
+                assert!(result(&outcome));
+                assert_eq!(message(&outcome), None);
+            }
+            // Asked without a system, the code is found the same way.
+            let bare = terms.validate_code_as(
+                Some("http://example.org/whole"),
+                None,
+                None,
+                "_other",
+                None,
+                Some(false),
+            );
+            assert!(!result(&bare));
+        }
+    }
+
+    fn flagged(expanded: &serde_json::Value, flag: &str) -> Vec<String> {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry[flag] == true)
+            .map(|entry| entry["code"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_code_its_system_calls_inactive_is_listed_as_inactive() {
+        let system = "http://example.org/old";
+        let on = |property: &str, value: bool| json!([{"code": property, "valueBoolean": value}]);
+        let resources = [
+            json!({"resourceType": "CodeSystem", "url": system, "content": "complete",
+            "concept": [
+                {"code": "live"},
+                {"code": "old", "property": on("inactive", true)},
+                {"code": "kept", "property": on("inactive", false)},
+                // Both at once, which are two things to say about it.
+                {"code": "_gone", "property": [
+                    {"code": "inactive", "valueBoolean": true},
+                    {"code": "notSelectable", "valueBoolean": true}
+                ]},
+                {"code": "grouped", "property": on("notSelectable", true)},
+                {"code": "tagged", "inactive": true}
+            ]}),
+            value_set(
+                "http://example.org/whole",
+                json!({"include": [{"system": system}]}),
+            ),
+            value_set(
+                "http://example.org/filtered",
+                json!({"include": [{"system": system,
+                    "filter": [{"property": "concept", "op": "in", "value": "live,old,_gone"}]}]}),
+            ),
+            value_set(
+                "http://example.org/listed",
+                json!({"include": [{"system": system, "concept": [{"code": "old"}, {"code": "live"}]}]}),
+            ),
+            value_set(
+                "http://example.org/nested",
+                json!({"include": [{"valueSet": ["http://example.org/listed"]}]}),
+            ),
+            value_set(
+                "http://example.org/without",
+                json!({"include": [{"system": system}],
+                       "exclude": [{"system": system, "concept": [{"code": "old"}]}]}),
+            ),
+        ];
+        let live = MemoryTerminology::from_resources(&resources);
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        let stored = MemoryTerminology::from_stored(&resources, &documents);
+        for terms in [&live, &stored] {
+            let expand = |url: &str| terms.expand(url, None).unwrap_or_else(|| panic!("{url}"));
+            let whole = expand("http://example.org/whole");
+            assert_eq!(flagged(&whole, "inactive"), ["_gone", "old", "tagged"]);
+            // Not the same thing as abstract, and neither implies the other.
+            assert_eq!(flagged(&whole, "abstract"), ["_gone", "grouped"]);
+            // `inactive: false` says nothing, and neither does a code with no word about it.
+            let entry = |code: &str| {
+                whole["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["code"] == code)
+                    .unwrap()
+                    .clone()
+            };
+            assert!(entry("kept").get("inactive").is_none());
+            assert!(entry("live").get("inactive").is_none());
+            assert!(entry("live").get("abstract").is_none());
+            // The other ways to include a code say the same of it.
+            assert_eq!(
+                flagged(&expand("http://example.org/filtered"), "inactive"),
+                ["_gone", "old"]
+            );
+            assert_eq!(
+                flagged(&expand("http://example.org/listed"), "inactive"),
+                ["old"]
+            );
+            assert_eq!(
+                flagged(&expand("http://example.org/nested"), "inactive"),
+                ["old"]
+            );
+            // What is excluded is not there to be flagged.
+            assert_eq!(
+                flagged(&expand("http://example.org/without"), "inactive"),
+                ["_gone", "tagged"]
+            );
+        }
+        // An inactive code is still a member: `inactive` informs, it does not remove.
+        assert_eq!(
+            live.contains("http://example.org/whole", Some(system), "old"),
+            TermAnswer::Yes
+        );
+    }
+
+    #[test]
+    fn an_expansion_has_its_definitions_status_and_active_only_leaves_out_what_is_inactive() {
+        let system = "http://example.org/states";
+        let resources = [
+            json!({"resourceType": "CodeSystem", "url": system, "content": "complete",
+            "concept": [
+                {"code": "live", "display": "Live"},
+                {"code": "old", "display": "Old",
+                 "property": [{"code": "inactive", "valueBoolean": true}]},
+                {"code": "older", "display": "Older",
+                 "property": [{"code": "inactive", "valueBoolean": true}]}
+            ]}),
+            json!({"resourceType": "ValueSet", "url": "http://example.org/drafted",
+                   "status": "draft", "compose": {"include": [{"system": system}]}}),
+            json!({"resourceType": "ValueSet", "url": "http://example.org/retired",
+                   "status": "retired", "compose": {"include": [{"system": system}]}}),
+            // Another's status is not this one's, however it was put together.
+            json!({"resourceType": "ValueSet", "url": "http://example.org/nested",
+                   "status": "active",
+                   "compose": {"include": [{"valueSet": ["http://example.org/drafted"]}]}}),
+            json!({"resourceType": "ValueSet", "url": "http://example.org/unsaid",
+                   "compose": {"include": [{"system": system}]}}),
+        ];
+        let live = MemoryTerminology::from_resources(&resources);
+        let documents = MemoryTerminology::expansion_documents(&resources);
+        let stored = MemoryTerminology::from_stored(&resources, &documents);
+        for terms in [&live, &stored] {
+            let status = |url: &str| {
+                terms.expand(url, None).unwrap()["status"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            assert_eq!(status("http://example.org/drafted"), "draft");
+            assert_eq!(status("http://example.org/retired"), "retired");
+            assert_eq!(status("http://example.org/nested"), "active");
+            // R4 requires one, so a definition that says nothing is `active`.
+            assert_eq!(status("http://example.org/unsaid"), "active");
+
+            // `activeOnly` leaves out the inactive codes, and the page and the total follow.
+            let codes = |expanded: &serde_json::Value| -> Vec<String> {
+                expanded["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["code"].as_str().unwrap().to_string())
+                    .collect()
+            };
+            let url = "http://example.org/drafted";
+            assert_eq!(
+                codes(&terms.expand_with(url, None, false).unwrap()),
+                ["live", "old", "older"]
+            );
+            assert_eq!(
+                codes(&terms.expand_with(url, None, true).unwrap()),
+                ["live"]
+            );
+            // Together with a filter that matches what is inactive, nothing is left.
+            assert!(codes(&terms.expand_with(url, Some("old"), true).unwrap()).is_empty());
+            let page = terms.expand_page_with(url, None, true, 0, Some(5)).unwrap();
+            assert_eq!(page["expansion"]["total"], 1);
+            let all = terms
+                .expand_page_with(url, None, false, 1, Some(1))
+                .unwrap();
+            assert_eq!(all["expansion"]["total"], 3);
+            assert_eq!(codes(&all), ["old"]);
+        }
+    }
+
+    #[test]
+    fn abstract_is_judged_the_same_way_for_a_code_system_and_a_value_set_and_only_for_its_code() {
+        let (groups, other) = ("http://example.org/groups", "http://example.org/other");
+        let not_selectable = json!([{"code": "notSelectable", "valueBoolean": true}]);
+        let resources = [
+            json!({"resourceType": "CodeSystem", "url": groups, "content": "complete",
+            "concept": [
+                {"code": "_group", "display": "Group", "property": not_selectable},
+                {"code": "a", "display": "A"},
+                {"code": "x", "display": "X"}
+            ]}),
+            // The same code is selectable in a second system.
+            json!({"resourceType": "CodeSystem", "url": other, "content": "complete",
+                   "concept": [{"code": "_group", "display": "Group"}]}),
+            json!({"resourceType": "CodeSystem", "url": "http://example.org/odd",
+                   "content": "complete",
+                   "concept": [{"code": "x", "display": "X", "property": not_selectable}]}),
+            value_set(
+                "http://example.org/both",
+                json!({"include": [{"system": groups}, {"system": other},
+                                   {"system": "http://example.org/odd"}]}),
+            ),
+        ];
+        let terms = MemoryTerminology::from_resources(&resources);
+        let result = |outcome: &serde_json::Value| {
+            outcome["parameter"][0]["valueBoolean"].as_bool().unwrap()
+        };
+        let messages = |outcome: &serde_json::Value| -> Vec<String> {
+            outcome["parameter"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["name"] == "message")
+                .map(|item| item["valueString"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // R4 gives `abstract` to the code system's operation as to the value set's.
+        let in_system = |code: &str, allowed: Option<bool>| {
+            terms.validate_code_as(None, Some(groups), None, code, None, allowed)
+        };
+        let said_nothing = in_system("_group", None);
+        assert!(result(&said_nothing));
+        assert!(messages(&said_nothing)[0].contains("_group is abstract"));
+        let allowed = in_system("_group", Some(true));
+        assert!(result(&allowed) && messages(&allowed).is_empty());
+        let refused = in_system("_group", Some(false));
+        assert!(!result(&refused));
+        assert!(messages(&refused)[0].contains("_group is abstract"));
+        for allowed in [None, Some(true), Some(false)] {
+            let outcome = in_system("a", allowed);
+            assert!(result(&outcome) && messages(&outcome).is_empty());
+        }
+
+        // R4 allows one message, so the hint joins a display that does not match.
+        let mismatched = terms.validate_code_as(
+            Some("http://example.org/both"),
+            Some(groups),
+            None,
+            "_group",
+            Some("Wrong"),
+            None,
+        );
+        assert!(result(&mismatched));
+        let said = messages(&mismatched);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(
+            said[0].contains("display does not match") && said[0].contains("is abstract"),
+            "{said:?}"
+        );
+
+        // With no system named, a code that one of its systems makes selectable is not abstract
+        // (`x` is only in `groups` and `odd`: abstract in one and selectable in the other),
+        // while with its system named it is judged by that system.
+        let judged = |system: Option<&str>, code: &str| {
+            terms.validate_code_as(
+                Some("http://example.org/both"),
+                system,
+                None,
+                code,
+                None,
+                Some(false),
+            )
+        };
+        assert!(result(&judged(None, "x")));
+        assert!(result(&judged(Some(other), "_group")));
+        assert!(!result(&judged(Some(groups), "_group")));
+        assert!(!result(&judged(Some("http://example.org/odd"), "x")));
+        assert!(result(&judged(Some(groups), "x")));
+        // Listed under one system only, and abstract there, it is abstract without being named.
+        let only = MemoryTerminology::from_resources(&[
+            resources[0].clone(),
+            value_set(
+                "http://example.org/only-groups",
+                json!({"include": [{"system": groups}]}),
+            ),
+        ]);
+        let alone = only.validate_code_as(
+            Some("http://example.org/only-groups"),
+            None,
+            None,
+            "_group",
+            None,
+            Some(false),
+        );
+        assert!(!result(&alone));
+    }
+
+    #[test]
+    fn value_sets_that_were_waiting_are_expanded_when_asked_again_and_the_rest_stay() {
+        let (arrived, fragment) = ("http://example.org/arrived", "http://example.org/fragment");
+        let resources = [
+            code_system(arrived, "complete", &["a", "b"]),
+            code_system(fragment, "fragment", &["a"]),
+            value_set(
+                "http://example.org/waits",
+                json!({"include": [{"system": arrived}]}),
+            ),
+            // Waits on a value set that is waiting.
+            value_set(
+                "http://example.org/nested",
+                json!({"include": [{"valueSet": ["http://example.org/waits"]}]}),
+            ),
+            value_set(
+                "http://example.org/blocked",
+                json!({"include": [{"system": fragment}]}),
+            ),
+        ];
+        // What a catalog holds when the store had no expansion for any of them: the code systems
+        // are there, and the value sets are not expanded.
+        let mut terms = MemoryTerminology::from_stored(&resources, &[]);
+        assert_eq!(
+            terms.unexpandable_urls(),
+            [
+                "http://example.org/blocked",
+                "http://example.org/nested",
+                "http://example.org/waits"
+            ]
+        );
+        assert!(terms.expand("http://example.org/waits", None).is_none());
+
+        let updates = terms.expand_waiting();
+        let mut urls: Vec<&str> = updates.iter().map(|update| update.url.as_str()).collect();
+        urls.sort();
+        assert_eq!(
+            urls,
+            ["http://example.org/nested", "http://example.org/waits"]
+        );
+        // Each says which package's definition it is of, and carries what a rebuild would store.
+        let rebuilt = MemoryTerminology::expansion_documents(&resources);
+        for update in &updates {
+            assert!(update.scope.is_some(), "{}", update.url);
+            let document = update.document.as_ref().expect("an expansion");
+            assert_eq!(
+                Some(document),
+                rebuilt
+                    .iter()
+                    .find(|item| item["url"] == update.url.as_str()),
+                "{}",
+                update.url
+            );
+        }
+        for url in ["http://example.org/waits", "http://example.org/nested"] {
+            let expanded = terms.expand(url, None).expect(url);
+            assert_eq!(
+                expanded["expansion"]["contains"].as_array().unwrap().len(),
+                2
+            );
+        }
+        // The one that cannot be expanded is still waiting, with its reason, and asking again
+        // finds nothing more to do.
+        assert_eq!(terms.unexpandable_urls(), ["http://example.org/blocked"]);
+        let why = terms
+            .why_not_expanded("http://example.org/blocked")
+            .unwrap();
+        assert_eq!(why[0].reason(), "code-system-incomplete");
+        assert!(terms.expand_waiting().is_empty());
+        // Nothing waiting is nothing to do.
+        let mut complete = MemoryTerminology::from_resources(&resources[..3]);
+        assert!(complete.unexpandable_urls().is_empty());
+        assert!(complete.expand_waiting().is_empty());
     }
 
     #[test]
@@ -4885,7 +6024,7 @@ mod tests {
             .into_iter()
             .map(|document| (url_of(&document), document))
             .collect();
-        for ExpansionUpdate { url, document } in updates {
+        for ExpansionUpdate { url, document, .. } in updates {
             match document {
                 Some(document) => rows.insert(url, document),
                 None => rows.remove(&url),

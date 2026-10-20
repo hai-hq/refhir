@@ -8,9 +8,9 @@ use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    compare_versions, same_expression, ConformanceStore, InstallError, InstallOutcome,
-    NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology,
-    PackageRows, ParamStatus, RetiredParam, StoredBackfill, StoredPackage,
+    compare_versions, same_expression, ConformanceStore, ExpansionChange, InstallError,
+    InstallOutcome, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
+    NewTerminology, PackageRows, ParamStatus, RetiredParam, StoredBackfill, StoredPackage,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::TerminologyBuilder;
@@ -99,6 +99,22 @@ pub fn expression_clash_dir() -> &'static Path {
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/expression-clash"
     ))
+}
+
+/// The International Patient Summary package as the registry serves it: `hl7.fhir.uv.ips` 2.0.1
+/// for R4, with its profiles, value sets, `$summary` definition and example summaries.
+pub fn ips_package() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/ips/hl7.fhir.uv.ips-2.0.1.tgz"
+    ))
+}
+
+/// A tiny package for the tests of SMART Health Cards over HTTP: a Patient and an Immunization,
+/// with the search a card needs. The whole R4 release holds far more than such a test uses, and
+/// loading it is most of what the test costs.
+pub fn cards_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/cards"))
 }
 
 pub fn sdc_dir() -> &'static Path {
@@ -457,6 +473,9 @@ fn finish_staging(
 ) -> Result<Option<PendingBackfill>, FhirError> {
     if publish_now {
         publish(store, catalog)?;
+        if outcome.inserted {
+            expand_waiting(store, catalog);
+        }
     }
     // Installing a large package takes a while; say where the time went. The readings are taken
     // in quick succession, and a monotonic clock on a virtual machine can read slightly earlier
@@ -673,6 +692,7 @@ pub(crate) fn finish_install(
             "rebuilt the catalog in {:.1?}",
             started.elapsed()
         );
+        expand_waiting(store, catalog);
         for backfill in pending {
             backfill.create(store, db)?;
         }
@@ -681,6 +701,54 @@ pub(crate) fn finish_install(
     let finished = finish();
     result?;
     finished
+}
+
+/// After packages are installed and the catalog is loaded again: give an expansion to the value
+/// sets that had none and now can have, because a package brought what they waited on, and store
+/// each under the package whose definition it is of. A package stores the expansions of its own
+/// value sets only, so without this a value set in one package that includes a code system of
+/// another would stay unexpandable, whichever of the two came first, until the next full rebuild.
+///
+/// The packages are installed whether or not this succeeds, so a failure is logged and not
+/// returned: the value sets stay as they were, and the next install tries them again.
+pub(crate) fn expand_waiting(store: &dyn ConformanceStore, catalog: &RwLock<Catalog>) {
+    let started = std::time::Instant::now();
+    let updates = catalog
+        .write()
+        .expect("catalog")
+        .terms_mut()
+        .expand_waiting();
+    let changes: Vec<ExpansionChange> = updates
+        .into_iter()
+        .filter_map(|update| {
+            Some(ExpansionChange {
+                package_id: update.scope?,
+                url: update.url,
+                json: Some(update.document?.to_string()),
+            })
+        })
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+    let stored = store
+        .apply_expansions(&changes)
+        .map_err(FhirError::from)
+        .and_then(|()| announce_terminology(store));
+    match stored {
+        Ok(()) => tracing::info!(
+            target: "refhir_engine",
+            "expanded {} value sets that were waiting for a package, in {:.1?}",
+            changes.len(),
+            started.elapsed()
+        ),
+        Err(err) => tracing::warn!(
+            target: "refhir_engine",
+            error = %err,
+            "expanded {} value sets that were waiting for a package, but could not store them",
+            changes.len()
+        ),
+    }
 }
 
 pub(crate) fn publish(
@@ -1298,7 +1366,7 @@ fn fhir_version(manifest: &Value, definition_version: Option<String>) -> Result<
     definition_version.ok_or_else(|| FhirError::Invalid("package fhirVersion is required".into()))
 }
 
-fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
+pub(crate) fn terminology_row(resource: &Value) -> Result<NewTerminology, FhirError> {
     Ok(NewTerminology {
         resource_type: required_str(resource, "resourceType")?,
         url: required_str(resource, "url")?,

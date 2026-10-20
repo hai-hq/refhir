@@ -230,6 +230,30 @@ curl -s https://fhir.example.com/oauth/introspect \
 
 **`demo_login = true` (or `--smart-demo-login`) is for testing only.** It accepts any username and verifies nothing, so anyone who can reach the server can sign in as anyone and read patient data. It cannot be combined with `[smart.oidc]`, and the server refuses to start with it on a non-loopback bind unless `REFHIR_ALLOW_REMOTE_DEMO_LOGIN=1` is set.
 
+## SMART Health Cards signing key
+
+A server issues [SMART Health Cards](../docs/health-cards.md) once it has a key to sign them with.
+The key is the one secret that makes a card yours, so treat it like the database password:
+
+```bash
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out health-cards.pem
+chmod 600 health-cards.pem
+```
+
+- **Keep it out of the image and out of `refhir.toml`.** Mount the file as a secret (in
+  Kubernetes, `kubectl create secret generic refhir-health-cards --from-file=key.pem=health-cards.pem`,
+  mounted into the pod) and point `REFHIR_HEALTH_CARDS_KEY_FILE` at the mounted path.
+- **Set `public_url` to the `https` address clients reach the server at.** A card names where its
+  public key is published, `[public_url]/health-cards/.well-known/jwks.json`, and verifiers fetch
+  it from there. A server on a bind that is not loopback will not start with a key and no
+  `public_url`.
+- **Let `/health-cards/.well-known/jwks.json` through the reverse proxy** without authentication.
+  It holds the public key only. The server answers it for any origin.
+- **Back the key up, and do not replace it casually.** The server publishes the one key it signs
+  with. Cards signed with a key you have replaced stop verifying.
+- **Every process serving one deployment needs the same key**, or a card made by one fails to
+  verify against the key set another publishes.
+
 ## FHIR version and Implementation Guides
 
 `[fhir].version = "r4"` (default) installs **`hl7.fhir.r4.core@4.0.1`** and **`hl7.fhir.uv.sdc@4.0.0`**, and the packages they depend on (`hl7.terminology.r4`, `hl7.fhir.uv.extensions.r4`, `hl7.fhir.uv.tools.r4` and `hl7.fhir.uv.xver-r5.r4`), on first startup. SDC also lists `hl7.fhir.r4.examples`, which holds example resources and a second copy of the core definitions, so a package that is only a dependency and holds examples is left out, with a line in the log. A database that already has it keeps it, and naming it in `[conformance].packages` or sending it to `$install` installs it. Packages already in the conformance database are not reinstalled.

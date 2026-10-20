@@ -86,6 +86,68 @@ jobs:
           npm run build
           npm test
 
+  # The link host: a TypeScript server that keeps its links in Postgres or SQLite. Its tests run on the
+  # memory store, and again on each database, so that everything it does is checked against all three.
+  link-host:
+    name: Link host
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      LINK_HOST_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+    defaults:
+      run:
+        working-directory: link-host
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: link-host/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Check the types
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test, with links kept in memory where a test does not need a database
+        run: npm test
+
+      - name: Test again, with every test of the host on SQLite
+        run: npm test
+        env:
+          LINK_HOST_TEST_STORE: sqlite
+
+      - name: Test again, with every test of the host on Postgres
+        run: npm test
+        env:
+          LINK_HOST_TEST_STORE: postgres
+
+      - name: Check the compose file
+        working-directory: link-host/deploy
+        run: |
+          DOMAIN=links.example.org ADMIN_TOKEN=ci-token-of-sixteen-characters POSTGRES_PASSWORD=ci docker compose config --quiet
+          DOMAIN=links.example.org ADMIN_TOKEN=ci-token-of-sixteen-characters docker compose -f compose.sqlite.yaml config --quiet
+
   # Warnings fail the build, so the code base stays clean. The toolchain is the pinned 1.88.0,
   # whose lints are the ones that count: a newer clippy knows lints this one does not.
   clippy:
@@ -220,6 +282,40 @@ jobs:
 
       - name: Run the image
         run: docker run --rm refhir:ci --version
+
+      - name: Build the link host image, and see that it starts on Postgres, is ready, and stops cleanly
+        run: |
+          docker build -t refhir-link-host:ci link-host
+          docker network create link-host-ci
+          docker run -d --name link-host-ci-db --network link-host-ci \
+            -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=links postgres:17-alpine
+          docker run -d --name link-host-ci --network link-host-ci --read-only --tmpfs /tmp --cap-drop ALL \
+            -e ADMIN_TOKEN=ci-token-of-sixteen-characters -e PUBLIC_URL=https://links.example.org \
+            -e DATABASE_URL=postgres://postgres:ci@link-host-ci-db:5432/links refhir-link-host:ci
+          for _ in $(seq 1 40); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' link-host-ci)" = "healthy" ] && break
+            sleep 2
+          done
+          docker logs link-host-ci
+          test "$(docker inspect -f '{{.State.Health.Status}}' link-host-ci)" = "healthy"
+          docker stop link-host-ci
+          test "$(docker inspect -f '{{.State.ExitCode}}' link-host-ci)" = "0"
+
+      - name: Run the link host image on SQLite, with a volume, and see that it is ready and stops cleanly
+        run: |
+          docker run -d --name link-host-ci-sqlite --read-only --tmpfs /tmp --cap-drop ALL \
+            -v link-host-ci-data:/data \
+            -e ADMIN_TOKEN=ci-token-of-sixteen-characters -e PUBLIC_URL=https://links.example.org \
+            -e DATABASE_URL=sqlite:///data/links.db refhir-link-host:ci
+          for _ in $(seq 1 40); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' link-host-ci-sqlite)" = "healthy" ] && break
+            sleep 2
+          done
+          docker logs link-host-ci-sqlite
+          test "$(docker inspect -f '{{.State.Health.Status}}' link-host-ci-sqlite)" = "healthy"
+          docker exec link-host-ci-sqlite node dist/server.js backup /data/backup.db
+          docker stop link-host-ci-sqlite
+          test "$(docker inspect -f '{{.State.ExitCode}}' link-host-ci-sqlite)" = "0"
 
       # The release's packages are in the image, so a first start needs no network, and the
       # deployment guide says to start from 512 MiB: run it so, and see that it starts and is not

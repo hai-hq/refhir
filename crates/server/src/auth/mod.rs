@@ -29,8 +29,8 @@ pub use store::SmartStore;
 pub(crate) use interact::patient_exists;
 pub(crate) use interact::{interact_get, interact_post, oidc_callback};
 pub(crate) use oauth::{
-    authorize, configuration, ehr_launch, introspect, issue, jwks, manage, parse_authorize_form,
-    register, revoke, security_extension, style,
+    authorize, configuration, ehr_launch, introspect, issue, issuer, jwks, manage,
+    parse_authorize_form, register, revoke, security_extension, style,
 };
 pub(crate) use scopes::http_interaction;
 pub(crate) use store::origin_allowed;
@@ -382,6 +382,13 @@ pub fn patient_http_operation(
     }
     let id = parts.next();
     let tail = parts.next();
+    // These two read the patient the path names. Their body is parameters, which belong to no
+    // patient's compartment, so it is not one of the resources the token's patient must hold.
+    if let (Some(id), Some("$summary" | "$health-cards-issue")) = (id, tail) {
+        if is_instance_id(id) {
+            return Ok(Some((format!("{resource}/read"), json!({"id": id}))));
+        }
+    }
     match (method, id, tail) {
         ("GET" | "HEAD", None, None) => Ok(None),
         ("POST", None, None) => {
@@ -1012,5 +1019,31 @@ mod tests {
             http_interaction("POST", "/ImplementationGuide/$install"),
             "install"
         );
+        // The terminology operations change nothing, so a GET and a POST are both reads, and a
+        // client with only `read` can use them.
+        for (method, path) in [
+            ("GET", "/ValueSet/$expand"),
+            ("POST", "/ValueSet/$expand"),
+            ("POST", "/ValueSet/$expandability"),
+            ("GET", "/ValueSet/$validate-code"),
+            ("POST", "/ValueSet/$validate-code"),
+            ("POST", "/CodeSystem/$validate-code"),
+            ("GET", "/CodeSystem/$lookup"),
+            ("POST", "/CodeSystem/$lookup"),
+            ("GET", "/CodeSystem/$subsumes"),
+            ("POST", "/CodeSystem/$subsumes"),
+            ("GET", "/ConceptMap/$translate"),
+            ("POST", "/ConceptMap/$translate"),
+            ("GET", "/ValueSet/vs1/$expand"),
+            ("POST", "/ValueSet/vs1/$expand"),
+            ("GET", "/ValueSet/vs1/$validate-code"),
+            ("POST", "/CodeSystem/cs1/$validate-code"),
+            ("GET", "/CodeSystem/cs1/$subsumes"),
+            ("POST", "/ConceptMap/cm1/$translate"),
+        ] {
+            assert_eq!(http_interaction(method, path), "read", "{method} {path}");
+        }
+        // Writing a terminology resource is still not a read.
+        assert_eq!(http_interaction("POST", "/ValueSet"), "create");
     }
 }

@@ -227,13 +227,14 @@ pub fn dispatch(
         op,
         "$expand" | "$expandability" | "$validate-code" | "$lookup" | "$translate" | "$subsumes"
     ) {
-        return crate::terms::operation(catalog, type_name, op, args);
+        let args = crate::terms::resolve_instance(tx, catalog, type_name, op, args)?;
+        return crate::terms::operation(catalog, type_name, op, &args);
     }
     if path == "system/history" {
         return history::system_history(
             tx,
             catalog,
-            optional_ts(args, "_since")?,
+            since_arg(args)?,
             optional_usize(args, "_count")?,
             optional_usize(args, "_offset")?.unwrap_or(0),
         );
@@ -339,7 +340,7 @@ pub fn dispatch(
             history::type_history(
                 tx,
                 model,
-                optional_ts(args, "_since")?,
+                since_arg(args)?,
                 optional_usize(args, "_count")?,
                 optional_usize(args, "_offset")?.unwrap_or(0),
             )
@@ -376,9 +377,17 @@ pub fn dispatch(
         }
         "$everything" => {
             catalog.deny_response_read(type_name)?;
-            crate::meta::everything(tx, catalog, model, &id_arg(args)?)
+            crate::meta::everything(tx, catalog, model, &id_arg(args)?, args)
         }
-        "$document" => crate::meta::document(tx, catalog, model, &id_arg(args)?),
+        "$document" => crate::meta::document(tx, catalog, model, &id_arg(args)?, args),
+        "$health-cards-issue" => {
+            catalog.deny_response_read(type_name)?;
+            crate::cards::issue(tx, catalog, model, args)
+        }
+        "$summary" => {
+            catalog.deny_response_read(type_name)?;
+            crate::summary::summary(tx, catalog, model, args)
+        }
         "$match" => crate::patient_match::operation(tx, catalog, type_name, args),
         other => Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/{other}"
@@ -515,13 +524,26 @@ fn validation_with_profile(
     validate(resource, profiles, catalog.schema(), catalog.terms(), &host).operation_outcome()
 }
 
-fn optional_ts(args: &Value, name: &str) -> Result<Option<Timestamp>, FhirError> {
-    match args.get(name).and_then(|value| value.as_str()) {
-        None => Ok(None),
-        Some(text) => Timestamp::from_version_id(text)
-            .map(Some)
-            .map_err(|_| FhirError::Invalid(format!("invalid {name}"))),
+/// A history's `_since`: a moment (`2026-01-01T00:00:00Z`, as FHIR has it), or, as the server's
+/// own clients give it, a version id, which is all digits.
+fn since_arg(args: &Value) -> Result<Option<history::Since>, FhirError> {
+    let Some(text) = args.get("_since").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    let refused = || {
+        FhirError::Invalid(
+            "invalid _since: use a date and time such as 2026-01-01T00:00:00Z, or a version id"
+                .into(),
+        )
+    };
+    if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Timestamp::from_version_id(text)
+            .map(|ts| Some(history::Since::Version(ts)))
+            .map_err(|_| refused());
     }
+    crate::instant::parse(text)
+        .map(|ms| Some(history::Since::Instant(ms)))
+        .ok_or_else(refused)
 }
 
 fn optional_usize(args: &Value, name: &str) -> Result<Option<usize>, FhirError> {

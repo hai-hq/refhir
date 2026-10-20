@@ -11,9 +11,24 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         if op == "$match" && method == "POST" {
             return "search";
         }
+        // Operations that read, whichever way they are sent: the SDC ones, the summary and health
+        // card ones, and the terminology ones, which R4 defines as having no side effects (so a
+        // `POST` is only a way to send what does not fit in a URL).
         if matches!(
             op,
-            "$populate" | "$assemble" | "$extract" | "$next-question" | "$behavior"
+            "$populate"
+                | "$assemble"
+                | "$extract"
+                | "$next-question"
+                | "$behavior"
+                | "$summary"
+                | "$health-cards-issue"
+                | "$expand"
+                | "$expandability"
+                | "$validate-code"
+                | "$lookup"
+                | "$subsumes"
+                | "$translate"
         ) {
             return "read";
         }

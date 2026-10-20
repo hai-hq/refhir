@@ -12,6 +12,110 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **The terminology operations answer a `GET`.** R4 defines `$expand`, `$validate-code`, `$lookup`,
+  `$subsumes` and `$translate` as having no side effects, and they were `POST` only (a `GET`
+  answered `405`). Their parameters go in the query string (`url`, `filter`, `count` and `offset`
+  for `$expand`; `system`, `code`, `display`, `abstract` and so on for the rest), and the answer is
+  the one the `POST` gives. A `coding` or `codeableConcept` is still sent as a `POST`. See
+  [FHIR API](docs/fhir-api.md#terminology).
+- **Expansions are complete R4 ValueSets.** The ValueSet an expansion comes in has the `status` R4
+  requires (that of the value set expanded, `active` when it says nothing), and the expansion has
+  the required `timestamp` (the time the server produced it for the request), an `identifier`
+  (a `urn:uuid` made from what the expansion says), and in `expansion.parameter` what was asked that shaped
+  it (`filter`, `count`, `offset`, `activeOnly`). An entry carries `"inactive": true` when its code
+  system says the concept is inactive.
+- **`$expand` takes `activeOnly`.** `activeOnly=true` leaves out the codes whose code system calls
+  them inactive; the `total` counts what is left.
+- **The terminology operations answer at the instance.** `ValueSet/[id]/$expand` and
+  `/$validate-code`, `CodeSystem/[id]/$validate-code` and `/$subsumes`, and
+  `ConceptMap/[id]/$translate`, as `POST` or `GET`, with R4's instance forms (`CodeSystem/$lookup`
+  is the type only). The instance is a resource the server stores, and what is asked of it is asked
+  of the value set, code system or concept map its `url` names (`409` when a package defines that url
+  too, since the terminology cannot tell which is meant). A value set that came from a package
+  is expanded by `url`.
+- **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
+  and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include
+  of a code system whose `content` is `example`, and were refused for that. They now expand to the
+  concepts the server holds, and the expansion says it is only a sample with an `expansion.parameter`
+  named `<system>|<version>#CodeSystem.content` whose value is `example`, as R4 describes. A filter on
+  such a system, an exclusion of one, one with no concepts installed, and a `fragment` are still
+  refused. `$validate-code` agrees with `$expand`; a code outside the sample is `false` with a
+  message that says the list is only a sample, and the resource validator reports the code as one it
+  cannot check, not as an error.
+- **Expansions mark abstract codes.** An entry of `$expand` carries `"abstract": true` when its code
+  system marks the concept `notSelectable`, as HL7's v3 code systems do for their grouping concepts
+  (R4's `ValueSet.expansion.contains.abstract`). `coverage-type` flags `_ActCoverageTypeCode`,
+  `_ActHealthInsuranceTypeCode`, `_ActInsurancePolicyCode`, `_ActInsuranceTypeCode` and
+  `_ActProgramTypeCode`, and no other entry. `ValueSet/$validate-code` takes R4's `abstract` input:
+  `false` refuses an abstract code, `true` accepts it, and without it the code is valid and the
+  `message` says it is a grouping concept.
+- **A value set that waits on another package's code system is expanded when that package
+  arrives.** A package stores the expansions of its own value sets, made from its own resources,
+  so a value set that includes a code system (or a value set) that another package carries was
+  left with no expansion, and installing that other package later, or earlier, did not give it
+  one until the next rebuild. After any install, the value sets that have no expansion are tried
+  again, and the ones that can now be expanded are expanded and stored under the package whose
+  definition they are of. It is one attempt at each value set that has none (94 for the R4 and SDC
+  packages, about a sixth of a second) and not a rebuild.
+- **ISO 4217 currency codes are built in.** HL7 publishes `ValueSet/currencies` (the required
+  binding of `Money.currency`) as an include of `urn:iso:std:iso:4217` and no CodeSystem for it, so
+  the value set could not be expanded and a currency could not be checked. The server now installs the
+  code system itself, at start, once: the 178 active alphabetic codes with their numeric codes and
+  English names. `$expand` of `currencies` lists them, `$validate-code` accepts a real code and
+  refuses an unknown one, and a `Money` with an unknown `currency` is rejected. A database that
+  already has the R4 packages gets it at its next start, as the package `refhir.builtin.terminology`.
+- **`Patient/$summary`: an International Patient Summary.** `GET` or `POST` it on a patient (or on
+  `Patient`, with an `identifier`) and it returns an IPS document Bundle: a Composition with
+  allergies, problems and medications (always there, with `emptyReason` when there is nothing),
+  and immunizations, laboratory results and procedures (left out when empty), each with a table
+  in its text, together with the patient's own resources and what they point at. It holds only
+  what the caller's scopes let them read, and never another patient. With the IPS package
+  installed, the summary validates against the IPS profiles. See
+  [Patient summary](docs/patient-summary.md).
+- **`Patient/[id]/$health-cards-issue`: SMART Health Cards.** With a P-256 key in
+  `[health_cards].key_file` (or `REFHIR_HEALTH_CARDS_KEY_FILE`), the server signs cards that hold the
+  patient's name and birth date and the resources asked for by `credentialType`, shrunk as the card
+  format asks, and publishes the public key at `/health-cards/.well-known/jwks.json`. `_since` holds
+  a card to what was written at or after it. See [SMART Health Cards](docs/health-cards.md).
+- **`meta.lastUpdated`, `_lastUpdated`, and history by date.** The server sets `meta.lastUpdated` on
+  every version it writes, to the millisecond, in UTC. `_lastUpdated` finds resources by it (it
+  matched nothing before, because nothing was ever set), and `_since` on a type's or the server's
+  history takes a date and time as FHIR has it (it was a `400` for anything but a version id). A
+  version id still works. Versions written before this release have no time: they are not found by
+  `_lastUpdated`, and get one the next time they are written. A deletion has no time, so a history
+  by date lists a deletion from just before the date, never leaves one out. See
+  [When a resource was written](docs/fhir-api.md#when-a-resource-was-written).
+- **A guide to SMART Health Links**, with a script that fetches a summary, encrypts it and
+  makes the link, and a host for the links (`link-host`, below). The server does not host links: a
+  separate host holds the encrypted files, so the key is never on a server that holds the record.
+  See [SMART Health Links](docs/health-links.md).
+- **A link host to run, as a package of its own.** `link-host` is a [Hono](https://hono.dev) server in
+  TypeScript that stores the encrypted files of SMART Health Links in Postgres, or in a SQLite file for
+  one machine with no database server, and answers whoever opens a link. It never has a key, so a host
+  that is broken into holds nothing that can be read. `link-host/deploy` starts it with Caddy, which
+  gets and renews an HTTPS certificate, and Postgres (`compose.yaml`) or a SQLite volume
+  (`compose.sqlite.yaml`), from one `.env` file. The host:
+  - **Keeps nothing on its own disk** with Postgres, so any number of copies run against one
+    database, and a new one may start before the old one stops. With SQLite several copies share the
+    file on one machine, and `refhir-link-host backup` copies it while they run. Either way a guess at
+    a passcode is counted once whichever copy receives it: in a transaction on the link's row in
+    Postgres, and by running again a change that finds the link changed under it in SQLite. The schema
+    is made on first start.
+  - **Clears away what has ended.** The encrypted files of a link that expired, was switched off or ran
+    out of attempts are deleted, and the record is kept for 30 days so its owner can read who asked.
+    A link without an `expiresAt` lasts 30 days, and the answer says when.
+  - **Limits how often it is asked**: by address, by link, for owners, for making links, and a caller
+    who keeps getting a token wrong is shut out. Requests, headers, time and concurrency are bounded.
+  - **Says who may make links**: a clients file with a token (or its hash) and limits for each,
+    addresses the owner routes or a client are tied to, and `REQUIRE_PASSCODE`. Owner routes cannot
+    be called from another site's page unless it is named.
+  - **Says what it does**: a JSON line for each request and event, naming a link by its first eight
+    characters and logging nothing that opens one; the address, browser and outcome of each caller in
+    the link's access list; `/readyz`, which fails when the database cannot be written; `/metrics`;
+    and a stop that tells the balancer first and then finishes what it is answering.
+  - **Can be changed in code**: `authenticate`, `authorizeCreate`, `authorizeManifest` (to check who a
+    recipient is), `onEvent`, and a `store` that another database can stand in for.
+
 - **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
   to answer `405`. It now takes FHIR R4's `Parameters` (`resource`, `onlyCertainMatches`, `count`)
   and answers a `searchset` Bundle, best first, with a `search.score` and the `match-grade`
@@ -61,6 +165,62 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   given it up. Resources of a type that only the older
   version defined stay in the database but are not served.
   See [Upgrading a package](docs/configuration.md#upgrading-a-package).
+- **With SMART, the terminology operations need the `read` permission, not `create`.** `$expand`,
+  `$expandability`, `$validate-code`, `$lookup`, `$subsumes` and `$translate` change nothing, but a
+  `POST` of one was authorised as a create, so a client with only `read` could not use them and
+  one with only `create` could. They are reads, as a `GET` of them is. A client that was given only
+  `create` for these resources to call them needs `read` now.
+- **Stored expansions are rebuilt once at the first start after this version**, so a database
+  that holds the R4 packages gains the expansions above. It is the same one-time rebuild an upgrade
+  has done before, and the next start finds nothing to do.
+- **A date search compares to the millisecond and in the zone a time is written in.** It compared
+  in whole seconds, so two times in one second could not be told apart (`lt` on a time missed a time
+  33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an
+  hour or more away from where it is. A value that is a date, or that has no fraction, still
+  stands for all of the day or the second it names.
+- **`gt` and `lt` on a date follow FHIR.** `gt2026-10-18` found a resource that ended after the
+  day's end, and `lt` one that began before the day's start, as `sa` and `eb` did: a period or a
+  day that straddles the value was left out. `gt` and `lt` now take what reaches beyond the value;
+  `sa` and `eb` take only what lies wholly beyond it.
+- **A slice's minimum and maximum are checked.** A profile that asks for at least one value in a
+  slice (an IPS section a summary must have, say) now fails a resource that has none, and one that
+  allows a slice once fails a resource that has it twice. A slice that is told apart by a profile
+  is still not checked.
+- **A health card's `iss` is an address a verifier can reach.** The server refuses to start with a
+  signing key on a non-loopback address when no `public_url` is set, and says so when `public_url`
+  is not `https`. `credentialType` takes the clinical types the summary holds, and no other.
+- **`Patient/$summary` and `$health-cards-issue` read a bounded part of a record.** Each kind is
+  read newest first, up to 2,000 resources, and a section holds the 100 most recently written.
+- **`$document` for a token tied to one patient holds nothing of another patient.** A reference
+  that names a host (`http://other.example/Patient/1`) is no longer taken as a resource of this
+  server.
+- **A date search no longer misses a time because of how the time is written.** The index was
+  read in the order of the text, which is not the order of time: `ge2026-10-18T04:45:53Z` found
+  nothing where a time was stored as `...:53.065Z` (a `.` sorts before a `Z`), and a time in another
+  zone was cut off the same way. A date search now reads every day it could reach, and a date
+  written to the year or the month is read by its own key, and the comparison above decides.
+- **A resource inside a Bundle entry is validated as the resource it is.** `entry.resource` (and
+  any other element that holds a whole resource, such as a Parameters part) was checked as the
+  abstract `Resource`, so every element of every entry was "unknown" and a Bundle with entries
+  could not be validated. It is now checked against its own type, the profiles the entry's slice
+  names and the ones it states in `meta.profile`. HL7's own example IPS summaries now validate.
+- **A narrative is checked, not refused.** `txt-1` and `txt-2` use FHIR's `htmlChecks()`, which
+  the server did not implement, so `$validate` of any resource with a narrative failed with
+  "unsupported function htmlChecks". It now checks that the narrative is one `div` in the XHTML
+  namespace with only the basic formatting elements, no script and some text.
+- **A complex extension is validated by the values inside it,** as is anything else a profile
+  slices: the `value[x]` of a part of an extension (the `lang` and `content` of a translation)
+  was looked for under that literal name and reported missing. Slices of an element that sits
+  inside a slice of its parent (each section of a Composition slicing its `entry`) are now told
+  apart, and no longer applied to every value of the element.
+- **`$document` returns a valid document.** It has an `identifier`, a `timestamp` and a `urn:uuid`
+  `fullUrl` for each entry, references that point at them, and holds what the Composition's
+  resources reference as well as what it references itself, each once. A document of more than
+  1000 resources is a `422`.
+- **`$everything` and `$document` hold only what the caller's scopes let them read.** They used to
+  read every kind of resource of the compartment or the document regardless of the token.
+- The built-in Patient compartment holds `MedicationStatement` and `Immunization`, for a server
+  with no `CompartmentDefinition` installed.
 
 ## [0.0.2] - 2026-10-19
 

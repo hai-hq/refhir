@@ -1,0 +1,67 @@
+{
+  "name": "@haihq/refhir-link-host",
+  "version": "0.0.1",
+  "description": "A SMART Health Links host: stores encrypted files in Postgres or SQLite and answers whoever opens a link",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hai-hq/refhir.git",
+    "directory": "link-host"
+  },
+  "homepage": "https://github.com/hai-hq/refhir/tree/main/link-host#readme",
+  "bugs": {
+    "url": "https://github.com/hai-hq/refhir/issues"
+  },
+  "keywords": [
+    "smart-health-links",
+    "fhir",
+    "hl7",
+    "healthcare",
+    "interoperability",
+    "hono"
+  ],
+  "bin": {
+    "refhir-link-host": "./dist/server.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "migrations",
+    "deploy"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "check": "node dist/server.js --check",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "hono": "^4.13.13",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  }
+}

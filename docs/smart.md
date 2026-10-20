@@ -7,6 +7,7 @@
 - Token endpoint: `authorization_code`, `refresh_token`, and `client_credentials` (asymmetric JWT)
 - OpenID Connect `id_token`, token introspection, revocation, and dynamic client registration
 - SMART v1 (`patient/*.read`) and v2 (`patient/*.rs`) scopes, plus patient-compartment enforcement
+- Operations that read a patient's record (`$everything`, `$summary`, `$document` and `$health-cards-issue`) hold only the kinds of resource the token's scopes let it read. `$summary` and `$health-cards-issue` are reads even when sent with `POST`, so they need read scope and not create. A token tied to one patient uses the instance form for that patient (`Patient/[id]/$summary`); another patient, or finding one by identifier, is a `403`
 
 Default clients: `public` (no secret) and `confidential` (`--smart-confidential-secret`), with loopback redirect URIs `/cb` and `/app`. App-launch tokens cannot include `system/` scopes.
 
