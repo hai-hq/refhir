@@ -1792,7 +1792,12 @@ fn is_date(text: &str) -> bool {
         None => (text, None),
     };
     let mut parts = date.split('-');
-    let Some(year) = parts.next().and_then(|part| digits(part, 4)) else {
+    // R4 has no year 0: a year is 0001 to 9999, as the validator reads the same value.
+    let Some(year) = parts
+        .next()
+        .and_then(|part| digits(part, 4))
+        .filter(|year| *year >= 1)
+    else {
         return false;
     };
     let month = match parts.next() {

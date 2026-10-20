@@ -190,6 +190,11 @@ is every parameter of the type: `date` on an `Encounter` or an `Observation`, `c
   asks for a zone with every time in a `dateTime`, a time with no zone names no moment, and a search
   by a moment could only guess. Writing `"effectiveDateTime": "2026-10-31T22:30:00"` is a `400`
   that names the element. A date with no time (`2026-10-31`) needs no zone.
+- **A date has to exist.** A `date`, a `dateTime` or an `instant` is refused when it is written
+  unless it is a date of the calendar: a year from `0001` to `9999` with no sign, and a day that is
+  one of its month in that year. `2026-02-30`, `2023-02-29`, `2026-10-00` and `0000-01-01` are each
+  a `400` that names the element. A search value is held to the same rule, so `date=0000` is a
+  `400` and not an empty result.
 - **A period is the range between its ends**, each read in the zone it was written in. One with no
   `end` has not ended, and one with no `start` has no beginning, so each runs without limit that
   way: `gt2030-01-01` finds an Encounter that started in 2026 and has no `period.end`, as it finds a

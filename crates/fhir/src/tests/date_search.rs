@@ -509,6 +509,153 @@ fn a_stored_time_must_have_a_zone_and_a_date_need_not() {
     }
 }
 
+/// The elements a resource is refused for, as the elements they name.
+fn errors_of(resource: Value) -> Vec<String> {
+    let harness = fixture();
+    let catalog = harness.catalog.read().expect("catalog");
+    let path = format!("{}/$validate", resource["resourceType"].as_str().unwrap());
+    let report =
+        run(&harness.db, &catalog, &path, &json!({"resource": resource})).expect("validate");
+    report.value["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["severity"] == "error")
+        .flat_map(|issue| issue["expression"].as_array().cloned().unwrap_or_default())
+        .map(|expression| expression.as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A `date` of a Patient, a `dateTime` of an Encounter's period and an `instant` of an
+/// Observation, each with `value`: the errors it is refused for.
+fn errors_for(kind: &str, value: &str) -> Vec<String> {
+    match kind {
+        "date" => errors_of(json!({"resourceType": "Patient", "birthDate": value})),
+        "dateTime" => errors_of(encounter("check", json!({"start": value}))),
+        _ => errors_of(json!({
+            "resourceType": "Observation", "status": "final", "code": {"text": "vitals"},
+            "issued": value})),
+    }
+}
+
+/// A date that cannot be searched for, or that does not exist, is refused when it is written, in
+/// each of the three kinds that hold one. The day and the month start at 1, the year at 0001 (R4
+/// has no year 0 and no year before it), and the day has to be one of the month in that year.
+#[test]
+fn a_stored_date_must_be_one_that_exists() {
+    let element = |kind: &str| match kind {
+        "date" => "Patient.birthDate",
+        "dateTime" => "Encounter.period.start",
+        _ => "Observation.issued",
+    };
+    // A day and a clock, for the kinds that need both; the kinds that may stop at a day or at a
+    // month are also asked with less.
+    for (kind, shorter) in [("date", true), ("dateTime", true), ("instant", false)] {
+        let at = |day: &str| {
+            if kind == "date" {
+                day.to_string()
+            } else {
+                format!("{day}T10:00:00Z")
+            }
+        };
+        for day in [
+            "2026-10-00",
+            "2026-00-10",
+            "2026-13-01",
+            "0000-01-01",
+            "-0001-01-01",
+            "2026-02-30",
+            "2026-04-31",
+            "2023-02-29",
+            "1900-02-29",
+            "2100-02-29",
+            "2026-02-32",
+        ] {
+            assert_eq!(
+                errors_for(kind, &at(day)),
+                [element(kind)],
+                "{kind} {day} should be refused"
+            );
+        }
+        for day in [
+            "2024-02-29",
+            "2000-02-29",
+            "2026-02-28",
+            "2026-04-30",
+            "2026-10-31",
+            "0001-01-01",
+            "9999-12-31",
+        ] {
+            assert!(
+                errors_for(kind, &at(day)).is_empty(),
+                "{kind} {day} should be accepted"
+            );
+        }
+        if shorter {
+            for text in ["0000", "0000-01", "-2026", "-2026-10", "2026-00", "2026-13"] {
+                assert_eq!(
+                    errors_for(kind, text),
+                    [element(kind)],
+                    "{kind} {text} should be refused"
+                );
+            }
+            for text in ["0001", "9999", "2026", "2026-02", "2026-12"] {
+                assert!(
+                    errors_for(kind, text).is_empty(),
+                    "{kind} {text} should be accepted"
+                );
+            }
+        }
+    }
+}
+
+/// What can be written as a `date` is what can be searched for: one grammar for the two. A date
+/// that is stored and that no search can read is a record nothing finds, and a value that is asked
+/// for and could never be stored is a search that cannot find anything.
+#[test]
+fn a_date_that_can_be_stored_is_one_that_can_be_asked_for() {
+    let birthdate = crate::extract::compile_parameter(
+        &json!({"code": "birthdate", "type": "date", "expression": "Patient.birthDate"}),
+        &BTreeMap::new(),
+    )
+    .expect("a date parameter");
+    for text in [
+        "2026",
+        "2026-10",
+        "2026-10-31",
+        "2024-02-29",
+        "2000-02-29",
+        "0001",
+        "0001-01-01",
+        "9999",
+        "9999-12-31",
+        "2026-10-00",
+        "2026-00",
+        "2026-13",
+        "2026-02-30",
+        "2026-04-31",
+        "2023-02-29",
+        "1900-02-29",
+        "0000",
+        "0000-01",
+        "0000-01-01",
+        "-2026",
+        "-0001-01-01",
+        "20261031",
+        "2026-1-5",
+        "26-10-31",
+        "2026-10-31-01",
+        "yesterday",
+        "",
+    ] {
+        assert_eq!(
+            errors_for("date", text).is_empty(),
+            birthdate.check_value(None, text).is_ok(),
+            "{text:?}: the validator and the search disagree"
+        );
+    }
+}
+
 #[test]
 fn a_write_of_a_time_with_no_zone_is_refused_and_stores_nothing() {
     let harness = ready();

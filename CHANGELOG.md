@@ -98,6 +98,12 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   (no end) or by `lt` and `le` (no start) only near the date it does have until it is written
   again, since the index holds a key for the open end only from now on (see [Searching by a date
   or a time](docs/fhir-api.md#searching-by-a-date-or-a-time)).
+- **A date that does not exist is refused when it is stored.** A `date`, `dateTime` or `instant`
+  with day `00` (`2026-10-00`), year `0000`, a sign before the year, or a day that is not one of its
+  month (`2026-02-30`, `2023-02-29`) was accepted, and every one of them but year `0000` was a date
+  that no search could read, so the resource was stored and nothing found it. It is now a `400`
+  that names the element, as R4 asks. `date=0000` in a search is a `400` too. Such a date that is
+  already stored stays stored, and is still found by no search.
 - **A time with no zone is refused when it is stored.** `"effectiveDateTime": "2026-10-31T22:30:00"`
   was accepted, though FHIR asks for a zone with every time in a `dateTime`, and a search by a date
   read it as UTC whatever zone its writer meant. It is now a `400` that names the element. A date
