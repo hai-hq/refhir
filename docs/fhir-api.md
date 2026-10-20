@@ -49,11 +49,8 @@ an entry of a history shows when that version was written.
   missed.
 - **Cards** for what is new: `_since` on [`$health-cards-issue`](health-cards.md).
 
-A date, or a time that stops short, stands for the start of what it names, and a time with no zone
-is UTC. Dates and times are compared to the millisecond and in the zone they are written in, so
-`2026-10-18T06:00:00+01:00` and `2026-10-18T05:00:00Z` are the same moment. A value such as
-`2026-10-18T04:45:36.5` stands for a tenth of a second, and one with no fraction for the whole
-second.
+How a date and a time are compared, in this and in any other search by a date, is under [Searching
+by a date or a time](#searching-by-a-date-or-a-time).
 
 Versions written before the server kept times have none. A search by time does not find them, and a
 history by time lists them only when the time is earlier than the first version that has one. A
@@ -191,6 +188,63 @@ resource gets its time the next time it is written.
   client described), nor to a `batch` or `transaction` entry, GraphQL or a live query. A
   `_handling` in the query string does nothing.
 
+### Searching by a date or a time
+
+A `date` parameter finds a resource by the moment it names, not by the text it was written as. That
+is every parameter of the type: `date` on an `Encounter` or an `Observation`, `created` on a
+`Claim`, a `ClaimResponse` and a `PaymentReconciliation`, `birthdate` on a `Patient`, and
+`_lastUpdated`.
+
+- **A time with a zone is a moment, whatever zone it is written in.** `2026-10-31T23:30:00+01:00`
+  and `2026-10-31T22:30:00Z` are the same moment, so these two searches find the same resources, and
+  both find an Encounter stored with either:
+
+  ```
+  GET /Encounter?date=ge2026-09-30T23:00:00Z&date=lt2026-10-31T23:00:00Z
+  GET /Encounter?date=ge2026-10-01T00:00:00%2B01:00&date=lt2026-11-01T00:00:00%2B01:00
+  ```
+
+  Give `date` twice for a window (a parameter given twice is AND). Write the `+` of a zone as `%2B`
+  in a URL: an unencoded `+` reads as a space, and the search is refused with a message that says
+  so.
+- **A value says how much it names.** `2026` is the year, `2026-10` the month, `2026-10-31` the
+  day, `2026-10-31T22:30` the minute, `2026-10-31T22:30:00` the second and `2026-10-31T22:30:00.5`
+  the tenth of a second. A stored value says the same of itself, so a stored `2026-10-31` is the
+  whole of that day. Times are compared to the millisecond.
+- **A date has no zone, and is read as UTC.** `2026-10-31` is the day that starts at
+  `2026-10-31T00:00:00Z`. Ask for a day in another zone with its two times:
+  `date=ge2026-11-01T00:00:00%2B01:00&date=lt2026-11-02T00:00:00%2B01:00`.
+- **The prefixes compare ranges.** A value stands for a range of time (a year, a month, a day, a
+  minute, a second), and so does each stored date, and a `Period` for the range between its ends.
+  `eq`, the default, finds what lies wholly inside the value, and `ne` what does not: `eq2026-10`
+  finds an Observation of `2026-10-31` and not one of `2026`, which reaches beyond the month.
+  `gt` and `lt` find what reaches above or below the value, so a year, which holds days after a
+  day, is above that day; `sa` and `eb` find only what lies wholly after or before it. `ge` and
+  `le` find what `gt` and `lt` find, and what lies wholly inside the value. `ap` finds what
+  overlaps the value. A value to the second is a range of one second, so `gt2026-10-31T22:30:00Z`
+  does not find a time stored as `2026-10-31T23:30:00+01:00`, which is the same second.
+- **A time with no zone** is read as UTC when it is a search value. A stored one is refused: FHIR
+  asks for a zone with every time in a `dateTime`, a time with no zone names no moment, and a search
+  by a moment could only guess. Writing `"effectiveDateTime": "2026-10-31T22:30:00"` is a `400`
+  that names the element. A date with no time (`2026-10-31`) needs no zone.
+- **A date has to exist.** A `date`, a `dateTime` or an `instant` is refused when it is written
+  unless it is a date of the calendar: a year from `0001` to `9999` with no sign, and a day that is
+  one of its month in that year. `2026-02-30`, `2023-02-29`, `2026-10-00` and `0000-01-01` are each
+  a `400` that names the element. A search value is held to the same rule, so `date=0000` is a
+  `400` and not an empty result.
+- **A period is the range between its ends**, each read in the zone it was written in. One with no
+  `end` has not ended, and one with no `start` has no beginning, so each runs without limit that
+  way: `gt2030-01-01` finds an Encounter that started in 2026 and has no `period.end`, as it finds a
+  period that is still going. An Encounter that has finished should say so with `period.end`:
+  without it, every window after its start finds it. A window of two values finds every period that
+  is going on at some moment in it:
+  `date=ge2026-10-30T00:00:00Z&date=lt2026-10-31T00:00:00Z`. Write a window as two times, not as
+  one day: `date=2026-10-31` finds only the periods wholly inside that day, and `ge2026-10-31`
+  leaves out one that ends on it, since neither reaches above the day.
+- **`_sort`** on a date, `_sort=date` or `_sort=-date`, orders by the moment each one starts, so the
+  order is the same whatever zones were written. Dates that start at the same moment are in the
+  order of their ids.
+
 ## Operations
 
 | Operation | Where | Notes |
@@ -203,7 +257,7 @@ resource gets its time the next time it is written.
 | `$document` | `Composition/[id]` | A document Bundle of the Composition and what it references; see [Documents](#documents) |
 | `$summary` | `Patient`, `Patient/[id]` | An International Patient Summary. See [Patient summary](patient-summary.md) |
 | `$health-cards-issue` | `Patient/[id]` | A SMART Health Card, where the server has a signing key. See [SMART Health Cards](health-cards.md) |
-| `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology) |
+| `$expand`, `$lookup`, `$validate-code`, `$subsumes`, `$translate` | `ValueSet`, `CodeSystem`, `ConceptMap` | See [Terminology](#terminology). Each also answers a `GET`, and with SMART needs only `read` |
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
@@ -468,8 +522,40 @@ The server assigns the id of every resource it creates. `POST [type]` ignores an
 
 ## Terminology
 
-`ValueSet/$expand` returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`example`, `fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned, because a client cannot tell it from a complete one.
+`ValueSet/$expand` takes `url`, and optionally `filter`, `count`, `offset` and `activeOnly`, as a `POST` (a JSON body or a Parameters resource) or as a `GET` with the same names in the query string:
+
+```bash
+curl 'http://localhost:8080/ValueSet/$expand?url=http://hl7.org/fhir/ValueSet/organization-type&filter=hospital&count=10'
+```
+
+The other terminology operations (`$validate-code`, `$lookup`, `$subsumes`, `$translate`) take their parameters the same way: as a `POST`, or as a `GET` with plain names in the query string (`system`, `code`, `display`, `url`, `version`, `codeA`, `codeB`, `targetsystem`, `abstract`). A parameter that is not a plain value, a `coding` or a `codeableConcept`, is sent as a `POST`. R4 also defines `$expand` and `$validate-code` on a value set, `$validate-code` and `$subsumes` on a code system, and `$translate` on a concept map at the instance level: `POST` or `GET /ValueSet/[id]/$expand`, `/ValueSet/[id]/$validate-code`, `/CodeSystem/[id]/$validate-code`, `/CodeSystem/[id]/$subsumes`, `/ConceptMap/[id]/$translate`. The instance is a resource the server stores, one written through the API, and what is asked of it is asked of the value set, code system (at its `version`) or concept map its `url` names, so no `url` or `system` is given. The body may be empty. An id the server does not store is `404`, and one whose `url` a package defines too is `409` (the terminology holds one definition of a url, and cannot tell which is meant: ask by `url`); a value set that came from a package has no id to ask for, and is expanded by `url`. (`CodeSystem/$lookup` is defined on the type only.)
+
+These operations change nothing, so with SMART they need only the `read` permission, whichever way they are sent, and a client that may only create is refused.
+
+It returns the expansion, or `422` with an `OperationOutcome` when the value set cannot be expanded. Each cause is one issue, with the failing part of the value set in `expression` (for example `ValueSet.compose.include[1]`) and the code system, its `content` mode and the filter in `diagnostics`. The usual causes are a code system that is not installed, one that holds only part of its content (`fragment`, or `not-present`, as the R4 SNOMED CT stub does), or a filter this server does not evaluate. A partial expansion is never returned without saying so, because a client cannot tell it from a complete one.
+
+One partial case is expanded, and says so. A code system whose `content` is `example` holds a few representative concepts, and HL7 publishes value sets that are nothing but a whole-system include of one (`service-category` and `service-type`, which offer choices for `HealthcareService`). Such a value set expands to the concepts the server holds for the system, and the expansion names each system that is only a sample in an `expansion.parameter` called `<system>|<version>#CodeSystem.content`, as R4 describes, with the content mode as its value:
+
+```json
+"expansion": {
+  "parameter": [{
+    "name": "http://terminology.hl7.org/CodeSystem/service-category|4.0.1#CodeSystem.content",
+    "valueCode": "example"
+  }],
+  "total": 38, "offset": 0, "contains": ["…"]
+}
+```
+
+A client that needs a closed list checks for such a parameter. Only an include of the whole system is expanded this way: a filter on a sample, an exclusion of one, a sample that holds no concepts, and a `fragment` are still refused. `$validate-code` against such a value set answers from the same list, with `result` false and a `message` that says the list is only a sample for a code outside it. A resource whose binding is to one is not rejected for a code the sample lacks: the validator reports that the code cannot be checked.
+
+The ValueSet an expansion comes in has the `status` of the value set it was expanded from (`active` when that says nothing), and the expansion carries the `timestamp` R4 requires, the time the server produced it for the request, and an `identifier` (a `urn:uuid` made from what the expansion says, so the same for two answers that say the same). What was asked that shaped it is listed in `expansion.parameter`: `filter`, `count`, `offset` and `activeOnly`. An entry says `"inactive": true` when its code system says the concept is inactive (no longer to be used, but kept to make sense of old data); it is still listed, unless the request said `activeOnly=true`, which leaves such codes out (and the `total` counts what is left).
+
+An expansion marks an entry `"abstract": true` when its code system says the concept is not to be selected as a value (the `notSelectable` property, which HL7's v3 code systems use for their grouping concepts: `_ActCoverageTypeCode`, `_ActInsuranceTypeCode` and so on in `coverage-type`). The entry is still listed, for navigation, so a picker leaves out the entries that carry the flag. `$validate-code` takes R4's `abstract` input: with `abstract=false` an abstract code is not valid (`result` false, and the `message` says why), with `abstract=true` it is valid, and without the input it is valid and the `message` says it is a grouping concept.
+
+HL7 publishes `ValueSet/currencies` (the binding of `Money.currency`) as an include of ISO 4217 and no CodeSystem for it, so ReFHIR installs one itself at start: the active alphabetic currency codes (178, with their numeric codes and English names, for example `NGN` Nigerian Naira). `$expand` of `currencies` lists them, `filter=naira` finds `NGN`, `$validate-code` accepts a real code and refuses an unknown one, and a `Money` with an unknown `currency` is refused by `$validate` and on write. It is installed once, as the package `refhir.builtin.terminology`, after the packages the server installs, so it works with packages you add with `--package` too. A server that has no package has nothing to use it, and gets it at the first start after it has one.
 
 A code system can be installed in several versions, and each is kept. Name a version with `system|version` (or `include.version`) and the expansion uses exactly that one. A version that is not installed is refused, and the error lists the versions that are. With no version named, a value set from a package uses the versions its own package holds, and a value set you write through the API, or one whose package does not hold the system, uses the version of the FHIR release the server serves (`4.0.1` for R4) when it is installed, and the latest installed version otherwise. The expansion records the version it read. `$lookup`, `$subsumes` and `CodeSystem/$validate-code` take a `version` parameter.
+
+A value set that includes a code system, or a value set, that another package carries is expanded when both are installed, whichever came first: after any install the server tries again the value sets that have no expansion (see `$expandability` for the ones that still have none), and it stores what it can now expand.
 
 `POST /ValueSet/$expandability` reports, for the value sets named in `url` (a string, an array, or `url` parameters of a Parameters resource), whether each can be expanded and why not; with none named it lists every loaded value set that cannot. Use it as a deployment check for the value sets a UI depends on. `POST /ImplementationGuide/$install` adds a warning to its response for any value set the package made unexpandable, and the server logs how many there are at start-up.

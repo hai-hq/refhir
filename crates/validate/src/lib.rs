@@ -230,6 +230,39 @@ mod tests {
     }
 
     #[test]
+    fn a_required_binding_to_a_sample_does_not_reject_a_code_the_sample_lacks() {
+        // The value set is a whole `example` system: it lists the concepts installed, and a
+        // code outside them may still be in the system. `required` would turn that into an error.
+        let terms = MemoryTerminology::from_resources(&[
+            json!({"resourceType": "CodeSystem", "url": "http://hl7.org/fhir/administrative-gender",
+                   "content": "example", "concept": [{"code": "male"}, {"code": "female"}]}),
+            json!({"resourceType": "ValueSet", "url": "http://hl7.org/fhir/ValueSet/administrative-gender",
+                   "compose": {"include": [{"system": "http://hl7.org/fhir/administrative-gender"}]}}),
+        ]);
+        let validate = |gender: &str| {
+            check(
+                json!({"resourceType": "Patient", "gender": gender,
+                       "generalPractitioner": {"reference": "Organization/1"}}),
+                &terms,
+            )
+        };
+        let listed = validate("male");
+        assert!(listed.issues.is_empty(), "{:?}", listed.issues);
+        let unlisted = validate("otherish");
+        assert!(!unlisted.has_errors(), "{:?}", unlisted.issues);
+        let warning = unlisted
+            .issues
+            .iter()
+            .find(|issue| issue.code == "not-supported")
+            .expect("a warning that the code cannot be checked");
+        assert!(
+            warning.diagnostics.contains("only some of the concepts"),
+            "{warning:?}"
+        );
+        assert_eq!(warning.expression, "Patient.gender");
+    }
+
+    #[test]
     fn missing_value_set_warns_without_rejecting_the_instance() {
         let outcome = check(
             json!({

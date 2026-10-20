@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use refhir_database::Transaction;
 use refhir_fhirpath::Model;
 use refhir_sdc::{behavior_document, scope_allows, Chart};
+use refhir_validate::{TermAnswer, Terminology};
 use serde_json::{json, Value};
 
 use crate::catalog::{Catalog, ResourceModel};
@@ -80,27 +81,13 @@ impl Chart for Bridge<'_> {
     }
 
     fn in_valueset(&mut self, system: Option<&str>, code: &str, value_set: &str) -> Option<bool> {
-        let result = self
-            .catalog
-            .terms()
-            .validate_code(Some(value_set), system, None, code, None);
-        if result.get("resourceType").and_then(|value| value.as_str()) == Some("OperationOutcome") {
-            return None;
+        match self.catalog.terms().contains(value_set, system, code) {
+            TermAnswer::Yes => Some(true),
+            TermAnswer::No => Some(false),
+            // No expansion, or a sample of a code system that cannot rule a code out: nothing to
+            // say, as the resource validator says nothing.
+            TermAnswer::Unknown => None,
         }
-        result
-            .get("parameter")
-            .and_then(|value| value.as_array())
-            .and_then(|items| {
-                items.iter().find_map(|parameter| {
-                    if parameter.get("name").and_then(|value| value.as_str()) == Some("result") {
-                        parameter
-                            .get("valueBoolean")
-                            .and_then(|value| value.as_bool())
-                    } else {
-                        None
-                    }
-                })
-            })
     }
 }
 

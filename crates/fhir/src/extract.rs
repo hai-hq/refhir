@@ -370,11 +370,53 @@ impl Extractor {
                 .collect();
         }
         let values = self.indexed_values(resource, path_model, host);
-        match self.probe("") {
+        let mut rows = match self.probe("") {
             Probe::Token(_) | Probe::Tokens(_) => token_rows(index, id, &values),
             Probe::Prefix(_) | Probe::Dates(_) => string_rows(index, id, &values),
             Probe::Range(_) | Probe::Cells { .. } | Probe::Scan => Vec::new(),
+        };
+        rows.extend(self.open_period_rows(resource, id, index, path_model, host));
+        rows
+    }
+
+    /// The keys that let a search find a period that has no end, or no start. A date is indexed by
+    /// the text it was written as, and a search reads the keys near the value it asks for; a period
+    /// that never ends reaches above every value, and its own start may be far below them, so it
+    /// is also indexed as `OPEN_END_KEY`, which no value is above, and one with no start as
+    /// `OPEN_START_KEY`, which none is below.
+    fn open_period_rows(
+        &self,
+        resource: &Value,
+        id: &str,
+        index: &IndexId,
+        path_model: &Model,
+        host: &dyn Host,
+    ) -> Vec<(IndexId, Vec<u8>)> {
+        let ranges: Vec<Range> = match &self.source {
+            Source::Path(expr) if self.kind == SearchKind::Date => {
+                date_ranges(expr, resource, path_model, host)
+            }
+            Source::Composite { focus, parts }
+                if parts
+                    .first()
+                    .is_some_and(|part| part.kind == SearchKind::Date) =>
+            {
+                let part = &parts[0];
+                focus_nodes(focus, resource, path_model, host)
+                    .into_iter()
+                    .flat_map(|node| date_ranges(&part.expr, &node, path_model, host))
+                    .collect()
+            }
+            _ => return Vec::new(),
+        };
+        let mut rows = Vec::new();
+        if ranges.iter().any(|range| range.0 == NO_START) {
+            rows.push((index.clone(), string_key(OPEN_START_KEY, id)));
         }
+        if ranges.iter().any(|range| range.1 == NO_END) {
+            rows.push((index.clone(), string_key(OPEN_END_KEY, id)));
+        }
+        rows
     }
 
     pub fn indexed(&self, resource: &Value, path_model: &Model, host: &dyn Host) -> Vec<String> {
@@ -783,6 +825,12 @@ fn probe_kind(kind: Option<SearchKind>, query: &str) -> Probe<'_> {
     }
 }
 
+/// The keys a period with no start, and a period with no end, are also indexed under: dates that
+/// sort before and after every date a search can ask for (see `date_probe`, which reads the end
+/// of the index for `gt` and `ge`, and the start of it for `lt` and `le`).
+const OPEN_START_KEY: &str = "0000-01-01";
+const OPEN_END_KEY: &str = "9999-12-31T23:59:59.999Z";
+
 /// How far a stored time can be from where its text puts it: a zone moves it by less than a day,
 /// and a time given to the hour is an hour wide. Two days is more than both.
 const DATE_SLACK_MS: i64 = 2 * 86_400_000;
@@ -794,8 +842,11 @@ const DATE_SLACK_MS: i64 = 2 * 86_400_000;
 /// sorts after it. So a range is cut at a day, which every date with a time begins with, and is
 /// widened by `DATE_SLACK_MS` so that no zone and no precision can put a match outside it. A date
 /// written to the year or the month sorts before every day inside it, so the ones that might match
-/// are read by their own keys. What is read is a superset, which is what lets `date_match`, which
-/// does read times as times, have the last word.
+/// are read by their own keys. A period is indexed by the text of its start and of its end, and
+/// one with an end open also by `OPEN_END_KEY`, and one with an open start by `OPEN_START_KEY`, so
+/// what reaches above a value is found by its end, and what reaches below it by its start. What is
+/// read is a superset, which is what lets `date_ranges_match`, which does read times as times and
+/// a period as the range it is, have the last word.
 fn date_probe(query: &str) -> Probe<'_> {
     let (op, rest) = split_prefix(query);
     if matches!(op, "ap" | "ne") {
@@ -1039,12 +1090,10 @@ fn path_match<S: AsRef<str>>(
             })
         }
         SearchKind::Date => {
-            let values = path_strings(kind, expr, resource, path_model, host);
-            expected.iter().any(|wanted| {
-                values
-                    .iter()
-                    .any(|text| date_match(op, text, wanted.as_ref()))
-            })
+            let ranges = date_ranges(expr, resource, path_model, host);
+            expected
+                .iter()
+                .any(|wanted| date_ranges_match(op, &ranges, wanted.as_ref()))
         }
         SearchKind::Number => {
             let items = eval_items(expr, resource, path_model, host);
@@ -1479,27 +1528,47 @@ fn compare_span(op: &str, value: &Span, query: &Span) -> bool {
     }
 }
 
-fn date_match(op: &str, stored: &str, expected: &str) -> bool {
-    let (prefix, query) = prefixed(op, expected);
-    let Some(stored) = date_period(stored) else {
-        return false;
-    };
-    let Some(query) = date_period(query) else {
-        return false;
-    };
+/// A stretch of time, in milliseconds since 1970: from where it starts up to where it stops, the
+/// first moment after it. A period with no start begins at `NO_START` and one with no end ends at
+/// `NO_END`, which lie beyond any moment a date can name.
+type Range = (i64, i64);
+
+const NO_START: i64 = i64::MIN;
+const NO_END: i64 = i64::MAX;
+
+/// Whether a stored range answers the prefix for the range the search value names. These are the
+/// rules of R4 for a date search, on ranges:
+///
+/// - `eq` takes what lies wholly inside the value, and `ne` what does not;
+/// - `gt` takes what reaches above the value, and `lt` what reaches below it;
+/// - `ge` and `le` take those and what lies wholly inside the value;
+/// - `sa` takes what lies wholly after the value, and `eb` what lies wholly before it;
+/// - `ap` takes what overlaps it.
+fn range_matches(prefix: &str, stored: Range, query: Range) -> bool {
+    let inside = query.0 <= stored.0 && stored.1 <= query.1;
     match prefix {
-        "eq" | "ap" => stored.0 < query.1 && stored.1 > query.0,
-        "ne" => !(stored.0 < query.1 && stored.1 > query.0),
-        // FHIR: `gt` and `lt` take what reaches above or below the query (a year holds days after
-        // a day of it), where `sa` and `eb` take only what lies wholly beyond it.
+        "eq" => inside,
+        "ne" => !inside,
+        "ap" => stored.0 < query.1 && stored.1 > query.0,
         "gt" => stored.1 > query.1,
         "sa" => stored.0 >= query.1,
         "lt" => stored.0 < query.0,
         "eb" => stored.1 <= query.0,
-        "ge" => stored.1 > query.0,
-        "le" => stored.0 < query.1,
+        "ge" => stored.1 > query.1 || inside,
+        "le" => stored.0 < query.0 || inside,
         _ => false,
     }
+}
+
+/// Whether any of the stored ranges answers `expected`, a date after an optional prefix.
+fn date_ranges_match(op: &str, stored: &[Range], expected: &str) -> bool {
+    let (prefix, query) = prefixed(op, expected);
+    let Some(query) = date_period(query) else {
+        return false;
+    };
+    stored
+        .iter()
+        .any(|range| range_matches(prefix, *range, query))
 }
 
 fn prefixed<'a>(op: &'a str, expected: &'a str) -> (&'a str, &'a str) {
@@ -1575,6 +1644,18 @@ fn date_period(text: &str) -> Option<(i64, i64)> {
         start + ((hour * 60 + minute.unwrap_or(0)) * 60 + second.unwrap_or(0)) * 1_000 + millis
             - offset;
     Some((start, start + width))
+}
+
+/// What a date is ordered by under `_sort`: the moment it starts, as a number written to a fixed
+/// width, so that the order of the text is the order of time. The text of a date is not: it is in
+/// the zone it was written in, and `T23:30:00+01:00` is earlier than `T23:00:00Z`. `None` for text
+/// that is no date.
+pub(crate) fn date_sort_key(text: &str) -> Option<String> {
+    // The year is four digits, so a moment is within 2.6e14 ms of 1970; this puts every one above
+    // zero and below sixteen digits.
+    const SHIFT: i64 = 1_000_000_000_000_000;
+    let (start, _) = date_period(text)?;
+    Some(format!("{:016}", start + SHIFT))
 }
 
 /// How far ahead of UTC a zone (`Z`, `+01:00`, `-05`) is, in milliseconds.
@@ -1736,7 +1817,12 @@ fn is_date(text: &str) -> bool {
         None => (text, None),
     };
     let mut parts = date.split('-');
-    let Some(year) = parts.next().and_then(|part| digits(part, 4)) else {
+    // R4 has no year 0: a year is 0001 to 9999, as the validator reads the same value.
+    let Some(year) = parts
+        .next()
+        .and_then(|part| digits(part, 4))
+        .filter(|year| *year >= 1)
+    else {
         return false;
     };
     let month = match parts.next() {
@@ -1870,6 +1956,59 @@ fn string_json(json: &Value) -> Vec<String> {
         }
     }
     string_tokens(json, &[])
+}
+
+/// The stretch of time each date in a resource stands for: a date or a time is the period it is
+/// written to, and a `Period` is the range from where its `start` begins to where its `end` stops.
+/// A Period with no `end` has not ended and one with no `start` has no beginning, so each runs
+/// without limit that way; one with neither says nothing, and so does a value that is not a date,
+/// and a Period that ends before it starts.
+fn date_ranges(expr: &Expr, resource: &Value, path_model: &Model, host: &dyn Host) -> Vec<Range> {
+    // A plain path of members is read straight from the JSON, as `path_strings` reads it.
+    if let Some(found) = refhir_fhirpath::member_values(expr, resource, path_model) {
+        return found.into_iter().flat_map(date_ranges_json).collect();
+    }
+    eval_items(expr, resource, path_model, host)
+        .iter()
+        .flat_map(|item| match item {
+            refhir_fhirpath::Value::Node { json, .. } => date_ranges_json(json),
+            other => encode_value(SearchKind::Date, other)
+                .iter()
+                .filter_map(|text| date_period(text))
+                .collect(),
+        })
+        .collect()
+}
+
+fn date_ranges_json(json: &Value) -> Vec<Range> {
+    if let Some(text) = json.as_str() {
+        return date_period(text).into_iter().collect();
+    }
+    let bound = |name: &str| json.get(name).and_then(|item| item.as_str());
+    let (start, end) = (bound("start"), bound("end"));
+    if start.is_none() && end.is_none() {
+        return Vec::new();
+    }
+    // A bound that is no date leaves the whole period unreadable, and it matches nothing.
+    let low = match start {
+        Some(text) => match date_period(text) {
+            Some((low, _)) => low,
+            None => return Vec::new(),
+        },
+        None => NO_START,
+    };
+    let high = match end {
+        Some(text) => match date_period(text) {
+            Some((_, high)) => high,
+            None => return Vec::new(),
+        },
+        None => NO_END,
+    };
+    // A period that ends before it starts (R4 refuses one, `per-1`) is no stretch of time.
+    if low >= high {
+        return Vec::new();
+    }
+    vec![(low, high)]
 }
 
 fn date_json(json: &Value) -> Vec<String> {
@@ -2054,7 +2193,13 @@ mod tests {
 
     use refhir_types::{string_key, token_interval, IndexId};
 
-    use super::{compile_parameter, date_match, date_probe, number_match, Probe, ReferenceId};
+    use super::{compile_parameter, date_probe, number_match, Probe, ReferenceId};
+
+    /// Whether a stored date, as the text it was written as, answers `expected`.
+    fn date_match(op: &str, stored: &str, expected: &str) -> bool {
+        let stored: Vec<super::Range> = super::date_period(stored).into_iter().collect();
+        super::date_ranges_match(op, &stored, expected)
+    }
 
     #[test]
     fn every_r4_search_parameter_compiles() {
@@ -2616,6 +2761,95 @@ mod tests {
         );
     }
 
+    /// A period is indexed by the text of its start and of its end, a period with no end also by
+    /// an end of the index and one with no start by a start of it. What a query reads must hold a
+    /// key of every period it matches: one that reaches above the value by its end, one that
+    /// reaches below it by its start, and one inside it by either. The keys are the ones the
+    /// extractor writes, and the match is its own.
+    #[test]
+    fn a_date_query_reads_every_period_it_matches() {
+        let host = EmptyHost;
+        let model = Model::new();
+        let date = parameter("date", "date", "Encounter.period");
+        let index = IndexId::new("Encounter/date");
+        let bounds = [
+            "2025-12-31T23:59:59-12:00",
+            "2026",
+            "2026-10",
+            "2026-10-29",
+            "2026-10-29T09:00:00+01:00",
+            "2026-10-31",
+            "2026-10-31T12:00:00Z",
+            "2026-10-31T07:00:00-05:00",
+            "2026-11-01",
+            "2026-12-31T23:59:59.999Z",
+            "2027-01-01T00:00:00+14:00",
+        ];
+        let mut periods: Vec<(Option<&str>, Option<&str>)> = Vec::new();
+        for start in std::iter::once(None).chain(bounds.iter().copied().map(Some)) {
+            for end in std::iter::once(None).chain(bounds.iter().copied().map(Some)) {
+                if start.is_some() || end.is_some() {
+                    periods.push((start, end));
+                }
+            }
+        }
+        let mut asked: Vec<String> = ["2025", "2026", "2027", "2026-10", "2026-11", "2026-12"]
+            .iter()
+            .map(|text| text.to_string())
+            .collect();
+        for day in [
+            "2025-12-31",
+            "2026-10-28",
+            "2026-10-29",
+            "2026-10-30",
+            "2026-10-31",
+            "2026-11-01",
+            "2027-01-01",
+        ] {
+            asked.push(day.to_string());
+            for clock in ["T00:00:00", "T12:00:00", "T23:59:59.999"] {
+                for zone in ["Z", "+14:00", "-12:00"] {
+                    asked.push(format!("{day}{clock}{zone}"));
+                }
+            }
+        }
+        let mut matched = 0;
+        for (start, end) in &periods {
+            let mut period = serde_json::Map::new();
+            for (name, bound) in [("start", start), ("end", end)] {
+                if let Some(text) = bound {
+                    period.insert(name.to_string(), json!(text));
+                }
+            }
+            let resource = json!({"resourceType": "Encounter", "period": period});
+            let keys = date.keys(&resource, "id", &index, &model, &host);
+            for value in &asked {
+                for prefix in ["", "eq", "gt", "ge", "lt", "le", "sa", "eb"] {
+                    let query = format!("{prefix}{value}");
+                    if !date.matches(&resource, &query, &model, &host) {
+                        continue;
+                    }
+                    matched += 1;
+                    let read = match date.probe(&query) {
+                        Probe::Dates(ranges) => ranges
+                            .iter()
+                            .any(|range| keys.iter().any(|(_, key)| range.contains(key))),
+                        Probe::Scan => true,
+                        other => panic!("{query}: {other:?}"),
+                    };
+                    assert!(
+                        read,
+                        "{query} matches {start:?} to {end:?}, and what it reads from the index holds none of its keys"
+                    );
+                }
+            }
+        }
+        assert!(
+            matched > 5_000,
+            "{matched}: the check has to have something to check"
+        );
+    }
+
     #[test]
     fn what_a_date_query_reads_is_still_a_narrow_part_of_the_index() {
         let near = "2026-10-18T04:45:53.065Z";
@@ -2653,6 +2887,101 @@ mod tests {
         assert!(!date_probe_reads("2026-13-45", "2026-10-18"));
         assert!(date_probe_reads("ne2026-10-18", "2000-01-01"));
         assert!(date_probe_reads("ap2026-10-18", "2000-01-01"));
+    }
+
+    /// The index holds the text of a date, so what a window reads from it has to reach the text of
+    /// the same moment in any zone: the one that is on the other side of a day or a month in
+    /// the text from where it is in time.
+    #[test]
+    fn the_index_ranges_of_a_window_reach_the_same_moment_in_every_zone() {
+        // The window 2026-09-30T23:00:00Z up to 2026-10-31T23:00:00Z, and 2026-10-31T22:30:00Z
+        // written the ways a clinic might.
+        for stored in [
+            "2026-10-31T22:30:00Z",
+            "2026-10-31T23:30:00+01:00",
+            "2026-10-31T17:30:00-05:00",
+            "2026-11-01T04:00:00+05:30",
+            "2026-11-01T12:30:00+14:00",
+            "2026-10-31T10:30:00-12:00",
+        ] {
+            for query in [
+                "ge2026-09-30T23:00:00Z",
+                "ge2026-10-01T00:00:00+01:00",
+                "ge2026-09-30T11:00:00-12:00",
+                "lt2026-10-31T23:00:00Z",
+                "lt2026-11-01T00:00:00+01:00",
+                "lt2026-11-01T13:00:00+14:00",
+            ] {
+                assert!(
+                    date_probe_reads(query, stored),
+                    "{query} does not read {stored}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_date_is_the_range_it_stands_for() {
+        let range = |text: &str| super::date_period(text).unwrap();
+        let ranges = |json: serde_json::Value| super::date_ranges_json(&json);
+        // A date or a time is the stretch it names.
+        assert_eq!(ranges(json!("2026-10-31")), [range("2026-10-31")]);
+        assert_eq!(
+            ranges(json!("2026-10-31T23:30:00+01:00")),
+            [range("2026-10-31T22:30:00Z")]
+        );
+        // A period runs from where its start begins to where its end stops.
+        let (start, end) = ("2026-10-29T08:00:00Z", "2026-10-31");
+        assert_eq!(
+            ranges(json!({"start": start, "end": end})),
+            [(range(start).0, range(end).1)]
+        );
+        // With no end it has not ended, and with no start it has no beginning.
+        assert_eq!(
+            ranges(json!({"start": start})),
+            [(range(start).0, super::NO_END)]
+        );
+        assert_eq!(
+            ranges(json!({"end": end})),
+            [(super::NO_START, range(end).1)]
+        );
+        // With neither, with a bound that is no date, and one that ends before it starts, it says
+        // nothing.
+        assert!(ranges(json!({})).is_empty());
+        assert!(ranges(json!({"start": "yesterday"})).is_empty());
+        assert!(ranges(json!({"start": start, "end": "2026-02-30"})).is_empty());
+        assert!(ranges(json!({"start": "2026-10-31", "end": "2026-10-29"})).is_empty());
+        assert!(ranges(json!(true)).is_empty());
+    }
+
+    #[test]
+    fn dates_are_ordered_by_the_moment_they_start() {
+        let key = |text: &str| super::date_sort_key(text).unwrap_or_else(|| panic!("{text}"));
+        // In the order of time, though not of the text.
+        let in_time = [
+            "2026-10-31T10:30:00-12:00", // 22:30Z
+            "2026-10-31T22:30:00Z",
+            "2026-10-31T23:30:00+01:00", // the same moment as the one before
+            "2026-10-31T22:30:00.001Z",
+            "2026-10-31T22:30:01Z",
+            "2026-11-01T04:00:00+05:30", // 22:30Z on the 31st, again
+        ];
+        assert_eq!(key(in_time[0]), key(in_time[1]));
+        assert_eq!(key(in_time[1]), key(in_time[2]));
+        assert!(key(in_time[2]) < key(in_time[3]));
+        assert!(key(in_time[3]) < key(in_time[4]));
+        assert_eq!(key(in_time[1]), key(in_time[5]));
+        // A date is where it starts, and one that begins first sorts first.
+        assert!(key("2026") < key("2026-10"));
+        assert_eq!(key("2026-10-31"), key("2026-10-31T00:00:00Z"));
+        assert!(key("2026-10-31T23:59:59Z") < key("2026-11-01"));
+        // Far from 1970 either way, and the text of the key is as wide as the text of another.
+        assert!(key("0001-01-01") < key("1969-12-31T23:59:59Z"));
+        assert!(key("1969-12-31T23:59:59Z") < key("1970-01-01"));
+        assert!(key("1970-01-01") < key("9999-12-31T23:59:59Z"));
+        assert_eq!(key("0001-01-01").len(), key("9999-12-31").len());
+        assert_eq!(super::date_sort_key("not a date"), None);
+        assert_eq!(super::date_sort_key(""), None);
     }
 
     #[test]

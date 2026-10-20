@@ -8,6 +8,7 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2026-0381", reason = "The distrusted emSign root is removed in webpki-roots 1.0.10, which Cargo.lock holds. What is left is webpki-roots 0.26.11, which is only a shim over the 1.x crate (its one dependency is webpki-roots 1) and carries no root certificates of its own, but cargo-deny reads its version number. ureq 2.12 still asks for 0.26. Drop this entry when ureq moves to webpki-roots 1, and check that Cargo.lock holds webpki-roots >= 1.0.10 until then." },
     { id = "RUSTSEC-2023-0071", reason = "Marvin timing attack on the rsa crate's private-key operations; no fixed release exists. ReFHIR uses rsa only to generate, encode and decode the SMART signing key and to read its public parameters for the JWKS. Tokens are signed by jsonwebtoken through ring, and nothing calls an rsa sign or decrypt function. Revisit if that changes." },
+    { id = "RUSTSEC-2026-0381", reason = "Mozilla roots that include distrusted emSign intermediates. Cargo.lock holds webpki-roots 1.0.10, the patched release. The one entry still flagged is webpki-roots 0.26.11, which holds no certificates: it is `pub use` of webpki-roots 1.x (`webpki-roots = \"1\"`), and ureq 2.x depends on the 0.26 line, so cargo-deny matches it by its version number. Remove this entry when ureq moves to 3.x and 0.26.11 leaves Cargo.lock (cargo deny then says the advisory was not encountered)." },
 ]
 
 [licenses]
