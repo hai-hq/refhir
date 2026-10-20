@@ -2125,4 +2125,17 @@ mod tests {
         refhir_persistence::conformance::exercise_parameter_clashes(&persistence, &tag);
         refhir_persistence::conformance::exercise_terminology_changes(&persistence, &tag);
     }
+
+    #[test]
+    fn postgres_package_versions_when_configured() {
+        let Some(admin) = test_url("postgres package versions") else {
+            return;
+        };
+        // Collecting the replaced packages removes every one of the database, so it has a database
+        // of its own: the other tests here replace packages in the shared one and read them after.
+        let url = fresh_database(&admin, "pgver");
+        let persistence = PostgresPersistence::connect(&url).expect("connect");
+        let tag = format!("pgver{}", std::process::id());
+        refhir_persistence::conformance::exercise_package_versions(&persistence, &tag, false);
+    }
 }

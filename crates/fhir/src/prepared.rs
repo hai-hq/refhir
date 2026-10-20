@@ -33,13 +33,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
 use crate::error::FhirError;
-use crate::npm::{
-    compare_versions, materialize, parse_package_spec, source_digest, Node, PackageFetcher,
-    Resolver,
-};
+use crate::npm::{materialize, parse_package_spec, source_digest, Node, PackageFetcher, Resolver};
 use crate::package::{
-    finish_install, package_identity, read_package, run_backfills, stage_package_in_pieces,
-    PackageHead, PendingBackfill,
+    finish_install, held_at_least, package_identity, read_package, run_backfills,
+    stage_package_in_pieces, PackageHead, PendingBackfill,
 };
 
 /// The name a prepared file is given when nothing else names it, and the one looked for next to
@@ -496,15 +493,7 @@ pub fn install_prepared(
     if !bundle.covers(specs) {
         return Ok(None);
     }
-    let mut newest: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    for package in store.load_packages().map_err(FhirError::from)? {
-        let newer = newest
-            .get(&package.name)
-            .is_none_or(|current| compare_versions(&package.version, current).is_gt());
-        if newer {
-            newest.insert(package.name, package.version);
-        }
-    }
+    let installed = store.load_packages().map_err(FhirError::from)?;
     let expected = bundle.names.len();
     let mut seen = 0;
     let mut staged = 0;
@@ -520,10 +509,7 @@ pub fn install_prepared(
             }
         };
         seen += 1;
-        if newest
-            .get(&head.name)
-            .is_some_and(|have| compare_versions(have, &head.version).is_ge())
-        {
+        if held_at_least(&installed, &head.name, &head.version) {
             if let Err(err) = bundle.skip_package() {
                 result = Err(err);
                 break;

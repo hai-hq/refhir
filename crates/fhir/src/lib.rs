@@ -46,9 +46,9 @@ pub use npm::{
     DOWNLOAD_VARIABLE,
 };
 pub use package::{
-    cards_dir, cross_version_dir, default_r4_registry_specs, expression_clash_dir,
-    extension_copies_dir, extra_dir, install_package_dir, ips_package, minir4_dir,
-    newer_terminology_dir, patient_match_dir, r4_dir, r4_examples_dir, reload_catalog,
+    cards_dir, collect_superseded, cross_version_dir, default_r4_registry_specs,
+    expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir, ips_package,
+    minir4_dir, newer_terminology_dir, patient_match_dir, r4_dir, r4_examples_dir, reload_catalog,
     run_backfills, sdc_dir, stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher,
     R4_CORE_PACKAGE, SDC_PACKAGE,
 };

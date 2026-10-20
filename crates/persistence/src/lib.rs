@@ -5,10 +5,12 @@
 //! timestamp. Row streams are `Vec`s. `DocumentLogEntry::value` is JSON text.
 
 mod pool;
+mod version;
 
 pub mod migrate;
 
 pub use pool::{Pool, PoolGuard, PoolStats};
+pub use version::compare_versions;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -628,8 +630,14 @@ pub struct InstalledParam {
     pub package_id: i64,
     pub url: String,
     pub expression: String,
+    pub param_type: String,
     pub status: String,
     pub json: String,
+    /// The row belongs to the version of the package that the install being planned replaces (its
+    /// predecessor): it takes no part in a clash with the incoming definition, and it goes once the
+    /// package is stored (see [`plan_search_parameter`]). A row of a package an earlier install
+    /// replaced is not given to the planner at all (see [`superseded_package_ids`]).
+    pub predecessor: bool,
 }
 
 /// What installing a search parameter should do given the rows already stored for its base
@@ -648,8 +656,41 @@ pub enum ParamPlan {
     Conflict,
 }
 
+/// Whether `row` indexes a document as `param` would, so that what it already indexed holds for
+/// `param`: the same type and expression, and the same `target` and `component`, which are the
+/// other parts of a definition that an index is made from. When this cannot be told apart the
+/// answer is no, which costs a backfill that finds nothing to change. A composite is never the
+/// same: its keys also depend on the types of the parameters its components name, which a row
+/// does not say.
+fn indexes_the_same(param: &NewSearchParameter, row: &InstalledParam) -> bool {
+    let incoming = param.expression.clone().unwrap_or_default();
+    // The parts of a definition besides its type and expression that decide what is indexed: the
+    // resource types a reference may point at (as a set), and the components of a composite.
+    let shape = |json: &str| {
+        let value: JsonValue = serde_json::from_str(json).unwrap_or(JsonValue::Null);
+        let targets: std::collections::BTreeSet<String> = value
+            .get("target")
+            .and_then(JsonValue::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|target| target.as_str().map(str::to_string))
+            .collect();
+        (targets, value.get("component").cloned())
+    };
+    param.param_type != "composite"
+        && param.param_type == row.param_type
+        && same_expression(&param.base, &row.expression, &incoming)
+        && shape(&param.json) == shape(&row.json)
+}
+
 /// Decide how `param` meets the `installed` rows that share its base and code. Only the rows
 /// that actually disagree with it and are experimental are ever removed.
+///
+/// A row of the version of the same package that this install replaces (`predecessor`) is neither
+/// kept nor in conflict, whatever it says: the package that holds the incoming definition replaces
+/// it. The incoming parameter takes its place with the status it had when it would index the same,
+/// so that a parameter a new version leaves as it was is not indexed again, and as new when it
+/// would not, which is also what a parameter whose backfill never finished is.
 pub fn plan_search_parameter(
     param: &NewSearchParameter,
     installed: &[InstalledParam],
@@ -659,6 +700,15 @@ pub fn plan_search_parameter(
     let mut remove = Vec::new();
     let (mut keep, mut conflict) = (false, false);
     for row in installed {
+        if row.predecessor {
+            if status.is_none()
+                && ParamStatus::parse(&row.status)? == ParamStatus::Ready
+                && indexes_the_same(param, row)
+            {
+                status = Some(ParamStatus::Ready);
+            }
+            continue;
+        }
         if same_expression(&param.base, &row.expression, &incoming) {
             if status.is_none() {
                 status = Some(ParamStatus::parse(&row.status)?);
@@ -776,8 +826,10 @@ pub fn plan_package_parameters(
             package_id,
             url: param.url.clone(),
             expression: param.expression.clone().unwrap_or_default(),
+            param_type: param.param_type.clone(),
             status: status.as_str().to_string(),
             json: param.json.clone(),
+            predecessor: false,
         });
         plan.inserts.push((position, status));
     }
@@ -840,6 +892,45 @@ pub struct NewPackage {
 pub struct PendingParam {
     pub base: String,
     pub code: String,
+}
+
+/// A search parameter that an older version of a package had and no search parameter has now,
+/// named like a pending one by its base and code.
+pub type RetiredParam = PendingParam;
+
+/// The condition `column NOT IN (…)` that leaves the rows of the packages `ids` out of a statement,
+/// or nothing when there are none, so that a database without a replaced package reads what it
+/// did. The ids are numbers, so they are written into the statement.
+pub fn not_in_packages(column: &str, ids: &[i64]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+    Some(format!("{column} NOT IN ({})", list.join(", ")))
+}
+
+/// The ids of the packages in `packages` that a newer version of the same name has replaced: every
+/// one but the newest of each name. Versions that [`compare_versions`] orders the same are told
+/// apart by id, the one stored later being the newer, as a package that is stored replaces them.
+/// A store leaves what these hold out of every list it gives, and keeps it until it is collected
+/// (see [`ConformanceStore::collect_superseded`]).
+pub fn superseded_package_ids(packages: &[StoredPackage]) -> Vec<i64> {
+    let mut newest: HashMap<&str, &StoredPackage> = HashMap::new();
+    for package in packages {
+        let newer = newest.get(package.name.as_str()).is_none_or(|held| {
+            compare_versions(&package.version, &held.version)
+                .then(package.id.cmp(&held.id))
+                .is_gt()
+        });
+        if newer {
+            newest.insert(package.name.as_str(), package);
+        }
+    }
+    packages
+        .iter()
+        .filter(|package| newest[package.name.as_str()].id != package.id)
+        .map(|package| package.id)
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1104,7 +1195,41 @@ pub trait ConformanceStore: Send + Sync {
         expansions: &[NewExpansion],
     ) -> Result<(), PersistError>;
 
+    /// Store a package: its definitions, search parameters, terminology and expansions go in one
+    /// transaction, so it is there whole or not at all.
+    ///
+    /// The newest version of a package is the one in force. A package that is stored replaces the
+    /// older versions of the same name (ordered by [`compare_versions`], so `0.10` replaces `0.10.0`
+    /// as well, a version that orders the same and is written another way): from then on no list
+    /// the store gives holds anything of theirs, not their package, definitions, search parameters,
+    /// terminology or expansions. Their rows stay stored until [`ConformanceStore::collect_superseded`]
+    /// removes them, because a process that serves from the catalog it loaded before may still read
+    /// them by key. What the new version defines again takes the place of what it defined before.
+    /// The older versions' search parameters take no part in a clash with the new ones. A search
+    /// parameter keeps the status of the one it replaces (`Ready`: what was indexed holds) when its
+    /// type, expression, `target` and `component` are the same, and is otherwise stored as the
+    /// package gives it, to be backfilled. Packages with other names are never replaced.
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
+
+    /// The search parameters that only packages a newer version has replaced define: what is
+    /// indexed under them is not used by the catalog in force, and
+    /// [`ConformanceStore::collect_superseded`] is about to remove their rows, so a caller clears
+    /// those indexes first. Worked out from what is stored, so it is the same after a crash. The
+    /// default is none, for a store that never keeps a replaced package.
+    fn retired_parameters(&self) -> Result<Vec<RetiredParam>, PersistError> {
+        Ok(Vec::new())
+    }
+
+    /// Remove the packages that newer versions have replaced, with everything they hold:
+    /// definitions, search parameters, terminology, expansions and the backfills queued for them.
+    /// Call it when nothing waits for an index and a process that follows the catalog has had time
+    /// to load the one that replaced them: the start of a process after the one that replaced them
+    /// is late enough, and an install that follows the one that replaced them is not. A store that
+    /// shares what its tenants have in common also removes a shared package that no tenant has any
+    /// longer, in the same transaction in which the tenant gives it up. The default does nothing.
+    fn collect_superseded(&self) -> Result<(), PersistError> {
+        Ok(())
+    }
 
     /// [`ConformanceStore::install_package`] for a package that is not held whole: `feed` is
     /// given the place the rows go and hands them over a few at a time, and the package is
@@ -1269,8 +1394,10 @@ mod clash_tests {
             package_id,
             url: format!("http://example.org/{package_id}"),
             expression: expression.into(),
+            param_type: "string".into(),
             status: "ready".into(),
             json: format!(r#"{{"experimental":{experimental}}}"#),
+            predecessor: false,
         }
     }
 
@@ -1300,6 +1427,30 @@ mod clash_tests {
             plan_search_parameter(&param("Patient.b", false), &clash).unwrap(),
             ParamPlan::Conflict
         );
+    }
+
+    #[test]
+    fn a_predecessor_composite_is_indexed_again_and_a_plain_parameter_is_not() {
+        let predecessor = |param_type: &str| InstalledParam {
+            predecessor: true,
+            param_type: param_type.into(),
+            ..row(1, "Patient.same", false)
+        };
+        let incoming = |param_type: &str| NewSearchParameter {
+            param_type: param_type.into(),
+            ..param("Patient.same", false)
+        };
+        let status = |param_type: &str| match plan_search_parameter(
+            &incoming(param_type),
+            &[predecessor(param_type)],
+        )
+        .unwrap()
+        {
+            ParamPlan::Insert { status, .. } => status,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(status("string"), Some(ParamStatus::Ready));
+        assert_eq!(status("composite"), None);
     }
 
     #[test]
@@ -1370,8 +1521,10 @@ mod clash_tests {
                 package_id,
                 url: param.url.clone(),
                 expression: param.expression.clone().unwrap_or_default(),
+                param_type: param.param_type.clone(),
                 status: status.as_str().into(),
                 json: param.json.clone(),
+                predecessor: false,
             });
         }
         let mut rows: Rows = rows
@@ -1408,8 +1561,10 @@ mod clash_tests {
                 package_id,
                 url: param.url.clone(),
                 expression: param.expression.clone().unwrap_or_default(),
+                param_type: param.param_type.clone(),
                 status: status.as_str().into(),
                 json: param.json.clone(),
+                predecessor: false,
             });
         }
         let mut rows: Rows = rows
@@ -3293,6 +3448,489 @@ pub mod conformance {
             .install_package(&package("clash", "Patient.other", false))
             .unwrap_err();
         assert!(matches!(err, InstallError::Expression { .. }), "{err}");
+    }
+
+    /// A newer version of a package replaces its older versions: they are out of every list from
+    /// the transaction that stores it, and gone, with everything they held, once collected. With
+    /// `shared_links`, other tenants of the store have a link to every package it holds, so a
+    /// package that tenant owns is kept whole when it is collected, and only what changes per
+    /// tenant (expansions, search parameters, queued backfills) goes.
+    pub fn exercise_package_versions(store: &dyn ConformanceStore, tag: &str, shared_links: bool) {
+        let name = format!("upgrade.{tag}");
+        let code = |short: &str| format!("{short}-{tag}");
+        let param = |short: &str, expression: &str| NewSearchParameter {
+            url: format!("http://example.org/sp/{tag}/{short}"),
+            base: "Patient".into(),
+            code: code(short),
+            param_type: "string".into(),
+            expression: Some(expression.into()),
+            status: ParamStatus::Pending,
+            json: r#"{"type":"string"}"#.into(),
+        };
+        // What a package holds besides its search parameters: a definition every version has, one
+        // only its own version has, a code system and a value set expansion.
+        let package = |name: &str, version: &str, parameters: Vec<NewSearchParameter>| NewPackage {
+            name: name.into(),
+            version: version.into(),
+            fhir_version: "4.0.1".into(),
+            structure_definitions: ["kept".to_string(), format!("only-{version}")]
+                .iter()
+                .map(|what| NewStructureDefinition {
+                    url: format!("http://example.org/sd/{name}/{what}"),
+                    type_name: "Patient".into(),
+                    kind: "resource".into(),
+                    is_abstract: false,
+                    json: "{}".into(),
+                })
+                .collect(),
+            search_parameters: parameters,
+            terminology: vec![NewTerminology {
+                resource_type: "CodeSystem".into(),
+                url: format!("http://example.org/cs/{name}/{version}"),
+                json: "{}".into(),
+            }],
+            expansions: vec![NewExpansion {
+                url: format!("http://example.org/vs/{name}/{version}"),
+                json: "{}".into(),
+            }],
+        };
+        // The definitions, terminology and expansions of the package `owner`, as the parts of their
+        // URLs after its name, and the id of the package they are stored under.
+        let content = |owner: &str| -> (Vec<String>, Vec<String>, Vec<String>, Vec<i64>) {
+            let part = |url: &str| {
+                url.rsplit(&format!("/{owner}/"))
+                    .next()
+                    .unwrap()
+                    .to_string()
+            };
+            let mut ids = Vec::new();
+            let mut definitions: Vec<String> = store
+                .load_structure_definitions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{owner}/")))
+                .map(|row| {
+                    ids.push(row.package_id);
+                    part(&row.url)
+                })
+                .collect();
+            let mut terminology: Vec<String> = store
+                .load_terminology()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{owner}/")))
+                .map(|row| part(&row.url))
+                .collect();
+            let mut expansions: Vec<String> = store
+                .load_expansions()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.url.contains(&format!("/{owner}/")))
+                .map(|row| part(&row.url))
+                .collect();
+            definitions.sort();
+            terminology.sort();
+            expansions.sort();
+            ids.sort();
+            ids.dedup();
+            (definitions, terminology, expansions, ids)
+        };
+        // The same as `content`, read a page at a time the way a catalog is loaded.
+        let visited = |owner: &str| -> (Vec<String>, Vec<String>, Vec<String>) {
+            let (mut definitions, mut terminology, mut expansions) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let marker = format!("/{owner}/");
+            let part = |url: &str| url.rsplit(marker.as_str()).next().unwrap().to_string();
+            store
+                .visit_structure_definitions(&mut |page| {
+                    definitions.extend(
+                        page.iter()
+                            .filter(|row| row.url.contains(marker.as_str()))
+                            .map(|row| part(&row.url)),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .visit_terminology(&mut |page| {
+                    terminology.extend(
+                        page.iter()
+                            .filter(|row| row.url.contains(marker.as_str()))
+                            .map(|row| part(&row.url)),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .visit_expansions(&mut |page| {
+                    expansions.extend(
+                        page.iter()
+                            .filter(|row| row.url.contains(marker.as_str()))
+                            .map(|row| part(&row.url)),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            definitions.sort();
+            terminology.sort();
+            expansions.sort();
+            (definitions, terminology, expansions)
+        };
+        // This test's rows, as (code, expression, status, package id), by code.
+        let rows = || -> Vec<(String, String, ParamStatus, i64)> {
+            let mut rows: Vec<_> = store
+                .load_search_parameters()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.code.ends_with(&format!("-{tag}")))
+                .map(|row| {
+                    let short = row.code.trim_end_matches(&format!("-{tag}")).to_string();
+                    (
+                        short,
+                        row.expression.unwrap_or_default(),
+                        row.status,
+                        row.package_id,
+                    )
+                })
+                .collect();
+            rows.sort_by(|left, right| left.0.cmp(&right.0));
+            rows
+        };
+        let package_id = |version: &str| {
+            store
+                .load_packages()
+                .unwrap()
+                .into_iter()
+                .find(|held| held.name == name && held.version == version)
+                .map(|held| held.id)
+        };
+        let shorts = |list: &[PendingParam]| -> Vec<String> {
+            let mut shorts: Vec<String> = list
+                .iter()
+                .map(|param| param.code.trim_end_matches(&format!("-{tag}")).to_string())
+                .collect();
+            shorts.sort();
+            shorts
+        };
+        let retired_shorts = |list: &[RetiredParam]| -> Vec<String> {
+            let mut shorts: Vec<String> = list
+                .iter()
+                .filter(|param| param.code.ends_with(&format!("-{tag}")))
+                .map(|param| param.code.trim_end_matches(&format!("-{tag}")).to_string())
+                .collect();
+            shorts.sort();
+            shorts
+        };
+
+        // 0.1.0 has four parameters, and a package that is not a version of it has one.
+        let first = store
+            .install_package(&package(
+                &name,
+                "0.1.0",
+                vec![
+                    param("keep", "Patient.keep"),
+                    param("change", "Patient.change"),
+                    param("drop", "Patient.drop"),
+                    param("rename", "Patient.rename"),
+                ],
+            ))
+            .unwrap();
+        store.mark_base_ready(first.package_id, "Patient").unwrap();
+        let bystander = format!("bystander.{tag}");
+        let other = store
+            .install_package(&package(
+                &bystander,
+                "1.0.0",
+                vec![param("bystander", "Patient.bystander")],
+            ))
+            .unwrap();
+        store.mark_base_ready(other.package_id, "Patient").unwrap();
+        assert_eq!(content(&name).0, ["kept", "only-0.1.0"]);
+        // Each package has a backfill queued, as an install that had stored parameters waiting for
+        // their index would have left.
+        let queued = |package_id: i64| {
+            store
+                .load_backfills()
+                .unwrap()
+                .into_iter()
+                .filter(|job| job.package_id == package_id)
+                .count()
+        };
+        // The first names the parameters it may mark ready, which is a row of its own to remove
+        // with it; the other leaves the choice to the parameters that are pending.
+        store
+            .insert_backfill(
+                first.package_id,
+                1,
+                "Patient",
+                &[format!("http://example.org/sp/{tag}/keep")],
+            )
+            .unwrap();
+        store
+            .insert_backfill(other.package_id, 1, "Patient", &[])
+            .unwrap();
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (1, 1));
+
+        // 0.2.0 keeps one as it was, gives one another expression, leaves one out, moves one to
+        // another code under the same URL, and adds one.
+        let mut moved = param("rename", "Patient.rename");
+        moved.code = code("renamed");
+        let second = store
+            .install_package(&package(
+                &name,
+                "0.2.0",
+                vec![
+                    param("keep", "Patient.keep"),
+                    param("change", "Patient.changed"),
+                    moved,
+                    param("added", "Patient.added"),
+                ],
+            ))
+            .unwrap();
+        assert!(second.inserted);
+        // What is already indexed is not indexed again; what changed or is new is.
+        assert_eq!(
+            shorts(&second.newly_pending),
+            ["added", "change", "renamed"]
+        );
+        // What only the replaced version defines: the one left out, and the code that was moved from.
+        assert_eq!(
+            retired_shorts(&store.retired_parameters().unwrap()),
+            ["drop", "rename"]
+        );
+        let now = rows();
+        let held = [
+            (
+                "added",
+                "Patient.added",
+                ParamStatus::Pending,
+                second.package_id,
+            ),
+            (
+                "bystander",
+                "Patient.bystander",
+                ParamStatus::Ready,
+                other.package_id,
+            ),
+            (
+                "change",
+                "Patient.changed",
+                ParamStatus::Pending,
+                second.package_id,
+            ),
+            (
+                "keep",
+                "Patient.keep",
+                ParamStatus::Ready,
+                second.package_id,
+            ),
+            (
+                "renamed",
+                "Patient.rename",
+                ParamStatus::Pending,
+                second.package_id,
+            ),
+        ]
+        .map(|(short, expression, status, id)| {
+            (short.to_string(), expression.to_string(), status, id)
+        });
+        assert_eq!(now, held);
+        // The older version is out of every list: its definitions, its terminology, its expansions
+        // and its place among the packages. What the new version holds, and what another package
+        // holds, is there.
+        assert_eq!(package_id("0.1.0"), None);
+        // But what it holds is still stored, for a process that serves from the catalog it loaded
+        // before the install and reads a definition, a code system or an expansion by its key.
+        let (kept, system, expansion) = (
+            format!("http://example.org/sd/{name}/kept"),
+            format!("http://example.org/cs/{name}/0.1.0"),
+            format!("http://example.org/vs/{name}/0.1.0"),
+        );
+        let reads = |package: i64| {
+            (
+                store
+                    .load_structure_definition_json(package, &kept)
+                    .unwrap(),
+                store.load_terminology_json(package, &system).unwrap(),
+                store.load_expansion_json(package, &expansion).unwrap(),
+            )
+        };
+        let (definition, terminology, expanded) = reads(first.package_id);
+        assert!(definition.is_some() && terminology.is_some() && expanded.is_some());
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (1, 1));
+        assert_eq!(
+            content(&name),
+            (
+                vec!["kept".to_string(), "only-0.2.0".to_string()],
+                vec!["0.2.0".to_string()],
+                vec!["0.2.0".to_string()],
+                vec![second.package_id]
+            )
+        );
+        assert_eq!(
+            content(&bystander),
+            (
+                vec!["kept".to_string(), "only-1.0.0".to_string()],
+                vec!["1.0.0".to_string()],
+                vec!["1.0.0".to_string()],
+                vec![other.package_id]
+            )
+        );
+
+        let listed = content(&name);
+        assert_eq!(visited(&name), (listed.0, listed.1, listed.2));
+        // Collected, it is gone with everything it held, the backfills queued for it too, and
+        // what another package holds is not.
+        store.collect_superseded().unwrap();
+        let collected = reads(first.package_id);
+        assert_eq!(collected.2, None);
+        if !shared_links {
+            assert_eq!(collected, (None, None, None));
+        }
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (0, 1));
+        assert!(retired_shorts(&store.retired_parameters().unwrap()).is_empty());
+        assert_eq!(rows(), now);
+        assert_eq!(content(&bystander).0, ["kept", "only-1.0.0"]);
+
+        // An install that fails changes nothing: the version that was in force still is, whether
+        // the package was handed over whole or in pieces.
+        let clash = |url: &str, expression: &str| NewSearchParameter {
+            url: url.into(),
+            ..param("added", expression)
+        };
+        let content_before = content(&name);
+        let twice = package(
+            &name,
+            "0.3.0",
+            vec![
+                param("keep", "Patient.keep"),
+                clash("http://example.org/sp/one", "Patient.one"),
+                clash("http://example.org/sp/two", "Patient.two"),
+            ],
+        );
+        let err = store.install_package(&twice).unwrap_err();
+        assert!(matches!(err, InstallError::Expression { .. }), "{err}");
+        let err = store
+            .install_package_in_pieces(&name, "0.3.0", "4.0.1", &mut |rows| {
+                rows.search_parameters(&twice.search_parameters)
+            })
+            .unwrap_err();
+        assert!(matches!(err, InstallError::Expression { .. }), "{err}");
+        let against_bystander = package(
+            &name,
+            "0.3.0",
+            vec![
+                param("keep", "Patient.keep"),
+                param("bystander", "Patient.other"),
+            ],
+        );
+        let err = store.install_package(&against_bystander).unwrap_err();
+        assert!(matches!(err, InstallError::Expression { .. }), "{err}");
+        let err = store
+            .install_package_in_pieces(&name, "0.3.0", "4.0.1", &mut |rows| {
+                rows.search_parameters(&[param("keep", "Patient.keep")])?;
+                Err(InstallError::Persist(PersistError::Definite("stop".into())))
+            })
+            .unwrap_err();
+        assert!(matches!(err, InstallError::Persist(_)), "{err}");
+        assert_eq!(rows(), now);
+        assert_eq!(content(&name), content_before);
+        assert_eq!(package_id("0.3.0"), None);
+        assert!(package_id("0.2.0").is_some());
+
+        // In pieces, a newer version replaces them as well. `added` is still waiting for its
+        // index, so its definition is new again; a `keep` of another type, or that points at other
+        // resources, is not what was indexed; and `keep` as it was is.
+        let third = store
+            .install_package_in_pieces(&name, "0.3.0", "4.0.1", &mut |rows| {
+                rows.search_parameters(&[
+                    param("keep", "Patient.keep"),
+                    param("added", "Patient.added"),
+                ])
+            })
+            .unwrap();
+        assert_eq!(shorts(&third.newly_pending), ["added"]);
+        assert_eq!(
+            retired_shorts(&store.retired_parameters().unwrap()),
+            ["change", "renamed"]
+        );
+        store.collect_superseded().unwrap();
+        let now = rows();
+        assert_eq!(
+            now.iter()
+                .map(|(short, _, status, id)| (short.as_str(), *status, *id == third.package_id))
+                .collect::<Vec<_>>(),
+            [
+                ("added", ParamStatus::Pending, true),
+                ("bystander", ParamStatus::Ready, false),
+                ("keep", ParamStatus::Ready, true),
+            ]
+        );
+        store.mark_base_ready(third.package_id, "Patient").unwrap();
+        let mut token = param("keep", "Patient.keep");
+        token.param_type = "token".into();
+        let mut narrowed = param("added", "Patient.added");
+        narrowed.json = r#"{"type":"string","target":["Group"]}"#.into();
+        let fourth = store
+            .install_package(&package(&name, "0.4.0", vec![token, narrowed]))
+            .unwrap();
+        assert_eq!(shorts(&fourth.newly_pending), ["added", "keep"]);
+        assert!(retired_shorts(&store.retired_parameters().unwrap()).is_empty());
+        store.collect_superseded().unwrap();
+        // Version 0.10.0 is newer than 0.4.0, as a version number and not as text.
+        let fifth = store
+            .install_package(&package(
+                &name,
+                "0.10.0",
+                vec![param("keep", "Patient.keep")],
+            ))
+            .unwrap();
+        assert_eq!(
+            retired_shorts(&store.retired_parameters().unwrap()),
+            ["added"]
+        );
+        store.collect_superseded().unwrap();
+        assert!(rows()
+            .iter()
+            .all(|(short, _, _, id)| { short == "bystander" || *id == fifth.package_id }));
+        // `0.10` is `0.10.0` written another way, and replaces it all the same, so the two are
+        // never held side by side, where a changed parameter would clash with itself.
+        let sixth = store
+            .install_package(&package(
+                &name,
+                "0.10",
+                vec![param("keep", "Patient.other")],
+            ))
+            .unwrap();
+        assert!(sixth.inserted);
+        assert_eq!(shorts(&sixth.newly_pending), ["keep"]);
+        assert_eq!(package_id("0.10.0"), None);
+        assert_eq!(package_id("0.10"), Some(sixth.package_id));
+        store.collect_superseded().unwrap();
+
+        // A package that a newer version replaced and that is not collected yet is not looked at
+        // when another package's parameters are checked: here `zz` is defined by nothing in force,
+        // and by a stale row with another expression.
+        let stale = format!("stale.{tag}");
+        store
+            .install_package(&package(&stale, "1.0.0", vec![param("zz", "Patient.zz1")]))
+            .unwrap();
+        store
+            .install_package(&package(&stale, "2.0.0", Vec::new()))
+            .unwrap();
+        let late = store
+            .install_package(&package(
+                &format!("late.{tag}"),
+                "1.0.0",
+                vec![param("zz", "Patient.zz2")],
+            ))
+            .unwrap();
+        assert_eq!(shorts(&late.newly_pending), ["zz"]);
+        assert!(retired_shorts(&store.retired_parameters().unwrap()).is_empty());
+        store.collect_superseded().unwrap();
+        assert!(rows()
+            .iter()
+            .any(|row| row.0 == "zz" && row.1 == "Patient.zz2"));
     }
     use refhir_types::TabletId;
 

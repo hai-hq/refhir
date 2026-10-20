@@ -555,6 +555,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         // Nothing serves from the catalog yet, so rebuilding it need not keep the old one alive.
         catalog.write().expect("catalog").set_rebuild_in_place(true);
         check_release_matches_database(release_from_plan(&cfg.packages), store.as_ref())?;
+        // What an earlier start or install replaced goes now, before this one replaces more.
+        refhir_fhir::collect_superseded(store.as_ref(), &db, &catalog);
         install_packages(store.as_ref(), &db, &catalog, &cfg.packages)?;
         let installed = started.elapsed();
 
