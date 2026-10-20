@@ -3,8 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use refhir_database::{ScannedEntry, ScannedRow, ScannedText, Transaction};
 use refhir_types::{
-    exact_key, sortable_f64, string_at_least, string_at_most, string_interval, token_interval,
-    IndexId, Interval, Timestamp,
+    exact_key, sortable_f64, string_interval, token_interval, IndexId, Interval, Timestamp,
 };
 use refhir_validate::{TermAnswer, Terminology};
 use serde_json::{json, Value};
@@ -1449,8 +1448,7 @@ fn probe_ranges(probe: Probe<'_>) -> Option<(u8, Vec<Interval>)> {
         Probe::Token(text) => (1, vec![token_interval(text)]),
         Probe::Tokens(tokens) => (1, tokens.iter().map(|text| token_interval(text)).collect()),
         Probe::Prefix(text) => (2, vec![string_interval(text)]),
-        Probe::AtLeast(text) => (3, vec![string_at_least(text)]),
-        Probe::AtMost(text) => (3, vec![string_at_most(text)]),
+        Probe::Dates(intervals) => (3, intervals),
         Probe::Range(interval) => (3, vec![interval]),
         Probe::Cells {
             ranges,

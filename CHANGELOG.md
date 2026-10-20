@@ -12,6 +12,132 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **`Patient/$summary`: an International Patient Summary.** `GET` or `POST` it on a patient (or on
+  `Patient`, with an `identifier`) and it returns an IPS document Bundle: a Composition with
+  allergies, problems and medications (always there, with `emptyReason` when there is nothing),
+  and immunizations, laboratory results and procedures (left out when empty), each with a table
+  in its text, together with the patient's own resources and what they point at. It holds only
+  what the caller's scopes let them read, and never another patient. With the IPS package
+  installed, the summary validates against the IPS profiles. See
+  [Patient summary](docs/patient-summary.md).
+- **`Patient/[id]/$health-cards-issue`: SMART Health Cards.** With a P-256 key in
+  `[health_cards].key_file` (or `REFHIR_HEALTH_CARDS_KEY_FILE`), the server signs cards that hold the
+  patient's name and birth date and the resources asked for by `credentialType`, shrunk as the card
+  format asks, and publishes the public key at `/health-cards/.well-known/jwks.json`. `_since` holds
+  a card to what was written at or after it. See [SMART Health Cards](docs/health-cards.md).
+- **`meta.lastUpdated`, `_lastUpdated`, and history by date.** The server sets `meta.lastUpdated` on
+  every version it writes, to the millisecond, in UTC. `_lastUpdated` finds resources by it (it
+  matched nothing before, because nothing was ever set), and `_since` on a type's or the server's
+  history takes a date and time as FHIR has it (it was a `400` for anything but a version id). A
+  version id still works. Versions written before this release have no time: they are not found by
+  `_lastUpdated`, and get one the next time they are written. A deletion has no time, so a history
+  by date lists a deletion from just before the date, never leaves one out. See
+  [When a resource was written](docs/fhir-api.md#when-a-resource-was-written).
+- **A guide to SMART Health Links**, with a script that fetches a summary, encrypts it and
+  makes the link, and a host for the links (`link-host`, below). The server does not host links: a
+  separate host holds the encrypted files, so the key is never on a server that holds the record.
+  See [SMART Health Links](docs/health-links.md).
+- **A link host to run, as a package of its own.** `link-host` is a [Hono](https://hono.dev) server in
+  TypeScript that stores the encrypted files of SMART Health Links in Postgres, or in a SQLite file for
+  one machine with no database server, and answers whoever opens a link. It never has a key, so a host
+  that is broken into holds nothing that can be read. `link-host/deploy` starts it with Caddy, which
+  gets and renews an HTTPS certificate, and Postgres (`compose.yaml`) or a SQLite volume
+  (`compose.sqlite.yaml`), from one `.env` file. The host:
+  - **Keeps nothing on its own disk** with Postgres, so any number of copies run against one
+    database, and a new one may start before the old one stops. With SQLite several copies share the
+    file on one machine, and `refhir-link-host backup` copies it while they run. Either way a guess at
+    a passcode is counted once whichever copy receives it: in a transaction on the link's row in
+    Postgres, and by running again a change that finds the link changed under it in SQLite. The schema
+    is made on first start.
+  - **Clears away what has ended.** The encrypted files of a link that expired, was switched off or ran
+    out of attempts are deleted, and the record is kept for 30 days so its owner can read who asked.
+    A link without an `expiresAt` lasts 30 days, and the answer says when.
+  - **Limits how often it is asked**: by address, by link, for owners, for making links, and a caller
+    who keeps getting a token wrong is shut out. Requests, headers, time and concurrency are bounded.
+  - **Says who may make links**: a clients file with a token (or its hash) and limits for each,
+    addresses the owner routes or a client are tied to, and `REQUIRE_PASSCODE`. Owner routes cannot
+    be called from another site's page unless it is named.
+  - **Says what it does**: a JSON line for each request and event, naming a link by its first eight
+    characters and logging nothing that opens one; the address, browser and outcome of each caller in
+    the link's access list; `/readyz`, which fails when the database cannot be written; `/metrics`;
+    and a stop that tells the balancer first and then finishes what it is answering.
+  - **Can be changed in code**: `authenticate`, `authorizeCreate`, `authorizeManifest` (to check who a
+    recipient is), `onEvent`, and a `store` that another database can stand in for.
+
+- **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
+  to answer `405`. It now takes FHIR R4's `Parameters` (`resource`, `onlyCertainMatches`, `count`)
+  and answers a `searchset` Bundle, best first, with a `search.score` and the `match-grade`
+  extension on each entry: `certain` for an identifier with the same system and value, `probable`
+  for the same name, full birth date and a phone number or email address, `possible` for the same
+  name and full birth date. Names ignore case, accents and order (a family name written as a given
+  name matches), phone numbers ignore spacing and whether they have a country code (`+234`, or the
+  `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
+  is not active is never returned, and a match on one that another replaced (`link` type
+  `replaced-by`) is the Patient that replaced it, followed through up to five links in the store,
+  `probable` at the most and never `certain`. `onlyCertainMatches` returns nothing when more than
+  one Patient is a potential match. Each entry says what it was found by in `match-evidence`
+  extensions on `search`: the name, birth date, identifier, phone number or email address that
+  matched (the last three as the request wrote them, so a caller can tell which of its own phone
+  numbers matched), and the replaced Patient a match came through. The request is JSON: an XML body
+  is refused with a `415`. The CapabilityStatement lists the operation on `Patient`. A scope that
+  may search Patients may use it; a token limited to one patient may not. See
+  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
+
+### Changed
+
+- **A date search compares to the millisecond and in the zone a time is written in.** It compared
+  in whole seconds, so two times in one second could not be told apart (`lt` on a time missed a time
+  33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an
+  hour or more away from where it is. A value that is a date, or that has no fraction, still
+  stands for all of the day or the second it names.
+- **`gt` and `lt` on a date follow FHIR.** `gt2026-10-18` found a resource that ended after the
+  day's end, and `lt` one that began before the day's start, as `sa` and `eb` did: a period or a
+  day that straddles the value was left out. `gt` and `lt` now take what reaches beyond the value;
+  `sa` and `eb` take only what lies wholly beyond it.
+- **A slice's minimum and maximum are checked.** A profile that asks for at least one value in a
+  slice (an IPS section a summary must have, say) now fails a resource that has none, and one that
+  allows a slice once fails a resource that has it twice. A slice that is told apart by a profile
+  is still not checked.
+- **A health card's `iss` is an address a verifier can reach.** The server refuses to start with a
+  signing key on a non-loopback address when no `public_url` is set, and says so when `public_url`
+  is not `https`. `credentialType` takes the clinical types the summary holds, and no other.
+- **`Patient/$summary` and `$health-cards-issue` read a bounded part of a record.** Each kind is
+  read newest first, up to 2,000 resources, and a section holds the 100 most recently written.
+- **`$document` for a token tied to one patient holds nothing of another patient.** A reference
+  that names a host (`http://other.example/Patient/1`) is no longer taken as a resource of this
+  server.
+- **A date search no longer misses a time because of how the time is written.** The index was
+  read in the order of the text, which is not the order of time: `ge2026-10-18T04:45:53Z` found
+  nothing where a time was stored as `...:53.065Z` (a `.` sorts before a `Z`), and a time in another
+  zone was cut off the same way. A date search now reads every day it could reach, and a date
+  written to the year or the month is read by its own key, and the comparison above decides.
+- **A resource inside a Bundle entry is validated as the resource it is.** `entry.resource` (and
+  any other element that holds a whole resource, such as a Parameters part) was checked as the
+  abstract `Resource`, so every element of every entry was "unknown" and a Bundle with entries
+  could not be validated. It is now checked against its own type, the profiles the entry's slice
+  names and the ones it states in `meta.profile`. HL7's own example IPS summaries now validate.
+- **A narrative is checked, not refused.** `txt-1` and `txt-2` use FHIR's `htmlChecks()`, which
+  the server did not implement, so `$validate` of any resource with a narrative failed with
+  "unsupported function htmlChecks". It now checks that the narrative is one `div` in the XHTML
+  namespace with only the basic formatting elements, no script and some text.
+- **A complex extension is validated by the values inside it,** as is anything else a profile
+  slices: the `value[x]` of a part of an extension (the `lang` and `content` of a translation)
+  was looked for under that literal name and reported missing. Slices of an element that sits
+  inside a slice of its parent (each section of a Composition slicing its `entry`) are now told
+  apart, and no longer applied to every value of the element.
+- **`$document` returns a valid document.** It has an `identifier`, a `timestamp` and a `urn:uuid`
+  `fullUrl` for each entry, references that point at them, and holds what the Composition's
+  resources reference as well as what it references itself, each once. A document of more than
+  1000 resources is a `422`.
+- **`$everything` and `$document` hold only what the caller's scopes let them read.** They used to
+  read every kind of resource of the compartment or the document regardless of the token.
+- The built-in Patient compartment holds `MedicationStatement` and `Immunization`, for a server
+  with no `CompartmentDefinition` installed.
+
+## [0.0.2] - 2026-10-19
+
+### Added
+
 - **A first start installs prepared packages, with no registry and little memory.** Release archives
   and container images now carry the release's FHIR packages (R4 core, SDC and what they depend on)
   in a file, `refhir-packages.bundle`, that is made when they are built: the packages are
@@ -49,6 +175,36 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `handling=strict` is the default. Conditional create, update and delete, `batch` and
   `transaction` entries, GraphQL and live queries are never lenient. See
   [FHIR API](docs/fhir-api.md#search).
+- **Many tenants in one Postgres database.** A process started with `--tenant NAME` (or
+  `REFHIR_TENANT`, or `tenant` under `[database]`) serves one tenant of a database that many tenants
+  share. Each tenant is a separate FHIR server: its own resources, SMART clients, audit trail,
+  writer, and standbys and replicas. `refhir tenant create | list | delete` manages them, and a
+  process whose tenant the database does not have refuses to start. The first `create` makes an
+  empty database a shared one, and a database keeps the layout it was made with: a database that
+  already holds a ReFHIR without tenants cannot hold them, and the reverse. **Nothing changes
+  without `--tenant`**: the same tables, migrations and SQL as before.
+  - **The packages tenants have in common are stored once.** The FHIR core and what it depends on
+    are read from a prepared file (see above) into the database one time, and each tenant is given
+    them, with its own search parameters and its own value set expansions. Packages installed from a
+    registry or a directory, and everything a tenant writes, stay the tenant's own.
+  - **The database keeps each tenant to its own rows.** Every table that holds tenants' rows has
+    row-level security, enabled and forced, so a connection sees and writes only the tenant it
+    serves. A superuser and a role with `BYPASSRLS` are never bound by it, so a process that connects
+    as one works and logs a warning. Take backups with such a role: `pg_dump` run as the ordinary
+    role refuses the database, and `--enable-row-security` dumps no tenant's rows.
+  - **A replica cannot write into the wrong tenant.** It sends its tenant with everything it
+    forwards, over REST and over `/sync`, and a primary of another tenant answers `421`.
+    `/healthz` names the tenant, `refhir migrate --status` says when a database is shared, and a
+    tenant's package cache and export directory default to a folder named for it. The Helm chart
+    takes `database.tenant` (one release per tenant).
+  - **A tenant announces its commits to its replicas at most every 20 ms.** Every tenant's replicas
+    listen in one database, so an announcement for each commit woke all of them and made busy
+    tenants slow each other down. The first commit after a quiet spell is announced with the commit
+    itself, and a burst ends with one announcement after its last commit. A database without tenants
+    announces every commit as before.
+
+  Each tenant adds a writer, so give the Postgres server room for all of them together. See
+  [Tenants on one database](docs/clustering.md#tenants-on-one-database).
 
 - **`_sort=near`, and the distance of each place `near` finds.** `Location?near=6.45|3.40|10|km&_sort=near`
   returns the places nearest first (`-near`: farthest first, places the same distance away by id),
@@ -326,6 +482,10 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   primary starts does the same, so a primary that stopped between writing and telling is made up
   for. The cost is that every replica and standby loads the whole catalog (a few seconds of one
   thread each) when a primary starts or a standby takes over.
+- **Claiming jobs on Postgres can no longer take more than was asked for.** The statement that
+  picks the waiting jobs (`$export` and the other durable jobs) let the planner run its locking
+  subquery again for each row it updated, skipping the rows it had just locked, so one claim could
+  take more jobs than the worker asked for. It now picks once, whatever the plan.
 
 ## [0.0.1] - 2026-10-15
 
@@ -372,5 +532,6 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.1...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/hai-hq/refhir/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/hai-hq/refhir/releases/tag/v0.0.1

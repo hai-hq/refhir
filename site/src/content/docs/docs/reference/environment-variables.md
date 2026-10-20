@@ -56,6 +56,12 @@ Set the DCR token and the confidential secret explicitly whenever you run a stan
 generated value changes on every restart, and those roles refuse to start without both pinned. See
 [Register a SMART app](/docs/guides/register-smart-app/).
 
+## Health cards
+
+| Variable | What it does |
+|---|---|
+| `REFHIR_HEALTH_CARDS_KEY_FILE` | The PEM file with the key that signs SMART Health Cards: an unencrypted PKCS#8 private key on P-256. Overrides `[health_cards].key_file`. Without a key the server issues no cards. See [Health cards](/docs/guides/health-cards/). |
+
 ## Audit
 
 | Variable | What it does |

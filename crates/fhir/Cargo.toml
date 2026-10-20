@@ -24,6 +24,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+unicode-normalization = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = { workspace = true }

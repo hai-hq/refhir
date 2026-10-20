@@ -1,12 +1,12 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use refhir_fhirpath::{Error, ErrorKind, Host, Value};
 use serde_json::{Map, Value as Json};
 
 use crate::outcome::{Issue, Outcome, Severity};
 use crate::primitive::{check_primitive, is_primitive, type_suffix};
-use crate::schema::{Cardinality, ElementDef, Schema, Structure};
+use crate::schema::{Cardinality, DiscriminatorKind, ElementDef, Schema, Structure};
 use crate::slice::{self, pattern_match};
 use crate::terminology::{TermAnswer, Terminology};
 
@@ -46,6 +46,8 @@ struct State<'a> {
     terms: &'a dyn Terminology,
     host: &'a dyn Host,
     issues: RefCell<Vec<Issue>>,
+    /// What has been said already, so a finding reached twice is said once.
+    reported: RefCell<HashSet<String>>,
     depth: Cell<usize>,
     frames: RefCell<Vec<Frame>>,
     /// An invariant is copied into the snapshot of every element of its type, so the element
@@ -68,6 +70,7 @@ pub fn validate(
         terms,
         host: &term_host,
         issues: RefCell::new(Vec::new()),
+        reported: RefCell::new(HashSet::new()),
         depth: Cell::new(0),
         frames: RefCell::new(Vec::new()),
         evaluated: RefCell::new(HashSet::new()),
@@ -219,52 +222,7 @@ impl State<'_> {
                 self.contained(object.get("contained"), element, root);
                 continue;
             }
-            if element.path.ends_with("[x]") {
-                let base = name.trim_end_matches("[x]").to_string();
-                let matches = choice_entries(object, &base, element);
-                used.extend(matches.iter().map(|(key, _)| key.clone()));
-                self.cardinality(element, matches.len(), &element.path);
-                if matches.len() > 1 {
-                    self.issue(
-                        Severity::Error,
-                        "structure",
-                        format!("choice {base} has more than one value"),
-                        &element.path,
-                    );
-                }
-                for (key, type_code) in &matches {
-                    if let Some(item) = object.get(key) {
-                        let underscore = object.get(&format!("_{key}"));
-                        self.repetitions(
-                            item,
-                            element,
-                            structure,
-                            root,
-                            resource,
-                            Some(type_code.clone()),
-                            underscore,
-                        );
-                    }
-                }
-                continue;
-            }
-            used.push(name.clone());
-            let underscore = object.get(&format!("_{name}"));
-            match object.get(&name) {
-                Some(item) => {
-                    self.repetitions(item, element, structure, root, resource, None, underscore)
-                }
-                None if underscore.is_some() => self.repetitions(
-                    &Json::Null,
-                    element,
-                    structure,
-                    root,
-                    resource,
-                    None,
-                    underscore,
-                ),
-                None => self.cardinality(element, 0, &element.path),
-            }
+            self.child(object, element, &name, structure, root, resource, &mut used);
         }
         let closed = !children.is_empty();
         for key in object.keys() {
@@ -292,6 +250,73 @@ impl State<'_> {
         }
         if object.contains_key("contained") && !used.iter().any(|name| name == "contained") {
             self.contained(object.get("contained"), &bare_contained(path), root);
+        }
+    }
+
+    /// One child element of an object: the keys that hold it (a choice type is held under a key
+    /// per type), how many values it has, and each value in turn. `used` collects the keys, so
+    /// the caller can tell which keys of the object no element accounts for.
+    // Part of the validator's recursive walk: the arguments are the state it carries down.
+    #[allow(clippy::too_many_arguments)]
+    fn child(
+        &self,
+        object: &serde_json::Map<String, Json>,
+        element: &ElementDef,
+        name: &str,
+        structure: &Structure,
+        root: &Json,
+        resource: &Json,
+        used: &mut Vec<String>,
+    ) {
+        if element.path.ends_with("[x]") {
+            let base = name.trim_end_matches("[x]").to_string();
+            let matches = choice_entries(object, &base, element);
+            used.extend(matches.iter().map(|(key, _)| key.clone()));
+            self.cardinality(element, matches.len(), &element.path);
+            if matches.len() > 1 {
+                self.issue(
+                    Severity::Error,
+                    "structure",
+                    format!("choice {base} has more than one value"),
+                    &element.path,
+                );
+            }
+            for (key, type_code) in &matches {
+                if let Some(item) = object.get(key) {
+                    let underscore = object.get(&format!("_{key}"));
+                    self.repetitions(
+                        item,
+                        element,
+                        structure,
+                        root,
+                        resource,
+                        Some(type_code.clone()),
+                        underscore,
+                    );
+                }
+            }
+            return;
+        }
+        used.push(name.to_string());
+        let underscore = object.get(&format!("_{name}"));
+        match object.get(name) {
+            Some(item) => {
+                self.repetitions(item, element, structure, root, resource, None, underscore)
+            }
+            None if underscore.is_some() => self.repetitions(
+                &Json::Null,
+                element,
+                structure,
+                root,
+                resource,
+                None,
+                underscore,
+            ),
+            None => {
+                self.cardinality(element, 0, &element.path);
+                // With no value at all, a slice a profile requires is missing too.
+                self.slice_cardinalities(element, structure, &HashMap::new());
+            }
         }
     }
 
@@ -336,6 +361,8 @@ impl State<'_> {
             .as_ref()
             .is_some_and(|slicing| slicing.ordered);
         let mut seen_order: Option<usize> = None;
+        // How many items each slice took, by its index in the structure.
+        let mut taken: HashMap<usize, usize> = HashMap::new();
         let name = child_name(&element.path);
         let key = match &choice_type {
             Some(code) => format!("{}{}", name.trim_end_matches("[x]"), type_suffix(code)),
@@ -357,7 +384,8 @@ impl State<'_> {
                 continue;
             }
             if element.slicing.is_some() {
-                if let Some((index, slice)) = slice::assign(item, structure, &element.path) {
+                if let Some((index, slice)) = slice::assign(item, structure, element) {
+                    *taken.entry(index).or_default() += 1;
                     if ordered {
                         if let Some(previous) = seen_order {
                             if index < previous {
@@ -384,7 +412,7 @@ impl State<'_> {
                     }
                     continue;
                 }
-                if slice::rules_reject_unmatched(&element.path, structure) {
+                if slice::rules_reject_unmatched(element) {
                     self.issue(
                         Severity::Error,
                         "structure",
@@ -404,6 +432,100 @@ impl State<'_> {
             );
             self.primitive_extensions(extra, &element.path, root, resource);
         }
+        self.slice_cardinalities(element, structure, &taken);
+    }
+
+    /// What a profile asks of each slice of `element`: how many items it must have, and may have.
+    /// `taken` says how many each got, by its index in the structure; a slice that got none is
+    /// missing, which is how a required one is found.
+    fn slice_cardinalities(
+        &self,
+        element: &ElementDef,
+        structure: &Structure,
+        taken: &HashMap<usize, usize>,
+    ) {
+        let Some(slicing) = &element.slicing else {
+            return;
+        };
+        // A slice is told apart by what its discriminators name, and only some can be decided from
+        // the content alone: a value, a pattern, a type, whether it exists. One that goes by a
+        // profile (which this validator reads as what the resource says of itself, where the
+        // profile asks what it conforms to) or by a function (`resolve()`) cannot be counted, and
+        // says nothing rather than that a slice is missing which is there.
+        if slicing.discriminators.is_empty()
+            || slicing.discriminators.iter().any(|item| {
+                item.path.contains('(') || matches!(item.kind, DiscriminatorKind::Profile)
+            })
+        {
+            return;
+        }
+        for (index, slice) in structure.slices_of(element) {
+            let found = taken.get(&index).copied().unwrap_or(0);
+            let name = slice.slice_name.as_deref().unwrap_or_default();
+            if found < slice.min as usize {
+                self.issue(
+                    Severity::Error,
+                    "required",
+                    format!(
+                        "{} slice {name} requires at least {}",
+                        element.path, slice.min
+                    ),
+                    &element.path,
+                );
+            }
+            if !slice.max.allows(found) {
+                self.issue(
+                    Severity::Error,
+                    "structure",
+                    format!("{} slice {name} has too many values", element.path),
+                    &element.path,
+                );
+            }
+        }
+    }
+
+    /// Whether a type code names a resource, or the abstract `Resource` and `DomainResource` an
+    /// element such as `Bundle.entry.resource` is typed as.
+    fn is_resource_type(&self, code: &str) -> bool {
+        matches!(code, "Resource" | "DomainResource")
+            || self
+                .schema
+                .base_type(code)
+                .is_some_and(|structure| structure.kind == "resource")
+    }
+
+    /// An element that holds a whole resource (a Bundle entry, a Parameters part) is checked as
+    /// the resource it holds, not as the abstract `Resource` it is typed as. The profiles it is
+    /// held to are the ones its type names (a slice of `Bundle.entry` names one) and the ones the
+    /// resource states itself. Whatever it finds is placed at the element's position.
+    fn resource_element(&self, value: &Json, element: &ElementDef, root: &Json) {
+        let type_name = value
+            .get("resourceType")
+            .and_then(|name| name.as_str())
+            .unwrap_or("");
+        let mut profiles: Vec<String> = Vec::new();
+        for item in &element.types {
+            if item.code != type_name
+                && !matches!(item.code.as_str(), "Resource" | "DomainResource")
+            {
+                continue;
+            }
+            for url in &item.profiles {
+                let url = url.split('|').next().unwrap_or(url).to_string();
+                if !profiles.contains(&url) {
+                    profiles.push(url);
+                }
+            }
+        }
+        for url in profile_urls(value) {
+            if !profiles.contains(&url) {
+                profiles.push(url);
+            }
+        }
+        let _frame = self.frame(type_name, None);
+        self.enter();
+        self.resource(value, root, &profiles);
+        self.leave();
     }
 
     fn primitive_extensions(&self, extra: Option<&Json>, path: &str, root: &Json, resource: &Json) {
@@ -429,24 +551,15 @@ impl State<'_> {
         let Some(object) = item.as_object() else {
             return;
         };
+        let mut used = Vec::new();
         for element in children {
-            let name = child_name(&element.path);
-            let underscore = object.get(&format!("_{name}"));
-            match object.get(&name) {
-                Some(value) => {
-                    self.repetitions(value, element, structure, root, resource, None, underscore)
-                }
-                None if underscore.is_some() => self.repetitions(
-                    &Json::Null,
-                    element,
-                    structure,
-                    root,
-                    resource,
-                    None,
-                    underscore,
-                ),
-                None => self.cardinality(element, 0, &element.path),
+            // A slice of a child is held to what its own slicing says of the child's values,
+            // not applied to all of them as if it were another child.
+            if element.slice_name.is_some() {
+                continue;
             }
+            let name = child_name(&element.path);
+            self.child(object, element, &name, structure, root, resource, &mut used);
         }
     }
 
@@ -489,6 +602,10 @@ impl State<'_> {
             if value.is_object() {
                 self.descend(value, structure, &element.path, root, resource);
             }
+            return;
+        }
+        if value.is_object() && type_codes.iter().all(|code| self.is_resource_type(code)) {
+            self.resource_element(value, element, root);
             return;
         }
         if type_codes.iter().all(|code| is_primitive(code)) {
@@ -948,10 +1065,18 @@ impl State<'_> {
         expression: impl Into<String>,
     ) {
         let expression = self.locate(expression.into());
-        self.issues.borrow_mut().push(Issue {
+        let diagnostics = diagnostics.into();
+        // A resource in a Bundle entry is walked once by the entry and once by the slice that
+        // names its profile, so the same finding can come twice. It is said once.
+        let key = format!("{severity:?}|{code}|{expression}|{diagnostics}");
+        if !self.reported.borrow_mut().insert(key) {
+            return;
+        }
+        let mut issues = self.issues.borrow_mut();
+        issues.push(Issue {
             severity,
             code: code.to_string(),
-            diagnostics: diagnostics.into(),
+            diagnostics,
             expression,
         });
     }
