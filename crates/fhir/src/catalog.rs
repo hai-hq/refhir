@@ -620,6 +620,35 @@ fn annotate_install(statement: &mut Value) {
     }
 }
 
+/// Say in a CapabilityStatement that `resource_type` has the operation `name`, whose definition is
+/// `definition`, besides any it already lists.
+pub(crate) fn add_operation(
+    statement: &mut Value,
+    resource_type: &str,
+    name: &str,
+    definition: &str,
+) {
+    let Some(resources) = statement
+        .pointer_mut("/rest/0/resource")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    for resource in resources {
+        if resource.get("type").and_then(|value| value.as_str()) != Some(resource_type) {
+            continue;
+        }
+        let operation = json!({"name": name, "definition": definition});
+        match resource
+            .get_mut("operation")
+            .and_then(|value| value.as_array_mut())
+        {
+            Some(operations) => operations.push(operation),
+            None => resource["operation"] = json!([operation]),
+        }
+    }
+}
+
 pub fn index_keys(
     path_model: &Model,
     model: &ResourceModel,

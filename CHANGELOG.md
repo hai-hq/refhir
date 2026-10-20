@@ -20,7 +20,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   conditions are true are put on the line. `totalNet` is the base price plus surcharges less
   deductions and discounts, and `totalGross` adds tax; `informational` components are only shown.
   Amounts are added as decimals, keep the definition's currency, and are never converted: two
-  currencies are a `422`. R4 leaves the answer as "Any" resource, so the Invoice is a choice, made
+  currencies are a `422`, as are two base prices that apply and a sum too large to hold. A condition
+  follows a reference only to a type the token may read. R4 leaves the answer as "Any" resource, so the Invoice is a choice, made
   because its line has price components shaped like the definition's. A definition that is not there is
   a `404`, a ChargeItem or Account that is not there a `422`. With SMART the token needs to read the
   definition, the ChargeItem and the Account; a token limited to one patient cannot use it. See
@@ -35,7 +36,9 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   and announced like any other create, a Subscription on `ClaimResponse?outcome=queued` tells whoever
   adjudicates, and they update the response with the decision. A submission is one transaction, so a
   request that is invalid, or names something that does not exist, stores nothing and is answered with the
-  validator's errors. The token needs to be able to create every type the submission writes. The
+  validator's errors. A request that `ifNoneExist` finds already stored is answered with the response it
+  has, and no second one is made. Bundles inside the Bundle each have their own `fullUrl`s. The token
+  needs to be able to create every type the submission writes (a `PUT` with a query creates, so it counts). The
   CapabilityStatement lists the operations. See
   [FHIR API](docs/fhir-api.md#submitting-a-claim-or-an-eligibility-request).
 - **ISO 4217 currency codes.** A currency that is not a code of ISO 4217 is now refused where it is
@@ -66,7 +69,10 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   (`xxx[x]`) was never looked at. Every such element is now checked: the target must exist (or, in a
   transaction Bundle, be named by the `fullUrl` of an entry), and be a type the element allows. As
   everywhere else under `strict`, a reference to a contained resource (`#id`) is refused, so a
-  `MedicationRequest` whose `medicationReference` is `#med1` is now refused too.
+  `MedicationRequest` whose `medicationReference` is `#med1` is now refused too. This is every
+  such element of every resource, not only the billing ones: a `Task` input, a `Communication`
+  payload, a `QuestionnaireResponse` answer or a `Parameters` value that is a reference must name
+  something on this server as well.
   `--references fhir` stays lenient. A resource that already holds a dangling reference of this
   kind is not changed, but a later update that keeps it is refused. See
   [FHIR API](docs/fhir-api.md#reference-checking).

@@ -10,6 +10,9 @@
 //!
 //! Everything a submission writes is one transaction: it is stored whole, or not at all.
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+
 use refhir_database::Transaction;
 use refhir_fhirpath::{EmptyHost, Host};
 use serde_json::{json, Map, Value};
@@ -66,35 +69,25 @@ const MAX_DEPTH: usize = 3;
 
 /// Say in a CapabilityStatement that the resource types that can be submitted can be.
 pub(crate) fn annotate_capability(statement: &mut Value) {
-    let Some(resources) = statement
-        .pointer_mut("/rest/0/resource")
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for resource in resources {
-        let Some(kind) = resource
-            .get("type")
-            .and_then(Value::as_str)
-            .and_then(|name| KINDS.iter().find(|kind| kind.request == name))
-        else {
-            continue;
-        };
-        let operation = json!({
-            "name": "submit",
-            "definition": format!("http://hl7.org/fhir/OperationDefinition/{}-submit", kind.request)
-        });
-        match resource.get_mut("operation").and_then(Value::as_array_mut) {
-            Some(operations) => operations.push(operation),
-            None => resource["operation"] = json!([operation]),
-        }
+    for kind in &KINDS {
+        crate::catalog::add_operation(
+            statement,
+            kind.request,
+            "submit",
+            &format!(
+                "http://hl7.org/fhir/OperationDefinition/{}-submit",
+                kind.request
+            ),
+        );
     }
 }
 
 /// The interaction each type needs that a submission of `body` to `type_name/$submit` writes: the
 /// requests and what they come with, as the entries say (a `PUT` is an update, and a create too
-/// where an update may create), and the responses. A body that cannot be read writes nothing, and
-/// the operation refuses it itself.
+/// where an update may create, and always for a conditional one, which creates when nothing
+/// matches), and the responses. A body that cannot be read writes nothing, and the operation
+/// refuses it itself. The resources are not copied: only their types and the entries' requests
+/// are read.
 ///
 /// A caller is allowed to submit only what its scopes let it write, which the path of the request
 /// (`Claim/$submit`) cannot say.
@@ -110,11 +103,11 @@ pub fn submission_writes(
     let Ok(input) = submitted(&args) else {
         return Vec::new();
     };
-    let mut plan = Plan::default();
+    let mut plan = Plan::shallow();
     let planned = if input.get("resourceType").and_then(Value::as_str) == Some("Bundle") {
         plan.add_bundle(kind, input, 1)
     } else {
-        plan.add_resource(kind, input.clone(), None)
+        plan.add_resource(kind, input, None)
     };
     if planned.is_err() {
         return Vec::new();
@@ -135,7 +128,11 @@ pub fn submission_writes(
         };
         if entry.pointer("/request/method").and_then(Value::as_str) == Some("PUT") {
             note(written, "update");
-            if update_creates {
+            let conditional = entry
+                .pointer("/request/url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| url.contains('?'));
+            if update_creates || conditional {
                 note(written, "create");
             }
         } else {
@@ -166,7 +163,7 @@ pub(crate) fn operation(
     if is_bundle {
         plan.add_bundle(kind, input, 1)?;
     } else if input.get("resourceType").and_then(Value::as_str) == Some(kind.request) {
-        plan.add_resource(kind, input.clone(), None)?;
+        plan.add_resource(kind, input, None)?;
     } else {
         return Err(FhirError::Invalid(format!(
             "resource must be a {} or a Bundle that holds them",
@@ -203,6 +200,13 @@ pub(crate) fn operation(
             .ok_or_else(|| {
                 FhirError::Storage(format!("entry {index} was stored without a body"))
             })?;
+        let matched = matched_by_condition(&plan.entries[*index], &stored, *index);
+        if matched {
+            if let Some(answer) = answer_to(tx, catalog, kind, response_model, request) {
+                responses.push(answer);
+                continue;
+            }
+        }
         let response = ops::create(tx, catalog, response_model, queued(kind, request, &created))?;
         responses.push(response);
     }
@@ -250,16 +254,36 @@ struct Plan {
     entries: Vec<Value>,
     /// The position in `entries` of each request, in the order they were submitted.
     requests: Vec<usize>,
+    /// The `urn:uuid:` full URLs the entries have, which each name one entry of the transaction
+    /// every entry is flattened into.
+    full_urls: BTreeSet<String>,
+    /// Keep of each resource only its type: for working out what a submission would write, which
+    /// needs no copy of what is written.
+    shallow: bool,
 }
 
 impl Plan {
+    fn shallow() -> Self {
+        Plan {
+            shallow: true,
+            ..Plan::default()
+        }
+    }
+
     fn add_bundle(&mut self, kind: &Kind, bundle: &Value, depth: usize) -> Result<(), FhirError> {
         if depth > MAX_DEPTH {
             return Err(FhirError::Invalid(format!(
                 "Bundles are nested more than {MAX_DEPTH} deep"
             )));
         }
-        for entry in bundle
+        // A full URL names an entry only inside its own Bundle, and a nested Bundle may use one that
+        // another uses for something else.
+        let scoped = if depth > 1 {
+            self.scoped(bundle)?
+        } else {
+            Cow::Borrowed(bundle)
+        };
+        for entry in scoped
             .get("entry")
             .and_then(Value::as_array)
             .into_iter()
@@ -271,10 +295,43 @@ impl Plan {
             if resource.get("resourceType").and_then(Value::as_str) == Some("Bundle") {
                 self.add_bundle(kind, resource, depth + 1)?;
             } else {
-                self.add_resource(kind, resource.clone(), Some(entry))?;
+                self.add_resource(kind, resource, Some(entry))?;
             }
         }
         Ok(())
+    }
+
+    /// `bundle`, a Bundle inside another, as its own full URLs mean in the transaction: one that an
+    /// entry already added uses is replaced, in the Bundle and everything that names it, by a new
+    /// one, so that what it names is the entry of this Bundle and not that one. The same full URL
+    /// on two entries of one Bundle is refused, since nothing says which a reference means.
+    fn scoped<'a>(&self, bundle: &'a Value) -> Result<Cow<'a, Value>, FhirError> {
+        let mut own = BTreeSet::new();
+        let mut renames = BTreeMap::new();
+        for full in bundle
+            .get("entry")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("fullUrl").and_then(Value::as_str))
+            .filter(|full| full.starts_with("urn:uuid:"))
+        {
+            if !own.insert(full) {
+                return Err(shared_url(full));
+            }
+            if self.full_urls.contains(full) {
+                renames.insert(
+                    full.to_string(),
+                    format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+                );
+            }
+        }
+        if renames.is_empty() {
+            return Ok(Cow::Borrowed(bundle));
+        }
+        let mut renamed = bundle.clone();
+        rename_urls(&mut renamed, &renames);
+        Ok(Cow::Owned(renamed))
     }
 
     /// Add a resource as a `POST` of its type, or as the entry's own `request` says: a conditional
@@ -283,7 +340,7 @@ impl Plan {
     fn add_resource(
         &mut self,
         kind: &Kind,
-        resource: Value,
+        resource: &Value,
         entry: Option<&Value>,
     ) -> Result<(), FhirError> {
         if self.entries.len() >= MAX_RESOURCES {
@@ -298,6 +355,14 @@ impl Plan {
             .to_string();
         let mut added = Map::new();
         if let Some(full_url) = entry.and_then(|entry| entry.get("fullUrl")) {
+            if let Some(full) = full_url
+                .as_str()
+                .filter(|full| full.starts_with("urn:uuid:"))
+            {
+                if !self.full_urls.insert(full.to_string()) {
+                    return Err(shared_url(full));
+                }
+            }
             added.insert("fullUrl".into(), full_url.clone());
         }
         let request = match entry.and_then(|entry| entry.get("request")) {
@@ -314,13 +379,71 @@ impl Plan {
             None => json!({"method": "POST", "url": type_name}),
         };
         added.insert("request".into(), request);
-        added.insert("resource".into(), resource);
+        added.insert(
+            "resource".into(),
+            if self.shallow {
+                json!({"resourceType": type_name})
+            } else {
+                resource.clone()
+            },
+        );
         if type_name == kind.request {
             self.requests.push(self.entries.len());
         }
         self.entries.push(Value::Object(added));
         Ok(())
     }
+}
+
+fn shared_url(full: &str) -> FhirError {
+    FhirError::Invalid(format!(
+        "the fullUrl {full} names more than one entry of the submission"
+    ))
+}
+
+/// Replace each string of `value` that is a key of `renames` by its value.
+fn rename_urls(value: &mut Value, renames: &BTreeMap<String, String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(renamed) = renames.get(text.as_str()) {
+                *text = renamed.clone();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(|item| rename_urls(item, renames)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| rename_urls(field, renames)),
+        _ => {}
+    }
+}
+
+/// Whether the entry was a conditional create (`ifNoneExist`) that found the request already
+/// stored, so that it is not a new one: the transaction answers `200`, and a create answers `201`.
+fn matched_by_condition(entry: &Value, stored: &Value, index: usize) -> bool {
+    entry.pointer("/request/ifNoneExist").is_some()
+        && stored
+            .pointer(&format!("/entry/{index}/response/status"))
+            .and_then(Value::as_str)
+            == Some("200 OK")
+}
+
+/// The response a request that was submitted before already has, if it has one. A request sent
+/// again (a client that did not see the answer, and tried again with `ifNoneExist`) is answered with
+/// that, and not with a second response for an adjudicator to decide.
+fn answer_to(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    kind: &Kind,
+    response_model: &crate::catalog::ResourceModel,
+    request: &Value,
+) -> Option<Value> {
+    let id = request.get("id").and_then(Value::as_str)?;
+    let params = BTreeMap::from([
+        ("request".to_string(), format!("{}/{id}", kind.request)),
+        ("_count".to_string(), "1".to_string()),
+    ]);
+    let found = crate::search::search(tx, catalog, response_model, &params).ok()?;
+    found.pointer("/entry/0/resource").cloned()
 }
 
 /// The response that says `request`, as it was stored, is waiting to be decided.

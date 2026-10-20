@@ -7631,6 +7631,69 @@ fn a_transaction_creates_what_a_choice_reference_names_before_the_resource_that_
     assert_eq!(found["total"], 1, "the refused transaction wrote nothing");
 }
 
+#[test]
+fn a_reference_in_a_choice_element_of_any_resource_is_checked_not_only_billing() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    for resource in [
+        json!({"resourceType": "Patient", "id": "pat"}),
+        json!({"resourceType": "Medication", "id": "para"}),
+    ] {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        apply(&harness, &path, json!({"resource": resource}));
+    }
+    let create = |resource: Value| {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        run_op(&harness, &path, &json!({"resource": resource}))
+    };
+    let refused = |result: Result<crate::run::RunResult, RunError>, said: &str| {
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(said), "{err}");
+    };
+
+    // What a Task is asked to work on is a choice (`Task.input.value[x]`).
+    let task = |reference: &str| {
+        json!({"resourceType": "Task", "status": "requested", "intent": "order",
+            "input": [{"type": {"text": "subject"}, "valueReference": {"reference": reference}}]})
+    };
+    create(task("Patient/pat")).unwrap();
+    refused(
+        create(task("Patient/nobody")),
+        "input.valueReference Patient/nobody does not exist",
+    );
+
+    // So is what a Communication carries (`Communication.payload.content[x]`), which may be any
+    // resource, and so is the answer to a question of a form, which is the same element kind.
+    let message = |reference: &str| {
+        json!({"resourceType": "Communication", "status": "completed",
+            "payload": [{"contentReference": {"reference": reference}}]})
+    };
+    create(message("Patient/pat")).unwrap();
+    refused(
+        create(message("Patient/nobody")),
+        "payload.contentReference Patient/nobody does not exist",
+    );
+
+    // A medication held in the resource itself is a reference to something that is not on the
+    // server, which is what `strict` refuses for every element: the Medication has to be written.
+    let request = |reference: &str| {
+        json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+            "subject": {"reference": "Patient/pat"},
+            "contained": [{"resourceType": "Medication", "id": "med1"}],
+            "medicationReference": {"reference": reference}})
+    };
+    refused(create(request("#med1")), "must be a relative reference");
+    create(json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+        "subject": {"reference": "Patient/pat"}, "medicationReference": {"reference": "Medication/para"}}))
+    .unwrap();
+    harness
+        .catalog
+        .write()
+        .unwrap()
+        .set_reference_policy(ReferencePolicy::Fhir);
+    create(request("#med1")).unwrap();
+}
+
 fn claim_response(currency: &str) -> Value {
     json!({
         "resourceType": "ClaimResponse", "status": "active",

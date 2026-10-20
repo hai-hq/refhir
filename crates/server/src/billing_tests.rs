@@ -628,6 +628,7 @@ fn guarded() -> axum::Router {
             install_package_dir(store.as_ref(), &db, &catalog, r4_dir()).unwrap();
             for resource in [
                 json!({"resourceType": "Patient", "id": "billed"}),
+                json!({"resourceType": "Patient", "id": "put-patient"}),
                 json!({"resourceType": "Organization", "id": "insurer", "name": "An insurer"}),
                 json!({"resourceType": "Organization", "id": "clinic", "name": "A clinic"}),
                 json!({"resourceType": "Coverage", "id": "policy", "status": "active",
@@ -639,6 +640,19 @@ fn guarded() -> axum::Router {
                     "url": "http://example.org/cid/guarded",
                     "propertyGroup": [{"priceComponent": [
                         {"type": "base", "amount": {"value": 100, "currency": "NGN"}}]}]}),
+                // A price that depends on what the patient's record says.
+                json!({"resourceType": "Patient", "id": "young", "birthDate": "2030-01-01"}),
+                json!({"resourceType": "ChargeItem", "id": "young-visit", "status": "billable",
+                    "code": {"text": "consultation"}, "subject": {"reference": "Patient/young"}}),
+                json!({"resourceType": "ChargeItemDefinition", "id": "by-age", "status": "active",
+                    "url": "http://example.org/cid/by-age",
+                    "propertyGroup": [
+                        {"priceComponent": [
+                            {"type": "base", "amount": {"value": 100, "currency": "NGN"}}]},
+                        {"applicability": [{"language": "text/fhirpath",
+                            "expression": "%context.subject.resolve().birthDate > today() - 14 years"}],
+                         "priceComponent": [
+                            {"type": "discount", "amount": {"value": 10, "currency": "NGN"}}]}]}),
             ] {
                 refhir_fhir::import_resource(&db, &catalog.read().unwrap(), &resource).unwrap();
             }
@@ -673,6 +687,21 @@ fn guarded() -> axum::Router {
                 None,
             );
             smart.install_token("charge-items-only", &["user/ChargeItem.read"], None);
+            smart.install_token(
+                "pricer-with-patients",
+                &[
+                    "user/ChargeItemDefinition.read",
+                    "user/ChargeItem.read",
+                    "user/Patient.read",
+                ],
+                None,
+            );
+            // May create claims and responses, and only update patients.
+            smart.install_token(
+                "updater",
+                &["user/Claim.c", "user/ClaimResponse.c", "user/Patient.u"],
+                None,
+            );
             smart.install_token("reader", &["user/*.read"], None);
             smart.install_token(
                 "patient",
@@ -738,7 +767,7 @@ async fn a_token_submits_only_what_it_may_write() {
     let (status, text) = crate::tests::send_text(
         &guarded(),
         "GET",
-        "/Claim?_summary=count",
+        "/Claim?patient=Patient/billed&_summary=count",
         "",
         &[("authorization", "Bearer reader")],
     )
@@ -1151,8 +1180,8 @@ async fn the_capability_statement_lists_apply() {
     );
 }
 
-async fn apply_as(token: &str, definition: &str, body: Value) -> StatusCode {
-    crate::tests::send_text(
+async fn apply_as_reply(token: &str, definition: &str, body: Value) -> (StatusCode, Value) {
+    let (status, text) = crate::tests::send_text(
         &guarded(),
         "POST",
         &format!("/ChargeItemDefinition/{definition}/$apply"),
@@ -1162,8 +1191,12 @@ async fn apply_as(token: &str, definition: &str, body: Value) -> StatusCode {
             ("content-type", "application/fhir+json"),
         ],
     )
-    .await
-    .0
+    .await;
+    (status, serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+async fn apply_as(token: &str, definition: &str, body: Value) -> StatusCode {
+    apply_as_reply(token, definition, body).await.0
 }
 
 #[tokio::test]
@@ -1354,5 +1387,402 @@ async fn an_include_of_a_reference_parameter_still_follows_it() {
     assert!(
         kinds(&body).contains(&("include".into(), "Claim".into())),
         "{body}"
+    );
+}
+
+// What the review of the first version found: each of these was wrong, and none was tested.
+
+/// A Bundle of `Patient`s that is more than a submission may hold.
+fn bundle_of_patients(count: usize) -> Value {
+    let entries: Vec<Value> = (0..count)
+        .map(|_| json!({"resource": {"resourceType": "Patient"}}))
+        .collect();
+    json!({"resourceType": "Bundle", "type": "collection", "entry": entries})
+}
+
+#[tokio::test]
+async fn a_nested_bundle_that_reuses_a_full_url_keeps_its_own_resources() {
+    seed().await;
+    let shared = "urn:uuid:cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+    // Each Bundle holds one Claim and the Patient it names, and each names its Patient the same
+    // way, which is a way to name it only inside its own Bundle.
+    let one_claim = |family: &str| {
+        let mut claim = claim("claim");
+        claim["patient"] = json!({"reference": shared});
+        json!({"resource": {"resourceType": "Bundle", "type": "collection", "entry": [
+            {"fullUrl": shared, "resource": {"resourceType": "Patient", "name": [{"family": family}]}},
+            {"resource": claim}
+        ]}})
+    };
+    let bundle = json!({"resourceType": "Bundle", "type": "collection",
+        "entry": [one_claim("Firstborn"), one_claim("Secondborn")]});
+    let reply = post("/Claim/$submit", parameters(bundle)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let entries = reply.body["entry"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    let mut families = Vec::new();
+    for entry in entries {
+        let patient = entry["resource"]["patient"]["reference"].as_str().unwrap();
+        families.push(get(&format!("/{patient}")).await.body["name"][0]["family"].clone());
+        // The Claim the response answers names the same Patient as the response does.
+        let request = entry["resource"]["request"]["reference"].as_str().unwrap();
+        assert_eq!(
+            get(&format!("/{request}")).await.body["patient"]["reference"],
+            patient
+        );
+    }
+    assert_eq!(families, [json!("Firstborn"), json!("Secondborn")]);
+
+    // The same full URL on two entries of one Bundle does not say which is meant.
+    let twice = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"fullUrl": shared, "resource": {"resourceType": "Patient"}},
+        {"fullUrl": shared, "resource": {"resourceType": "Patient"}},
+        {"resource": claim("claim")}]});
+    let refused = post("/Claim/$submit", parameters(twice)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert!(issues(&refused.body).contains(shared), "{}", refused.body);
+    // Nor does one that an entry of an outer Bundle has and an inner one has too.
+    let outer = json!({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "Bundle", "type": "collection", "entry": [
+            {"fullUrl": shared, "resource": {"resourceType": "Patient"}}]}},
+        {"fullUrl": shared, "resource": {"resourceType": "Patient"}},
+        {"resource": claim("claim")}]});
+    let refused = post("/Claim/$submit", parameters(outer)).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+}
+
+#[tokio::test]
+async fn a_submission_has_limits_on_what_it_holds_and_how_deep() {
+    seed().await;
+    // At most 500 resources, the ones a Claim names included.
+    let refused = post("/Claim/$submit", parameters(bundle_of_patients(501))).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert!(
+        issues(&refused.body).contains("at most 500"),
+        "{}",
+        refused.body
+    );
+    // Bundles may be three deep.
+    let nested = |depth: usize| {
+        let mut bundle = json!({"resourceType": "Bundle", "type": "collection",
+            "entry": [{"resource": claim("claim")}]});
+        for _ in 1..depth {
+            bundle = json!({"resourceType": "Bundle", "type": "collection",
+                "entry": [{"resource": bundle}]});
+        }
+        bundle
+    };
+    let reply = post("/Claim/$submit", parameters(nested(3))).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let refused = post("/Claim/$submit", parameters(nested(4))).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert!(
+        issues(&refused.body).contains("nested more than 3"),
+        "{}",
+        refused.body
+    );
+}
+
+#[tokio::test]
+async fn an_entry_with_its_own_request_is_stored_as_it_says_and_a_repeat_is_not_a_new_request() {
+    seed().await;
+    let identifier =
+        |value: &str| json!([{"system": "http://example.org/submitted", "value": value}]);
+    let submission = |claim_key: &str, patient_key: &str| {
+        let mut claim = claim("claim");
+        claim["identifier"] = identifier(claim_key);
+        claim["patient"] = json!({"reference": "urn:uuid:dddddddd-dddd-4ddd-8ddd-dddddddddddd"});
+        json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+            // A Patient that is made only if there is none like it: what a client that sends the
+            // same Bundle twice means.
+            {"fullUrl": "urn:uuid:dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+             "resource": {"resourceType": "Patient", "identifier": identifier(patient_key)},
+             "request": {"method": "POST", "url": "Patient",
+                "ifNoneExist": format!("identifier=http://example.org/submitted|{patient_key}")}},
+            {"resource": claim,
+             "request": {"method": "POST", "url": "Claim",
+                "ifNoneExist": format!("identifier=http://example.org/submitted|{claim_key}")}},
+            // An update of what is there, as the entry says.
+            {"resource": {"resourceType": "Organization", "id": "clinic", "name": "A clinic"},
+             "request": {"method": "PUT", "url": "Organization/clinic"}}
+        ]})
+    };
+    let first = post(
+        "/Claim/$submit",
+        parameters(submission("claim-once", "patient-once")),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let again = post(
+        "/Claim/$submit",
+        parameters(submission("claim-once", "patient-once")),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::OK, "{}", again.body);
+    // Nothing is made twice: not the Patient, not the Claim, and not the response to it. The
+    // second answer is the first.
+    let patients = get("/Patient?identifier=http://example.org/submitted|patient-once").await;
+    assert_eq!(patients.body["total"], 1, "{}", patients.body);
+    let request = first.body["entry"][0]["resource"]["request"]["reference"]
+        .as_str()
+        .unwrap();
+    let claims = get("/Claim?identifier=http://example.org/submitted|claim-once").await;
+    assert_eq!(claims.body["total"], 1, "{}", claims.body);
+    let responses = get(&format!("/ClaimResponse?request={request}")).await;
+    assert_eq!(responses.body["total"], 1, "{}", responses.body);
+    assert_eq!(
+        again.body["entry"][0]["resource"]["id"],
+        first.body["entry"][0]["resource"]["id"]
+    );
+    // A Claim with another identifier is a new request, with a response of its own.
+    let other = post(
+        "/Claim/$submit",
+        parameters(submission("claim-other", "patient-once")),
+    )
+    .await;
+    assert_eq!(other.status, StatusCode::OK, "{}", other.body);
+    assert_ne!(
+        other.body["entry"][0]["resource"]["id"],
+        first.body["entry"][0]["resource"]["id"]
+    );
+}
+
+#[tokio::test]
+async fn a_conditional_put_creates_and_so_needs_the_scope_to_create() {
+    // The path names the Claim, and the Patient is only in the body: the token is held to what the
+    // body writes too.
+    let mut put_claim = claim("claim");
+    put_claim["patient"] = json!({"reference": "Patient/put-patient"});
+    let conditional = |what: &str| {
+        json!({"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"resource": {"resourceType": "Patient",
+                "identifier": [{"system": "http://example.org/guarded", "value": what}]},
+             "request": {"method": "PUT",
+                "url": format!("Patient?identifier=http://example.org/guarded|{what}")}},
+            {"resource": put_claim.clone()}]})
+    };
+    // A PUT with a query that finds nothing creates, whether or not an update may.
+    let (status, body) = submit_as("updater", "Claim", parameters(conditional("one"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(issues(&body).contains("create of Patient"), "{body}");
+    // A token that may create is let through, and the Patient is made.
+    let (status, body) = submit_as("biller", "Claim", parameters(conditional("one"))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["entry"][0]["resource"]["outcome"], "queued");
+}
+
+#[tokio::test]
+async fn a_submission_is_answered_as_xml_when_asked_and_apply_takes_json_only() {
+    seed().await;
+    // (The server's XML reader does not take a Claim: it keeps no name for an element that holds
+    // others, so a request is JSON, and the answer may be either.)
+    let (status, text) = crate::tests::send_text(
+        &billing(),
+        "POST",
+        "/Claim/$submit",
+        &parameters(claim("claim")).to_string(),
+        &[
+            ("content-type", "application/fhir+json"),
+            ("accept", "application/fhir+xml"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        text.contains("<ClaimResponse") && text.contains(r#"<outcome value="queued""#),
+        "{text}"
+    );
+    // `$apply` takes Parameters as JSON, and says so.
+    let (status, text) = crate::tests::send_text(
+        &billing(),
+        "POST",
+        "/ChargeItemDefinition/any/$apply",
+        r#"<Parameters xmlns="http://hl7.org/fhir"/>"#,
+        &[("content-type", "application/fhir+xml")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{text}");
+}
+
+#[tokio::test]
+async fn a_replica_sends_a_submission_to_the_primary() {
+    // The primary: a real port and a database file, with the people a claim names. The replica
+    // opens the same file, as another process would, and is told where the primary is.
+    let path = std::env::temp_dir().join(format!(
+        "refhir-billing-replica-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let primary_store = Arc::new(SqlitePersistence::open(&path).unwrap());
+    let primary_db = Arc::new(Database::open(primary_store.clone()).unwrap());
+    let primary_catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(
+        primary_store.as_ref(),
+        &primary_db,
+        &primary_catalog,
+        r4_dir(),
+    )
+    .unwrap();
+    for resource in [
+        json!({"resourceType": "Patient", "id": "billed"}),
+        json!({"resourceType": "Organization", "id": "insurer", "name": "An insurer"}),
+        json!({"resourceType": "Organization", "id": "clinic", "name": "A clinic"}),
+        json!({"resourceType": "Coverage", "id": "policy", "status": "active",
+            "beneficiary": {"reference": "Patient/billed"},
+            "payor": [{"reference": "Organization/insurer"}]}),
+    ] {
+        refhir_fhir::import_resource(&primary_db, &primary_catalog.read().unwrap(), &resource)
+            .unwrap();
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = listener.local_addr().unwrap();
+    let primary_app = crate::app_with(
+        primary_db.clone(),
+        primary_catalog.clone(),
+        primary_store.clone(),
+        crate::ServerConfig::default(),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, primary_app).await.unwrap();
+    });
+    let replica_store = Arc::new(SqlitePersistence::open(&path).unwrap());
+    let replica_db = Arc::new(Database::open_read_only(replica_store.clone()).unwrap());
+    let (loaded, _) =
+        Catalog::open_consistent(replica_store.as_ref(), refhir_fhir::CatalogClock::Stable)
+            .unwrap();
+    let replica = crate::app_with(
+        replica_db,
+        Arc::new(RwLock::new(loaded)),
+        replica_store,
+        crate::ServerConfig {
+            primary_url: Some(format!("http://{primary_addr}")),
+            ..Default::default()
+        },
+    );
+    let (status, text) = crate::tests::send_text(
+        &replica,
+        "POST",
+        "/Claim/$submit",
+        &parameters(claim("claim")).to_string(),
+        &[("content-type", "application/fhir+json")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["outcome"], "queued");
+    // It was stored where the primary keeps things, not on the replica.
+    let id = body["id"].as_str().unwrap();
+    let stored = refhir_fhir::run(
+        &primary_db,
+        &primary_catalog.read().unwrap(),
+        "ClaimResponse/read",
+        &json!({"id": id}),
+    )
+    .unwrap();
+    assert_eq!(stored.value["request"], body["request"]);
+    for suffix in ["", "-wal", "-shm", ".lock"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(name);
+    }
+}
+
+#[tokio::test]
+async fn a_condition_cannot_follow_a_reference_to_what_the_token_may_not_read() {
+    let body = apply_body("ChargeItem/young-visit", None);
+    // With the right to read Patients, a child's price has the discount a condition found in the
+    // Patient's record.
+    let (status, priced) = apply_as_reply("pricer-with-patients", "by-age", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{priced}");
+    assert_eq!(priced["totalNet"], json!({"value": 90, "currency": "NGN"}));
+    // Without it, the reference leads nowhere, the condition is not met, and the price says
+    // nothing about the Patient.
+    let (status, priced) = apply_as_reply("pricer", "by-age", body).await;
+    assert_eq!(status, StatusCode::OK, "{priced}");
+    assert_eq!(priced["totalNet"], json!({"value": 100, "currency": "NGN"}));
+}
+
+#[tokio::test]
+async fn two_base_prices_that_apply_are_not_added_and_a_sum_that_does_not_fit_is_refused() {
+    put_all(vec![
+        json!({"resourceType": "Patient", "id": "numbers"}),
+        charged("numbers-visit", "numbers", "billable", None),
+        json!({"resourceType": "ChargeItemDefinition", "id": "two-bases", "status": "active",
+            "url": "http://example.org/cid/two-bases",
+            "propertyGroup": [
+                {"priceComponent": [{"type": "base", "amount": {"value": 15000, "currency": "NGN"}}]},
+                {"applicability": [{"language": "text/fhirpath", "expression": "%context.status = 'billable'"}],
+                 "priceComponent": [{"type": "base", "amount": {"value": 22000, "currency": "NGN"}}]}]}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "huge", "status": "active",
+            "url": "http://example.org/cid/huge",
+            "propertyGroup": [{"priceComponent": [
+                {"type": "base", "amount": {"value": 7e28, "currency": "NGN"}},
+                {"type": "surcharge", "amount": {"value": 7e28, "currency": "NGN"}}]}]}),
+        json!({"resourceType": "ChargeItemDefinition", "id": "huge-fraction", "status": "active",
+            "url": "http://example.org/cid/huge-fraction",
+            "propertyGroup": [{"priceComponent": [
+                {"type": "base", "amount": {"value": 7e28, "currency": "NGN"}},
+                {"type": "surcharge", "factor": 7e28}]}]}),
+    ])
+    .await;
+    // Which of two bases is the price is not for the server to guess, and adding them would bill
+    // the patient for both.
+    let reply = apply("two-bases", apply_body("ChargeItem/numbers-visit", None)).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
+    let text = issues(&reply.body);
+    assert!(text.contains("two base prices apply"), "{text}");
+    assert!(
+        text.contains("propertyGroup[1].priceComponent[0]"),
+        "{text}"
+    );
+    // Amounts too large to add are refused, and nothing panics.
+    for definition in ["huge", "huge-fraction"] {
+        let reply = apply(definition, apply_body("ChargeItem/numbers-visit", None)).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{definition}: {}",
+            reply.body
+        );
+        assert!(
+            issues(&reply.body).contains("too large"),
+            "{definition}: {}",
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_fraction_that_is_only_shown_needs_no_base_price() {
+    put_all(vec![
+        json!({"resourceType": "Patient", "id": "shown"}),
+        charged("shown-visit", "shown", "billable", None),
+        // The base is for a condition this ChargeItem does not meet; the co-payment share is shown
+        // for every one.
+        json!({"resourceType": "ChargeItemDefinition", "id": "shown-only", "status": "active",
+            "url": "http://example.org/cid/shown-only",
+            "propertyGroup": [
+                {"priceComponent": [{"type": "informational", "code": {"text": "co-payment"}, "factor": 0.2}]},
+                {"applicability": [{"language": "text/fhirpath", "expression": "%context.note.exists()"}],
+                 "priceComponent": [{"type": "base", "amount": {"value": 500, "currency": "NGN"}}]}]}),
+    ])
+    .await;
+    let reply = apply("shown-only", apply_body("ChargeItem/shown-visit", None)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(reply.body.get("totalNet").is_none(), "{}", reply.body);
+    let components = reply.body["lineItem"][0]["priceComponent"]
+        .as_array()
+        .unwrap();
+    assert_eq!(components.len(), 1, "{}", reply.body);
+    assert_eq!(components[0]["type"], "informational");
+    assert_eq!(components[0]["factor"], 0.2);
+    assert!(
+        components[0].get("amount").is_none(),
+        "no price to take a fraction of"
     );
 }

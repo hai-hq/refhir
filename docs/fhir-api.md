@@ -177,7 +177,9 @@ curl -s -X POST http://localhost:8080/ChargeItemDefinition/consultation/\$apply 
 
 - **Conditions.** `applicability` of the definition and of a `propertyGroup` is FHIRPath (`text/fhirpath`,
   which is what a condition with no `language` is), with the ChargeItem as `%context` and its references
-  followed with `resolve()`: `%context.subject.resolve().birthDate > today() - 14 years`. Every condition
+  followed with `resolve()`: `%context.subject.resolve().birthDate > today() - 14 years`. A reference is
+  followed only to a type the token may read; to any other it leads nowhere, as if the resource were not
+  there, so a price never tells what is in a record the caller may not see. Every condition
   of the definition must be true, or it does not apply to this ChargeItem and the answer is a `422`
   `OperationOutcome` (`business-rule`) that names the condition. A group is used when every condition of
   its own is true, and a group with none always is. A condition the server cannot decide (another
@@ -188,10 +190,15 @@ curl -s -X POST http://localhost:8080/ChargeItemDefinition/consultation/\$apply 
   them. A component with a `factor` and no `amount` is that fraction of the base price, and the Invoice
   has the amount worked out beside the `factor`. `totalNet` is the base price plus surcharges, less
   deductions and discounts (written positive or negative: both are taken off), and `totalGross` adds
-  tax. `informational` components are shown and never added. Amounts are added as decimals, not rounded,
-  and keep the currency of the definition; amounts in two currencies are a `422`, because no rate is
-  guessed. The ChargeItem's `quantity` is not applied, since the definition does not say what its prices
-  are for. With no base price (no group applies) there is a line and no totals: no price.
+  tax. `informational` components are shown and never added (one that is a `factor` and has no base price
+  to take it of is shown without an amount). There is one base price: two `base` components that apply,
+  in one group or two, are a `422` that names both, because nothing says which is the price and adding
+  them would charge for both. Amounts are added as decimals, not rounded, and keep the currency of the
+  definition; they are as exact as the JSON numbers they are read from (about 15 significant digits, as
+  everywhere in this server). Amounts in two currencies are a `422`, because no rate is guessed, and so
+  is a sum too large to hold. The ChargeItem's `quantity` is not applied, since the definition does not
+  say what its prices are for. With no base price (no group applies) there is a line and no totals: no
+  price.
 - **Not found.** An `[id]` that is not a definition is a `404`. A `chargeItem` or `account` that does not
   exist is a `422`: the request is well formed, and what it names is not there. A parameter that is
   missing, is not a reference, or refers to a resource of another type is a `400`. The body is JSON: XML
@@ -228,8 +235,13 @@ adjudicator decides by updating the response (`outcome` `complete`, the `item`s 
 
 A `Bundle` may hold Claims, Bundles that each hold a Claim, and the resources they refer to (a
 `Patient`, a `Coverage`). Each is stored as a new resource, and an entry refers to another by its
-`fullUrl` (`urn:uuid:...`), as in a transaction; an entry with its own `request` (`POST` with
-`ifNoneExist`, or `PUT`) is stored as it says, which keeps a `Patient` from being made again each time.
+`fullUrl` (`urn:uuid:...`), as in a transaction; a `fullUrl` names an entry only inside its own Bundle, so
+Bundles inside the Bundle may each use the same one for their own Patient (the server gives them
+separate ones), and the same `fullUrl` on two entries of one Bundle is a `400`. An entry with its own
+`request` (`POST` with `ifNoneExist`, or `PUT`) is stored as it says, which keeps a `Patient` from being
+made again each time. A request that `ifNoneExist` finds already stored is not a new one: the answer is
+the response it already has, and no second response is made for the adjudicator to decide. A submission
+holds at most 500 resources, and Bundles may be nested three deep.
 What comes back follows what went in: a Claim gets its `ClaimResponse`, and a Bundle gets a `collection`
 Bundle with one response for each Claim, in the order they were submitted. A submission is one
 transaction: if anything in it is invalid, a reference names something that does not exist, or the token
@@ -237,7 +249,8 @@ may not write it, nothing is stored, and the answer says why (`400` with the val
 and, in a Bundle, the position of the entry).
 
 With SMART, the token needs to be able to create everything the submission writes: the Claim, the response
-type, and every other type in the Bundle (or to update it, for a `PUT` entry). A token that is limited to
+type, and every other type in the Bundle (or to update it, for a `PUT` entry; a `PUT` with a query, which
+creates when nothing matches, needs to create as well). A token that is limited to
 one patient cannot submit. `$submit` is not available over `/sync`.
 
 Beyond REST:
@@ -345,7 +358,7 @@ is written:
 | `strict` (default) | The reference must be a relative `Type/id`, and its target must exist in the snapshot the write sees. Inside a transaction Bundle, an entry may refer to another entry by `fullUrl` |
 | `fhir` | Absolute URLs and targets that are not on this server are allowed. A type outside the element's `targetProfile` is still rejected |
 
-Every element that can hold a reference is checked, the ones that may hold something else instead as well: `ChargeItem.productReference`, `Invoice.lineItem.chargeItemReference` and `MedicationRequest.medicationReference` are refused when what they name does not exist, and an element that holds a `CodeableConcept` (`productCodeableConcept`) or nothing is not asked for a reference.
+Every element that can hold a reference is checked, the ones that may hold something else instead as well: `ChargeItem.productReference`, `Invoice.lineItem.chargeItemReference` and `MedicationRequest.medicationReference` are refused when what they name does not exist, and an element that holds a `CodeableConcept` (`productCodeableConcept`) or nothing is not asked for a reference. That is every such element of every resource, not only the billing ones: `Task.input.valueReference`, `Communication.payload.contentReference`, `QuestionnaireResponse.item.answer.valueReference` and `Parameters.parameter.valueReference` must name something on this server too (or, under `fhir`, anything). As everywhere under `strict`, a reference to a contained resource (`#med1`, as in a `MedicationRequest` with its `Medication` inside it) is refused: write the resource and name it.
 
 ## Resource ids
 

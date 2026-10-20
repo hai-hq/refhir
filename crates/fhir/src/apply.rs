@@ -14,11 +14,15 @@
 //! - `applicability` conditions are FHIRPath with the ChargeItem as `%context`, as the element
 //!   says. Every condition of the definition must be true, or the definition does not apply to this
 //!   ChargeItem (`422`, `business-rule`). A property group is used when every condition of its own is
-//!   true, and a group with none always is.
+//!   true, and a group with none always is. A reference a condition follows (`resolve()`) is read
+//!   only if the caller's scopes let it read that type.
 //! - The amounts are the definition's, in the definition's currency, with no rounding and no
 //!   conversion. A component with a `factor` and no `amount` is that fraction of the base price.
-//!   The ChargeItem's `quantity` is not applied: the definition does not say what its prices are
-//!   for.
+//!   There is one base price: two that apply are a `422`, since nothing says which is the price. The
+//!   ChargeItem's `quantity` is not applied: the definition does not say what its prices are for.
+//!   Amounts are added as decimals and are as exact as the JSON numbers they are read from (this
+//!   server reads a number as a double, about 15 significant digits); a sum too large to hold is a
+//!   `422`.
 //! - `totalNet` is the base price plus surcharges, less deductions and discounts (taken as they are
 //!   written, positive or negative); `totalGross` adds tax. `informational` components are shown and
 //!   never added. With no base price, nothing is added up and there is no total: no price.
@@ -26,7 +30,7 @@
 use std::str::FromStr;
 
 use refhir_database::Transaction;
-use refhir_fhirpath::Value as PathValue;
+use refhir_fhirpath::{Error as PathError, Host, Value as PathValue};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
@@ -51,25 +55,12 @@ const COMPONENT_TYPES: [&str; 6] = [
 
 /// Say in a CapabilityStatement that a definition can be applied.
 pub(crate) fn annotate_capability(statement: &mut Value) {
-    let Some(resources) = statement
-        .pointer_mut("/rest/0/resource")
-        .and_then(Value::as_array_mut)
-    else {
-        return;
-    };
-    for resource in resources {
-        if resource.get("type").and_then(Value::as_str) != Some(TYPE) {
-            continue;
-        }
-        let operation = json!({
-            "name": "apply",
-            "definition": "http://hl7.org/fhir/OperationDefinition/ChargeItemDefinition-apply"
-        });
-        match resource.get_mut("operation").and_then(Value::as_array_mut) {
-            Some(operations) => operations.push(operation),
-            None => resource["operation"] = json!([operation]),
-        }
-    }
+    crate::catalog::add_operation(
+        statement,
+        TYPE,
+        "apply",
+        "http://hl7.org/fhir/OperationDefinition/ChargeItemDefinition-apply",
+    );
 }
 
 /// The types and interactions a request to apply reads besides the definition: the ChargeItem,
@@ -103,6 +94,7 @@ pub(crate) fn operation(
     let charge_item_reference = reference_parameter(body, "chargeItem", "ChargeItem")?
         .ok_or_else(|| FhirError::Invalid("the parameter chargeItem is required".into()))?;
     let account_reference = reference_parameter(body, "account", "Account")?;
+    let scopes = read_scopes(args);
 
     // The definition is what the URL names, so it is a 404 when it is not there. What the
     // parameters name is not in the URL: a request that names something that does not exist is
@@ -116,7 +108,14 @@ pub(crate) fn operation(
     // The definition as a whole.
     for (position, condition) in conditions(&definition).iter().enumerate() {
         let path = format!("ChargeItemDefinition.applicability[{position}]");
-        if !holds(tx, catalog, condition, &charge_item, &path)? {
+        if !holds(
+            tx,
+            catalog,
+            scopes.as_deref(),
+            condition,
+            &charge_item,
+            &path,
+        )? {
             return Err(FhirError::Unprocessable(outcome(
                 "business-rule",
                 &format!(
@@ -142,7 +141,14 @@ pub(crate) fn operation(
             let path = format!(
                 "ChargeItemDefinition.propertyGroup[{group_position}].applicability[{position}]"
             );
-            if !holds(tx, catalog, condition, &charge_item, &path)? {
+            if !holds(
+                tx,
+                catalog,
+                scopes.as_deref(),
+                condition,
+                &charge_item,
+                &path,
+            )? {
                 applies = false;
                 break;
             }
@@ -273,6 +279,7 @@ fn describe(condition: &Value) -> String {
 fn holds(
     tx: &mut Transaction,
     catalog: &Catalog,
+    scopes: Option<&[String]>,
     condition: &Value,
     charge_item: &Value,
     path: &str,
@@ -295,7 +302,10 @@ fn holds(
     };
     let expression = refhir_fhirpath::parse(text)
         .map_err(|err| cannot(format!("the expression {text:?} cannot be read: {err}")))?;
-    let host = TxHost::new(tx, catalog);
+    let host = ScopedHost {
+        inner: TxHost::new(tx, catalog),
+        scopes,
+    };
     let result = refhir_fhirpath::evaluate(&expression, charge_item, catalog.path_model(), &host)
         .map_err(|err| {
         cannot(format!(
@@ -311,6 +321,43 @@ fn holds(
     }
 }
 
+/// The scopes of the token the request came with, which only the server puts in the arguments of
+/// an operation. Without them (authorization is off) nothing is held back.
+fn read_scopes(args: &Value) -> Option<Vec<String>> {
+    args.get("_readScopes")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+}
+
+/// What a condition sees: the store, less the types the caller may not read. A reference to one is
+/// as a reference to something that is not there, so a price cannot tell the caller what a
+/// condition found in a resource it has no right to.
+struct ScopedHost<'a> {
+    inner: TxHost<'a>,
+    scopes: Option<&'a [String]>,
+}
+
+impl Host for ScopedHost<'_> {
+    fn resolve(&self, reference: &str) -> Result<Option<Value>, PathError> {
+        if let Some(scopes) = self.scopes {
+            let type_name = reference.rsplit('/').nth(1).unwrap_or("");
+            if !refhir_sdc::scope_allows(scopes, type_name) {
+                return Ok(None);
+            }
+        }
+        self.inner.resolve(reference)
+    }
+
+    fn conforms_to(&self, resource: &Value, url: &str) -> Result<Option<bool>, PathError> {
+        self.inner.conforms_to(resource, url)
+    }
+}
+
 /// The price components that apply, as the Invoice has them, and what they add up to.
 struct Priced {
     components: Vec<Value>,
@@ -321,15 +368,28 @@ struct Priced {
 fn price(components: &[(Value, String)]) -> Result<Priced, FhirError> {
     let invalid =
         |path: &str, why: String| FhirError::Unprocessable(outcome("business-rule", &why, path));
+    // Amounts are decimals, and a sum that does not fit one is refused rather than wrapped or
+    // panicked over: the definition is data somebody wrote.
+    let too_large = |path: &str| invalid(path, "the amounts are too large to add".into());
     // The base price comes first: the others may be a fraction of it.
     let mut base: Option<Decimal> = None;
+    let mut base_at: Option<&str> = None;
     let mut currency: Option<String> = None;
     for (component, path) in components {
         if component.get("type").and_then(Value::as_str) != Some("base") {
             continue;
         }
         if let Some((amount, unit)) = amount_of(component, path)? {
-            *base.get_or_insert(Decimal::ZERO) += amount;
+            if let Some(first) = base_at {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "two base prices apply, {first} and {path}, and nothing says which is the price"
+                    ),
+                ));
+            }
+            base = Some(amount);
+            base_at = Some(path);
             agree(&mut currency, &unit, path)?;
         }
     }
@@ -368,10 +428,12 @@ fn price(components: &[(Value, String)]) -> Result<Priced, FhirError> {
                 }
                 None => match (factor_of(component, path)?, base) {
                     (Some(factor), Some(base)) => {
-                        let amount = base * factor;
+                        let amount = base.checked_mul(factor).ok_or_else(|| too_large(path))?;
                         out["amount"] = money(amount, currency.as_deref().unwrap_or_default());
                         Some(amount)
                     }
+                    // Shown and never added, so with no base price it is a component with no amount.
+                    (Some(_), None) if kind == "informational" => None,
                     (Some(_), None) => return Err(invalid(
                         path,
                         "the price component is a fraction of the base price, and there is none"
@@ -381,9 +443,17 @@ fn price(components: &[(Value, String)]) -> Result<Priced, FhirError> {
                 },
             };
         match (kind, amount) {
-            ("surcharge", Some(amount)) => net += amount,
-            ("deduction" | "discount", Some(amount)) => net -= amount.abs(),
-            ("tax", Some(amount)) => tax += amount,
+            ("surcharge", Some(amount)) => {
+                net = net.checked_add(amount).ok_or_else(|| too_large(path))?
+            }
+            ("deduction" | "discount", Some(amount)) => {
+                net = net
+                    .checked_sub(amount.abs())
+                    .ok_or_else(|| too_large(path))?
+            }
+            ("tax", Some(amount)) => {
+                tax = tax.checked_add(amount).ok_or_else(|| too_large(path))?
+            }
             ("base" | "informational", _) => {}
             (_, None) => {
                 return Err(invalid(
@@ -396,7 +466,12 @@ fn price(components: &[(Value, String)]) -> Result<Priced, FhirError> {
         shown.push(out);
     }
     let totals = match (base, currency) {
-        (Some(_), Some(currency)) => Some((net, net + tax, currency)),
+        (Some(_), Some(currency)) => {
+            let gross = net
+                .checked_add(tax)
+                .ok_or_else(|| too_large("ChargeItemDefinition"))?;
+            Some((net, gross, currency))
+        }
         _ => None,
     };
     Ok(Priced {
@@ -475,13 +550,7 @@ fn money(value: Decimal, currency: &str) -> Value {
 }
 
 fn outcome(code: &str, diagnostics: &str, expression: &str) -> Value {
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{
-            "severity": "error",
-            "code": code,
-            "diagnostics": diagnostics,
-            "expression": [expression]
-        }]
-    })
+    let mut outcome = crate::bundle::operation_outcome(code, diagnostics);
+    outcome["issue"][0]["expression"] = json!([expression]);
+    outcome
 }

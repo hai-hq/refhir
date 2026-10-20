@@ -1142,12 +1142,16 @@ async fn apply_op(
     {
         return response;
     }
+    // The conditions of a definition follow references, and only what the token may read is theirs
+    // to follow: the engine is told the token's scopes, as an SDC operation is.
+    let mut args = json!({"id": id, "resource": resource});
+    stamp_sdc(&app, &headers, &mut args);
     match execute(
         &app.db,
         &app.catalog,
         &app.store,
         &format!("{resource_type}/$apply"),
-        json!({"id": id, "resource": resource}),
+        args,
     )
     .await
     {
