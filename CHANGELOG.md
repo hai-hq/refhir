@@ -78,6 +78,34 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   search parameter) on a replica, and a replica waits for the migration as for any other. Back the
   database up first, as for any migration ([Schema migrations](docs/migrations.md)); there is no
   going back to an earlier release afterwards.
+- **`_has` is answered for the places the rest of the search leaves, and `_include` and `_revinclude`
+  are read for the whole page at once.** `Location?near=…&_has:OrganizationAffiliation:location:network=…` ran the
+  `OrganizationAffiliation` search over every affiliation in the database, built a Bundle of all of
+  them and read their references, whatever few places `near` had left: with 10,000 places it took
+  10 to 30 seconds, the same for a circle of 6 places as of 223, and the directory search that adds a
+  second `_has`, an `_include` and two `_revinclude` took about twenty. When the other parameters
+  leave up to a few thousand resources, each is now looked up in the index of the reference
+  (`OrganizationAffiliation.location`), and what refers to it is checked against `network=…`, so the
+  cost follows the places near and not the size of the database. An `_include` and a `_revinclude` read
+  what their rules lead to for every match of the page in one request to the database for each
+  rule, where each used one for each match. SQLite and Postgres answer such a read in one statement for each 200 and 50 index ranges
+  instead of one each. The answers are the same: a search that leaves many resources, a `_has` that is
+  not a plain parameter of the type (a chain, `_id`, a parameter the type lacks), and a server run with
+  `--references fhir` (where a reference can be a URL that an index lookup would not find) take the
+  search of the whole type, as before. **Numbers.** A directory of 10,000 places (and as many
+  organizations, services and affiliations) in a SQLite file, the releases before and after started
+  on copies of it, one request at a time on a busy machine (load average 90 to 240, so read the
+  ratios): `Location?near=6.6|3.35|100|km&_sort=near&_count=100` with a `_has` on the service
+  category took 4.5 s and now takes 52 ms; with a `_has` on the network, 8.7 s and now 61 ms; a 5 km
+  circle with the `_has` on the network, 10.0 s and now 3 ms; and the directory search (`near`, both
+  `_has`, an `_include` and two `_revinclude`), 15.0 s and now 199 ms, its CPU time falling from 4.2 s
+  to 0.15 s. Every Bundle is identical entry for entry. On Postgres 16 in a local container (3.5 ms a
+  statement) with 2,000 places the same searches went from 1.4 s to 46 ms, 1.2 s to 51 ms and 4.3 s
+  to 0.5 s (a multi-range statement there costs more to plan than to run, so it is the slowest part).
+  A `_has` that nothing else narrows still costs what the whole type costs, about 9 s at 10,000
+  places, and with thousands of places left it can cost more on Postgres than before (2.6 s against
+  1.1 s at 2,000 places).
+
 - **A control the server cannot apply is refused, not echoed.** `Location?_sort=bogus` answered
   `200` and its `self` link still said `_sort=bogus`, as if the order had been applied, though FHIR
   says that link holds the parameters the server used. The same held for `_sort` by a parameter

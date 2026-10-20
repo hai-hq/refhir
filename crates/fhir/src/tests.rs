@@ -9537,14 +9537,17 @@ mod near_search {
         })
     }
 
-    /// Stores the resources as Locations, a thousand to a transaction. They are not validated,
-    /// which costs far more than storing them, so a table of tens of thousands is quick to make.
+    /// Stores the resources, each as the type it says it is, a thousand to a transaction. They are
+    /// not validated, which costs far more than storing them, so a table of tens of thousands is
+    /// quick to make.
     fn store_places(harness: &Harness, places: &[Value]) {
         for batch in places.chunks(1000) {
             let catalog = harness.catalog.read().unwrap();
-            let model = catalog.get("Location").unwrap();
             let mut tx = harness.db.begin();
             for resource in batch {
+                let model = catalog
+                    .get(resource["resourceType"].as_str().unwrap())
+                    .unwrap();
                 let keys = {
                     let host = TxHost::new(&mut tx, &catalog);
                     index_keys(catalog.path_model(), model, resource, &host).unwrap()
@@ -10729,6 +10732,817 @@ mod near_search {
         let (again, _) = Catalog::open_consistent(&store, CatalogClock::Latest).unwrap();
         assert!(!again.has_pending_parameters());
         remove();
+    }
+
+    /// What a provider directory holds for each of `count` organizations: a Location (spread over
+    /// Nigeria, managed by the organization), a HealthcareService of service category 17 at it, and an
+    /// OrganizationAffiliation of the organization in one network, at that place and for that service.
+    fn directory(count: usize) -> Vec<Value> {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let mut resources = Vec::with_capacity(count * 4);
+        for n in 0..count {
+            let (org, place, service) =
+                (format!("o{n:05}"), format!("l{n:05}"), format!("h{n:05}"));
+            resources.push(
+                json!({"resourceType": "Organization", "id": org, "name": format!("Clinic {n}")}),
+            );
+            let mut at = location(
+                &place,
+                random.between(SOUTH, NORTH),
+                random.between(WEST, EAST),
+            );
+            at["managingOrganization"] = json!({"reference": format!("Organization/{org}")});
+            resources.push(at);
+            resources.push(json!({
+                "resourceType": "HealthcareService", "id": service, "active": true,
+                "providedBy": {"reference": format!("Organization/{org}")},
+                "location": [{"reference": format!("Location/{place}")}],
+                "category": [{"coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/service-category", "code": "17"}]}]
+            }));
+            resources.push(json!({
+                "resourceType": "OrganizationAffiliation", "id": format!("a{n:05}"), "active": true,
+                "network": [{"reference": "Organization/boolbyte-network"}],
+                "participatingOrganization": {"reference": format!("Organization/{org}")},
+                "location": [{"reference": format!("Location/{place}")}],
+                "healthcareService": [{"reference": format!("HealthcareService/{service}")}],
+                "code": [{"coding": [{"system": "http://example.org/role", "code": "member"}]}]
+            }));
+        }
+        resources
+    }
+
+    const IN_NETWORK: (&str, &str) = (
+        "_has:OrganizationAffiliation:location:network",
+        "Organization/boolbyte-network",
+    );
+    const OF_CATEGORY_17: (&str, &str) = (
+        "_has:HealthcareService:location:service-category",
+        "http://terminology.hl7.org/CodeSystem/service-category|17",
+    );
+
+    /// Times for ByteNetwork's directory search over a directory of `INTERNAL_BENCHMARK_PLACES`
+    /// (default 10,000) places. Run it with
+    /// `cargo test --release -p refhir-fhir --lib directory_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: prints times"]
+    fn directory_benchmark() {
+        let count: usize = std::env::var("INTERNAL_BENCHMARK_PLACES")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(10_000);
+        let harness = r4();
+        let started = Instant::now();
+        store_places(&harness, &directory(count));
+        eprintln!(
+            "stored a directory of {count} places in {:.1?}",
+            started.elapsed()
+        );
+        let near_100 = ("near", "6.6|3.35|100|km");
+        let near_5 = ("near", "6.6|3.35|5|km");
+        let sorted = ("_sort", "near");
+        let page = ("_count", "100");
+        let queries: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("near 100 km, sorted", vec![near_100, sorted, page]),
+            (
+                "+ has service category",
+                vec![near_100, sorted, page, OF_CATEGORY_17],
+            ),
+            ("+ has network", vec![near_100, sorted, page, IN_NETWORK]),
+            (
+                "near 5 km + has network",
+                vec![near_5, sorted, page, IN_NETWORK],
+            ),
+            (
+                "has network, no near, count 1",
+                vec![IN_NETWORK, ("_count", "1")],
+            ),
+            (
+                "the directory search",
+                vec![
+                    near_100,
+                    sorted,
+                    page,
+                    IN_NETWORK,
+                    OF_CATEGORY_17,
+                    ("_include", "Location:organization"),
+                    (
+                        "_revinclude",
+                        "HealthcareService:location,OrganizationAffiliation:location",
+                    ),
+                ],
+            ),
+        ];
+        for (label, query) in queries {
+            let (bundle, work, took) = search(&harness, &query);
+            let cheap = fastest(&harness, &query).min(took);
+            eprintln!(
+                "{label:<34} {cheap:>10.2?}  total {}  entries {}  {work:?}",
+                bundle["total"],
+                bundle["entry"].as_array().map_or(0, Vec::len)
+            );
+        }
+    }
+
+    /// The search as the whole type used to answer `_has`, to hold the search to.
+    fn reference(
+        harness: &Harness,
+        type_name: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Value, FhirError> {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get(type_name).unwrap();
+        let mut tx = harness.db.begin();
+        crate::search::search_reference(&mut tx, &catalog, model, &query_params(query))
+    }
+
+    /// A directory in a small, awkward form. Sixty places round Lagos and thirty round Kano, each
+    /// with a Location. Most have a HealthcareService (of category 17, or 99 for some), a few have a
+    /// second one, most have an affiliation in the network, a few an affiliation in another network
+    /// as well, and one affiliation is at two places.
+    fn small_directory() -> Vec<Value> {
+        let mut random = Random(0x5eed_5eed_5eed_5eed);
+        let mut resources = Vec::new();
+        for n in 0..90usize {
+            let (latitude, longitude) = if n < 60 {
+                (random.between(6.3, 6.9), random.between(3.05, 3.65))
+            } else {
+                (random.between(11.7, 12.3), random.between(8.2, 8.8))
+            };
+            let place = format!("l{n:03}");
+            let mut at = location(&place, latitude, longitude);
+            at["managingOrganization"] = json!({"reference": format!("Organization/o{n:03}")});
+            resources.push(at);
+            let service = |id: String, code: &str| {
+                json!({"resourceType": "HealthcareService", "id": id, "active": true,
+                    "location": [{"reference": format!("Location/{place}")}],
+                    "category": [{"coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/service-category",
+                        "code": code}]}]})
+            };
+            if n % 5 != 0 {
+                resources.push(service(
+                    format!("h{n:03}"),
+                    if n % 7 == 0 { "99" } else { "17" },
+                ));
+            }
+            if n % 11 == 0 {
+                resources.push(service(format!("h{n:03}b"), "99"));
+            }
+            let affiliation = |id: String, network: &str, places: &[String]| {
+                json!({"resourceType": "OrganizationAffiliation", "id": id, "active": true,
+                    "network": [{"reference": format!("Organization/{network}")}],
+                    "location": places.iter()
+                        .map(|place| json!({"reference": format!("Location/{place}")}))
+                        .collect::<Vec<_>>()})
+            };
+            if n % 4 != 0 {
+                let mut places = vec![place.clone()];
+                if n % 9 == 0 {
+                    places.push(format!("l{:03}", n + 1));
+                }
+                resources.push(affiliation(format!("a{n:03}"), "boolbyte-network", &places));
+            }
+            if n % 6 == 0 {
+                resources.push(affiliation(
+                    format!("x{n:03}"),
+                    "other-network",
+                    std::slice::from_ref(&place),
+                ));
+            }
+        }
+        resources
+    }
+
+    const NEAR_LAGOS: (&str, &str) = ("near", "6.6|3.35|40|km");
+
+    fn narrowed(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work) {
+        let (bundle, work, _) = search(harness, query);
+        (bundle, work)
+    }
+
+    #[test]
+    fn has_asked_of_the_places_a_search_left_answers_as_the_search_of_the_whole_type_did() {
+        let harness = r4();
+        let directory = small_directory();
+        store_places(&harness, &directory);
+        let service_17 = (
+            "_has:HealthcareService:location:service-category",
+            "http://terminology.hl7.org/CodeSystem/service-category|17",
+        );
+        let either = (
+            "_has:HealthcareService:location:service-category",
+            "http://terminology.hl7.org/CodeSystem/service-category|17,\
+             http://terminology.hl7.org/CodeSystem/service-category|99",
+        );
+        let not_17 = (
+            "_has:HealthcareService:location:service-category:not",
+            "http://terminology.hl7.org/CodeSystem/service-category|17",
+        );
+        let bare_network = (
+            "_has:OrganizationAffiliation:location:network",
+            "boolbyte-network",
+        );
+        let other_network = (
+            "_has:OrganizationAffiliation:location:network",
+            "Organization/other-network",
+        );
+        let nobody = (
+            "_has:OrganizationAffiliation:location:network",
+            "Organization/nobody",
+        );
+        let unnetworked = (
+            "_has:OrganizationAffiliation:location:network:missing",
+            "true",
+        );
+        let networked = (
+            "_has:OrganizationAffiliation:location:network:missing",
+            "false",
+        );
+        let sorted = ("_sort", "near");
+        let queries: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("one has", vec![NEAR_LAGOS, IN_NETWORK]),
+            ("one has, sorted", vec![NEAR_LAGOS, IN_NETWORK, sorted]),
+            ("the other has", vec![NEAR_LAGOS, service_17]),
+            ("two has", vec![NEAR_LAGOS, IN_NETWORK, service_17, sorted]),
+            (
+                "two has, a page",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, sorted, ("_count", "5")],
+            ),
+            (
+                "two has, the page after",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    service_17,
+                    sorted,
+                    ("_count", "5"),
+                    ("_offset", "5"),
+                ],
+            ),
+            (
+                "two has, farthest first",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, ("_sort", "-near")],
+            ),
+            (
+                "two has, no total",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, ("_total", "none")],
+            ),
+            (
+                "two has, a count",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, ("_summary", "count")],
+            ),
+            ("alternatives", vec![NEAR_LAGOS, either]),
+            ("not", vec![NEAR_LAGOS, not_17]),
+            ("a bare id", vec![NEAR_LAGOS, bare_network]),
+            ("another network", vec![NEAR_LAGOS, other_network]),
+            ("a network nobody is in", vec![NEAR_LAGOS, nobody]),
+            ("missing", vec![NEAR_LAGOS, unnetworked]),
+            ("not missing", vec![NEAR_LAGOS, networked]),
+            (
+                "with includes",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    service_17,
+                    sorted,
+                    ("_count", "8"),
+                    ("_include", "Location:organization"),
+                    (
+                        "_revinclude",
+                        "HealthcareService:location,OrganizationAffiliation:location",
+                    ),
+                ],
+            ),
+            (
+                "an include rule with a target",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    sorted,
+                    ("_count", "6"),
+                    ("_revinclude", "OrganizationAffiliation:location:Location"),
+                ],
+            ),
+            (
+                "an include rule for a target the places are not",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    (
+                        "_revinclude",
+                        "OrganizationAffiliation:location:Organization",
+                    ),
+                ],
+            ),
+            (
+                "with another parameter",
+                vec![NEAR_LAGOS, IN_NETWORK, ("status", "active"), sorted],
+            ),
+            (
+                "with an id",
+                vec![("_id", "l000,l001,l002,l003"), IN_NETWORK],
+            ),
+            ("no near", vec![IN_NETWORK, service_17]),
+            (
+                "no near, sorted by name",
+                vec![IN_NETWORK, ("_sort", "name")],
+            ),
+            (
+                "round Kano",
+                vec![("near", "12|8.5|30|km"), IN_NETWORK, service_17, sorted],
+            ),
+            (
+                "round nothing",
+                vec![("near", "0|0|5|km"), IN_NETWORK, service_17],
+            ),
+            (
+                "a place that does not exist",
+                vec![("_id", "nobody"), IN_NETWORK],
+            ),
+        ];
+        let mut asked = 0;
+        for (label, query) in &queries {
+            let (bundle, work) = narrowed(&harness, query);
+            let want = reference(&harness, "Location", query).expect(label);
+            assert_eq!(bundle, want, "{label}");
+            assert_eq!(
+                work.searched, 0,
+                "{label}: asked of the places, not of the whole type"
+            );
+            asked += work.probed;
+        }
+        assert!(asked > 100, "the clauses were asked of the places: {asked}");
+        // Both ways say what they find, for the places that do and do not have what is asked.
+        let (bundle, _) = narrowed(&harness, &[NEAR_LAGOS, IN_NETWORK, service_17]);
+        let found = ids(&bundle);
+        assert!(found.len() > 10 && found.len() < 60, "{}", found.len());
+        for place in &directory {
+            if place["resourceType"] != "Location" {
+                continue;
+            }
+            let n: usize = place["id"].as_str().unwrap()[1..].parse().unwrap();
+            let lagos = n < 60;
+            // Its own affiliation, or the one of the place before it that is at two places.
+            let in_network = n % 4 != 0 || (n % 9 == 1 && (n - 1) % 4 != 0);
+            let category_17 = n % 5 != 0 && n % 7 != 0;
+            let near = lagos && near_before(place, "6.6|3.35|40|km");
+            let expect = near && in_network && category_17;
+            assert_eq!(
+                found.contains(&place["id"].as_str().unwrap().to_string()),
+                expect,
+                "l{n:03}"
+            );
+        }
+    }
+
+    #[test]
+    fn has_is_asked_only_of_the_places_inside_the_circle() {
+        // The ranges of the index that cover a circle hold places outside it, the corners of the
+        // square round it. Those are read and measured and turned away, and nothing is asked about
+        // them.
+        let harness = r4();
+        let mut resources = Vec::new();
+        // About 13 km from the centre, in a corner of the square that holds the circle of 10 km.
+        for (id, latitude, longitude) in [
+            ("centre", 6.6, 3.35),
+            ("corner-ne", 6.685, 3.435),
+            ("corner-nw", 6.685, 3.265),
+            ("corner-se", 6.515, 3.435),
+            ("corner-sw", 6.515, 3.265),
+        ] {
+            resources.push(location(id, latitude, longitude));
+            resources.push(json!({"resourceType": "OrganizationAffiliation",
+                "id": format!("a-{id}"),
+                "network": [{"reference": "Organization/boolbyte-network"}],
+                "location": [{"reference": format!("Location/{id}")}]}));
+        }
+        store_places(&harness, &resources);
+        let query = [("near", "6.6|3.35|10|km"), IN_NETWORK];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["centre"]);
+        assert!(
+            work.rows >= 5,
+            "the corners are in the ranges read: {work:?}"
+        );
+        assert_eq!((work.searched, work.probed), (0, 1), "{work:?}");
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    #[test]
+    fn has_asked_of_one_place_or_of_none() {
+        let harness = r4();
+        let directory = small_directory();
+        store_places(&harness, &directory);
+        // The exact place of one Location, so that a circle of a metre holds that one.
+        let place = directory
+            .iter()
+            .find(|place| place["id"] == "l001")
+            .unwrap();
+        let (latitude, longitude) = (
+            place["position"]["latitude"].as_f64().unwrap(),
+            place["position"]["longitude"].as_f64().unwrap(),
+        );
+        let here = format!("{latitude}|{longitude}|0.001|km");
+        let query = [("near", here.as_str()), IN_NETWORK, OF_CATEGORY_17];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["l001"]);
+        assert_eq!(bundle["total"], 1);
+        assert_eq!((work.searched, work.probed), (0, 2));
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        // A place that is near and has no service (n % 5 == 0).
+        let lonely = directory
+            .iter()
+            .find(|place| place["id"] == "l005")
+            .unwrap();
+        let there = format!(
+            "{}|{}|0.001|km",
+            lonely["position"]["latitude"].as_f64().unwrap(),
+            lonely["position"]["longitude"].as_f64().unwrap()
+        );
+        let query = [("near", there.as_str()), IN_NETWORK, OF_CATEGORY_17];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert!(ids(&bundle).is_empty());
+        assert_eq!(bundle["total"], 0);
+        assert_eq!(work.searched, 0);
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        // No place at all: nothing is asked.
+        let query = [("near", "0|0|1|km"), IN_NETWORK, OF_CATEGORY_17];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert!(ids(&bundle).is_empty());
+        assert_eq!((work.searched, work.probed), (0, 0));
+    }
+
+    #[test]
+    fn has_does_not_cost_more_for_places_outside_the_circle() {
+        // The same directory round Lagos, then with two thousand places and everything that refers
+        // to them added a long way off. The search round Lagos reads what it read, and asks of the
+        // places it asked, and no more.
+        let harness = r4();
+        store_places(&harness, &small_directory());
+        let query = vec![
+            NEAR_LAGOS,
+            IN_NETWORK,
+            OF_CATEGORY_17,
+            ("_sort", "near"),
+            (
+                "_revinclude",
+                "HealthcareService:location,OrganizationAffiliation:location",
+            ),
+        ];
+        let (before, work_before) = narrowed(&harness, &query);
+        let mut far = Vec::new();
+        for n in 0..2000usize {
+            let place = format!("far{n:04}");
+            // Somewhere between Maiduguri and Sokoto, more than 500 km from Lagos.
+            far.push(location(
+                &place,
+                11.0 + (n % 40) as f64 * 0.05,
+                7.0 + (n / 40) as f64 * 0.1,
+            ));
+            far.push(
+                json!({"resourceType": "HealthcareService", "id": format!("fh{n:04}"),
+                "location": [{"reference": format!("Location/{place}")}],
+                "category": [{"coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/service-category",
+                    "code": "17"}]}]}),
+            );
+            far.push(
+                json!({"resourceType": "OrganizationAffiliation", "id": format!("fa{n:04}"),
+                "network": [{"reference": "Organization/boolbyte-network"}],
+                "location": [{"reference": format!("Location/{place}")}]}),
+            );
+        }
+        store_places(&harness, &far);
+        let (after, work_after) = narrowed(&harness, &query);
+        assert_eq!(after, before);
+        assert!(work_before.probed > 0);
+        assert_eq!(
+            (work_after.rows, work_after.probed, work_after.searched),
+            (work_before.rows, work_before.probed, work_before.searched)
+        );
+        assert_eq!(work_after.searched, 0);
+    }
+
+    #[test]
+    fn has_over_most_of_the_type_is_the_search_of_the_type_as_before() {
+        // Past what is worth asking one place at a time, the search for the type answers, and
+        // reads each place it leaves once.
+        let harness = r4();
+        let mut places: Vec<Value> = (0..5100)
+            .map(|n| {
+                location(
+                    &format!("p{n:05}"),
+                    6.0 + (n % 100) as f64 * 0.01,
+                    3.0 + (n / 100) as f64 * 0.01,
+                )
+            })
+            .collect();
+        places.push(
+            json!({"resourceType": "OrganizationAffiliation", "id": "a1",
+            "network": [{"reference": "Organization/boolbyte-network"}],
+            "location": [{"reference": "Location/p00007"}, {"reference": "Location/p05000"}]}),
+        );
+        store_places(&harness, &places);
+        let query = [IN_NETWORK, ("_count", "10")];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["p00007", "p05000"]);
+        assert_eq!(bundle["total"], 2);
+        assert_eq!((work.searched, work.probed), (1, 0));
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        // A narrower search over the same table is asked of its places.
+        let query = [("near", "6.07|3.0|2|km"), IN_NETWORK];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["p00007"]);
+        assert_eq!(work.searched, 0);
+        assert!(work.probed >= 1);
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    #[test]
+    fn has_that_the_type_cannot_answer_one_place_at_a_time_is_answered_or_refused_as_before() {
+        let harness = r4();
+        store_places(&harness, &small_directory());
+        // What the search for the type refuses or reads its own way is left to it, and says the
+        // same: a parameter that does not exist, a chain, a type that is not a type, a modifier
+        // that is not one, a reference that is not one.
+        for (name, value) in [
+            ("_has:OrganizationAffiliation:location:bogus", "x"),
+            ("_has:OrganizationAffiliation:location:network.name", "x"),
+            ("_has:Bogus:location:network", "Organization/x"),
+            (
+                "_has:OrganizationAffiliation:bogus:network",
+                "Organization/x",
+            ),
+            (
+                "_has:OrganizationAffiliation:active:network",
+                "Organization/x",
+            ),
+            (
+                "_has:OrganizationAffiliation:location:network:bogus",
+                "Organization/x",
+            ),
+            ("_has:OrganizationAffiliation:location:active", "maybe"),
+            ("_has:OrganizationAffiliation:location:_id", "a001"),
+            // A `_has` inside a `_has`, which the search for the type answers or refuses itself.
+            (
+                "_has:OrganizationAffiliation:location:_has:Provenance:target:agent",
+                "Patient/x",
+            ),
+        ] {
+            let query = [NEAR_LAGOS, (name, value)];
+            let got = run(&harness, "Location", &query, Handling::Strict);
+            let want = reference(&harness, "Location", &query);
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{name}={value}"),
+                (Err(got), Err(want)) => {
+                    assert_eq!(got.to_string(), want.to_string(), "{name}={value}")
+                }
+                (got, want) => panic!("{name}={value}: {got:?} and {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_that_takes_references_as_urls_answers_has_the_old_way() {
+        // Under `--references fhir` a reference can be a URL, which looking a place up in the
+        // index would not find, so the search for the type answers, as it did.
+        let harness = r4();
+        let mut directory = small_directory();
+        directory.push(
+            json!({"resourceType": "OrganizationAffiliation", "id": "by-url",
+            "network": [{"reference": "Organization/boolbyte-network"}],
+            "location": [{"reference": "http://elsewhere.example/fhir/Location/l002"}]}),
+        );
+        store_places(&harness, &directory);
+        harness
+            .catalog
+            .write()
+            .unwrap()
+            .set_reference_policy(ReferencePolicy::Fhir);
+        let query = [NEAR_LAGOS, IN_NETWORK, ("_sort", "near")];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!((work.searched, work.probed), (1, 0));
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        assert!(ids(&bundle).contains(&"l002".to_string()));
+    }
+
+    #[test]
+    fn include_follows_each_reference_of_the_page_once_in_the_order_the_places_have() {
+        let harness = r4();
+        let mut directory = small_directory();
+        // Every tenth place is part of the next, which is often a match itself; and only the first
+        // forty-five of the organizations the places name are stored, so the rest point at nothing.
+        for resource in &mut directory {
+            if resource["resourceType"] != "Location" {
+                continue;
+            }
+            let n: usize = resource["id"].as_str().unwrap()[1..].parse().unwrap();
+            if n % 10 == 0 {
+                resource["partOf"] = json!({"reference": format!("Location/l{:03}", n + 1)});
+            }
+        }
+        for n in 0..45 {
+            directory.push(
+                json!({"resourceType": "Organization", "id": format!("o{n:03}"),
+                "name": format!("Clinic {n}")}),
+            );
+        }
+        store_places(&harness, &directory);
+        let by_id = |id: &str| directory.iter().find(|resource| resource["id"] == id);
+        for (rules, target) in [
+            ("Location:organization,Location:partof", None),
+            ("Location:partof,Location:organization", None),
+            ("Location:organization:Organization", Some("Organization")),
+            ("Location:partof:Location", Some("Location")),
+            ("Location:organization:Patient", Some("Patient")),
+        ] {
+            let query = [
+                NEAR_LAGOS,
+                ("_sort", "near"),
+                ("_count", "15"),
+                ("_include", rules),
+            ];
+            let (bundle, work) = narrowed(&harness, &query);
+            let entries = bundle["entry"].as_array().unwrap();
+            let page: Vec<&str> = entries
+                .iter()
+                .filter(|entry| entry["search"]["mode"] == "match")
+                .map(|entry| entry["resource"]["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(page.len(), 15);
+            // What the rules lead to, place by place and rule by rule, each resource once and none
+            // that is a match already or is not there.
+            let mut seen: Vec<String> = page.iter().map(|id| format!("Location/{id}")).collect();
+            let mut want: Vec<String> = Vec::new();
+            for place in &page {
+                let place = by_id(place).unwrap();
+                for rule in rules.split(',') {
+                    let field = if rule.contains("organization") {
+                        "managingOrganization"
+                    } else {
+                        "partOf"
+                    };
+                    let Some(reference) = place[field]["reference"].as_str() else {
+                        continue;
+                    };
+                    let type_name = reference.split('/').next().unwrap();
+                    if target.is_some_and(|target| target != type_name) {
+                        continue;
+                    }
+                    if seen.iter().any(|known| known == reference) {
+                        continue;
+                    }
+                    seen.push(reference.to_string());
+                    if by_id(reference.split('/').nth(1).unwrap()).is_some() {
+                        want.push(reference.to_string());
+                    }
+                }
+            }
+            let included: Vec<String> = entries
+                .iter()
+                .filter(|entry| entry["search"]["mode"] == "include")
+                .map(|entry| {
+                    format!(
+                        "{}/{}",
+                        entry["resource"]["resourceType"].as_str().unwrap(),
+                        entry["resource"]["id"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            assert_eq!(included, want, "{rules}");
+            assert_eq!(work.searched, 0);
+            assert_eq!(
+                bundle,
+                reference(&harness, "Location", &query).unwrap(),
+                "{rules}"
+            );
+        }
+        // The page that has something to include has it, and the pointless rule has nothing.
+        let query = [
+            NEAR_LAGOS,
+            ("_count", "15"),
+            ("_include", "Location:organization"),
+        ];
+        let (bundle, _) = narrowed(&harness, &query);
+        assert!(bundle["entry"].as_array().unwrap().len() > 15);
+        let query = [
+            NEAR_LAGOS,
+            ("_count", "15"),
+            ("_include", "Location:organization:Patient"),
+        ];
+        let (bundle, _) = narrowed(&harness, &query);
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 15);
+    }
+
+    #[test]
+    fn revinclude_finds_what_refers_to_each_place_in_the_order_the_places_have() {
+        let harness = r4();
+        let directory = small_directory();
+        store_places(&harness, &directory);
+        let query = [
+            NEAR_LAGOS,
+            ("_sort", "near"),
+            ("_count", "12"),
+            (
+                "_revinclude",
+                "HealthcareService:location,OrganizationAffiliation:location",
+            ),
+        ];
+        let (bundle, _) = narrowed(&harness, &query);
+        let entries = bundle["entry"].as_array().unwrap();
+        let places: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(places.len(), 12);
+        // For each place in turn, the rules in the order they were given, and under each the
+        // referrers by id (a place has two services, or two affiliations in different networks).
+        let mut want = Vec::new();
+        for place in &places {
+            for (kind, field) in [
+                ("HealthcareService", "location"),
+                ("OrganizationAffiliation", "location"),
+            ] {
+                let mut found: Vec<String> = directory
+                    .iter()
+                    .filter(|resource| resource["resourceType"] == kind)
+                    .filter(|resource| {
+                        resource[field].as_array().is_some_and(|list| {
+                            list.iter()
+                                .any(|item| item["reference"] == format!("Location/{place}"))
+                        })
+                    })
+                    .map(|resource| resource["id"].as_str().unwrap().to_string())
+                    .collect();
+                found.sort();
+                want.extend(found);
+            }
+        }
+        // A referrer already added for an earlier place is not added again: one affiliation is at two.
+        let mut once = Vec::new();
+        for id in want {
+            if !once.contains(&id) {
+                once.push(id);
+            }
+        }
+        let included: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "include")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(included, once);
+        assert!(included.len() > 12);
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    /// ByteNetwork's directory search (near, two `_has`, an `_include` and two `_revinclude`) over a
+    /// directory of `INTERNAL_BENCHMARK_PLACES` (default 10,000) places answers in a hundred
+    /// milliseconds, and so does `near` with one `_has`. Run it with
+    /// `cargo test --release -p refhir-fhir --lib the_directory_search -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a directory of tens of thousands of places: run with --release, as the timing asks for"]
+    fn the_directory_search_answers_in_a_hundred_milliseconds() {
+        let count: usize = std::env::var("INTERNAL_BENCHMARK_PLACES")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(10_000);
+        let harness = r4();
+        store_places(&harness, &directory(count));
+        for query in [
+            vec![
+                ("near", "6.6|3.35|100|km"),
+                ("_sort", "near"),
+                ("_count", "100"),
+                IN_NETWORK,
+                OF_CATEGORY_17,
+                ("_include", "Location:organization"),
+                (
+                    "_revinclude",
+                    "HealthcareService:location,OrganizationAffiliation:location",
+                ),
+            ],
+            vec![
+                ("near", "6.6|3.35|100|km"),
+                ("_sort", "near"),
+                ("_count", "100"),
+                IN_NETWORK,
+            ],
+            vec![("near", "6.6|3.35|5|km"), ("_sort", "near"), IN_NETWORK],
+        ] {
+            let (bundle, work, _) = search(&harness, &query);
+            let took = fastest(&harness, &query);
+            eprintln!(
+                "{count} places, {} found: {took:.2?}  {work:?}",
+                bundle["total"]
+            );
+            assert_eq!(work.searched, 0, "{query:?}");
+            assert!(
+                took < Duration::from_millis(100),
+                "{query:?} took {took:.2?} over {count} places"
+            );
+        }
     }
 
     /// A query in a long run of searches over 40,000 places, as a provider directory sends.

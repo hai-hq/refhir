@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use refhir_persistence::{
-    document_from_parts, index_target, ConflictStrategy, DocumentLogEntry, IndexScanEntry,
-    IndexScanRow, LatestDocument, Lease, LiveEntries, PersistError, Persistence,
+    document_from_parts, index_target, spread_rows, ConflictStrategy, DocumentLogEntry,
+    IndexScanEntry, IndexScanRow, LatestDocument, Lease, LiveEntries, PersistError, Persistence,
     PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader, Pool, PoolGuard, PoolStats,
-    TimestampRange,
+    TimestampRange, RANGES_PER_STATEMENT,
 };
 use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 use rusqlite::{
@@ -241,8 +241,6 @@ impl PersistenceReader for SqlitePersistence {
         interval: &Interval,
         order: Order,
     ) -> Result<Vec<IndexScanRow>, PersistError> {
-        // Index-only backfill rows use a later commit than the document, so the
-        // document join is the latest live revision at the read timestamp.
         let upper = if interval.end.is_some() {
             " AND key < ?4"
         } else {
@@ -252,85 +250,103 @@ impl PersistenceReader for SqlitePersistence {
             Order::Asc => "ASC",
             Order::Desc => "DESC",
         };
-        let sql = format!(
-            r#"
-SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
-FROM (
-    SELECT index_id, key, MAX(ts) as max_ts
-    FROM indexes
-    WHERE index_id = ?1 AND ts <= ?2 AND key >= ?3{upper}
-    GROUP BY index_id, key
-) A
-JOIN indexes B
-  ON B.deleted = 0
- AND A.index_id = B.index_id
- AND A.key = B.key
- AND A.max_ts = B.ts
-JOIN documents C
-  ON C.table_id = B.table_id
- AND C.id = B.document_id
- AND C.deleted = 0
- AND C.ts = (
-    SELECT MAX(D.ts) FROM documents D
-    WHERE D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= ?2
- )
-ORDER BY B.key {ord}
-"#
-        );
+        let sql = scan_sql(&format!("key >= ?3{upper}"), ord);
         let guard = self.read()?;
         let mut stmt = guard.connection.prepare(&sql).map_err(definite)?;
         let ts = i64_ts(read_timestamp)?;
-        let map_row = |row: &rusqlite::Row<'_>| {
-            let key: Vec<u8> = row.get(0)?;
-            let row_ts: i64 = row.get(1)?;
-            let document_id: Vec<u8> = row.get(2)?;
-            let table_id: Vec<u8> = row.get(3)?;
-            let json_value: Option<String> = row.get(4)?;
-            let prev_ts: Option<i64> = row.get(5)?;
-            Ok((key, row_ts, document_id, table_id, json_value, prev_ts))
-        };
         let raw = if let Some(end) = &interval.end {
             stmt.query_map(
                 params![index_id.as_bytes(), ts, interval.start, end],
-                map_row,
+                scan_columns,
             )
             .map_err(definite)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(definite)?
         } else {
-            stmt.query_map(params![index_id.as_bytes(), ts, interval.start], map_row)
+            stmt.query_map(
+                params![index_id.as_bytes(), ts, interval.start],
+                scan_columns,
+            )
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?
+        };
+        raw.into_iter()
+            .map(|columns| scan_row(index_id, columns))
+            .collect()
+    }
+
+    /// One statement for each `RANGES_PER_STATEMENT` intervals: the rows whose key is in any of them,
+    /// each then given to the list of every interval that holds it. SQLite prepares a statement
+    /// for every scan, so a search over hundreds of ranges (the references to each of a few hundred
+    /// places) would spend its time preparing statements.
+    fn index_scan_ranges(
+        &self,
+        index_id: &IndexId,
+        read_timestamp: Timestamp,
+        intervals: &[Interval],
+    ) -> Result<Vec<Vec<IndexScanRow>>, PersistError> {
+        let mut lists: Vec<Vec<IndexScanRow>> = vec![Vec::new(); intervals.len()];
+        if intervals.is_empty() {
+            return Ok(lists);
+        }
+        let guard = self.read()?;
+        let ts = i64_ts(read_timestamp)?;
+        let id = index_id.as_bytes();
+        // What an interval that holds nothing is made of: a key is never at least this and below it.
+        let nothing: Vec<u8> = Vec::new();
+        for (chunk_no, chunk) in intervals.chunks(RANGES_PER_STATEMENT).enumerate() {
+            // The statement is as long as the next size up from the intervals there are, the rest
+            // being intervals that hold nothing, so that searches that differ in how many places
+            // they ask about share a statement and SQLite compiles it once (`prepare_cached`).
+            let size = STATEMENT_SIZES
+                .into_iter()
+                .find(|size| *size >= chunk.len())
+                .unwrap_or(chunk.len());
+            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&id, &ts];
+            let mut arms = Vec::with_capacity(size);
+            for at in 0..size {
+                let start = params.len() + 1;
+                let (from, to) = match chunk.get(at) {
+                    Some(interval) => (&interval.start, interval.end.as_ref()),
+                    None => (&nothing, Some(&nothing)),
+                };
+                params.push(from);
+                let upper = match to {
+                    Some(end) => {
+                        params.push(end);
+                        format!(" AND key < ?{}", start + 1)
+                    }
+                    None => String::new(),
+                };
+                arms.push(format!(
+                    "SELECT index_id, key, ts FROM indexes \
+                     WHERE index_id = ?1 AND ts <= ?2 AND key >= ?{start}{upper}"
+                ));
+            }
+            // One range search of the index for each interval, joined with `UNION ALL`: an `OR` of
+            // ranges is planned as a scan of everything the index holds for `index_id`, which is
+            // all the places there are. A key in two intervals comes twice and is grouped to one.
+            let sql = scan_sql_over(&format!("({})", arms.join(" UNION ALL ")), "ASC");
+            let mut stmt = guard.connection.prepare_cached(&sql).map_err(definite)?;
+            let raw = stmt
+                .query_map(rusqlite::params_from_iter(params), scan_columns)
                 .map_err(definite)?
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(definite)?
-        };
-        let mut out = Vec::with_capacity(raw.len());
-        for (key, row_ts, document_id, table_id, json_value, prev_ts) in raw {
-            let json_value = json_value.ok_or_else(|| {
-                PersistError::Definite(format!(
-                    "index {} points at a document with no json at ts {row_ts}",
-                    index_id.as_str()
-                ))
-            })?;
-            let entry = document_from_parts(
-                document_id,
-                row_ts,
-                table_id,
-                Some(json_value),
-                false,
-                prev_ts,
-            )?;
-            let value = entry.value.expect("live document");
-            out.push(IndexScanRow {
-                key,
-                document: LatestDocument {
-                    ts: entry.ts,
-                    id: entry.id,
-                    value,
-                    prev_ts: entry.prev_ts,
-                },
-            });
+                .map_err(definite)?;
+            let rows = raw
+                .into_iter()
+                .map(|columns| scan_row(index_id, columns))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first = chunk_no * RANGES_PER_STATEMENT;
+            for (slot, found) in lists[first..first + chunk.len()]
+                .iter_mut()
+                .zip(spread_rows(chunk, rows))
+            {
+                *slot = found;
+            }
         }
-        Ok(out)
+        Ok(lists)
     }
 
     fn index_scan_ids(
@@ -619,6 +635,92 @@ impl Persistence for SqlitePersistence {
             .map_err(definite)?;
         Ok(())
     }
+}
+
+/// How many intervals a statement of `index_scan_ranges` holds: the least of these that fits the
+/// intervals asked for, so that a few dozen different counts make a few different statements.
+const STATEMENT_SIZES: [usize; 9] = [1, 2, 4, 8, 16, 32, 64, 128, RANGES_PER_STATEMENT];
+
+/// The statement behind `index_scan`: the live document of each key of an index at a read
+/// timestamp, the keys picked by `key_filter` (`?1` is the index and `?2` the read timestamp), in
+/// key order. Index-only backfill rows use a later commit than the document, so the document join
+/// is the latest live revision at the read timestamp.
+fn scan_sql(key_filter: &str, ord: &str) -> String {
+    scan_sql_over(
+        &format!("indexes WHERE index_id = ?1 AND ts <= ?2 AND {key_filter}"),
+        ord,
+    )
+}
+
+/// `scan_sql` for the index rows that `source` (what follows a `FROM`) supplies as `index_id`, `key`
+/// and `ts`: the latest of each key, and the live document it leads to.
+fn scan_sql_over(source: &str, ord: &str) -> String {
+    format!(
+        r#"
+SELECT B.key, C.ts, B.document_id, C.table_id, C.json_value, C.prev_ts
+FROM (
+    SELECT index_id, key, MAX(ts) as max_ts
+    FROM {source}
+    GROUP BY index_id, key
+) A
+JOIN indexes B
+  ON B.deleted = 0
+ AND A.index_id = B.index_id
+ AND A.key = B.key
+ AND A.max_ts = B.ts
+JOIN documents C
+  ON C.table_id = B.table_id
+ AND C.id = B.document_id
+ AND C.deleted = 0
+ AND C.ts = (
+    SELECT MAX(D.ts) FROM documents D
+    WHERE D.table_id = B.table_id AND D.id = B.document_id AND D.ts <= ?2
+ )
+ORDER BY B.key {ord}
+"#
+    )
+}
+
+/// The columns of a row of the statement `scan_sql` makes.
+type ScanColumns = (Vec<u8>, i64, Vec<u8>, Vec<u8>, Option<String>, Option<i64>);
+
+fn scan_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScanColumns> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn scan_row(index_id: &IndexId, columns: ScanColumns) -> Result<IndexScanRow, PersistError> {
+    let (key, row_ts, document_id, table_id, json_value, prev_ts) = columns;
+    let json_value = json_value.ok_or_else(|| {
+        PersistError::Definite(format!(
+            "index {} points at a document with no json at ts {row_ts}",
+            index_id.as_str()
+        ))
+    })?;
+    let entry = document_from_parts(
+        document_id,
+        row_ts,
+        table_id,
+        Some(json_value),
+        false,
+        prev_ts,
+    )?;
+    let value = entry.value.expect("live document");
+    Ok(IndexScanRow {
+        key,
+        document: LatestDocument {
+            ts: entry.ts,
+            id: entry.id,
+            value,
+            prev_ts: entry.prev_ts,
+        },
+    })
 }
 
 fn write_in_tx(

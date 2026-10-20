@@ -9,7 +9,7 @@ use refhir_types::{
 use refhir_validate::{TermAnswer, Terminology};
 use serde_json::{json, Value};
 
-use crate::catalog::{Catalog, ResourceModel};
+use crate::catalog::{Catalog, ReferencePolicy, ResourceModel};
 use crate::error::FhirError;
 use crate::extract::{Probe, ReferenceId, SearchKind, Sorting};
 use crate::ops::decorate;
@@ -268,6 +268,9 @@ struct Checks<'a> {
     proven: Option<usize>,
     chain_ids: &'a [BTreeSet<String>],
     has_ids: &'a [BTreeSet<String>],
+    /// Leave the `_has` clauses out of the check, which then says whether a resource satisfies the
+    /// rest: how the places `_has` is asked about are found.
+    without_has: bool,
 }
 
 /// What a search did, so a test can see that the work follows the page, not the matches.
@@ -285,6 +288,11 @@ pub(crate) struct Work {
     pub keyed: usize,
     /// Most matches held at once while the page was picked out of them.
     pub retained: usize,
+    /// Resources read through a reference index to answer `_has` for the places a search left,
+    /// each place asked of the index and not of a search of the whole type.
+    pub probed: usize,
+    /// `_has` clauses answered by running their search over the whole type.
+    pub searched: usize,
 }
 
 /// What a search does with a parameter whose value it cannot read (a date that is not one, a
@@ -359,7 +367,6 @@ pub(crate) fn search_counted(
     let mut controls = controls_from(&ran)?;
     controls.near = near;
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
-    let has_ids = has_sets(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
     // Three costs used to grow with the number of matches, whatever `_count` asked for: reading and
     // decoding every document in the index range, checking the parameter against each one again,
@@ -372,21 +379,27 @@ pub(crate) fn search_counted(
         && controls.sort.is_empty()
         && controls.page_is_cheap_to_fetch()
     {
+        // A `_has` is never decided by a range, so there is none here.
         page_from_index(tx, &scan, &controls)?
     } else {
-        page_by_checking(
-            tx,
-            catalog,
-            model,
-            &scan,
-            &Checks {
-                clauses: &clauses,
-                proven: scan.proven,
-                chain_ids: &chain_ids,
-                has_ids: &has_ids,
-            },
-            &controls,
-        )?
+        // The rows are read before `_has` is worked out, so that it is asked of the places that
+        // are left, not of every resource that could match it.
+        let rows = scan.text(tx)?;
+        let mut checks = Checks {
+            clauses: &clauses,
+            proven: scan.proven,
+            chain_ids: &chain_ids,
+            has_ids: &[],
+            without_has: true,
+        };
+        let (has_ids, has_work, decoded) = has_sets(tx, catalog, model, &checks, &controls, &rows)?;
+        checks.has_ids = &has_ids;
+        checks.without_has = false;
+        let (page, total, mut work) =
+            page_by_checking(tx, catalog, model, rows, decoded, &checks, &controls)?;
+        work.probed = has_work.probed;
+        work.searched = has_work.searched;
+        (page, total, work)
     };
     let mut bundle = assemble(tx, catalog, model, &ran, &controls, page, total)?;
     // `_summary=count` has no entries to put the outcome in; its `self` link shows what ran.
@@ -514,11 +527,11 @@ fn page_by_checking(
     tx: &mut Transaction,
     catalog: &Catalog,
     model: &ResourceModel,
-    scan: &Scan,
+    rows: Vec<ScannedText>,
+    mut decoded: Option<Vec<Value>>,
     checks: &Checks<'_>,
     controls: &Controls,
 ) -> Result<Page, FhirError> {
-    let rows = scan.text(tx)?;
     let mut work = Work {
         rows: rows.len(),
         ..Work::default()
@@ -536,8 +549,11 @@ fn page_by_checking(
     let mut kept = Vec::new();
     let mut ranked = Vec::new();
     let mut total = 0usize;
-    for row in &rows {
-        let json = row.json()?;
+    for (at, row) in rows.iter().enumerate() {
+        let json = match decoded.as_mut() {
+            Some(values) => std::mem::take(&mut values[at]),
+            None => row.json()?,
+        };
         work.decoded += 1;
         work.checked += 1;
         if !row_matches(catalog, model, &json, checks, controls, &host) {
@@ -650,7 +666,7 @@ pub(crate) fn search_reference(
     let mut controls = controls_from(params)?;
     controls.near = near_of(model, &clauses);
     let chain_ids = chain_sets(tx, catalog, model, &clauses)?;
-    let has_ids = has_sets(tx, catalog, model, &clauses)?;
+    let has_ids = has_sets_by_search(tx, catalog, model, &clauses)?;
     let scan = choose_index(model, &clauses);
     let mut rows = Vec::new();
     for interval in &scan.intervals {
@@ -669,6 +685,7 @@ pub(crate) fn search_reference(
             proven: None,
             chain_ids: &chain_ids,
             has_ids: &has_ids,
+            without_has: false,
         };
         if !row_matches(catalog, model, &row.json, &checks, &controls, &host) {
             continue;
@@ -1582,7 +1599,86 @@ fn chain_sets(
     Ok(sets)
 }
 
+/// The ids of the resources of `model` that each `_has` clause lets through, one set for each
+/// clause (an empty one for a clause that is not `_has`), and what it took.
+///
+/// What `has_sets` finds: for each `_has` clause the ids it keeps, the work it took, and the
+/// resources it already decoded (the rows of the search, kept so they are not decoded twice).
+type HasSets = (Vec<BTreeSet<String>>, Work, Option<Vec<Value>>);
+
+/// `_has:Type:ref:param=value` keeps the resources that a `Type` with `param=value` points at
+/// through `ref`. The way to say that for any search is to run the search for the `Type`, over every
+/// resource of it, and read the references of what it finds. That costs what the whole type costs,
+/// which for a directory of tens of thousands of places is seconds, however few places the rest of
+/// the search leaves. So when the other parameters have narrowed the search to a few places
+/// (`near`, a status, a name), it is asked of those places instead: each is looked up in the index
+/// of `ref`, and what refers to it is checked against `param=value`. A search that leaves many
+/// places, or a clause that is not a plain parameter of the type, takes the first way, as it
+/// always did.
 fn has_sets(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    checks: &Checks<'_>,
+    controls: &Controls,
+    rows: &[ScannedText],
+) -> Result<HasSets, FhirError> {
+    let mut sets = Vec::new();
+    let mut work = Work::default();
+    // The places the rest of the search leaves, once they have been looked for: `None` is too many.
+    let mut left: Option<Option<Narrowed>> = None;
+    // A reference stored as a URL is found by the first way and not by looking one up, and only a
+    // server that takes such references can have them.
+    let exact = catalog.reference_policy() == ReferencePolicy::Strict;
+    for clause in checks.clauses {
+        let Clause::Has {
+            type_name,
+            ref_param,
+            search_param,
+            modifier,
+            value,
+        } = clause
+        else {
+            sets.push(BTreeSet::new());
+            continue;
+        };
+        let Ok(other) = catalog.get(type_name) else {
+            sets.push(BTreeSet::new());
+            continue;
+        };
+        if exact {
+            if let Some(probe) =
+                HasProbe::new(other, ref_param, search_param, modifier.as_deref(), value)
+            {
+                let narrowed = match &left {
+                    Some(known) => known,
+                    None => left.insert(places_left(tx, catalog, model, checks, controls, rows)?),
+                };
+                if let Some(narrowed) = narrowed {
+                    catalog.deny_response_read(&other.name)?;
+                    sets.push(probe.run(tx, catalog, model, other, &narrowed.places, &mut work)?);
+                    continue;
+                }
+            }
+        }
+        work.searched += 1;
+        sets.push(has_set_by_search(
+            tx,
+            catalog,
+            model,
+            other,
+            (ref_param, search_param, modifier.as_deref(), value),
+        )?);
+    }
+    // What was decoded to find the places is handed on, so the page does not decode it again.
+    let decoded = left.and_then(|narrowed| narrowed.map(|narrowed| narrowed.decoded));
+    Ok((sets, work, decoded))
+}
+
+/// `has_sets` the first way only, for every clause: the search for each type, over all of it. What
+/// a search that is asked of its places is held to.
+#[cfg(test)]
+fn has_sets_by_search(
     tx: &mut Transaction,
     catalog: &Catalog,
     model: &ResourceModel,
@@ -1605,43 +1701,213 @@ fn has_sets(
             sets.push(BTreeSet::new());
             continue;
         };
-        let mut params = BTreeMap::new();
-        let key = match modifier {
-            Some(modifier) => format!("{search_param}:{modifier}"),
-            None => search_param.clone(),
-        };
-        params.insert(key, value.clone());
-        let bundle = search(tx, catalog, other, &params)?;
-        let mut ids = BTreeSet::new();
-        let Some(param) = other.ready_param(ref_param) else {
-            sets.push(ids);
+        sets.push(has_set_by_search(
+            tx,
+            catalog,
+            model,
+            other,
+            (ref_param, search_param, modifier.as_deref(), value),
+        )?);
+    }
+    Ok(sets)
+}
+
+/// The resources of `model` that a `_has` clause lets through, found by searching `other` for
+/// `search_param=value` over every resource of it and reading the references of what it finds.
+fn has_set_by_search(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    other: &ResourceModel,
+    (ref_param, search_param, modifier, value): (&str, &str, Option<&str>, &str),
+) -> Result<BTreeSet<String>, FhirError> {
+    let mut params = BTreeMap::new();
+    let key = match modifier {
+        Some(modifier) => format!("{search_param}:{modifier}"),
+        None => search_param.to_string(),
+    };
+    params.insert(key, value.to_string());
+    let bundle = search(tx, catalog, other, &params)?;
+    let mut ids = BTreeSet::new();
+    let Some(param) = other.ready_param(ref_param) else {
+        return Ok(ids);
+    };
+    for entry in bundle
+        .get("entry")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(resource) = entry.get("resource") else {
             continue;
         };
-        for entry in bundle
-            .get("entry")
-            .and_then(|value| value.as_array())
-            .into_iter()
-            .flatten()
+        let host = TxHost::new(tx, catalog);
+        for reference in param
+            .extractor
+            .indexed(resource, catalog.path_model(), &host)
         {
-            let Some(resource) = entry.get("resource") else {
+            let Some((type_name, id)) = reference.rsplit_once('/') else {
                 continue;
             };
+            if type_name == model.name || type_name.ends_with(&format!("/{}", model.name)) {
+                ids.insert(id.to_string());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Most places `_has` is asked about one at a time. Past it, one search of the type is cheaper than
+/// looking up each place.
+const MAX_PLACES_ASKED: usize = 5000;
+
+/// Most rows of the range that are read to find the places that are left. Past it the range is the
+/// whole type or most of it, and the places are too many to ask about.
+const MAX_ROWS_NARROWED: usize = 20_000;
+
+/// The places in the rows that satisfy every clause but `_has`, and every row's document, which has
+/// been decoded to find them and need not be again.
+struct Narrowed {
+    places: Vec<String>,
+    decoded: Vec<Value>,
+}
+
+/// The places in `rows` that satisfy every clause but `_has`, or `None` when there are too many to
+/// ask about one at a time.
+fn places_left(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    checks: &Checks<'_>,
+    controls: &Controls,
+    rows: &[ScannedText],
+) -> Result<Option<Narrowed>, FhirError> {
+    if rows.len() > MAX_ROWS_NARROWED {
+        return Ok(None);
+    }
+    let host = TxHost::new(tx, catalog);
+    let mut places = Vec::new();
+    let mut decoded = Vec::with_capacity(rows.len());
+    for row in rows {
+        let json = row.json()?;
+        if row_matches(catalog, model, &json, checks, controls, &host) {
+            places.push(row.id.id_str().unwrap_or("").to_string());
+            if places.len() > MAX_PLACES_ASKED {
+                return Ok(None);
+            }
+        }
+        decoded.push(json);
+    }
+    Ok(Some(Narrowed { places, decoded }))
+}
+
+/// A `_has` clause that can be asked of one place at a time: what it refers through and what it
+/// checks are plain parameters of the type, and its value can be read as the search for the type
+/// would read it.
+struct HasProbe<'a> {
+    refers: &'a crate::catalog::SearchParam,
+    param: &'a str,
+    modifier: Option<&'a str>,
+    values: Vec<String>,
+}
+
+impl<'a> HasProbe<'a> {
+    /// `None` when the clause is something else, which the search for the type has to answer, and
+    /// has to refuse when it is wrong: a parameter the type does not have, a chain, a modifier or a
+    /// bare id that the search would turn away.
+    fn new(
+        other: &'a ResourceModel,
+        ref_param: &str,
+        search_param: &'a str,
+        modifier: Option<&'a str>,
+        value: &str,
+    ) -> Option<Self> {
+        let refers = other
+            .ready_param(ref_param)
+            .filter(|param| param.kind == SearchKind::Reference)?;
+        let checks = other.ready_param(search_param)?;
+        if search_param.starts_with('_') || search_param.contains('.') {
+            return None;
+        }
+        if modifier.is_some_and(|modifier| !MODIFIERS.contains(&modifier)) {
+            return None;
+        }
+        let values = if modifier == Some("missing") {
+            vec![value.to_string()]
+        } else {
+            or_values(value).ok().filter(|values| values.len() <= 16)?
+        };
+        if matches!(modifier, None | Some("not"))
+            && values
+                .iter()
+                .any(|value| matches!(checks.extractor.reference_id(value), ReferenceId::Open(_)))
+        {
+            return None;
+        }
+        Some(Self {
+            refers,
+            param: search_param,
+            modifier,
+            values,
+        })
+    }
+
+    /// The places among `places` (ids of `model`) that something refers to through the parameter
+    /// and that satisfies `param=value`.
+    fn run(
+        &self,
+        tx: &mut Transaction,
+        catalog: &Catalog,
+        model: &ResourceModel,
+        other: &ResourceModel,
+        places: &[String],
+        work: &mut Work,
+    ) -> Result<BTreeSet<String>, FhirError> {
+        let index = other.search_index(&self.refers.name);
+        let mut matched = BTreeSet::new();
+        // Two statements at a time on SQLite, one on Postgres: every place's own range is read in
+        // the same trip.
+        for chunk in places.chunks(2 * refhir_persistence::RANGES_PER_STATEMENT) {
+            let tokens: Vec<String> = chunk
+                .iter()
+                .map(|id| format!("{}/{id}", model.name))
+                .collect();
+            let intervals: Vec<Interval> =
+                tokens.iter().map(|token| token_interval(token)).collect();
+            let lists = tx.index_ranges_text(&index, &intervals)?;
             let host = TxHost::new(tx, catalog);
-            for reference in param
-                .extractor
-                .indexed(resource, catalog.path_model(), &host)
-            {
-                let Some((type_name, id)) = reference.rsplit_once('/') else {
-                    continue;
-                };
-                if type_name == model.name || type_name.ends_with(&format!("/{}", model.name)) {
-                    ids.insert(id.to_string());
+            for ((id, token), referrers) in chunk.iter().zip(&tokens).zip(lists) {
+                for row in referrers {
+                    work.probed += 1;
+                    let json = row.json()?;
+                    // The reference as the type holds it names this place, as the index says, unless
+                    // the value can differ from what was indexed (a `resolve()` in the expression).
+                    if !self.refers.extractor.index_proves(token)
+                        && !self
+                            .refers
+                            .extractor
+                            .indexed(&json, catalog.path_model(), &host)
+                            .contains(token)
+                    {
+                        continue;
+                    }
+                    if param_matches(
+                        catalog,
+                        other,
+                        &json,
+                        self.param,
+                        self.modifier,
+                        &self.values,
+                        &host,
+                    ) {
+                        matched.insert(id.clone());
+                        break;
+                    }
                 }
             }
         }
-        sets.push(ids);
+        Ok(matched)
     }
-    Ok(sets)
 }
 
 fn target_types(
@@ -1679,6 +1945,7 @@ fn row_matches(
         proven,
         chain_ids,
         has_ids,
+        without_has,
     } = *checks;
     for within in &controls.compartments {
         if !in_compartment(
@@ -1729,10 +1996,13 @@ fn row_matches(
                                     .is_some_and(|(_, id)| ids.contains(id))
                         })
                 }
-                Clause::Has { .. } => resource
-                    .get("id")
-                    .and_then(|item| item.as_str())
-                    .is_some_and(|id| has_ids[index].contains(id)),
+                Clause::Has { .. } => {
+                    without_has
+                        || resource
+                            .get("id")
+                            .and_then(|item| item.as_str())
+                            .is_some_and(|id| has_ids[index].contains(id))
+                }
             }
     })
 }
@@ -2114,6 +2384,13 @@ fn too_many_iterated() -> FhirError {
 struct Added {
     found: Vec<Value>,
     room: Option<usize>,
+    /// What refers to a resource through a reference index, for the resources and rules that were
+    /// read ahead (`prefetch_referencing`), by index and `Type/id`. A rule finds its documents here
+    /// before it asks storage.
+    prefetched: BTreeMap<(String, String), Vec<Referrer>>,
+    /// The documents `_include` rules will follow to, by type and id, read ahead
+    /// (`prefetch_forward`): `None` for one that is not there.
+    fetched: BTreeMap<(String, String), Fetched>,
 }
 
 impl Added {
@@ -2121,7 +2398,111 @@ impl Added {
         Self {
             found: Vec::new(),
             room,
+            prefetched: BTreeMap::new(),
+            fetched: BTreeMap::new(),
         }
+    }
+
+    /// Reads the documents the plain `_include` rules follow to from `sources`, a type at a time:
+    /// one request to storage for everything the page points at, not one for each reference. The
+    /// rules then run as they always did, in the same order, over what was read. A resource in
+    /// `seen` is not read: it is a match already, or was added.
+    fn prefetch_forward(
+        &mut self,
+        tx: &mut Transaction,
+        catalog: &Catalog,
+        controls: &Controls,
+        sources: &[&Value],
+        seen: &BTreeSet<String>,
+    ) -> Result<(), FhirError> {
+        let mut wanted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for spec in controls.include.iter().filter(|spec| !spec.iterate) {
+            for resource in sources {
+                for (type_name, id) in forward_targets(tx, catalog, resource, spec) {
+                    if !seen.contains(&format!("{type_name}/{id}")) {
+                        wanted.entry(type_name).or_default().insert(id);
+                    }
+                }
+            }
+        }
+        for (type_name, ids) in wanted {
+            let Ok(target) = catalog.get(&type_name) else {
+                continue;
+            };
+            let ids: Vec<String> = ids.into_iter().collect();
+            let intervals: Vec<Interval> = ids
+                .iter()
+                .map(|id| Interval::point(exact_key(id)))
+                .collect();
+            let lists = tx.index_ranges_text(&target.by_id(), &intervals)?;
+            for (id, rows) in ids.into_iter().zip(lists) {
+                let found = match rows.into_iter().next() {
+                    Some(row) => Some((row.json()?, row.ts)),
+                    None => None,
+                };
+                self.fetched.insert((type_name.clone(), id), found);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads what refers to each of `sources` for every plain `_revinclude` rule, a rule and a type
+    /// at a time: one request to storage for all of the page's resources, not one for each. The
+    /// rules then run as they always did, in the same order, over what was read.
+    fn prefetch_referencing(
+        &mut self,
+        tx: &mut Transaction,
+        catalog: &Catalog,
+        controls: &Controls,
+        sources: &[&Value],
+    ) -> Result<(), FhirError> {
+        for spec in controls.revinclude.iter().filter(|spec| !spec.iterate) {
+            let tokens: Vec<String> = sources
+                .iter()
+                .filter_map(|resource| {
+                    let (type_name, id) = identity(resource)?;
+                    if spec
+                        .target
+                        .as_deref()
+                        .is_some_and(|target| target != type_name)
+                    {
+                        return None;
+                    }
+                    Some(format!("{type_name}/{id}"))
+                })
+                .collect();
+            if tokens.is_empty() {
+                continue;
+            }
+            for other in catalog.resource_models() {
+                if spec
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source != "*" && source != other.name)
+                    || catalog.deny_response_read(&other.name).is_err()
+                    || other.ready_param(&spec.param).is_none()
+                {
+                    continue;
+                }
+                let index = other.search_index(&spec.param);
+                let intervals: Vec<Interval> =
+                    tokens.iter().map(|token| token_interval(token)).collect();
+                let lists = tx.index_ranges_text(&index, &intervals)?;
+                for (token, rows) in tokens.iter().zip(lists) {
+                    let mut documents = Vec::with_capacity(rows.len());
+                    for row in rows {
+                        documents.push((
+                            row.id.id_str().unwrap_or("").to_string(),
+                            row.json()?,
+                            row.ts,
+                        ));
+                    }
+                    self.prefetched
+                        .insert((index.as_str().to_string(), token.clone()), documents);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn push(&mut self, resource: Value) -> Result<(), FhirError> {
@@ -2178,6 +2559,8 @@ fn include_entries(
         .collect();
     let matches: Vec<&Value> = page.iter().map(|(_, resource)| resource).collect();
     let mut plain = Added::new(None);
+    plain.prefetch_forward(tx, catalog, controls, &matches, &seen)?;
+    plain.prefetch_referencing(tx, catalog, controls, &matches)?;
     apply_rules(
         tx, catalog, controls, &mut seen, &matches, false, &mut plain,
     )?;
@@ -2274,29 +2657,27 @@ fn identity(resource: &Value) -> Option<(&str, &str)> {
     ))
 }
 
-/// Follows the reference parameter of `spec` out of `resource` (`_include`), adding what it points
-/// at.
-fn push_forward(
+/// The `Type` and id of every resource `spec` follows out of `resource` (`_include`), in the order
+/// it finds them: the references of the parameter, of a type the rule allows and the server lets be
+/// read. A reference that was followed already is still here: `seen` is `push_forward`'s to keep.
+fn forward_targets(
     tx: &mut Transaction,
     catalog: &Catalog,
-    controls: &Controls,
     resource: &Value,
     spec: &IncludeSpec,
-    into: &mut Added,
-    seen: &mut BTreeSet<String>,
-) -> Result<(), FhirError> {
+) -> Vec<(String, String)> {
     let Some((source_type, _)) = identity(resource) else {
-        return Ok(());
+        return Vec::new();
     };
     if spec
         .source
         .as_deref()
         .is_some_and(|source| source != "*" && source != source_type)
     {
-        return Ok(());
+        return Vec::new();
     }
     let Ok(source) = catalog.get(source_type) else {
-        return Ok(());
+        return Vec::new();
     };
     let params: Vec<&crate::catalog::SearchParam> = if spec.param == "*" {
         source
@@ -2321,6 +2702,7 @@ fn push_forward(
             );
         }
     }
+    let mut targets = Vec::new();
     for reference in references {
         let Some((type_name, id)) = reference.rsplit_once('/') else {
             continue;
@@ -2336,14 +2718,38 @@ fn push_forward(
         if catalog.deny_response_read(type_name).is_err() {
             continue;
         }
+        targets.push((type_name.to_string(), id.to_string()));
+    }
+    targets
+}
+
+/// Follows the reference parameter of `spec` out of `resource` (`_include`), adding what it points
+/// at.
+fn push_forward(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    controls: &Controls,
+    resource: &Value,
+    spec: &IncludeSpec,
+    into: &mut Added,
+    seen: &mut BTreeSet<String>,
+) -> Result<(), FhirError> {
+    for (type_name, id) in forward_targets(tx, catalog, resource, spec) {
         if !seen.insert(format!("{type_name}/{id}")) {
             continue;
         }
-        let Ok(target) = catalog.get(type_name) else {
+        let Ok(target) = catalog.get(&type_name) else {
             continue;
         };
-        if let Some(stored) = tx.get(&target.tablet(), id, &target.by_id())? {
-            let included = decorate(stored.json, id, stored.ts);
+        // Read ahead with the rest of the page (`prefetch_forward`), or read now.
+        let stored = match into.fetched.remove(&(type_name.clone(), id.clone())) {
+            Some(found) => found,
+            None => tx
+                .get(&target.tablet(), &id, &target.by_id())?
+                .map(|stored| (stored.json, stored.ts)),
+        };
+        if let Some((json, ts)) = stored {
+            let included = decorate(json, &id, ts);
             if !outside_limit(tx, catalog, controls, target, &included) {
                 into.push(included)?;
             }
@@ -2351,6 +2757,12 @@ fn push_forward(
     }
     Ok(())
 }
+
+/// A document read by id, with its revision timestamp, or nothing for an id that is not there.
+type Fetched = Option<(Value, Option<Timestamp>)>;
+
+/// A document found through a reference index: its id, its JSON and its revision timestamp.
+type Referrer = (String, Value, Option<Timestamp>);
 
 /// The documents that have a key for `token` in `index`, as their id, JSON and revision timestamp.
 /// With a `room`, the range is read no further than one row past it and a range that holds more is
@@ -2360,7 +2772,7 @@ fn referencing(
     index: &IndexId,
     token: &str,
     room: Option<usize>,
-) -> Result<Vec<(String, Value, Option<Timestamp>)>, FhirError> {
+) -> Result<Vec<Referrer>, FhirError> {
     let interval = token_interval(token);
     let Some(room) = room else {
         return Ok(tx
@@ -2418,7 +2830,14 @@ fn push_reverse(
         let Some(param) = other.ready_param(&spec.param) else {
             continue;
         };
-        let documents = referencing(tx, &other.search_index(&spec.param), &token, into.room)?;
+        let index = other.search_index(&spec.param);
+        let documents = match into
+            .prefetched
+            .remove(&(index.as_str().to_string(), token.clone()))
+        {
+            Some(found) => found,
+            None => referencing(tx, &index, &token, into.room)?,
+        };
         for (other_id, json, ts) in documents {
             if !param
                 .extractor

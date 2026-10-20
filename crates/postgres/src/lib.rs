@@ -10,8 +10,8 @@ use postgres::fallible_iterator::FallibleIterator;
 use postgres::types::ToSql;
 use postgres::{Client, NoTls, Row, Transaction};
 use refhir_persistence::{
-    document_from_parts, index_target, ConflictStrategy, DocumentLogEntry, IndexScanEntry,
-    IndexScanRow, LatestDocument, Lease, LiveEntries, PersistError, Persistence,
+    document_from_parts, index_target, spread_rows, ConflictStrategy, DocumentLogEntry,
+    IndexScanEntry, IndexScanRow, LatestDocument, Lease, LiveEntries, PersistError, Persistence,
     PersistenceGlobalKey, PersistenceIndexEntry, PersistenceReader, Pool, PoolStats,
     TimestampRange,
 };
@@ -385,9 +385,10 @@ impl PersistenceReader for PostgresPersistence {
         })
     }
 
-    /// One statement for every interval: the rows whose key is in any of them, which an index range
-    /// scan finds for each arm in turn, and then each row goes to the lists of the intervals that
-    /// hold it. A search narrowed to dozens of ranges is one round trip, not dozens.
+    /// One statement for each `RANGES_PER_STATEMENT` intervals: the rows whose key is in any of them,
+    /// which an index range scan finds for each arm in turn, and then each row goes to the lists of
+    /// the intervals that hold it. A search narrowed to dozens of ranges is one round trip, not
+    /// dozens.
     fn index_scan_ranges(
         &self,
         index_id: &IndexId,
@@ -400,29 +401,35 @@ impl PersistenceReader for PostgresPersistence {
         crate::off_runtime(|| {
             let ts = i64_ts(read_timestamp)?;
             let id = index_id.as_bytes();
-            let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id, &ts];
-            let mut arms = Vec::with_capacity(intervals.len());
-            for interval in intervals {
-                let start = params.len() + 1;
-                params.push(&interval.start);
-                match &interval.end {
-                    Some(end) => {
-                        arms.push(format!("(key >= ${start} AND key < ${})", start + 1));
-                        params.push(end);
-                    }
-                    None => arms.push(format!("key >= ${start}")),
-                }
-            }
-            let sql = self.scan_sql(&format!("({})", arms.join(" OR ")), "ASC");
-            let mut guard = self.inner.lock()?;
-            let rows = guard.client.query(&sql, &params).map_err(definite)?;
             let mut lists: Vec<Vec<IndexScanRow>> = vec![Vec::new(); intervals.len()];
-            for row in &rows {
-                let scanned = scan_row(index_id, row)?;
-                for (list, interval) in lists.iter_mut().zip(intervals) {
-                    if interval.contains(&scanned.key) {
-                        list.push(scanned.clone());
+            for (chunk_no, chunk) in intervals.chunks(RANGES_PER_STATEMENT).enumerate() {
+                let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id, &ts];
+                let mut arms = Vec::with_capacity(chunk.len());
+                for interval in chunk {
+                    let start = params.len() + 1;
+                    params.push(&interval.start);
+                    match &interval.end {
+                        Some(end) => {
+                            arms.push(format!("(key >= ${start} AND key < ${})", start + 1));
+                            params.push(end);
+                        }
+                        None => arms.push(format!("key >= ${start}")),
                     }
+                }
+                let sql = self.scan_sql(&format!("({})", arms.join(" OR ")), "ASC");
+                let mut guard = self.inner.lock()?;
+                let rows = guard.client.query(&sql, &params).map_err(definite)?;
+                drop(guard);
+                let scanned = rows
+                    .iter()
+                    .map(|row| scan_row(index_id, row))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let first = chunk_no * RANGES_PER_STATEMENT;
+                for (slot, found) in lists[first..first + chunk.len()]
+                    .iter_mut()
+                    .zip(spread_rows(chunk, scanned))
+                {
+                    *slot = found;
                 }
             }
             Ok(lists)
@@ -1042,6 +1049,11 @@ fn sql_max_ts(scope: Scope) -> String {
         scope.and()
     )
 }
+
+/// The most intervals one statement of `index_scan_ranges` holds. The planner works on every
+/// alternative of an `OR` and the time it takes grows faster than their number, so a longer list is
+/// several statements: past about fifty a range costs more than it saves in round trips.
+const RANGES_PER_STATEMENT: usize = 50;
 
 /// A row of the statement `scan_sql` makes, as the row `index_scan` returns.
 fn scan_row(index_id: &IndexId, row: &Row) -> Result<IndexScanRow, PersistError> {

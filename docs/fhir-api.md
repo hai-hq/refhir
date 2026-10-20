@@ -36,6 +36,16 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 - Chaining (`Observation?subject:Patient.name=ann`), reverse chaining (`_has`), `_include` and
   `_revinclude`, and compartment search (`GET /Patient/123/Observation`) all work. Name the target
   type in a chain when a reference parameter can point at more than one type.
+- **`_has` is answered for the resources the rest of the search leaves**, not for the whole type.
+  `Location?near=6.6|3.35|5|km&_has:OrganizationAffiliation:location:network=Organization/n1`
+  looks up what refers to each place `near` finds, in the index of `OrganizationAffiliation.location`,
+  and checks `network` on those, so it costs what the places near cost and not what every
+  affiliation in the database costs, however many there are. `_include` and `_revinclude` read what
+  the rules lead to for every place of the page in one request to the database for each rule, not one
+  for each place. A search that
+  leaves a great many resources (a few thousand or more) asks the type once for everything that
+  matches instead, and so does a server that takes references as URLs (`--references fhir`); the
+  answer is the same either way.
 - A reference parameter takes `Type/id` or just the id: `Observation?patient=Patient/123` and
   `Observation?patient=123` return the same resources. A bare id is looked up as a reference to
   each type the parameter can point at in that resource: the types its `SearchParameter` lists as
