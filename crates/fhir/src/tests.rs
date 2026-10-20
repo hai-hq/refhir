@@ -17,9 +17,9 @@ use crate::error::FhirError;
 use crate::extract::ReferenceId;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
-    cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
-    minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir, run_backfills, sdc_dir,
-    stage_package_deferred, stage_package_dir, version_clash_dir,
+    collect_superseded, cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir,
+    install_package_dir, minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir,
+    run_backfills, sdc_dir, stage_package_deferred, stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
 
@@ -2054,6 +2054,11 @@ fn a_package_version_that_gives_a_search_parameter_another_code_is_searched_by_t
     let names = advertised(&harness);
     assert!(names.contains(&"alias".to_string()), "{names:?}");
     assert!(!names.contains(&"label".to_string()), "{names:?}");
+    // The old index is kept until the package that defined it is collected, for a process that
+    // still serves from the catalog it loaded before; then nothing is left under the old code.
+    assert_eq!(index_entries(&harness, "Patient/label"), entries);
+    assert_eq!(index_entries(&harness, "Patient/alias"), entries);
+    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
     assert_eq!(index_entries(&harness, "Patient/label"), 0);
     assert_eq!(index_entries(&harness, "Patient/alias"), entries);
     assert_eq!(
@@ -2085,6 +2090,8 @@ fn a_search_parameter_that_a_newer_package_version_leaves_out_is_gone() {
         "{message}"
     );
     assert!(!advertised(&harness).contains(&"nick".to_string()));
+    assert!(index_entries(&harness, "Patient/nick") > 0);
+    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
     assert_eq!(index_entries(&harness, "Patient/nick"), 0);
     // The one it kept is as it was: nothing was indexed again for it, so no backfill was queued
     // for the package that holds it.
@@ -2517,6 +2524,118 @@ fn a_changed_parameter_whose_install_stopped_before_its_backfill_was_queued_is_i
         upgrade_parameters(&harness),
         [upgrade_row("label", "Patient.birthDate", "0.2.0")]
     );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_catalog_loaded_before_an_upgrade_answers_as_it_did_until_the_replaced_package_is_collected() {
+    let harness = ready();
+    let label_v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    let profile_v1 = profile_package("0.1.0", "active", &["red", "blue"], false);
+    install_dir(&harness, &label_v1).unwrap();
+    install_dir(&harness, &profile_v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    // What a replica holds: a catalog loaded before the upgrade, that reads a definition from the
+    // store the first time it is used.
+    let store: Arc<dyn ConformanceStore> = Arc::new(harness.store.clone());
+    let source = Arc::new(crate::lazy::StoreSource::new(store.clone()));
+    let before = Catalog::open_from(store.as_ref(), Some(source)).unwrap();
+
+    // 0.2.0 gives the parameter another code and the profile another requirement.
+    let label_v2 = upgrade_package("0.2.0", &[("label", "alias", "Patient.name")]);
+    let profile_v2 = profile_package("0.2.0", "birthDate", &["red", "blue"], false);
+    install_dir(&harness, &label_v2).unwrap();
+    install_dir(&harness, &profile_v2).unwrap();
+
+    // The catalog in force has moved on.
+    let message = refusal(&harness, "label");
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+    assert_eq!(search_total(&harness, "alias", "Smith"), 1);
+
+    // The one loaded before still has the old parameter, and finds what was indexed for it; and it
+    // reads the old profile, which it had not read, from rows that are still stored.
+    let found = run(
+        &harness.db,
+        &before,
+        "Patient/search",
+        &json!({"label": "Smith"}),
+    )
+    .unwrap();
+    assert_eq!(found.value["total"], 1);
+    let errors = |catalog: &Catalog, active: bool, born: bool| -> usize {
+        let mut resource = json!({"resourceType": "Patient",
+            "meta": {"profile": ["http://example.org/StructureDefinition/needs"]}});
+        if active {
+            resource["active"] = json!(true);
+        }
+        if born {
+            resource["birthDate"] = json!("1990-05-05");
+        }
+        run(
+            &harness.db,
+            catalog,
+            "Patient/$validate",
+            &json!({"resource": resource}),
+        )
+        .unwrap()
+        .value["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|issue| issue["severity"] == "error")
+            .count()
+    };
+    assert_eq!(errors(&before, true, false), 0);
+    assert!(errors(&before, false, true) > 0);
+    {
+        let current = harness.catalog.read().unwrap();
+        assert!(errors(&current, true, false) > 0);
+        assert_eq!(errors(&current, false, true), 0);
+    }
+
+    // Collected, the old index is cleared, and what the new catalog answers does not change.
+    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(index_entries(&harness, "Patient/label"), 0);
+    assert_eq!(search_total(&harness, "alias", "Smith"), 1);
+    assert_eq!(errors(&harness.catalog.read().unwrap(), false, true), 0);
+    remove_dirs(&[&label_v1, &label_v2, &profile_v1, &profile_v2]);
+}
+
+#[test]
+fn nothing_is_collected_while_a_search_parameter_waits_for_its_index() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "alias", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    // 0.2.0 drops the code and adds another, which is stored and published and has no index yet,
+    // so a replica is still on the catalog that has the code that went.
+    let v2 = upgrade_package("0.2.0", &[("nick", "nick", "Patient.birthDate")]);
+    let follow_up = stage_package_deferred(&harness.store, &harness.db, &harness.catalog, &v2)
+        .unwrap()
+        .expect("the new parameter waits for its index");
+    publish(&harness.store, &harness.catalog).unwrap();
+    follow_up.create(&harness.store, &harness.db).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert!(index_entries(&harness, "Patient/alias") > 0);
+    assert!(!harness.store.retired_parameters().unwrap().is_empty());
+
+    // Once the index is built it goes.
+    run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(index_entries(&harness, "Patient/alias"), 0);
+    assert!(harness.store.retired_parameters().unwrap().is_empty());
+    assert_eq!(search_total(&harness, "nick", "1990"), 1);
     remove_dirs(&[&v1, &v2]);
 }
 

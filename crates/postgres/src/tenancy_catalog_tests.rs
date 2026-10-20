@@ -202,14 +202,16 @@ fn a_newer_version_of_a_shared_package_replaces_the_older_one_for_the_tenant_tha
     let (two_a, reads) = install(&a, &second, "two").unwrap();
     assert_eq!(reads, 1);
     assert_eq!(codes(&two_a.newly_pending), ["versioned-code1"]);
-    assert_eq!(
-        two_a
-            .retired
-            .iter()
-            .map(|param| param.code.as_str())
-            .collect::<Vec<_>>(),
-        ["versioned-code2"]
-    );
+    let retired = |store: &PostgresPersistence| -> Vec<String> {
+        store
+            .retired_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|param| param.code)
+            .collect()
+    };
+    // What only the replaced version defines.
+    assert_eq!(retired(&a), ["versioned-code2"]);
     let held = rows(&a);
     assert_eq!(
         held,
@@ -237,6 +239,46 @@ fn a_newer_version_of_a_shared_package_replaces_the_older_one_for_the_tenant_tha
     assert_eq!(versions(&b), ["1.0.0"]);
     assert_eq!(owners(&b), (vec![one_b.package_id], vec![one_b.package_id]));
 
+    // The replaced version is out of every list of the tenant that replaced it, but still there to
+    // read by key, for a process that serves from the catalog it loaded before. Collected, the
+    // tenant has given up its link to the shared copy, which stays for the tenant that still has it.
+    let shared_packages = |version: &str| {
+        count(
+            &url,
+            &format!(
+                "SELECT count(*) FROM packages \
+                 WHERE instance_id = 0 AND name = 'versioned' AND version = '{version}'"
+            ),
+        )
+    };
+    let shared_rows = |package: i64| {
+        count(
+            &url,
+            &format!(
+                "SELECT (SELECT count(*) FROM base_search_parameters WHERE package_id = {package}) \
+                      + (SELECT count(*) FROM base_expansions WHERE package_id = {package}) \
+                      + (SELECT count(*) FROM structure_definitions \
+                         WHERE instance_id = 0 AND package_id = {package}) \
+                      + (SELECT count(*) FROM terminology \
+                         WHERE instance_id = 0 AND package_id = {package})"
+            ),
+        )
+    };
+    let definition = "http://example.org/versioned/sd/0";
+    assert!(a
+        .load_structure_definition_json(one_a.package_id, definition)
+        .unwrap()
+        .is_some());
+    a.collect_superseded().unwrap();
+    assert_eq!(versions(&a), ["2.0.0"]);
+    assert_eq!(shared_packages("1.0.0"), 1);
+    assert!(shared_rows(one_a.package_id) > 0);
+    assert!(b
+        .load_structure_definition_json(one_b.package_id, definition)
+        .unwrap()
+        .is_some());
+    assert_eq!(versions(&b), ["1.0.0"]);
+
     // It is given the newer version from the copy, and has not marked any of its own parameters
     // ready, so each of the two it keeps is waiting for its index.
     let (two_b, reads) = install(&b, &second, "two").unwrap();
@@ -246,11 +288,21 @@ fn a_newer_version_of_a_shared_package_replaces_the_older_one_for_the_tenant_tha
         codes(&two_b.newly_pending),
         ["versioned-code0", "versioned-code1"]
     );
-    assert_eq!(two_b.retired.len(), 1);
+    assert_eq!(retired(&b), ["versioned-code2"]);
     assert_eq!(rows(&b).len(), 2);
     assert_eq!(versions(&b), ["2.0.0"]);
     assert_eq!(owners(&b), (vec![two_b.package_id], vec![two_b.package_id]));
     // And the first is not disturbed by it.
+    assert_eq!(rows(&a), held);
+
+    // The last tenant to give the older version up takes the shared copy of it out of the catalog,
+    // with what it held there, and the newer version is still there for both.
+    b.collect_superseded().unwrap();
+    assert_eq!(versions(&b), ["2.0.0"]);
+    assert_eq!(shared_packages("1.0.0"), 0);
+    assert_eq!(shared_rows(one_a.package_id), 0);
+    assert_eq!(shared_packages("2.0.0"), 1);
+    assert!(shared_rows(two_a.package_id) > 0);
     assert_eq!(rows(&a), held);
 }
 

@@ -36,7 +36,7 @@ use crate::error::FhirError;
 use crate::npm::{materialize, parse_package_spec, source_digest, Node, PackageFetcher, Resolver};
 use crate::package::{
     finish_install, held_at_least, package_identity, read_package, run_backfills,
-    stage_package_in_pieces, InstallFollowUp, PackageHead,
+    stage_package_in_pieces, PackageHead, PendingBackfill,
 };
 
 /// The name a prepared file is given when nothing else names it, and the one looked for next to
@@ -497,7 +497,7 @@ pub fn install_prepared(
     let expected = bundle.names.len();
     let mut seen = 0;
     let mut staged = 0;
-    let mut pending: Vec<InstallFollowUp> = Vec::new();
+    let mut pending: Vec<PendingBackfill> = Vec::new();
     let mut result = Ok(());
     loop {
         let head = match bundle.next_package() {

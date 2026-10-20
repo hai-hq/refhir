@@ -137,24 +137,17 @@ pub fn stage_package_dir(
     stage_package(store, db, catalog, path, true).map(|_| ())
 }
 
-/// What is left to do once a package is stored, and the catalog is published: queue the backfills
-/// of its search parameters that are stored but not yet searchable, and clear the index of the ones
-/// an older version had and nothing has now. Neither can be part of storing the package: the
-/// watermark of a backfill, and the point after which no writer uses an index that is going, are
-/// known only once the new catalog is in use.
-pub(crate) struct InstallFollowUp {
+/// Backfill work for a package whose search parameters are stored but not yet searchable.
+pub(crate) struct PendingBackfill {
     package_id: i64,
     bases: BTreeSet<String>,
-    retired: Vec<RetiredParam>,
 }
 
-impl InstallFollowUp {
-    /// Queue the backfill jobs and clear the retired indexes. Call this after the catalog that
-    /// writers use has been published: the watermark is read here, and backfill leaves documents
-    /// newer than it to writers, which only index a parameter once the catalog knows it. The same
-    /// goes for clearing the index of a parameter that is gone, since a writer that still has the
-    /// old catalog would write to it again. A process that stops before this leaves parameters
-    /// pending without a job, which [`run_backfills`] queues at the next start.
+impl PendingBackfill {
+    /// Queue the backfill jobs. Call this after the catalog that writers use has been published:
+    /// the watermark is read here, and backfill leaves documents newer than it to writers, which
+    /// only index a parameter once the catalog knows it. A process that stops before this leaves
+    /// parameters pending without a job, which [`run_backfills`] queues at the next start.
     pub(crate) fn create(
         &self,
         store: &dyn ConformanceStore,
@@ -168,20 +161,43 @@ impl InstallFollowUp {
         store
             .insert_backfills(self.package_id, watermark, &bases)
             .map_err(FhirError::from)?;
-        for RetiredParam { base, code } in &self.retired {
-            // What is left under a parameter that no longer exists is never read, and a parameter
-            // added under that code later is backfilled over it, so a failure here is not worth
-            // stopping for.
-            if let Err(err) = tombstone_index(db, base, code) {
-                tracing::warn!(
-                    target: "refhir_engine",
-                    "could not clear the index of search parameter {base}.{code}, which is no longer \
-                     defined: {err}"
-                );
-            }
-        }
         Ok(())
     }
+}
+
+/// Remove the packages that newer versions replaced, which a store keeps out of every list but
+/// leaves stored until now (see `ConformanceStore::collect_superseded`), after clearing the index
+/// of each search parameter that only they defined.
+///
+/// Call it once before a run of installs, never between them: a replica serves from the catalog it
+/// loaded until the search parameters of the install that replaced the packages have their index
+/// and it loads the next, and reads what the catalog it has points at, so what is removed must
+/// have been replaced before the last install began. It does nothing while a search parameter
+/// still waits for its index, for the same reason. A clearing that fails is tried again at the
+/// next call, with the packages still there to say what it was.
+pub fn collect_superseded(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+) -> Result<(), FhirError> {
+    if catalog.read().expect("catalog").has_pending_parameters() {
+        return Ok(());
+    }
+    let mut cleared = true;
+    for RetiredParam { base, code } in store.retired_parameters().map_err(FhirError::from)? {
+        if let Err(err) = tombstone_index(db, &base, &code) {
+            tracing::warn!(
+                target: "refhir_engine",
+                "could not clear the index of search parameter {base}.{code}, which is no longer \
+                 defined; the package that defined it is kept until it can be: {err}"
+            );
+            cleared = false;
+        }
+    }
+    if cleared {
+        store.collect_superseded().map_err(FhirError::from)?;
+    }
+    Ok(())
 }
 
 /// The newest version of `name` in `installed` that is newer than `version`, if there is one.
@@ -217,13 +233,13 @@ pub(crate) fn note_newer_installed(name: &str, version: &str, newer: &str) {
 }
 
 /// Store a package without rebuilding the catalog, for installing several in a row. The caller
-/// must [`publish`], then [`InstallFollowUp::create`] each returned item and run the backfills.
+/// must [`publish`], then [`PendingBackfill::create`] each returned item and run the backfills.
 pub(crate) fn stage_package_deferred(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
     path: &Path,
-) -> Result<Option<InstallFollowUp>, FhirError> {
+) -> Result<Option<PendingBackfill>, FhirError> {
     stage_package(store, db, catalog, path, false)
 }
 
@@ -233,7 +249,7 @@ fn stage_package(
     catalog: &RwLock<Catalog>,
     path: &Path,
     publish_now: bool,
-) -> Result<Option<InstallFollowUp>, FhirError> {
+) -> Result<Option<PendingBackfill>, FhirError> {
     let (name, version) = package_identity(path)?;
     let installed = store.load_packages().map_err(FhirError::from)?;
     if let Some(package) = installed
@@ -277,7 +293,7 @@ pub(crate) fn stage_new_package(
     read_time: std::time::Duration,
     read_label: &str,
     publish_now: bool,
-) -> Result<Option<InstallFollowUp>, FhirError> {
+) -> Result<Option<PendingBackfill>, FhirError> {
     let started = std::time::Instant::now();
     let name = package.name.clone();
     let version = package.version.clone();
@@ -361,7 +377,7 @@ pub(crate) fn stage_package_in_pieces(
     content: Option<&str>,
     feed: &mut (dyn FnMut(&mut dyn PackageRows) -> Result<(), InstallError> + Send),
     publish_now: bool,
-) -> Result<Option<InstallFollowUp>, FhirError> {
+) -> Result<Option<PendingBackfill>, FhirError> {
     let started = std::time::Instant::now();
     let mut counts = (0, 0, 0);
     let mut counting_feed = |rows: &mut dyn PackageRows| {
@@ -423,7 +439,7 @@ fn finish_staging(
     (started, stored): (std::time::Instant, std::time::Duration),
     outcome: InstallOutcome,
     publish_now: bool,
-) -> Result<Option<InstallFollowUp>, FhirError> {
+) -> Result<Option<PendingBackfill>, FhirError> {
     if publish_now {
         publish(store, catalog)?;
     }
@@ -453,14 +469,13 @@ fn finish_staging(
     if !outcome.inserted {
         return Ok(None);
     }
-    let pending = InstallFollowUp {
+    let pending = PendingBackfill {
         package_id: outcome.package_id,
         bases: outcome
             .newly_pending
             .iter()
             .map(|param| param.base.clone())
             .collect(),
-        retired: outcome.retired,
     };
     if publish_now {
         pending.create(store, db)?;
@@ -632,7 +647,7 @@ pub(crate) fn finish_install(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
-    pending: &[InstallFollowUp],
+    pending: &[PendingBackfill],
     result: Result<(), FhirError>,
 ) -> Result<(), FhirError> {
     let finish = || -> Result<(), FhirError> {

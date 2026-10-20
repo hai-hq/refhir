@@ -824,14 +824,35 @@ pub struct PendingParam {
 /// named like a pending one by its base and code.
 pub type RetiredParam = PendingParam;
 
+/// The ids of the packages in `packages` that a newer version of the same name has replaced: every
+/// one but the newest of each name. Versions that [`compare_versions`] orders the same are told
+/// apart by id, the one stored later being the newer, as a package that is stored replaces them.
+/// A store leaves what these hold out of every list it gives, and keeps it until it is collected
+/// (see [`ConformanceStore::collect_superseded`]).
+pub fn superseded_package_ids(packages: &[StoredPackage]) -> Vec<i64> {
+    let mut newest: HashMap<&str, &StoredPackage> = HashMap::new();
+    for package in packages {
+        let newer = newest.get(package.name.as_str()).is_none_or(|held| {
+            compare_versions(&package.version, &held.version)
+                .then(package.id.cmp(&held.id))
+                .is_gt()
+        });
+        if newer {
+            newest.insert(package.name.as_str(), package);
+        }
+    }
+    packages
+        .iter()
+        .filter(|package| newest[package.name.as_str()].id != package.id)
+        .map(|package| package.id)
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallOutcome {
     pub package_id: i64,
     pub inserted: bool,
     pub newly_pending: Vec<PendingParam>,
-    /// The base and code of each search parameter that went with the older versions of the package
-    /// and that nothing defines any more. Whatever is indexed under them is no longer used.
-    pub retired: Vec<RetiredParam>,
     /// The package was not stored: this store keeps one copy of what its tenants have in common,
     /// and the package is now the tenant's from that copy. Its rows were not read.
     pub shared: bool,
@@ -1094,16 +1115,36 @@ pub trait ConformanceStore: Send + Sync {
     ///
     /// The newest version of a package is the one in force. A package that is stored replaces the
     /// older versions of the same name (ordered by [`compare_versions`], so `0.10` replaces `0.10.0`
-    /// as well, a version that orders the same and is written another way) in that transaction: each
-    /// is removed with everything it holds, its definitions, search parameters, terminology and
-    /// expansions, and so is its row in the list of packages, so what the store holds is one version
-    /// of each package. What the new version defines again takes the place of what it defined
-    /// before. The older versions' search parameters take no part in a clash with the new ones. A
-    /// search parameter keeps the status of the one it replaces (`Ready`: what was indexed holds)
-    /// when its type, expression, `target` and `component` are the same, and is otherwise stored as
-    /// the package gives it, to be backfilled. `InstallOutcome::retired` says which search
-    /// parameters nothing defines afterwards. Packages with other names are never replaced.
+    /// as well, a version that orders the same and is written another way): from then on no list
+    /// the store gives holds anything of theirs, not their package, definitions, search parameters,
+    /// terminology or expansions. Their rows stay stored until [`ConformanceStore::collect_superseded`]
+    /// removes them, because a process that serves from the catalog it loaded before may still read
+    /// them by key. What the new version defines again takes the place of what it defined before.
+    /// The older versions' search parameters take no part in a clash with the new ones. A search
+    /// parameter keeps the status of the one it replaces (`Ready`: what was indexed holds) when its
+    /// type, expression, `target` and `component` are the same, and is otherwise stored as the
+    /// package gives it, to be backfilled. Packages with other names are never replaced.
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError>;
+
+    /// The search parameters that only packages a newer version has replaced define: what is
+    /// indexed under them is not used by the catalog in force, and
+    /// [`ConformanceStore::collect_superseded`] is about to remove their rows, so a caller clears
+    /// those indexes first. Worked out from what is stored, so it is the same after a crash. The
+    /// default is none, for a store that never keeps a replaced package.
+    fn retired_parameters(&self) -> Result<Vec<RetiredParam>, PersistError> {
+        Ok(Vec::new())
+    }
+
+    /// Remove the packages that newer versions have replaced, with everything they hold:
+    /// definitions, search parameters, terminology, expansions and the backfills queued for them.
+    /// Call it when nothing waits for an index and a process that follows the catalog has had time
+    /// to load the one that replaced them: a start or an install that comes after the one that
+    /// replaced them is late enough, and one in the same run of installs is not. A store that
+    /// shares what its tenants have in common also removes a shared package that no tenant has any
+    /// longer. The default does nothing.
+    fn collect_superseded(&self) -> Result<(), PersistError> {
+        Ok(())
+    }
 
     /// [`ConformanceStore::install_package`] for a package that is not held whole: `feed` is
     /// given the place the rows go and hands them over a few at a time, and the package is
@@ -3324,9 +3365,12 @@ pub mod conformance {
         assert!(matches!(err, InstallError::Expression { .. }), "{err}");
     }
 
-    /// A newer version of a package replaces the search parameters of its older versions, in the
-    /// transaction that stores it, and nothing else's.
-    pub fn exercise_package_versions(store: &dyn ConformanceStore, tag: &str) {
+    /// A newer version of a package replaces its older versions: they are out of every list from
+    /// the transaction that stores it, and gone, with everything they held, once collected. With
+    /// `shared_links`, other tenants of the store have a link to every package it holds, so a
+    /// package that tenant owns is kept whole when it is collected, and only what changes per
+    /// tenant (expansions, search parameters, queued backfills) goes.
+    pub fn exercise_package_versions(store: &dyn ConformanceStore, tag: &str, shared_links: bool) {
         let name = format!("upgrade.{tag}");
         let code = |short: &str| format!("{short}-{tag}");
         let param = |short: &str, expression: &str| NewSearchParameter {
@@ -3406,6 +3450,47 @@ pub mod conformance {
             ids.dedup();
             (definitions, terminology, expansions, ids)
         };
+        // The same as `content`, read a page at a time the way a catalog is loaded.
+        let visited = |owner: &str| -> (Vec<String>, Vec<String>, Vec<String>) {
+            let (mut definitions, mut terminology, mut expansions) =
+                (Vec::new(), Vec::new(), Vec::new());
+            let marker = format!("/{owner}/");
+            let part = |url: &str| url.rsplit(marker.as_str()).next().unwrap().to_string();
+            store
+                .visit_structure_definitions(&mut |page| {
+                    definitions.extend(
+                        page.iter()
+                            .filter(|row| row.url.contains(marker.as_str()))
+                            .map(|row| part(&row.url)),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .visit_terminology(&mut |page| {
+                    terminology.extend(
+                        page.iter()
+                            .filter(|row| row.url.contains(marker.as_str()))
+                            .map(|row| part(&row.url)),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            store
+                .visit_expansions(&mut |page| {
+                    expansions.extend(
+                        page.iter()
+                            .filter(|row| row.url.contains(marker.as_str()))
+                            .map(|row| part(&row.url)),
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            definitions.sort();
+            terminology.sort();
+            expansions.sort();
+            (definitions, terminology, expansions)
+        };
         // This test's rows, as (code, expression, status, package id), by code.
         let rows = || -> Vec<(String, String, ParamStatus, i64)> {
             let mut rows: Vec<_> = store
@@ -3445,6 +3530,7 @@ pub mod conformance {
         let retired_shorts = |list: &[RetiredParam]| -> Vec<String> {
             let mut shorts: Vec<String> = list
                 .iter()
+                .filter(|param| param.code.ends_with(&format!("-{tag}")))
                 .map(|param| param.code.trim_end_matches(&format!("-{tag}")).to_string())
                 .collect();
             shorts.sort();
@@ -3464,7 +3550,6 @@ pub mod conformance {
                 ],
             ))
             .unwrap();
-        assert!(first.retired.is_empty());
         store.mark_base_ready(first.package_id, "Patient").unwrap();
         let bystander = format!("bystander.{tag}");
         let other = store
@@ -3523,8 +3608,11 @@ pub mod conformance {
             shorts(&second.newly_pending),
             ["added", "change", "renamed"]
         );
-        // What nothing defines now: the one left out, and the code that was moved from.
-        assert_eq!(retired_shorts(&second.retired), ["drop", "rename"]);
+        // What only the replaced version defines: the one left out, and the code that was moved from.
+        assert_eq!(
+            retired_shorts(&store.retired_parameters().unwrap()),
+            ["drop", "rename"]
+        );
         let now = rows();
         let held = [
             (
@@ -3562,11 +3650,29 @@ pub mod conformance {
             (short.to_string(), expression.to_string(), status, id)
         });
         assert_eq!(now, held);
-        // The older version is gone with everything it held: its definitions, its terminology,
-        // its expansions and its place among the packages. What the new version holds, and what
-        // another package holds, is there.
+        // The older version is out of every list: its definitions, its terminology, its expansions
+        // and its place among the packages. What the new version holds, and what another package
+        // holds, is there.
         assert_eq!(package_id("0.1.0"), None);
-        assert_eq!((queued(first.package_id), queued(other.package_id)), (0, 1));
+        // But what it holds is still stored, for a process that serves from the catalog it loaded
+        // before the install and reads a definition, a code system or an expansion by its key.
+        let (kept, system, expansion) = (
+            format!("http://example.org/sd/{name}/kept"),
+            format!("http://example.org/cs/{name}/0.1.0"),
+            format!("http://example.org/vs/{name}/0.1.0"),
+        );
+        let reads = |package: i64| {
+            (
+                store
+                    .load_structure_definition_json(package, &kept)
+                    .unwrap(),
+                store.load_terminology_json(package, &system).unwrap(),
+                store.load_expansion_json(package, &expansion).unwrap(),
+            )
+        };
+        let (definition, terminology, expanded) = reads(first.package_id);
+        assert!(definition.is_some() && terminology.is_some() && expanded.is_some());
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (1, 1));
         assert_eq!(
             content(&name),
             (
@@ -3585,6 +3691,21 @@ pub mod conformance {
                 vec![other.package_id]
             )
         );
+
+        let listed = content(&name);
+        assert_eq!(visited(&name), (listed.0, listed.1, listed.2));
+        // Collected, it is gone with everything it held, the backfills queued for it too, and
+        // what another package holds is not.
+        store.collect_superseded().unwrap();
+        let collected = reads(first.package_id);
+        assert_eq!(collected.2, None);
+        if !shared_links {
+            assert_eq!(collected, (None, None, None));
+        }
+        assert_eq!((queued(first.package_id), queued(other.package_id)), (0, 1));
+        assert!(retired_shorts(&store.retired_parameters().unwrap()).is_empty());
+        assert_eq!(rows(), now);
+        assert_eq!(content(&bystander).0, ["kept", "only-1.0.0"]);
 
         // An install that fails changes nothing: the version that was in force still is, whether
         // the package was handed over whole or in pieces.
@@ -3644,7 +3765,11 @@ pub mod conformance {
             })
             .unwrap();
         assert_eq!(shorts(&third.newly_pending), ["added"]);
-        assert_eq!(retired_shorts(&third.retired), ["change", "renamed"]);
+        assert_eq!(
+            retired_shorts(&store.retired_parameters().unwrap()),
+            ["change", "renamed"]
+        );
+        store.collect_superseded().unwrap();
         let now = rows();
         assert_eq!(
             now.iter()
@@ -3665,7 +3790,8 @@ pub mod conformance {
             .install_package(&package(&name, "0.4.0", vec![token, narrowed]))
             .unwrap();
         assert_eq!(shorts(&fourth.newly_pending), ["added", "keep"]);
-        assert!(fourth.retired.is_empty());
+        assert!(retired_shorts(&store.retired_parameters().unwrap()).is_empty());
+        store.collect_superseded().unwrap();
         // Version 0.10.0 is newer than 0.4.0, as a version number and not as text.
         let fifth = store
             .install_package(&package(
@@ -3674,7 +3800,11 @@ pub mod conformance {
                 vec![param("keep", "Patient.keep")],
             ))
             .unwrap();
-        assert_eq!(retired_shorts(&fifth.retired), ["added"]);
+        assert_eq!(
+            retired_shorts(&store.retired_parameters().unwrap()),
+            ["added"]
+        );
+        store.collect_superseded().unwrap();
         assert!(rows()
             .iter()
             .all(|(short, _, _, id)| { short == "bystander" || *id == fifth.package_id }));
@@ -3691,6 +3821,31 @@ pub mod conformance {
         assert_eq!(shorts(&sixth.newly_pending), ["keep"]);
         assert_eq!(package_id("0.10.0"), None);
         assert_eq!(package_id("0.10"), Some(sixth.package_id));
+        store.collect_superseded().unwrap();
+
+        // A package that a newer version replaced and that is not collected yet is not looked at
+        // when another package's parameters are checked: here `zz` is defined by nothing in force,
+        // and by a stale row with another expression.
+        let stale = format!("stale.{tag}");
+        store
+            .install_package(&package(&stale, "1.0.0", vec![param("zz", "Patient.zz1")]))
+            .unwrap();
+        store
+            .install_package(&package(&stale, "2.0.0", Vec::new()))
+            .unwrap();
+        let late = store
+            .install_package(&package(
+                &format!("late.{tag}"),
+                "1.0.0",
+                vec![param("zz", "Patient.zz2")],
+            ))
+            .unwrap();
+        assert_eq!(shorts(&late.newly_pending), ["zz"]);
+        assert!(retired_shorts(&store.retired_parameters().unwrap()).is_empty());
+        store.collect_superseded().unwrap();
+        assert!(rows()
+            .iter()
+            .any(|row| row.0 == "zz" && row.1 == "Patient.zz2"));
     }
     use refhir_types::TabletId;
 

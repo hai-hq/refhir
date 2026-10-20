@@ -40,8 +40,9 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   gave a parameter another code left the old code answering beside the new, one that left a
   parameter out kept it, and a profile that a new version changed could lose to the older one's.
   The newest version of a package is now the one in force, and the database holds one version of
-  each package: installing a newer one removes the older one with its profiles, value sets, code
-  systems and search parameters. A search parameter the new version defines again takes its
+  each package: installing a newer one replaces the older one, and the older one's profiles, value
+  sets, code systems and search parameters are removed at the next start or `$install`, which is
+  how a replica can go on reading them until it has moved to the new catalog. A search parameter the new version defines again takes its
   definition, and the resources already stored are indexed again for it when its expression, type
   or targets changed (before the server answers requests, or before `$install` returns); one that
   did not change is left as it was. A parameter whose code changed is searched by the new code only,
@@ -54,7 +55,10 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   and a search parameter that an install left waiting for its index (it stopped before the
   backfill was queued) is queued at the next start. A version written differently but meaning the
   same, such as `0.10` for `0.10.0`, replaces the one installed. A replica keeps answering from its
-  previous catalog until the primary has finished indexing. Resources of a type that only the older
+  previous catalog until the primary has finished indexing: it still finds what the replaced
+  version held, and answers a parameter whose expression changed from an index that is being
+  rebuilt. A shared Postgres package leaves the shared catalog when the last tenant that had it has
+  given it up. Resources of a type that only the older
   version defined stay in the database but are not served.
   See [Upgrading a package](docs/configuration.md#upgrading-a-package).
 

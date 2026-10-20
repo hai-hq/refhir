@@ -14,7 +14,9 @@ Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or 
 
 Start the server with a newer version of a package it already holds (`--package ./ig-0.2.0`, `name@0.2.0`, or `[conformance].packages`) and it serves what that version defines. The newest version of a package is the one in force, so the same `--package` can stay on every start and moving to a new release is a change to it.
 
-The database holds one version of each package (on a database that several tenants share, each tenant holds one, and a package the tenants have in common stays in the shared catalog for those that still have it). Installing a newer one removes the older one with everything it held: profiles, value sets, code systems and search parameters. What the new version leaves out is gone, and what it changes is what the server uses from then on. Resources of a type that only the older version defined stay in the database, but the server does not serve them. A version that is written differently but means the same, such as `0.10` for `0.10.0`, replaces the one installed.
+A newer version replaces the older one: from the moment it is installed the server serves only what the newer version defines. What the new version leaves out is gone, and what it changes is what the server uses from then on. Resources of a type that only the older version defined stay in the database, but the server does not serve them. A version that is written differently but means the same, such as `0.10` for `0.10.0`, replaces the one installed.
+
+The older version's rows are removed at the next start or the next `$install`, not at once: its profiles, value sets, code systems, search parameters and what was indexed under a search parameter that only it defined. That is how a replica can go on reading them until it has moved to the new catalog. On a database that several tenants share, a tenant gives up the older version the same way, and a package the tenants have in common leaves the shared catalog when the last tenant that had it has given it up.
 
 For the package's search parameters:
 
@@ -27,7 +29,7 @@ The same holds for a package that another package depends on: installing one tha
 
 A package that replaces an older version counts as installed when it replaces it. That matters only when two packages define the same profile: the server uses the one with more elements and, if both have as many, the one installed first.
 
-A replica keeps answering from the catalog it had until the process that installed the package has finished indexing, and only then takes up the new one. Until then it still lists and answers a search parameter the new version dropped, answers a changed one from an index that is being rebuilt, and may not find a profile, value set or code system of the replaced version that it had not yet read. A search parameter the new version adds is not known to a replica until its index is complete.
+A replica keeps answering from the catalog it had until the process that installed the package has finished indexing, and only then takes up the new one. Until then it still finds the profiles, value sets and code systems of the replaced version, which stay stored, and the index of a search parameter the new version dropped, so it lists and answers that parameter as before. It answers a parameter whose expression changed from an index that is being rebuilt, so a search by it can return a mix of the old and the new until indexing is done, and it does not know a parameter the new version adds until that parameter's index is complete.
 
 Installing the same version again, or a version older than the one the server holds, changes nothing, so a server that is started again on an earlier release of its package keeps what it has. A new version that cannot be installed leaves the database on the version it had, and the server can be started again with either.
 

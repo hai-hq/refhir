@@ -1,10 +1,10 @@
 use refhir_persistence::{
-    compare_versions, plan_search_parameter, ConformanceStore, ExpansionChange, InstallError,
-    InstallOutcome, InstalledParam, NewExpansion, NewPackage, NewSearchParameter,
-    NewStructureDefinition, NewTerminology, PackageRows, ParamPlan, ParamStatus, PendingParam,
-    PersistError, PersistenceGlobalKey, RetiredParam, StoredBackfill, StoredExpansion,
-    StoredPackage, StoredSearchParameter, StoredStructureDefinition, StoredTerminology,
-    CONFORMANCE_PAGE_ROWS,
+    compare_versions, plan_search_parameter, superseded_package_ids, ConformanceStore,
+    ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion, NewPackage,
+    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamPlan,
+    ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, RetiredParam, StoredBackfill,
+    StoredExpansion, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
+    StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 
@@ -41,7 +41,53 @@ fn expansion_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredExpansion> 
     })
 }
 
+/// `" AND package_id NOT IN (…)"` for the ids, or nothing when there are none.
+fn and_not_in(ids: &[i64]) -> String {
+    if ids.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+    format!(" AND package_id NOT IN ({})", list.join(", "))
+}
+
 impl SqlitePersistence {
+    /// Every package stored, the ones a newer version of the same name has replaced included.
+    fn all_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
+        let guard = self.inner.lock()?;
+        let mut stmt = guard
+            .connection
+            .prepare("SELECT id, name, version, fhir_version FROM packages ORDER BY id")
+            .map_err(definite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(StoredPackage {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    version: row.get(2)?,
+                    fhir_version: row.get(3)?,
+                })
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?;
+        Ok(rows)
+    }
+
+    /// The ids of the packages a newer version has replaced. Their rows stay stored until
+    /// [`ConformanceStore::collect_superseded`] removes them, so a process that still serves from
+    /// the catalog it loaded before can read them by key, and every list leaves them out.
+    fn superseded_ids(&self) -> Result<Vec<i64>, PersistError> {
+        Ok(superseded_package_ids(&self.all_packages()?))
+    }
+
+    /// What to add to a statement over a table with a `package_id` so that it leaves out the rows
+    /// of the replaced packages: the text for `WHERE`, and the text for after another condition.
+    fn only_in_force(&self) -> Result<(String, String), PersistError> {
+        let and = and_not_in(&self.superseded_ids()?);
+        let wher = and.replacen(" AND", " WHERE", 1);
+        Ok((wher, and))
+    }
+
     /// Read `select` (a `SELECT` of a table keyed by `(package_id, url)`) a page at a time, in key
     /// order, and hand each page to `visit`. The connection is locked for the query of each page
     /// only, so nothing waits on what `visit` does with the rows, which for a catalog load is
@@ -53,9 +99,11 @@ impl SqlitePersistence {
         key: impl Fn(&T) -> (i64, String),
         visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
-        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let (wher, and) = self.only_in_force()?;
+        let first =
+            format!("{select}{wher} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
         let next = format!(
-            "{select} WHERE (package_id, url) > (?1, ?2) \
+            "{select} WHERE (package_id, url) > (?1, ?2){and} \
              ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
         );
         let mut after: Option<(i64, String)> = None;
@@ -204,34 +252,23 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
-        let guard = self.inner.lock()?;
-        let mut stmt = guard
-            .connection
-            .prepare("SELECT id, name, version, fhir_version FROM packages ORDER BY id")
-            .map_err(definite)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(StoredPackage {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    version: row.get(2)?,
-                    fhir_version: row.get(3)?,
-                })
-            })
-            .map_err(definite)?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(definite)?;
-        Ok(rows)
+        let all = self.all_packages()?;
+        let replaced = superseded_package_ids(&all);
+        Ok(all
+            .into_iter()
+            .filter(|package| !replaced.contains(&package.id))
+            .collect())
     }
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
+        let (wher, _) = self.only_in_force()?;
         let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT package_id, url, type_name, kind, is_abstract, json \
-                 FROM structure_definitions ORDER BY package_id, url",
-            )
+                 FROM structure_definitions{wher} ORDER BY package_id, url"
+            ))
             .map_err(definite)?;
         let rows = stmt
             .query_map([], structure_definition_from)
@@ -282,13 +319,14 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
+        let (wher, _) = self.only_in_force()?;
         let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT package_id, url, base, code, param_type, expression, status, json \
-                 FROM search_parameters ORDER BY package_id, base, code",
-            )
+                 FROM search_parameters{wher} ORDER BY package_id, base, code"
+            ))
             .map_err(definite)?;
         let rows = stmt
             .query_map([], |row| {
@@ -326,12 +364,14 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
+        let (wher, _) = self.only_in_force()?;
         let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
-            .prepare(
-                "SELECT package_id, resource_type, url, json FROM terminology ORDER BY package_id, url",
-            )
+            .prepare(&format!(
+                "SELECT package_id, resource_type, url, json FROM terminology{wher} \
+                 ORDER BY package_id, url"
+            ))
             .map_err(definite)?;
         let rows = stmt
             .query_map([], terminology_from)
@@ -357,6 +397,7 @@ impl ConformanceStore for SqlitePersistence {
         &self,
         urls: &[String],
     ) -> Result<Vec<StoredTerminology>, PersistError> {
+        let (_, and) = self.only_in_force()?;
         let guard = self.inner.lock()?;
         let mut rows = Vec::new();
         // SQLite caps the number of bound parameters, so a long list goes in pieces.
@@ -367,9 +408,9 @@ impl ConformanceStore for SqlitePersistence {
                 .connection
                 .prepare(&format!(
                     "SELECT package_id, resource_type, url, json FROM terminology \
-                     WHERE url IN ({marks}) \
+                     WHERE (url IN ({marks}) \
                         OR (CASE WHEN instr(url, '|') > 0 \
-                                 THEN substr(url, 1, instr(url, '|') - 1) ELSE url END) IN ({marks}) \
+                                 THEN substr(url, 1, instr(url, '|') - 1) ELSE url END) IN ({marks})){and} \
                      ORDER BY package_id, url"
                 ))
                 .map_err(definite)?;
@@ -490,12 +531,14 @@ impl ConformanceStore for SqlitePersistence {
     }
 
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
+        let (wher, _) = self.only_in_force()?;
         let guard = self.inner.lock()?;
         let mut stmt = guard
             .connection
-            .prepare(
-                "SELECT package_id, url, json FROM value_set_expansion ORDER BY package_id, url",
-            )
+            .prepare(&format!(
+                "SELECT package_id, url, json FROM value_set_expansion{wher} \
+                 ORDER BY package_id, url"
+            ))
             .map_err(definite)?;
         let rows = stmt
             .query_map([], expansion_from)
@@ -515,6 +558,61 @@ impl ConformanceStore for SqlitePersistence {
             |row| (row.package_id, row.url.clone()),
             visit,
         )
+    }
+
+    fn retired_parameters(&self) -> Result<Vec<RetiredParam>, PersistError> {
+        let replaced = self.superseded_ids()?;
+        if replaced.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list: Vec<String> = replaced.iter().map(i64::to_string).collect();
+        let list = list.join(", ");
+        let guard = self.inner.lock()?;
+        let mut stmt = guard
+            .connection
+            .prepare(&format!(
+                "SELECT DISTINCT s.base, s.code FROM search_parameters s \
+                 WHERE s.package_id IN ({list}) AND NOT EXISTS (SELECT 1 FROM search_parameters t \
+                       WHERE t.base = s.base AND t.code = s.code AND t.package_id NOT IN ({list})) \
+                 ORDER BY s.base, s.code"
+            ))
+            .map_err(definite)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(RetiredParam {
+                    base: row.get(0)?,
+                    code: row.get(1)?,
+                })
+            })
+            .map_err(definite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(definite)?;
+        Ok(rows)
+    }
+
+    fn collect_superseded(&self) -> Result<(), PersistError> {
+        let replaced = self.superseded_ids()?;
+        if replaced.is_empty() {
+            return Ok(());
+        }
+        self.fenced(|tx| {
+            for package_id in &replaced {
+                for statement in [
+                    "DELETE FROM backfill_parameter WHERE backfill_id IN \
+                     (SELECT id FROM index_backfills WHERE package_id = ?1)",
+                    "DELETE FROM index_backfills WHERE package_id = ?1",
+                    "DELETE FROM search_parameters WHERE package_id = ?1",
+                    "DELETE FROM structure_definitions WHERE package_id = ?1",
+                    "DELETE FROM terminology WHERE package_id = ?1",
+                    "DELETE FROM value_set_expansion WHERE package_id = ?1",
+                    "DELETE FROM packages WHERE id = ?1",
+                ] {
+                    tx.execute(statement, params![package_id])
+                        .map_err(definite)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -899,9 +997,13 @@ struct Installer<'a, 'c> {
     newly_pending: Vec<PendingParam>,
     /// Whether the package's earlier expansions have been cleared for this install's.
     expansions_cleared: bool,
-    /// The older versions of this package that are stored, whose search parameters this install
-    /// replaces. Empty for a package that was there before.
+    /// The versions of this package that are in force, which this install replaces: their search
+    /// parameters take no part in a clash with the package's, and lend it their status when
+    /// they index the same. Empty for a package that was there before.
     superseded: Vec<i64>,
+    /// The packages that an earlier install replaced, whose rows are still stored: they are not
+    /// looked at when the package's search parameters are checked against what is installed.
+    stale: Vec<i64>,
 }
 
 impl<'a, 'c> Installer<'a, 'c> {
@@ -927,6 +1029,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
                 superseded: Vec::new(),
+                stale: Vec::new(),
             });
         }
         let current: Option<String> = tx
@@ -943,7 +1046,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 });
             }
         }
-        let superseded = older_versions(tx, name, version)?;
+        let (stale, superseded) = replaced_by(tx, name, version)?;
         tx.execute(
             "INSERT INTO packages (name, version, fhir_version) VALUES (?1, ?2, ?3)",
             params![name, version, fhir_version],
@@ -956,58 +1059,8 @@ impl<'a, 'c> Installer<'a, 'c> {
             newly_pending: Vec::new(),
             expansions_cleared: false,
             superseded,
+            stale,
         })
-    }
-
-    /// Remove the older versions of the package, with everything they hold: definitions, search
-    /// parameters, terminology, expansions and the backfills that were queued for them. Whatever
-    /// the new version has carried over is stored under it. Says which search parameters nothing
-    /// defines now.
-    fn remove_superseded(&self) -> Result<Vec<RetiredParam>, InstallError> {
-        let mut gone = std::collections::BTreeSet::new();
-        for package_id in &self.superseded {
-            let mut stmt = self
-                .tx
-                .prepare("SELECT DISTINCT base, code FROM search_parameters WHERE package_id = ?1")
-                .map_err(definite)?;
-            let rows = stmt
-                .query_map(params![package_id], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })
-                .map_err(definite)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(definite)?;
-            gone.extend(rows);
-            for statement in [
-                "DELETE FROM backfill_parameter WHERE backfill_id IN \
-                 (SELECT id FROM index_backfills WHERE package_id = ?1)",
-                "DELETE FROM index_backfills WHERE package_id = ?1",
-                "DELETE FROM search_parameters WHERE package_id = ?1",
-                "DELETE FROM structure_definitions WHERE package_id = ?1",
-                "DELETE FROM terminology WHERE package_id = ?1",
-                "DELETE FROM value_set_expansion WHERE package_id = ?1",
-                "DELETE FROM packages WHERE id = ?1",
-            ] {
-                self.tx
-                    .execute(statement, params![package_id])
-                    .map_err(definite)?;
-            }
-        }
-        let mut retired = Vec::new();
-        for (base, code) in gone {
-            let defined: bool = self
-                .tx
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM search_parameters WHERE base = ?1 AND code = ?2)",
-                    params![base, code],
-                    |row| row.get(0),
-                )
-                .map_err(definite)?;
-            if !defined {
-                retired.push(RetiredParam { base, code });
-            }
-        }
-        Ok(retired)
     }
 
     fn clear_expansions(&mut self) -> Result<(), InstallError> {
@@ -1026,40 +1079,50 @@ impl<'a, 'c> Installer<'a, 'c> {
     fn finish(mut self) -> Result<InstallOutcome, InstallError> {
         // A package that is installed again and brings no expansions has none afterwards.
         self.clear_expansions()?;
-        let retired = self.remove_superseded()?;
         Ok(InstallOutcome {
             package_id: self.package_id,
             inserted: !self.existing,
             newly_pending: self.newly_pending,
-            retired,
             shared: false,
         })
     }
 }
 
-/// The ids of the stored packages named `name` at a version older than `version`, or ordering the
-/// same (a package of that exact version is not among them: it was found before), which a package
-/// of that version replaces.
-fn older_versions(
+/// What a package of this `name` and `version`, about to be stored, finds: the packages an earlier
+/// install replaced and that are still stored, and the versions of the package that are in force
+/// and older than `version` or ordering the same (a package of that exact version is not among them:
+/// it was found before), which this one replaces.
+fn replaced_by(
     tx: &Transaction<'_>,
     name: &str,
     version: &str,
-) -> Result<Vec<i64>, InstallError> {
+) -> Result<(Vec<i64>, Vec<i64>), InstallError> {
     let mut stmt = tx
-        .prepare("SELECT id, version FROM packages WHERE name = ?1")
+        .prepare("SELECT id, name, version, fhir_version FROM packages")
         .map_err(definite)?;
-    let rows = stmt
-        .query_map(params![name], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    let packages = stmt
+        .query_map([], |row| {
+            Ok(StoredPackage {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                version: row.get(2)?,
+                fhir_version: row.get(3)?,
+            })
         })
         .map_err(definite)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(definite)?;
-    Ok(rows
-        .into_iter()
-        .filter(|(_, held)| compare_versions(held, version).is_le())
-        .map(|(id, _)| id)
-        .collect())
+    let stale = superseded_package_ids(&packages);
+    let older = packages
+        .iter()
+        .filter(|package| {
+            package.name == name
+                && !stale.contains(&package.id)
+                && compare_versions(&package.version, version).is_le()
+        })
+        .map(|package| package.id)
+        .collect();
+    Ok((stale, older))
 }
 
 impl PackageRows for Installer<'_, '_> {
@@ -1096,12 +1159,13 @@ impl PackageRows for Installer<'_, '_> {
             return Ok(());
         }
         let tx = self.tx;
+        let and_in_force = and_not_in(&self.stale);
         for param in rows {
             let installed = tx
-                .prepare(
+                .prepare(&format!(
                     "SELECT package_id, url, COALESCE(expression, ''), param_type, status, json \
-                     FROM search_parameters WHERE base = ?1 AND code = ?2",
-                )
+                     FROM search_parameters WHERE base = ?1 AND code = ?2{and_in_force}"
+                ))
                 .map_err(definite)?
                 .query_map(params![param.base, param.code], |row| {
                     let package_id: i64 = row.get(0)?;
@@ -1239,6 +1303,6 @@ mod tests {
     #[test]
     fn a_newer_version_of_a_package_replaces_the_older_ones() {
         let store = SqlitePersistence::open_in_memory().unwrap();
-        refhir_persistence::conformance::exercise_package_versions(&store, "sqlite");
+        refhir_persistence::conformance::exercise_package_versions(&store, "sqlite", false);
     }
 }

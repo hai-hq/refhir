@@ -155,6 +155,6 @@ fn the_conformance_store_is_per_tenant() {
         let clashes = format!("{tag}clash");
         conformance::exercise_parameter_clashes(&store, &clashes);
         conformance::exercise_terminology_changes(&store, &clashes);
-        conformance::exercise_package_versions(&store, &format!("{tag}ver"));
+        conformance::exercise_package_versions(&store, &format!("{tag}ver"), true);
     });
 }

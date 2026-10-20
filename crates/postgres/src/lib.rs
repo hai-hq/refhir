@@ -2019,6 +2019,6 @@ mod tests {
         };
         let persistence = PostgresPersistence::connect(&url).expect("connect");
         let tag = format!("pgver{}", std::process::id());
-        refhir_persistence::conformance::exercise_package_versions(&persistence, &tag);
+        refhir_persistence::conformance::exercise_package_versions(&persistence, &tag, false);
     }
 }

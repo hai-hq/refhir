@@ -18,8 +18,8 @@ use sha2::{Digest, Sha256};
 use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::package::{
-    finish_install, newer_version, note_newer_installed, package_identity, package_root,
-    read_manifest, run_backfills, stage_package_deferred,
+    collect_superseded, finish_install, newer_version, note_newer_installed, package_identity,
+    package_root, read_manifest, run_backfills, stage_package_deferred,
 };
 use crate::run::RunResult;
 use crate::s3::S3Source;
@@ -197,6 +197,8 @@ pub fn install_operation(
     let (name, version) = npm_spec_from_args(args)?;
     let spec = format!("{name}@{version}");
     let fetcher = NpmRegistry::from_env()?;
+    // What an earlier install replaced goes now, before this one replaces more.
+    collect_superseded(store, db, catalog)?;
     let before = unexpandable_value_sets(catalog);
     let newer = newer_installed(store, &name, &version)?;
     install_with(store, db, catalog, &spec, &fetcher, &fetcher.cache_dir)?;
