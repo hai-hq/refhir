@@ -4,7 +4,7 @@ import path from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 
 import { StoreBusy, type Store } from '../src/types.js';
-import { ID, aLink, databaseUrl, memory, schemaStore, sqliteFile } from './support.js';
+import { ID, aLink, databaseUrl, memory, schemaStore, scratchDatabase, sqliteFile } from './support.js';
 
 // Every store keeps the same promises, so one set of tests holds them all to it.
 const stores: Array<[string, () => Promise<{ store: Store; done: () => Promise<unknown> }>]> = [
@@ -461,23 +461,26 @@ describe.skipIf(!databaseUrl)('postgres store, as several processes would use it
   });
 
   it('says it cannot take a write when the database is read-only, and when it is not there', async () => {
-    const schema = await schemaStore();
-    try {
-      const store = await schema.open();
-      const raw = schema.raw();
-      await raw`ALTER DATABASE ${raw(new URL(databaseUrl!).pathname.slice(1))} SET default_transaction_read_only = on`;
-      try {
-        const readOnly = await schema.open({ migrate: false });
-        await expect(readOnly.ping()).rejects.toThrow(/read-only/);
-        await expect(store.ping()).resolves.toBeUndefined(); // an open connection is as it was made
-      } finally {
-        await raw`ALTER DATABASE ${raw(new URL(databaseUrl!).pathname.slice(1))} RESET default_transaction_read_only`;
-        await raw.end({ timeout: 1 });
-      }
-    } finally {
-      await schema.done();
-    }
     const { postgresStore } = await import('../src/store/postgres.js');
+    // `default_transaction_read_only` is set on a whole database, and the other tests are using the one
+    // they share while this one runs: this one has a database of its own.
+    const scratch = await scratchDatabase();
+    await scratch.create();
+    const raw = scratch.connect();
+    const opened: Store[] = [];
+    try {
+      const store = await postgresStore({ url: scratch.url });
+      opened.push(store);
+      await raw`ALTER DATABASE ${raw(scratch.name)} SET default_transaction_read_only = on`;
+      const readOnly = await postgresStore({ url: scratch.url, migrate: false });
+      opened.push(readOnly);
+      await expect(readOnly.ping()).rejects.toThrow(/read-only/);
+      await expect(store.ping()).resolves.toBeUndefined(); // an open connection is as it was made
+    } finally {
+      await Promise.allSettled(opened.map((store) => store.close()));
+      await raw.end({ timeout: 1 });
+      await scratch.done();
+    }
     await expect(postgresStore({ url: 'postgres://nobody:nothing@127.0.0.1:1/none' })).rejects.toThrow();
   });
 });
