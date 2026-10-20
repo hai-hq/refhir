@@ -16,7 +16,7 @@ Start the server with a newer version of a package it already holds (`--package 
 
 A newer version replaces the older one: from the moment it is installed the server serves only what the newer version defines. What the new version leaves out is gone, and what it changes is what the server uses from then on. Resources of a type that only the older version defined stay in the database, but the server does not serve them. A version that is written differently but means the same, such as `0.10` for `0.10.0`, replaces the one installed.
 
-The older version's rows are removed at the next start or the next `$install`, not at once: its profiles, value sets, code systems, search parameters and what was indexed under a search parameter that only it defined. That is how a replica can go on reading them until it has moved to the new catalog. On a database that several tenants share, a tenant gives up the older version the same way, and a package the tenants have in common leaves the shared catalog when the last tenant that had it has given it up.
+The older version's rows are removed at the next start, not at once: its profiles, value sets, code systems, search parameters and what was indexed under a search parameter that only it defined. That is how a replica can go on reading them until it has moved to the new catalog. A server that is given packages with `$install` and is never restarted keeps the older versions stored until it is, though none of them is in force. On a database that several tenants share, a tenant gives up the older version the same way, and a package the tenants have in common leaves the shared catalog when the last tenant that had it has given it up.
 
 For the package's search parameters:
 

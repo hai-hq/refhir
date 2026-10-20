@@ -1028,3 +1028,223 @@ fn a_shared_copy_that_lost_rows_is_not_given_to_another_tenant() {
         "tenant b was given a damaged package"
     );
 }
+
+/// A database in the shared layout with tenants `a` and `c`, in which `a` has installed 1.0.0 of a
+/// package that tenants share and then 2.0.0, so that 1.0.0 is a package `a` gives up the next time
+/// it collects, and the last tenant to do so removes it from the shared catalog. Returns the URL,
+/// both tenants, the 1.0.0 package as `a` installed it, and its id.
+fn a_shared_package_that_a_has_replaced(
+    admin: &str,
+    tag: &str,
+) -> (
+    String,
+    PostgresPersistence,
+    PostgresPersistence,
+    NewPackage,
+    i64,
+) {
+    let url = shared(admin, tag, &["a", "c"]);
+    let (a, c) = (open(&url, "a"), open(&url, "c"));
+    let first = demo("raced", "4.0.1");
+    let (one, _) = install(&a, &first, "one").unwrap();
+    let mut second = demo("raced", "4.0.1");
+    second.version = "2.0.0".into();
+    install(&a, &second, "two").unwrap();
+    (url, a, c, first, one.package_id)
+}
+
+/// Waits until `blocked` sessions of the database are waiting for a lock, which is how a test knows
+/// that a statement it started is held up where it means it to be.
+fn wait_for_sessions_blocked(url: &str, blocked: i64) {
+    let started = Instant::now();
+    loop {
+        let waiting = count(
+            url,
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        );
+        if waiting == blocked {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{waiting} sessions are waiting for a lock, not {blocked}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How many rows of the shared catalog the package holds: its parameters, expansions, definitions
+/// and terminology, and its own row.
+fn shared_catalog_rows(url: &str, package: i64) -> i64 {
+    count(
+        url,
+        &format!(
+            "SELECT (SELECT count(*) FROM base_search_parameters WHERE package_id = {package}) \
+                  + (SELECT count(*) FROM base_expansions WHERE package_id = {package}) \
+                  + (SELECT count(*) FROM structure_definitions \
+                     WHERE instance_id = 0 AND package_id = {package}) \
+                  + (SELECT count(*) FROM terminology \
+                     WHERE instance_id = 0 AND package_id = {package}) \
+                  + (SELECT count(*) FROM packages WHERE instance_id = 0 AND id = {package})"
+        ),
+    )
+}
+
+/// A tenant that is being given a shared package links it before it reads anything else of it, and
+/// the tenant that gives it up locks it before it removes anything. When the link comes first the
+/// removal waits for it, finds that a tenant has the package, and leaves it whole.
+#[test]
+fn a_tenant_given_a_shared_package_keeps_it_from_the_tenant_that_gives_it_up() {
+    let Some(admin) = test_url("shared package race, activation first") else {
+        return;
+    };
+    let (url, a, c, first, package) = a_shared_package_that_a_has_replaced(&admin, "traceact");
+    let held = shared_catalog_rows(&url, package);
+    assert!(held > 1);
+
+    // A lock on a table of the shared catalog holds the activation up after it has linked the
+    // package, where it counts what the copy holds.
+    let mut locker = client(&url);
+    locker
+        .batch_execute("BEGIN; LOCK TABLE base_search_parameters IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    std::thread::scope(|scope| {
+        let given = scope.spawn(|| install(&c, &first, "one").unwrap());
+        wait_for_sessions_blocked(&url, 1);
+        let collected = scope.spawn(|| a.collect_superseded().unwrap());
+        // The removal waits for the lock on the package that the link holds.
+        wait_for_sessions_blocked(&url, 2);
+        assert!(!collected.is_finished());
+        locker.batch_execute("COMMIT").unwrap();
+        collected.join().unwrap();
+        let (outcome, reads) = given.join().unwrap();
+        assert_eq!(
+            outcome.package_id, package,
+            "c was given the copy that was there"
+        );
+        assert!(outcome.shared);
+        assert_eq!(reads, 0, "c did not build a copy of its own");
+    });
+
+    assert_eq!(
+        shared_catalog_rows(&url, package),
+        held,
+        "the shared copy is whole"
+    );
+    assert_eq!(
+        c.load_packages()
+            .unwrap()
+            .into_iter()
+            .map(|package| (package.name, package.version, package.id))
+            .collect::<Vec<_>>(),
+        [("raced".to_string(), "1.0.0".to_string(), package)]
+    );
+    assert!(c
+        .load_structure_definition_json(package, "http://example.org/raced/sd/0")
+        .unwrap()
+        .is_some());
+    // The tenant that gave it up has only the newer version.
+    let versions: Vec<_> = a
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .map(|package| package.version)
+        .collect();
+    assert_eq!(versions, ["2.0.0"]);
+}
+
+/// The other order: the removal has locked the package, and a tenant that is being given it waits
+/// for the removal, finds that the package is not there, and is given a copy built anew.
+#[test]
+fn a_tenant_given_a_shared_package_that_is_being_removed_gets_a_copy_built_anew() {
+    let Some(admin) = test_url("shared package race, removal first") else {
+        return;
+    };
+    let (url, a, c, first, package) = a_shared_package_that_a_has_replaced(&admin, "tracerem");
+    assert!(shared_catalog_rows(&url, package) > 1);
+
+    // A lock on a table of the shared catalog holds the removal up after it has locked the package
+    // and begun to remove what it holds.
+    let mut locker = client(&url);
+    locker
+        .batch_execute("BEGIN; LOCK TABLE base_expansions IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    std::thread::scope(|scope| {
+        let collected = scope.spawn(|| a.collect_superseded().unwrap());
+        wait_for_sessions_blocked(&url, 1);
+        let given = scope.spawn(|| install(&c, &first, "one").unwrap());
+        // The link waits for the lock the removal holds on the package.
+        wait_for_sessions_blocked(&url, 2);
+        assert!(!given.is_finished());
+        locker.batch_execute("COMMIT").unwrap();
+        collected.join().unwrap();
+        let (outcome, reads) = given.join().unwrap();
+        assert_ne!(
+            outcome.package_id, package,
+            "c was not given the copy that was removed"
+        );
+        assert!(outcome.shared);
+        assert_eq!(reads, 1, "c built the copy from the package");
+    });
+
+    assert_eq!(
+        shared_catalog_rows(&url, package),
+        0,
+        "the removed copy is gone"
+    );
+    let held = c.load_packages().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        (held[0].name.as_str(), held[0].version.as_str()),
+        ("raced", "1.0.0")
+    );
+    assert_ne!(held[0].id, package);
+    assert!(c
+        .load_structure_definition_json(held[0].id, "http://example.org/raced/sd/0")
+        .unwrap()
+        .is_some());
+}
+
+/// A tenant gives up a shared package and the package leaves the shared catalog in one
+/// transaction. When the removal fails the tenant still has its link, so that the next collection
+/// finds the package again; if the link were gone, nothing would name a package nobody has.
+#[test]
+fn a_removal_of_a_shared_package_that_fails_leaves_the_tenant_its_link() {
+    let Some(admin) = test_url("shared package removal that fails") else {
+        return;
+    };
+    let (url, a, _c, _first, package) = a_shared_package_that_a_has_replaced(&admin, "tracefail");
+    let held = shared_catalog_rows(&url, package);
+    let links = |url: &str| {
+        count(
+            url,
+            &format!("SELECT count(*) FROM tenant_packages WHERE package_id = {package}"),
+        )
+    };
+    assert_eq!(links(&url), 1);
+
+    // Something in the database refuses to let the package's parameters go.
+    client(&url)
+        .batch_execute(
+            "CREATE FUNCTION refuse_removal() RETURNS trigger LANGUAGE plpgsql AS \
+             $f$ BEGIN RAISE EXCEPTION 'removal refused'; END $f$; \
+             CREATE TRIGGER refuse_removal BEFORE DELETE ON base_search_parameters \
+             FOR EACH ROW EXECUTE FUNCTION refuse_removal()",
+        )
+        .unwrap();
+    assert!(a.collect_superseded().is_err());
+    assert_eq!(
+        links(&url),
+        1,
+        "the tenant gave the package up, and it is still there"
+    );
+    assert_eq!(shared_catalog_rows(&url, package), held);
+
+    client(&url)
+        .batch_execute("DROP TRIGGER refuse_removal ON base_search_parameters")
+        .unwrap();
+    a.collect_superseded().unwrap();
+    assert_eq!(links(&url), 0);
+    assert_eq!(shared_catalog_rows(&url, package), 0);
+}

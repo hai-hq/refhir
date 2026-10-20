@@ -1,10 +1,10 @@
 use postgres::Transaction;
 use refhir_persistence::{
-    compare_versions, plan_package_parameters, superseded_package_ids, ConformanceStore,
-    ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion, NewPackage,
-    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamStatus,
-    PendingParam, PersistError, PersistenceGlobalKey, PoolGuard, RetiredParam, StoredBackfill,
-    StoredExpansion, StoredPackage, StoredParameterRow, StoredSearchParameter,
+    compare_versions, not_in_packages, plan_package_parameters, superseded_package_ids,
+    ConformanceStore, ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion,
+    NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows,
+    ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, PoolGuard, RetiredParam,
+    StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow, StoredSearchParameter,
     StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 
@@ -162,24 +162,17 @@ fn sql_find_package(scope: Scope) -> String {
     }
 }
 
-/// What to add to a statement to leave out the rows of `replaced` packages: `column NOT IN (…)`, or
-/// nothing when there are none, so that a database without a replaced package reads what it did.
-fn not_in(column: &str, replaced: &[i64]) -> Option<String> {
-    if replaced.is_empty() {
-        return None;
-    }
-    let list: Vec<String> = replaced.iter().map(i64::to_string).collect();
-    Some(format!("{column} NOT IN ({})", list.join(", ")))
-}
-
-/// The condition for the end of a `WHERE` that already has one.
+/// The condition for the end of a `WHERE` that already has one, leaving out the rows of the
+/// `replaced` packages.
 fn and_not_in(column: &str, replaced: &[i64]) -> String {
-    not_in(column, replaced).map_or_else(String::new, |condition| format!(" AND {condition}"))
+    not_in_packages(column, replaced)
+        .map_or_else(String::new, |condition| format!(" AND {condition}"))
 }
 
-/// The `WHERE` of a statement that has none.
+/// The `WHERE` of a statement that has none, leaving out the rows of the `replaced` packages.
 fn where_not_in(column: &str, replaced: &[i64]) -> String {
-    not_in(column, replaced).map_or_else(String::new, |condition| format!(" WHERE {condition}"))
+    not_in_packages(column, replaced)
+        .map_or_else(String::new, |condition| format!(" WHERE {condition}"))
 }
 
 fn sql_load_structure_definitions(scope: Scope, replaced: &[i64]) -> String {
@@ -425,44 +418,6 @@ impl PostgresPersistence {
         ))))
     }
 
-    /// Remove from the catalog every tenant shares the packages in `candidates`, which this tenant
-    /// has just given up, unless another tenant still has them. This tenant cannot see the others'
-    /// links (its row policy hides them), so each package goes in a savepoint of its own and the
-    /// foreign key from a link to the package says whether anyone still has it: then that one is
-    /// undone. The last tenant to give a package up removes it.
-    ///
-    /// A tenant that is being given the package links it before it reads anything else of it
-    /// ([`PostgresPersistence::activate_shared`]), and the row is locked here before anything is
-    /// removed, so the two cannot interleave: whichever comes second waits, and finds the other's
-    /// outcome (a link to a package that was removed fails, and the tenant is given the package
-    /// again from a copy built anew).
-    fn collect_unlinked_shared(&self, candidates: &[i64]) -> Result<(), PersistError> {
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        crate::off_runtime(|| {
-            let _gate = self.gate();
-            let mut guard = self.inner.lock()?;
-            let mut tx = guard.client.transaction().map_err(definite)?;
-            self.fence(&mut tx)?;
-            // Only this transaction may write the shared catalog, and only here.
-            tx.batch_execute("SET LOCAL refhir.shared_writer = 'on'")
-                .map_err(definite)?;
-            for package_id in candidates {
-                let mut attempt = tx.savepoint("drop_shared").map_err(definite)?;
-                match drop_shared_package(&mut attempt, *package_id) {
-                    Ok(()) => attempt.commit().map_err(definite)?,
-                    Err(err)
-                        if err.code()
-                            == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {}
-                    Err(err) => return Err(definite(err)),
-                }
-            }
-            tx.commit().map_err(definite)?;
-            Ok(())
-        })
-    }
-
     /// Gives the tenant the shared copy of a package, if there is one made from `content`.
     fn activate_shared(
         &self,
@@ -499,17 +454,6 @@ impl PostgresPersistence {
         if digest.as_deref() != Some(content) {
             return Ok(Shared::Different);
         }
-        // The copy is whole: it holds what it was built with. A tenant is not given a package that
-        // is damaged, since every tenant added later would be given it too.
-        let recorded: Option<String> = shared.get(2);
-        let found = shared_row_counts(&mut tx, package_id)?;
-        if recorded.as_deref() != Some(found.as_str()) {
-            return Err(InstallError::Persist(PersistError::Definite(format!(
-                "the shared copy of {name}@{version} is damaged: it was built with {} (definitions, \
-                 terminology, search parameters, expansions) and holds {found}",
-                recorded.as_deref().unwrap_or("no count")
-            ))));
-        }
         if let Some(row) = tx
             .query_opt(&sql_first_fhir_version(scope), &[])
             .map_err(definite)?
@@ -523,16 +467,27 @@ impl PostgresPersistence {
             }
         }
         // Read before the package is linked, so that the package is not among them.
-        let (stale, superseded) = replaced_by(&mut tx, scope, name, version)?;
-        // The link comes before anything else of the package is read: the foreign key to the package
-        // locks its row, so a tenant that gives the package up cannot remove it from under this, and
-        // one that already did makes the link fail, which is a package that is not there.
+        let (superseded, predecessors) = replaced_by(&mut tx, scope, name, version)?;
+        // The link comes before anything else of the package's rows is read: the foreign key to the
+        // package locks its row, so a tenant that gives the package up cannot remove it from under
+        // this, and one that already did makes the link fail, which is a package that is not there.
         match try_link_package(&mut tx, tenant, package_id, 0) {
             Ok(()) => {}
             Err(err) if err.code() == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {
                 return Ok(Shared::Missing);
             }
             Err(err) => return Err(definite(err).into()),
+        }
+        // The copy is whole: it holds what it was built with. A tenant is not given a package that
+        // is damaged, since every tenant added later would be given it too.
+        let recorded: Option<String> = shared.get(2);
+        let found = shared_row_counts(&mut tx, package_id)?;
+        if recorded.as_deref() != Some(found.as_str()) {
+            return Err(InstallError::Persist(PersistError::Definite(format!(
+                "the shared copy of {name}@{version} is damaged: it was built with {} (definitions, \
+                 terminology, search parameters, expansions) and holds {found}",
+                recorded.as_deref().unwrap_or("no count")
+            ))));
         }
         // The tenant's own search parameters, planned against what it has as an install would.
         let rows = tx
@@ -559,7 +514,7 @@ impl PostgresPersistence {
             scope,
             package_id,
             &parameters,
-            (&superseded, &stale),
+            (&predecessors, &superseded),
         )?;
         tx.execute(
             &format!(
@@ -1155,8 +1110,8 @@ impl ConformanceStore for PostgresPersistence {
     }
 
     fn collect_superseded(&self) -> Result<(), PersistError> {
-        let replaced = self.superseded_ids()?;
-        if replaced.is_empty() {
+        let superseded = self.superseded_ids()?;
+        if superseded.is_empty() {
             return Ok(());
         }
         // The packages the tenant shares with the others, which it gives up here and which may then
@@ -1166,7 +1121,7 @@ impl ConformanceStore for PostgresPersistence {
             Scope::Tenant(tenant) => self
                 .tenant_packages(tenant)?
                 .into_iter()
-                .filter(|(package_id, owner)| *owner == 0 && replaced.contains(package_id))
+                .filter(|(package_id, owner)| *owner == 0 && superseded.contains(package_id))
                 .map(|(package_id, _)| package_id)
                 .collect(),
         };
@@ -1175,11 +1130,13 @@ impl ConformanceStore for PostgresPersistence {
             let mut guard = self.inner.lock()?;
             let mut tx = guard.client.transaction().map_err(definite)?;
             self.fence(&mut tx)?;
-            delete_superseded(&mut tx, self.scope, &replaced)?;
+            // One transaction: the tenant's link to a shared package is what says the package has
+            // a holder, and once it is given up nothing but this removal would find the package.
+            delete_superseded(&mut tx, self.scope, &superseded)?;
+            drop_unlinked_shared(&mut tx, &shared)?;
             tx.commit().map_err(definite)?;
             Ok::<_, PersistError>(())
-        })?;
-        self.collect_unlinked_shared(&shared)
+        })
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -1847,9 +1804,9 @@ fn install_in_tx(
 /// A package the store already has (same name and version) takes only terminology, which is added
 /// to what it has, and expansions, which replace what it has. A package it does not have gets its
 /// definitions and search parameters too, and the search parameters are checked against the ones
-/// installed, except those of older versions of the same package: it replaces them, and they are
-/// removed when it is stored whole. Each call stores the rows it is given in statements of its
-/// own, so what is held at once is the rows of one call, however large the package.
+/// installed, except those of the versions of the same package it replaces, which stay stored until
+/// they are collected. Each call stores the rows it is given in statements of its own, so what is
+/// held at once is the rows of one call, however large the package.
 struct Installer<'a, 'c> {
     tx: &'a mut Transaction<'c>,
     scope: Scope,
@@ -1867,10 +1824,10 @@ struct Installer<'a, 'c> {
     /// The versions of this package that are in force, which this install replaces: their search
     /// parameters take no part in a clash with the package's, and lend it their status when
     /// they index the same. Empty for a package that was there before.
-    superseded: Vec<i64>,
+    predecessors: Vec<i64>,
     /// The packages that an earlier install replaced, whose rows are still stored: they are not
     /// looked at when the package's search parameters are checked against what is installed.
-    stale: Vec<i64>,
+    superseded: Vec<i64>,
 }
 
 impl<'a, 'c> Installer<'a, 'c> {
@@ -1900,8 +1857,8 @@ impl<'a, 'c> Installer<'a, 'c> {
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
                 heaviest: 0,
+                predecessors: Vec::new(),
                 superseded: Vec::new(),
-                stale: Vec::new(),
             });
         }
         let current = tx
@@ -1916,7 +1873,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 });
             }
         }
-        let (stale, superseded) = replaced_by(tx, scope, name, version)?;
+        let (superseded, predecessors) = replaced_by(tx, scope, name, version)?;
         let inserted = tx
             .query_one(
                 &format!(
@@ -1941,8 +1898,8 @@ impl<'a, 'c> Installer<'a, 'c> {
             newly_pending: Vec::new(),
             expansions_cleared: false,
             heaviest: 0,
+            predecessors,
             superseded,
-            stale,
         })
     }
 
@@ -2004,7 +1961,7 @@ impl PackageRows for Installer<'_, '_> {
             self.scope,
             self.package_id,
             rows,
-            (&self.superseded, &self.stale),
+            (&self.predecessors, &self.superseded),
         )?;
         self.newly_pending.extend(pending);
         Ok(())
@@ -2110,15 +2067,15 @@ fn insert_structure_definitions(
 
 /// Store the search parameters of a package, and say which of them wait for a backfill. What the
 /// rows already stored decide about each one (see [`plan_package_parameters`]) is read in one
-/// query for all of them, not one per parameter. The rows of `superseded` packages are read as the
-/// ones the package replaces, and those of `stale` packages, which an earlier install replaced, are
-/// not read.
+/// query for all of them, not one per parameter. The rows of the `predecessors` packages are read as
+/// the ones the package replaces, and those of the `superseded` packages, which an earlier install
+/// replaced, are not read.
 fn insert_search_parameters(
     tx: &mut Transaction<'_>,
     scope: Scope,
     package_id: i64,
     parameters: &[NewSearchParameter],
-    (superseded, stale): (&[i64], &[i64]),
+    (predecessors, superseded): (&[i64], &[i64]),
 ) -> Result<Vec<refhir_persistence::PendingParam>, InstallError> {
     if parameters.is_empty() {
         return Ok(Vec::new());
@@ -2135,7 +2092,7 @@ fn insert_search_parameters(
                    AND NOT (package_id = ANY($3))",
                 scope.and()
             ),
-            &[&bases, &codes, &stale],
+            &[&bases, &codes, &superseded],
         )
         .map_err(definite)?
         .iter()
@@ -2151,7 +2108,7 @@ fn insert_search_parameters(
                     param_type: row.get(5),
                     status: row.get(6),
                     json: row.get(7),
-                    superseded: superseded.contains(&package_id),
+                    predecessor: predecessors.contains(&package_id),
                 },
             }
         })
@@ -2186,9 +2143,9 @@ fn insert_search_parameters(
 }
 
 /// What a package of this `name` and `version`, about to be stored, finds: the packages an earlier
-/// install replaced and that are still stored, and the versions of the package that the tenant has,
-/// in force, and older than `version` or ordering the same (a package of that exact version is not
-/// among them: it was found before), which this one replaces.
+/// install replaced and that are still stored (superseded), and the versions of the package that
+/// the tenant has, in force, and older than `version` or ordering the same (a package of that exact
+/// version is not among them: it was found before), which this one replaces (its predecessors).
 fn replaced_by(
     tx: &mut Transaction<'_>,
     scope: Scope,
@@ -2206,17 +2163,17 @@ fn replaced_by(
             fhir_version: row.get(3),
         })
         .collect();
-    let stale = superseded_package_ids(&packages);
-    let older = packages
+    let superseded = superseded_package_ids(&packages);
+    let predecessors = packages
         .iter()
         .filter(|package| {
             package.name == name
-                && !stale.contains(&package.id)
+                && !superseded.contains(&package.id)
                 && compare_versions(&package.version, version).is_le()
         })
         .map(|package| package.id)
         .collect();
-    Ok((stale, older))
+    Ok((superseded, predecessors))
 }
 
 /// Remove packages that newer versions replaced from the tenant, with everything they hold:
@@ -2226,8 +2183,7 @@ fn replaced_by(
 /// Every statement is limited to the tenant's own rows. A package that every tenant shares keeps
 /// its definitions and terminology under the shared catalog (instance 0), which no tenant's
 /// statement reaches, so the tenant gives up its link to it and its own copies of what changes per
-/// tenant; [`PostgresPersistence::collect_unlinked_shared`] removes the shared copy when no tenant
-/// has it.
+/// tenant; [`drop_unlinked_shared`] removes the shared copy when no tenant has it.
 fn delete_superseded(
     tx: &mut Transaction<'_>,
     scope: Scope,
@@ -2267,9 +2223,14 @@ fn delete_superseded(
             }
         }
         Scope::Tenant(_) => {
-            // Unless a link of another tenant still names the package, which this crate never
-            // makes but the database permits and a tenant cannot see through its row policy: then
-            // the package stays whole for that tenant, and everything above this is undone.
+            // A link of another tenant that still names the package stops the removal of its row
+            // with a foreign key violation. This crate never makes such a link (a tenant's own
+            // package is linked by that tenant alone) but the database permits it, and a tenant
+            // cannot see through its row policy whether there is one. Then the package's own rows
+            // stay, which that tenant reads through its link, and only they: the statements above
+            // are not undone, so this tenant has given up its link and what it held per tenant.
+            // Nothing removes the rows left once the other tenant gives the package up, since no
+            // statement of a tenant reaches another tenant's rows.
             let mut attempt = tx.savepoint("drop_superseded").map_err(definite)?;
             let mut kept = false;
             for statement in &own {
@@ -2288,6 +2249,35 @@ fn delete_superseded(
             if !kept {
                 attempt.commit().map_err(definite)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Remove from the catalog every tenant shares the packages in `candidates`, which this tenant
+/// has just given up, unless another tenant still has them. This tenant cannot see the others'
+/// links (its row policy hides them), so each package goes in a savepoint of its own and the
+/// foreign key from a link to the package says whether anyone still has it: then that one is
+/// undone. The last tenant to give a package up removes it.
+///
+/// A tenant that is being given the package links it before it reads anything else of it
+/// ([`PostgresPersistence::activate_shared`]), and the row is locked here before anything is
+/// removed, so the two cannot interleave: whichever comes second waits, and finds the other's
+/// outcome (a link to a package that was removed fails, and the tenant is given the package
+/// again from a copy built anew).
+fn drop_unlinked_shared(tx: &mut Transaction<'_>, candidates: &[i64]) -> Result<(), PersistError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // Only this transaction may write the shared catalog, and only from here on.
+    tx.batch_execute("SET LOCAL refhir.shared_writer = 'on'")
+        .map_err(definite)?;
+    for package_id in candidates {
+        let mut attempt = tx.savepoint("drop_shared").map_err(definite)?;
+        match drop_shared_package(&mut attempt, *package_id) {
+            Ok(()) => attempt.commit().map_err(definite)?,
+            Err(err) if err.code() == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {}
+            Err(err) => return Err(definite(err)),
         }
     }
     Ok(())

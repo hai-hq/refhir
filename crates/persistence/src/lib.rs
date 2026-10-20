@@ -560,10 +560,11 @@ pub struct InstalledParam {
     pub param_type: String,
     pub status: String,
     pub json: String,
-    /// The row belongs to an older version of the package that is being installed, so the install
-    /// replaces it: it takes no part in a clash with the incoming definition, and it goes once the
-    /// package is stored (see [`plan_search_parameter`]).
-    pub superseded: bool,
+    /// The row belongs to the version of the package that the install being planned replaces (its
+    /// predecessor): it takes no part in a clash with the incoming definition, and it goes once the
+    /// package is stored (see [`plan_search_parameter`]). A row of a package an earlier install
+    /// replaced is not given to the planner at all (see [`superseded_package_ids`]).
+    pub predecessor: bool,
 }
 
 /// What installing a search parameter should do given the rows already stored for its base
@@ -612,11 +613,11 @@ fn indexes_the_same(param: &NewSearchParameter, row: &InstalledParam) -> bool {
 /// Decide how `param` meets the `installed` rows that share its base and code. Only the rows
 /// that actually disagree with it and are experimental are ever removed.
 ///
-/// A row of an older version of the same package (`superseded`) is neither kept nor in conflict,
-/// whatever it says: the package that holds the incoming definition replaces it. The incoming
-/// parameter takes its place with the status it had when it would index the same, so that a
-/// parameter a new version leaves as it was is not indexed again, and as new when it would not,
-/// which is also what a parameter whose backfill never finished is.
+/// A row of the version of the same package that this install replaces (`predecessor`) is neither
+/// kept nor in conflict, whatever it says: the package that holds the incoming definition replaces
+/// it. The incoming parameter takes its place with the status it had when it would index the same,
+/// so that a parameter a new version leaves as it was is not indexed again, and as new when it
+/// would not, which is also what a parameter whose backfill never finished is.
 pub fn plan_search_parameter(
     param: &NewSearchParameter,
     installed: &[InstalledParam],
@@ -626,7 +627,7 @@ pub fn plan_search_parameter(
     let mut remove = Vec::new();
     let (mut keep, mut conflict) = (false, false);
     for row in installed {
-        if row.superseded {
+        if row.predecessor {
             if status.is_none()
                 && ParamStatus::parse(&row.status)? == ParamStatus::Ready
                 && indexes_the_same(param, row)
@@ -755,7 +756,7 @@ pub fn plan_package_parameters(
             param_type: param.param_type.clone(),
             status: status.as_str().to_string(),
             json: param.json.clone(),
-            superseded: false,
+            predecessor: false,
         });
         plan.inserts.push((position, status));
     }
@@ -823,6 +824,17 @@ pub struct PendingParam {
 /// A search parameter that an older version of a package had and no search parameter has now,
 /// named like a pending one by its base and code.
 pub type RetiredParam = PendingParam;
+
+/// The condition `column NOT IN (…)` that leaves the rows of the packages `ids` out of a statement,
+/// or nothing when there are none, so that a database without a replaced package reads what it
+/// did. The ids are numbers, so they are written into the statement.
+pub fn not_in_packages(column: &str, ids: &[i64]) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+    Some(format!("{column} NOT IN ({})", list.join(", ")))
+}
 
 /// The ids of the packages in `packages` that a newer version of the same name has replaced: every
 /// one but the newest of each name. Versions that [`compare_versions`] orders the same are told
@@ -1138,10 +1150,10 @@ pub trait ConformanceStore: Send + Sync {
     /// Remove the packages that newer versions have replaced, with everything they hold:
     /// definitions, search parameters, terminology, expansions and the backfills queued for them.
     /// Call it when nothing waits for an index and a process that follows the catalog has had time
-    /// to load the one that replaced them: a start or an install that comes after the one that
-    /// replaced them is late enough, and one in the same run of installs is not. A store that
+    /// to load the one that replaced them: the start of a process after the one that replaced them
+    /// is late enough, and an install that follows the one that replaced them is not. A store that
     /// shares what its tenants have in common also removes a shared package that no tenant has any
-    /// longer. The default does nothing.
+    /// longer, in the same transaction in which the tenant gives it up. The default does nothing.
     fn collect_superseded(&self) -> Result<(), PersistError> {
         Ok(())
     }
@@ -1312,7 +1324,7 @@ mod clash_tests {
             param_type: "string".into(),
             status: "ready".into(),
             json: format!(r#"{{"experimental":{experimental}}}"#),
-            superseded: false,
+            predecessor: false,
         }
     }
 
@@ -1345,9 +1357,9 @@ mod clash_tests {
     }
 
     #[test]
-    fn a_superseded_composite_is_indexed_again_and_a_plain_parameter_is_not() {
-        let superseded = |param_type: &str| InstalledParam {
-            superseded: true,
+    fn a_predecessor_composite_is_indexed_again_and_a_plain_parameter_is_not() {
+        let predecessor = |param_type: &str| InstalledParam {
+            predecessor: true,
             param_type: param_type.into(),
             ..row(1, "Patient.same", false)
         };
@@ -1357,7 +1369,7 @@ mod clash_tests {
         };
         let status = |param_type: &str| match plan_search_parameter(
             &incoming(param_type),
-            &[superseded(param_type)],
+            &[predecessor(param_type)],
         )
         .unwrap()
         {
@@ -1439,7 +1451,7 @@ mod clash_tests {
                 param_type: param.param_type.clone(),
                 status: status.as_str().into(),
                 json: param.json.clone(),
-                superseded: false,
+                predecessor: false,
             });
         }
         let mut rows: Rows = rows
@@ -1479,7 +1491,7 @@ mod clash_tests {
                 param_type: param.param_type.clone(),
                 status: status.as_str().into(),
                 json: param.json.clone(),
-                superseded: false,
+                predecessor: false,
             });
         }
         let mut rows: Rows = rows

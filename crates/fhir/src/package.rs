@@ -169,22 +169,32 @@ impl PendingBackfill {
 /// leaves stored until now (see `ConformanceStore::collect_superseded`), after clearing the index
 /// of each search parameter that only they defined.
 ///
-/// Call it once before a run of installs, never between them: a replica serves from the catalog it
-/// loaded until the search parameters of the install that replaced the packages have their index
-/// and it loads the next, and reads what the catalog it has points at, so what is removed must
-/// have been replaced before the last install began. It does nothing while a search parameter
-/// still waits for its index, for the same reason. A clearing that fails is tried again at the
-/// next call, with the packages still there to say what it was.
-pub fn collect_superseded(
-    store: &dyn ConformanceStore,
-    db: &Database,
-    catalog: &RwLock<Catalog>,
-) -> Result<(), FhirError> {
+/// Call it once, when the process starts and before its installs, and nowhere else: a replica
+/// serves from the catalog it loaded until the search parameters of the install that replaced the
+/// packages have their index and it loads the next, and reads what the catalog it has points at,
+/// so what is removed must have been replaced a whole process lifetime ago, not by the install
+/// before this one. It does nothing while a search parameter still waits for its index, for the
+/// same reason.
+///
+/// Nothing that is left stored is in force, so a failure is no reason to stop what the caller is
+/// doing: it is said, and the same removal is tried at the next start, with the packages still
+/// there to say what it was.
+pub fn collect_superseded(store: &dyn ConformanceStore, db: &Database, catalog: &RwLock<Catalog>) {
     if catalog.read().expect("catalog").has_pending_parameters() {
-        return Ok(());
+        return;
     }
+    let retired = match store.retired_parameters() {
+        Ok(retired) => retired,
+        Err(err) => {
+            tracing::warn!(
+                target: "refhir_engine",
+                "could not tell which packages that newer versions replaced can be removed: {err}"
+            );
+            return;
+        }
+    };
     let mut cleared = true;
-    for RetiredParam { base, code } in store.retired_parameters().map_err(FhirError::from)? {
+    for RetiredParam { base, code } in retired {
         if let Err(err) = tombstone_index(db, &base, &code) {
             tracing::warn!(
                 target: "refhir_engine",
@@ -195,9 +205,14 @@ pub fn collect_superseded(
         }
     }
     if cleared {
-        store.collect_superseded().map_err(FhirError::from)?;
+        if let Err(err) = store.collect_superseded() {
+            tracing::warn!(
+                target: "refhir_engine",
+                "could not remove the packages that newer versions replaced; they are kept until \
+                 the next start: {err}"
+            );
+        }
     }
-    Ok(())
 }
 
 /// The newest version of `name` in `installed` that is newer than `version`, if there is one.

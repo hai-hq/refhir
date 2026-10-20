@@ -41,11 +41,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   parameter out kept it, and a profile that a new version changed could lose to the older one's.
   The newest version of a package is now the one in force, and the database holds one version of
   each package: installing a newer one replaces the older one, and the older one's profiles, value
-  sets, code systems and search parameters are removed at the next start or `$install`, which is
-  how a replica can go on reading them until it has moved to the new catalog. A search parameter the new version defines again takes its
-  definition, and the resources already stored are indexed again for it when its expression, type
-  or targets changed (before the server answers requests, or before `$install` returns); one that
-  did not change is left as it was. A parameter whose code changed is searched by the new code only,
+  sets, code systems and search parameters are removed at the next start, which is how a replica
+  can go on reading them until it has moved to the new catalog. A search parameter the new version
+  defines again takes its definition, and the resources already stored are indexed again for it
+  when its expression, type or targets changed (before the server answers requests, or before
+  `$install` returns); one that did not change is left as it was. A parameter whose code changed is searched by the new code only,
   a parameter the version leaves out is no longer accepted or listed in the CapabilityStatement,
   and what was indexed under a code that is gone is cleared. The same holds for a package that
   another package depends on. Other packages are never replaced, and a clash between a parameter

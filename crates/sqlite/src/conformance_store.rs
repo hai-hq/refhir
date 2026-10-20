@@ -1,7 +1,7 @@
 use refhir_persistence::{
-    compare_versions, plan_search_parameter, superseded_package_ids, ConformanceStore,
-    ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion, NewPackage,
-    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamPlan,
+    compare_versions, not_in_packages, plan_search_parameter, superseded_package_ids,
+    ConformanceStore, ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion,
+    NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamPlan,
     ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, RetiredParam, StoredBackfill,
     StoredExpansion, StoredPackage, StoredSearchParameter, StoredStructureDefinition,
     StoredTerminology, CONFORMANCE_PAGE_ROWS,
@@ -43,11 +43,8 @@ fn expansion_from(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredExpansion> 
 
 /// `" AND package_id NOT IN (…)"` for the ids, or nothing when there are none.
 fn and_not_in(ids: &[i64]) -> String {
-    if ids.is_empty() {
-        return String::new();
-    }
-    let list: Vec<String> = ids.iter().map(i64::to_string).collect();
-    format!(" AND package_id NOT IN ({})", list.join(", "))
+    not_in_packages("package_id", ids)
+        .map_or_else(String::new, |condition| format!(" AND {condition}"))
 }
 
 impl SqlitePersistence {
@@ -1000,10 +997,10 @@ struct Installer<'a, 'c> {
     /// The versions of this package that are in force, which this install replaces: their search
     /// parameters take no part in a clash with the package's, and lend it their status when
     /// they index the same. Empty for a package that was there before.
-    superseded: Vec<i64>,
+    predecessors: Vec<i64>,
     /// The packages that an earlier install replaced, whose rows are still stored: they are not
     /// looked at when the package's search parameters are checked against what is installed.
-    stale: Vec<i64>,
+    superseded: Vec<i64>,
 }
 
 impl<'a, 'c> Installer<'a, 'c> {
@@ -1028,8 +1025,8 @@ impl<'a, 'c> Installer<'a, 'c> {
                 existing: true,
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
+                predecessors: Vec::new(),
                 superseded: Vec::new(),
-                stale: Vec::new(),
             });
         }
         let current: Option<String> = tx
@@ -1046,7 +1043,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 });
             }
         }
-        let (stale, superseded) = replaced_by(tx, name, version)?;
+        let (superseded, predecessors) = replaced_by(tx, name, version)?;
         tx.execute(
             "INSERT INTO packages (name, version, fhir_version) VALUES (?1, ?2, ?3)",
             params![name, version, fhir_version],
@@ -1058,8 +1055,8 @@ impl<'a, 'c> Installer<'a, 'c> {
             existing: false,
             newly_pending: Vec::new(),
             expansions_cleared: false,
+            predecessors,
             superseded,
-            stale,
         })
     }
 
@@ -1089,9 +1086,9 @@ impl<'a, 'c> Installer<'a, 'c> {
 }
 
 /// What a package of this `name` and `version`, about to be stored, finds: the packages an earlier
-/// install replaced and that are still stored, and the versions of the package that are in force
-/// and older than `version` or ordering the same (a package of that exact version is not among them:
-/// it was found before), which this one replaces.
+/// install replaced and that are still stored (superseded), and the versions of the package that
+/// are in force and older than `version` or ordering the same (a package of that exact version is
+/// not among them: it was found before), which this one replaces (its predecessors).
 fn replaced_by(
     tx: &Transaction<'_>,
     name: &str,
@@ -1112,17 +1109,17 @@ fn replaced_by(
         .map_err(definite)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(definite)?;
-    let stale = superseded_package_ids(&packages);
-    let older = packages
+    let superseded = superseded_package_ids(&packages);
+    let predecessors = packages
         .iter()
         .filter(|package| {
             package.name == name
-                && !stale.contains(&package.id)
+                && !superseded.contains(&package.id)
                 && compare_versions(&package.version, version).is_le()
         })
         .map(|package| package.id)
         .collect();
-    Ok((stale, older))
+    Ok((superseded, predecessors))
 }
 
 impl PackageRows for Installer<'_, '_> {
@@ -1159,7 +1156,7 @@ impl PackageRows for Installer<'_, '_> {
             return Ok(());
         }
         let tx = self.tx;
-        let and_in_force = and_not_in(&self.stale);
+        let and_in_force = and_not_in(&self.superseded);
         for param in rows {
             let installed = tx
                 .prepare(&format!(
@@ -1176,7 +1173,7 @@ impl PackageRows for Installer<'_, '_> {
                         param_type: row.get(3)?,
                         status: row.get(4)?,
                         json: row.get(5)?,
-                        superseded: self.superseded.contains(&package_id),
+                        predecessor: self.predecessors.contains(&package_id),
                     })
                 })
                 .map_err(definite)?

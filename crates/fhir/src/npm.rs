@@ -11,15 +11,15 @@ use std::time::Duration;
 
 use flate2::read::GzDecoder;
 use refhir_database::{Database, ReadSet};
-use refhir_persistence::ConformanceStore;
+use refhir_persistence::{ConformanceStore, StoredPackage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::package::{
-    collect_superseded, finish_install, newer_version, note_newer_installed, package_identity,
-    package_root, read_manifest, run_backfills, stage_package_deferred,
+    finish_install, newer_version, note_newer_installed, package_identity, package_root,
+    read_manifest, run_backfills, stage_package_deferred,
 };
 use crate::run::RunResult;
 use crate::s3::S3Source;
@@ -164,11 +164,12 @@ pub fn install_with(
 /// Whether every `name@version` spec is in the database, or has been replaced there by a newer
 /// version of the package, which is what installing it would leave.
 pub fn packages_installed(store: &dyn ConformanceStore, specs: &[&str]) -> Result<bool, FhirError> {
+    let installed = store.load_packages().map_err(FhirError::from)?;
     for spec in specs {
         match parse_package_spec(spec)? {
             PackageSpec::Npm { name, version } => {
-                if !already_installed(store, &name, &version)?
-                    && newer_installed(store, &name, &version)?.is_none()
+                if !held_exactly(&installed, &name, &version)
+                    && newer_version(&installed, &name, &version).is_none()
                 {
                     return Ok(false);
                 }
@@ -197,8 +198,6 @@ pub fn install_operation(
     let (name, version) = npm_spec_from_args(args)?;
     let spec = format!("{name}@{version}");
     let fetcher = NpmRegistry::from_env()?;
-    // What an earlier install replaced goes now, before this one replaces more.
-    collect_superseded(store, db, catalog)?;
     let before = unexpandable_value_sets(catalog);
     let newer = newer_installed(store, &name, &version)?;
     install_with(store, db, catalog, &spec, &fetcher, &fetcher.cache_dir)?;
@@ -811,10 +810,7 @@ fn nothing_to_install(
     version: &str,
 ) -> Result<bool, FhirError> {
     let installed = store.load_packages().map_err(FhirError::from)?;
-    if installed
-        .iter()
-        .any(|package| package.name == name && package.version == version)
-    {
+    if held_exactly(&installed, name, version) {
         return Ok(true);
     }
     let Some(newer) = newer_version(&installed, name, version) else {
@@ -829,11 +825,15 @@ fn already_installed(
     name: &str,
     version: &str,
 ) -> Result<bool, FhirError> {
-    Ok(store
-        .load_packages()
-        .map_err(FhirError::from)?
+    let installed = store.load_packages().map_err(FhirError::from)?;
+    Ok(held_exactly(&installed, name, version))
+}
+
+/// Whether `installed` holds `name` at exactly `version`.
+fn held_exactly(installed: &[StoredPackage], name: &str, version: &str) -> bool {
+    installed
         .iter()
-        .any(|package| package.name == name && package.version == version))
+        .any(|package| package.name == name && package.version == version)
 }
 
 fn scratch_dir() -> Result<PathBuf, FhirError> {

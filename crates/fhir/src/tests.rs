@@ -2058,7 +2058,7 @@ fn a_package_version_that_gives_a_search_parameter_another_code_is_searched_by_t
     // still serves from the catalog it loaded before; then nothing is left under the old code.
     assert_eq!(index_entries(&harness, "Patient/label"), entries);
     assert_eq!(index_entries(&harness, "Patient/alias"), entries);
-    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
     assert_eq!(index_entries(&harness, "Patient/label"), 0);
     assert_eq!(index_entries(&harness, "Patient/alias"), entries);
     assert_eq!(
@@ -2091,7 +2091,7 @@ fn a_search_parameter_that_a_newer_package_version_leaves_out_is_gone() {
     );
     assert!(!advertised(&harness).contains(&"nick".to_string()));
     assert!(index_entries(&harness, "Patient/nick") > 0);
-    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
     assert_eq!(index_entries(&harness, "Patient/nick"), 0);
     // The one it kept is as it was: nothing was indexed again for it, so no backfill was queued
     // for the package that holds it.
@@ -2601,7 +2601,7 @@ fn a_catalog_loaded_before_an_upgrade_answers_as_it_did_until_the_replaced_packa
     }
 
     // Collected, the old index is cleared, and what the new catalog answers does not change.
-    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
     assert_eq!(index_entries(&harness, "Patient/label"), 0);
     assert_eq!(search_total(&harness, "alias", "Smith"), 1);
     assert_eq!(errors(&harness.catalog.read().unwrap(), false, true), 0);
@@ -2626,16 +2626,36 @@ fn nothing_is_collected_while_a_search_parameter_waits_for_its_index() {
         .expect("the new parameter waits for its index");
     publish(&harness.store, &harness.catalog).unwrap();
     follow_up.create(&harness.store, &harness.db).unwrap();
-    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
     assert!(index_entries(&harness, "Patient/alias") > 0);
     assert!(!harness.store.retired_parameters().unwrap().is_empty());
 
     // Once the index is built it goes.
     run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
-    collect_superseded(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
     assert_eq!(index_entries(&harness, "Patient/alias"), 0);
     assert!(harness.store.retired_parameters().unwrap().is_empty());
     assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_collection_that_fails_does_not_stop_the_caller_and_is_tried_at_the_next_call() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "alias", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    let v2 = upgrade_package("0.2.0", &[("nick", "nick", "Patient.birthDate")]);
+    install_dir(&harness, &v2).unwrap();
+    assert!(!harness.store.retired_parameters().unwrap().is_empty());
+
+    // The store refuses once: the call returns, and what the older version held is still stored.
+    let watched = WatchedStore::new(harness.store.clone());
+    watched.fail_collect_superseded.store(1, Ordering::SeqCst);
+    collect_superseded(&watched, &harness.db, &harness.catalog);
+    assert!(!harness.store.retired_parameters().unwrap().is_empty());
+
+    collect_superseded(&watched, &harness.db, &harness.catalog);
+    assert!(harness.store.retired_parameters().unwrap().is_empty());
     remove_dirs(&[&v1, &v2]);
 }
 
@@ -6925,6 +6945,8 @@ struct WatchedStore {
     fail_apply_expansions: AtomicUsize,
     /// How many of the next reads of every terminology row to fail.
     fail_load_terminology: AtomicUsize,
+    /// How many of the next collections of replaced packages to fail.
+    fail_collect_superseded: AtomicUsize,
     /// Counter writes that announce a change to the other processes.
     fail_bump_catalog: AtomicUsize,
     fail_bump_terminology: AtomicUsize,
@@ -6947,6 +6969,7 @@ impl WatchedStore {
             fail_upsert_terminology: AtomicUsize::new(0),
             fail_apply_expansions: AtomicUsize::new(0),
             fail_load_terminology: AtomicUsize::new(0),
+            fail_collect_superseded: AtomicUsize::new(0),
             fail_bump_catalog: AtomicUsize::new(0),
             fail_bump_terminology: AtomicUsize::new(0),
             fail_row_reads: AtomicUsize::new(0),
@@ -7012,6 +7035,17 @@ impl ConformanceStore for WatchedStore {
     }
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         self.inner.load_packages()
+    }
+    fn retired_parameters(&self) -> Result<Vec<refhir_persistence::RetiredParam>, PersistError> {
+        self.inner.retired_parameters()
+    }
+    fn collect_superseded(&self) -> Result<(), PersistError> {
+        if Self::should_fail(&self.fail_collect_superseded) {
+            return Err(PersistError::Definite(
+                "injected: collect superseded".into(),
+            ));
+        }
+        self.inner.collect_superseded()
     }
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
         self.definition_loads.fetch_add(1, Ordering::SeqCst);
