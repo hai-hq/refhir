@@ -42,6 +42,44 @@ const EDGES: &[(&str, &str)] = &[
 const STAY_START: &str = "2026-10-31T23:30:00+01:00";
 const STAY_END: &str = "2026-11-01T01:30:00+01:00";
 
+/// Encounters that started and have no end, which R4 reads as going on. Their ids start with
+/// `open-`: `found` leaves them out, so that what goes on past a window does not change the sets
+/// the moments above are checked against, and `found_open` reads only them.
+const OPEN: &[(&str, &str)] = &[
+    // 2026-10-31T22:30:00Z: the first Encounter of the report that started this.
+    ("open-z", "2026-10-31T22:30:00Z"),
+    // The same moment, written at +01:00: the second.
+    ("open-plus01", "2026-10-31T23:30:00+01:00"),
+    // 2026-12-01T08:00:00Z.
+    ("open-dec", "2026-12-01T09:00:00+01:00"),
+];
+
+/// Periods of an EpisodeOfCare, whose `date` is its `period`: a start and an end, either of which
+/// may be missing. Each comment is what it stands for in UTC, up to the first moment after it.
+#[allow(clippy::type_complexity)]
+const EPISODES: &[(&str, Option<&str>, Option<&str>)] = &[
+    // 2026-10-29T08:00:00Z up to 2026-10-31T12:00:01Z: the end is the second it names.
+    (
+        "ep-closed",
+        Some("2026-10-29T08:00:00Z"),
+        Some("2026-10-31T12:00:00Z"),
+    ),
+    // The same two moments, written at +01:00.
+    (
+        "ep-zones",
+        Some("2026-10-29T09:00:00+01:00"),
+        Some("2026-10-31T13:00:00+01:00"),
+    ),
+    // From 2026-10-29T08:00:00Z, and not ended.
+    ("ep-open-end", Some("2026-10-29T08:00:00Z"), None),
+    // Until 2026-10-31T12:00:01Z, with no start.
+    ("ep-open-start", None, Some("2026-10-31T12:00:00Z")),
+    // 2026-10-29T00:00:00Z up to 2026-11-01T00:00:00Z: the start of one day to the end of another.
+    ("ep-days", Some("2026-10-29"), Some("2026-10-31")),
+    // 2026-01-01 up to 2027-01-01.
+    ("ep-year", Some("2026"), Some("2026")),
+];
+
 /// The window 2026-09-30T23:00:00Z (the first moment in it) up to 2026-10-31T23:00:00Z (the first
 /// moment after it), written in six zones: each pair is the same two moments.
 const WINDOWS: &[(&str, &str)] = &[
@@ -140,16 +178,36 @@ fn fixture() -> &'static Harness {
     SHARED.get_or_init(|| {
         let harness = r4_ready();
         for (id, start) in SAME.iter().chain(EDGES) {
-            store(&harness, encounter(id, json!({"start": start})));
+            // A moment is a period that starts and ends in it.
+            store(
+                &harness,
+                encounter(id, json!({"start": start, "end": start})),
+            );
         }
         store(
             &harness,
             encounter("stay", json!({"start": STAY_START, "end": STAY_END})),
         );
+        for (id, start) in OPEN {
+            store(&harness, encounter(id, json!({"start": start})));
+        }
         for (id, written) in PRECISIONS {
             store(&harness, effective(&format!("obs-{id}"), written));
         }
         store(&harness, json!({"resourceType": "Patient", "id": "p1"}));
+        for (id, start, end) in EPISODES {
+            let mut period = serde_json::Map::new();
+            for (name, value) in [("start", start), ("end", end)] {
+                if let Some(value) = value {
+                    period.insert(name.to_string(), json!(value));
+                }
+            }
+            store(
+                &harness,
+                json!({"resourceType": "EpisodeOfCare", "id": id, "status": "active",
+                    "patient": {"reference": "Patient/p1"}, "period": period}),
+            );
+        }
         store(
             &harness,
             json!({"resourceType": "Organization", "id": "o1", "name": "Insurer"}),
@@ -172,14 +230,27 @@ fn fixture() -> &'static Harness {
     })
 }
 
-/// The ids a search finds, in order. A parameter given more than once is AND.
-fn found(type_name: &str, param: &str, values: &[&str]) -> Vec<String> {
+/// The ids a search finds, in order, whatever they are. A parameter given more than once is AND.
+fn found_all(type_name: &str, param: &str, values: &[&str]) -> Vec<String> {
     let bundle = apply(
         fixture(),
         &format!("{type_name}/search"),
         json!({param: values.join("\u{1f}")}),
     );
     matched_ids(&bundle)
+}
+
+/// `found_all`, without the Encounters that have no end.
+fn found(type_name: &str, param: &str, values: &[&str]) -> Vec<String> {
+    found_all(type_name, param, values)
+        .into_iter()
+        .filter(|id| !id.starts_with("open-"))
+        .collect()
+}
+
+/// What a search finds among the Encounters that have no end.
+fn found_open(values: &[&str]) -> Vec<String> {
+    only(found_all("Encounter", "date", values), "open-")
 }
 
 fn sorted(ids: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
@@ -257,9 +328,11 @@ fn a_window_keeps_what_its_clock_says_and_its_moment_does_not() {
         assert_eq!(ids, after_open, "gt{open} le{close}");
     }
     // `sa` and `eb` take only what lies wholly beyond a value: the second before the close is
-    // wholly before it, the one at the close is not, and one at the opening is not after it.
+    // wholly before it, the one at the close is not, and one at the opening is not after it. The
+    // stay starts inside the window and ends at 2026-11-01T00:30:01Z, so it is not wholly before the
+    // close.
     let mut wholly = same_ids();
-    wholly.extend(["edge-before-close", "stay"].map(String::from));
+    wholly.extend(["edge-before-close"].map(String::from));
     let wholly = sorted(wholly);
     for (open, close) in WINDOWS {
         let ids = found(
@@ -331,7 +404,7 @@ fn every_prefix_answers_alike_for_the_same_moment_in_any_zone() {
     }
 }
 
-/// A period is read at both ends, each in the zone it was written in.
+/// A period runs between its ends, each read in the zone it was written in.
 #[test]
 fn the_ends_of_a_period_are_read_in_their_own_zones() {
     let has_stay = |value: &str| {
@@ -523,26 +596,9 @@ fn all_names() -> Vec<&'static str> {
     PRECISIONS.iter().map(|(name, _)| *name).collect()
 }
 
-/// `have` is what the search must find; of the rest, what is not in `open` it must not find. A
-/// stored value wider than the search value overlaps it without lying inside it, and for `eq`,
-/// `ne`, and `ge` and `le` at the edge of it, R4 and a plain overlap answer differently; those are
-/// left `open`, and each is the stored value that is wider than the one asked for.
-fn check(query: &str, have: &[&str], open: &[&str]) {
-    let names = by_name(query);
-    for name in have.iter().copied() {
-        assert!(
-            names.iter().any(|found| found == name),
-            "{query} should find {name}: {names:?}"
-        );
-    }
-    for name in all_names() {
-        if !have.contains(&name) && !open.contains(&name) {
-            assert!(
-                !names.iter().any(|found| found == name),
-                "{query} should not find {name}: {names:?}"
-            );
-        }
-    }
+/// What the search must find among the Observations, and nothing else.
+fn exact(query: &str, expected: &[&str]) {
+    assert_eq!(by_name(query), sorted(expected), "{query}");
 }
 
 fn all_but(left_out: &[&str]) -> Vec<&'static str> {
@@ -552,38 +608,37 @@ fn all_but(left_out: &[&str]) -> Vec<&'static str> {
         .collect()
 }
 
+/// `eq` is what the search value holds, whole: R4 asks that the range of the search value fully
+/// contains the range of the stored value, so a month or a year, which reaches beyond the day, is
+/// not `eq` to it, and it is `ne`.
 #[test]
 fn a_value_to_the_day_is_the_day_in_utc() {
     // 2026-10-31 up to 2026-11-01.
-    let (day, narrower) = (
-        "2026-10-31",
-        [
-            "day",
-            "second",
-            "second-plus01",
-            "tenth",
-            "milli",
-            "prev-second",
-            "next-second",
-        ],
+    let narrower = [
+        "day",
+        "second",
+        "second-plus01",
+        "tenth",
+        "milli",
+        "prev-second",
+        "next-second",
+    ];
+    exact("eq2026-10-31", &narrower);
+    exact("2026-10-31", &narrower);
+    exact(
+        "ne2026-10-31",
+        &["year", "month", "next-day", "next-month", "next-year"],
     );
-    check(&format!("eq{day}"), &narrower, &["year", "month"]);
-    check(day, &narrower, &["year", "month"]);
-    check(
-        &format!("ne{day}"),
-        &["next-day", "next-month", "next-year"],
-        &["year", "month"],
-    );
-    check(
-        &format!("gt{day}"),
+    exact(
+        "gt2026-10-31",
         &["year", "next-day", "next-month", "next-year"],
-        &[],
     );
-    check(&format!("lt{day}"), &["year", "month"], &[]);
-    // The month ends where the day does, and a plain overlap takes it; R4 does not.
-    check(&format!("ge{day}"), &all_but(&["month"]), &["month"]);
-    check(
-        &format!("le{day}"),
+    exact("lt2026-10-31", &["year", "month"]);
+    // The month ends where the day does: it does not reach above the day, and the day does not
+    // hold it, so it is not `ge` the day.
+    exact("ge2026-10-31", &all_but(&["month"]));
+    exact(
+        "le2026-10-31",
         &[
             "year",
             "month",
@@ -595,14 +650,9 @@ fn a_value_to_the_day_is_the_day_in_utc() {
             "prev-second",
             "next-second",
         ],
-        &[],
     );
-    check(
-        &format!("sa{day}"),
-        &["next-day", "next-month", "next-year"],
-        &[],
-    );
-    check(&format!("eb{day}"), &[], &[]);
+    exact("sa2026-10-31", &["next-day", "next-month", "next-year"]);
+    exact("eb2026-10-31", &[]);
 }
 
 #[test]
@@ -610,13 +660,20 @@ fn a_value_to_the_minute_is_the_minute() {
     // 22:30:00 up to 22:31:00.
     let q = "2026-10-31T22:30Z";
     let inside = ["second", "second-plus01", "tenth", "milli", "next-second"];
-    check(&format!("eq{q}"), &inside, &["year", "month", "day"]);
-    check(
+    exact(&format!("eq{q}"), &inside);
+    exact(
         &format!("ne{q}"),
-        &["prev-second", "next-day", "next-month", "next-year"],
-        &["year", "month", "day"],
+        &[
+            "year",
+            "month",
+            "day",
+            "prev-second",
+            "next-day",
+            "next-month",
+            "next-year",
+        ],
     );
-    check(
+    exact(
         &format!("gt{q}"),
         &[
             "year",
@@ -626,15 +683,10 @@ fn a_value_to_the_minute_is_the_minute() {
             "next-month",
             "next-year",
         ],
-        &[],
     );
-    check(
-        &format!("lt{q}"),
-        &["year", "month", "day", "prev-second"],
-        &[],
-    );
-    check(&format!("ge{q}"), &all_but(&["prev-second"]), &[]);
-    check(
+    exact(&format!("lt{q}"), &["year", "month", "day", "prev-second"]);
+    exact(&format!("ge{q}"), &all_but(&["prev-second"]));
+    exact(
         &format!("le{q}"),
         &[
             "year",
@@ -647,48 +699,36 @@ fn a_value_to_the_minute_is_the_minute() {
             "prev-second",
             "next-second",
         ],
-        &[],
     );
-    check(
-        &format!("sa{q}"),
-        &["next-day", "next-month", "next-year"],
-        &[],
-    );
-    check(&format!("eb{q}"), &["prev-second"], &[]);
+    exact(&format!("sa{q}"), &["next-day", "next-month", "next-year"]);
+    exact(&format!("eb{q}"), &["prev-second"]);
     // The same minute in another zone.
-    check(
-        "eq2026-10-31T23:30+01:00",
-        &inside,
-        &["year", "month", "day"],
-    );
-    check(
-        "eq2026-10-31T17:30-05:00",
-        &inside,
-        &["year", "month", "day"],
-    );
+    exact("eq2026-10-31T23:30+01:00", &inside);
+    exact("eq2026-10-31T17:30-05:00", &inside);
 }
 
 #[test]
 fn a_value_to_the_second_is_the_second() {
     // 22:30:00 up to 22:30:01.
     let q = "2026-10-31T22:30:00Z";
-    check(
+    exact(
         &format!("eq{q}"),
         &["second", "second-plus01", "tenth", "milli"],
-        &["year", "month", "day"],
     );
-    check(
+    exact(
         &format!("ne{q}"),
         &[
+            "year",
+            "month",
+            "day",
             "prev-second",
             "next-second",
             "next-day",
             "next-month",
             "next-year",
         ],
-        &["year", "month", "day"],
     );
-    check(
+    exact(
         &format!("gt{q}"),
         &[
             "year",
@@ -699,15 +739,10 @@ fn a_value_to_the_second_is_the_second() {
             "next-month",
             "next-year",
         ],
-        &[],
     );
-    check(
-        &format!("lt{q}"),
-        &["year", "month", "day", "prev-second"],
-        &[],
-    );
-    check(&format!("ge{q}"), &all_but(&["prev-second"]), &[]);
-    check(
+    exact(&format!("lt{q}"), &["year", "month", "day", "prev-second"]);
+    exact(&format!("ge{q}"), &all_but(&["prev-second"]));
+    exact(
         &format!("le{q}"),
         &[
             "year",
@@ -719,18 +754,15 @@ fn a_value_to_the_second_is_the_second() {
             "milli",
             "prev-second",
         ],
-        &[],
     );
-    check(
+    exact(
         &format!("sa{q}"),
         &["next-second", "next-day", "next-month", "next-year"],
-        &[],
     );
-    check(&format!("eb{q}"), &["prev-second"], &[]);
-    check(
+    exact(&format!("eb{q}"), &["prev-second"]);
+    exact(
         "eq2026-10-31T23:30:00+01:00",
         &["second", "second-plus01", "tenth", "milli"],
-        &["year", "month", "day"],
     );
 }
 
@@ -738,20 +770,9 @@ fn a_value_to_the_second_is_the_second() {
 fn a_value_to_the_millisecond_is_the_millisecond() {
     // 22:30:00.123 up to 22:30:00.124.
     let q = "2026-10-31T22:30:00.123Z";
-    let wider = ["year", "month", "day", "second", "second-plus01", "tenth"];
-    check(&format!("eq{q}"), &["milli"], &wider);
-    check(
-        &format!("ne{q}"),
-        &[
-            "prev-second",
-            "next-second",
-            "next-day",
-            "next-month",
-            "next-year",
-        ],
-        &wider,
-    );
-    check(
+    exact(&format!("eq{q}"), &["milli"]);
+    exact(&format!("ne{q}"), &all_but(&["milli"]));
+    exact(
         &format!("gt{q}"),
         &[
             "year",
@@ -765,9 +786,8 @@ fn a_value_to_the_millisecond_is_the_millisecond() {
             "next-month",
             "next-year",
         ],
-        &[],
     );
-    check(
+    exact(
         &format!("lt{q}"),
         &[
             "year",
@@ -778,10 +798,9 @@ fn a_value_to_the_millisecond_is_the_millisecond() {
             "tenth",
             "prev-second",
         ],
-        &[],
     );
-    check(&format!("ge{q}"), &all_but(&["prev-second"]), &[]);
-    check(
+    exact(&format!("ge{q}"), &all_but(&["prev-second"]));
+    exact(
         &format!("le{q}"),
         &[
             "year",
@@ -793,23 +812,17 @@ fn a_value_to_the_millisecond_is_the_millisecond() {
             "milli",
             "prev-second",
         ],
-        &[],
     );
-    check(
+    exact(
         &format!("sa{q}"),
         &["next-second", "next-day", "next-month", "next-year"],
-        &[],
     );
-    check(&format!("eb{q}"), &["prev-second"], &[]);
-    check("eq2026-10-31T23:30:00.123+01:00", &["milli"], &wider);
+    exact(&format!("eb{q}"), &["prev-second"]);
+    exact("eq2026-10-31T23:30:00.123+01:00", &["milli"]);
     // A fraction is a tenth, a hundredth or a thousandth, however many digits are written.
-    check(
-        "eq2026-10-31T22:30:00.1Z",
-        &["tenth", "milli"],
-        &["year", "month", "day", "second", "second-plus01"],
-    );
-    check("eq2026-10-31T22:30:00.12Z", &["milli"], &wider);
-    check("eq2026-10-31T22:30:00.123456Z", &["milli"], &wider);
+    exact("eq2026-10-31T22:30:00.1Z", &["tenth", "milli"]);
+    exact("eq2026-10-31T22:30:00.12Z", &["milli"]);
+    exact("eq2026-10-31T22:30:00.123456Z", &["milli"]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -865,6 +878,216 @@ fn created_is_compared_as_a_moment_for_claims_responses_and_payments() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Periods
+
+/// What a search finds among the EpisodeOfCare periods.
+fn episodes(values: &[&str]) -> Vec<String> {
+    found("EpisodeOfCare", "date", values)
+}
+
+fn ids(names: &[&str]) -> Vec<String> {
+    sorted(names)
+}
+
+/// A period is the range from where its start begins to where its end stops, and the prefixes
+/// compare that range with the one the value names. Each expected answer below is worked out from
+/// `EPISODES`: the closed ones run 2026-10-29T08:00:00Z up to 2026-10-31T12:00:01Z (`ep-closed`
+/// and `ep-zones`), `ep-days` is 2026-10-29 up to 2026-11-01, `ep-year` is 2026, `ep-open-end` has
+/// no end and `ep-open-start` no start.
+#[test]
+fn a_period_is_compared_as_the_range_between_its_ends() {
+    let all = ids(&[
+        "ep-closed",
+        "ep-zones",
+        "ep-open-end",
+        "ep-open-start",
+        "ep-days",
+        "ep-year",
+    ]);
+    // `eq` is a period that lies wholly inside the value.
+    assert_eq!(episodes(&["eq2026-10-30"]), ids(&[]));
+    assert_eq!(episodes(&["ne2026-10-30"]), all);
+    assert_eq!(
+        episodes(&["eq2026-10"]),
+        ids(&["ep-closed", "ep-zones", "ep-days"])
+    );
+    assert_eq!(
+        episodes(&["ne2026-10"]),
+        ids(&["ep-open-end", "ep-open-start", "ep-year"])
+    );
+    assert_eq!(
+        episodes(&["eq2026"]),
+        ids(&["ep-closed", "ep-zones", "ep-days", "ep-year"])
+    );
+    assert_eq!(
+        episodes(&["ne2026"]),
+        ids(&["ep-open-end", "ep-open-start"])
+    );
+    assert_eq!(episodes(&["eq2026-10-31T12:00:00Z"]), ids(&[]));
+    // `gt` is a period that reaches above the value, `lt` one that reaches below it.
+    assert_eq!(
+        episodes(&["gt2026-10-31"]),
+        ids(&["ep-open-end", "ep-year"])
+    );
+    assert_eq!(episodes(&["lt2026-10-30"]), all);
+    assert_eq!(
+        episodes(&["lt2026-10-29"]),
+        ids(&["ep-open-start", "ep-year"])
+    );
+    // `ge` and `le` add the period that lies wholly inside the value. None does here: one that
+    // ends inside the day does not reach above it, and one that starts inside the day does not
+    // reach below it.
+    assert_eq!(
+        episodes(&["ge2026-10-31"]),
+        ids(&["ep-open-end", "ep-year"])
+    );
+    assert_eq!(
+        episodes(&["le2026-10-29"]),
+        ids(&["ep-open-start", "ep-year"])
+    );
+    // `sa` is a period wholly after the value, `eb` one wholly before it.
+    assert_eq!(
+        episodes(&["sa2026-10-28"]),
+        ids(&["ep-closed", "ep-zones", "ep-open-end", "ep-days"])
+    );
+    assert_eq!(episodes(&["sa2026-10-31"]), ids(&[]));
+    assert_eq!(
+        episodes(&["eb2026-11-01"]),
+        ids(&["ep-closed", "ep-zones", "ep-days", "ep-open-start"])
+    );
+    assert_eq!(episodes(&["eb2026-10-29"]), ids(&[]));
+}
+
+/// A window of two values, which is how a period is asked for between two times: it finds every
+/// period that is going on at some time in it.
+#[test]
+fn a_window_finds_the_periods_that_are_going_on_in_it() {
+    let all = ids(&[
+        "ep-closed",
+        "ep-zones",
+        "ep-open-end",
+        "ep-open-start",
+        "ep-days",
+        "ep-year",
+    ]);
+    // Every one of them is going on during 2026-10-30, written in UTC and at +01:00.
+    for window in [
+        ["ge2026-10-30T00:00:00Z", "lt2026-10-31T00:00:00Z"],
+        ["ge2026-10-30T01:00:00+01:00", "lt2026-10-31T01:00:00+01:00"],
+        ["ge2026-10-29T19:00:00-05:00", "lt2026-10-30T19:00:00-05:00"],
+    ] {
+        assert_eq!(episodes(&window), all, "{window:?}");
+    }
+    // Only what has not ended, and the year, are going on in the middle of November.
+    for window in [
+        ["ge2026-11-02T00:00:00Z", "lt2026-11-03T00:00:00Z"],
+        ["ge2026-11-02T01:00:00+01:00", "lt2026-11-03T01:00:00+01:00"],
+    ] {
+        assert_eq!(
+            episodes(&window),
+            ids(&["ep-open-end", "ep-year"]),
+            "{window:?}"
+        );
+    }
+    // Before any of them started, what has no start and the year are going on.
+    assert_eq!(
+        episodes(&["ge2026-09-01T00:00:00Z", "lt2026-09-02T00:00:00Z"]),
+        ids(&["ep-open-start", "ep-year"])
+    );
+    // Far from every date they hold, only what has no start is below 2020, and only what has no end
+    // is above 2030: they are found by being open, not by being near.
+    assert_eq!(episodes(&["lt2020-01-01"]), ids(&["ep-open-start"]));
+    assert_eq!(episodes(&["gt2030-01-01"]), ids(&["ep-open-end"]));
+    // And in January 2027 only what has no end, since the year ends at the start of it.
+    assert_eq!(
+        episodes(&["ge2027-01-01T00:00:00Z", "lt2027-02-01T00:00:00Z"]),
+        ids(&["ep-open-end"])
+    );
+}
+
+/// The same two moments written at +01:00 are the same period, whichever way it is asked for.
+#[test]
+fn a_period_written_in_another_zone_is_the_same_period() {
+    let mut values: Vec<String> = Vec::new();
+    for prefix in ["eq", "ne", "gt", "lt", "ge", "le", "sa", "eb"] {
+        for value in [
+            "2026",
+            "2026-10",
+            "2026-10-29",
+            "2026-10-31",
+            "2026-11-01",
+            "2026-10-29T08:00:00Z",
+            "2026-10-29T09:00:00+01:00",
+            "2026-10-29T07:59:59Z",
+            "2026-10-29T08:00:01Z",
+            "2026-10-31T12:00:00Z",
+            "2026-10-31T07:00:00-05:00",
+            "2026-10-31T11:59:59Z",
+            "2026-10-31T12:00:01Z",
+        ] {
+            values.push(format!("{prefix}{value}"));
+        }
+    }
+    for value in &values {
+        let ids = episodes(&[value]);
+        assert_eq!(
+            ids.contains(&"ep-closed".to_string()),
+            ids.contains(&"ep-zones".to_string()),
+            "{value}: {ids:?}"
+        );
+    }
+}
+
+/// An Encounter with a start and no end has not ended: R4 reads its period as going on, so it is
+/// found by a window after the one it started in as well as by the one it started in, and it is
+/// `ne` any time it is not wholly inside.
+#[test]
+fn an_encounter_with_no_end_is_going_on() {
+    let both = ids(&["open-plus01", "open-z"]);
+    // The request that started this: the one at 22:30Z and the same moment at +01:00 are both in
+    // the window, in UTC and in other zones, and the one that starts in December is not.
+    for (open, close) in WINDOWS {
+        assert_eq!(
+            found_open(&[&format!("ge{open}"), &format!("lt{close}")]),
+            both,
+            "ge{open} lt{close}"
+        );
+    }
+    // A window in the middle of November: both are still going on, and the December one has not
+    // started.
+    assert_eq!(
+        found_open(&["ge2026-11-15T00:00:00Z", "lt2026-11-16T00:00:00Z"]),
+        both
+    );
+    // A window in 2027: all three.
+    assert_eq!(
+        found_open(&["ge2027-01-01T00:00:00Z", "lt2027-01-02T00:00:00Z"]),
+        ids(&["open-dec", "open-plus01", "open-z"])
+    );
+    // A window that closes before any of them started holds none.
+    assert!(found_open(&["ge2026-10-01T00:00:00Z", "lt2026-10-02T00:00:00Z"]).is_empty());
+    assert!(found_open(&["lt2026-10-31T22:15:00Z"]).is_empty());
+    assert_eq!(found_open(&["lt2026-10-31T22:45:00Z"]), both);
+    assert_eq!(found_open(&["lt2026-10-31T23:45:00+01:00"]), both);
+    // They reach above anything, and lie wholly after what is before them.
+    assert_eq!(
+        found_open(&["gt2030-01-01"]),
+        ids(&["open-dec", "open-plus01", "open-z"])
+    );
+    assert_eq!(
+        found_open(&["sa2026-10-31T22:00:00Z"]),
+        ids(&["open-dec", "open-plus01", "open-z"])
+    );
+    // They are never inside a value and never wholly before one.
+    assert!(found_open(&["eq2026-10-31"]).is_empty());
+    assert!(found_open(&["eb2030-01-01"]).is_empty());
+    assert_eq!(
+        found_open(&["ne2026-10-31"]),
+        ids(&["open-dec", "open-plus01", "open-z"])
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Order
 
 /// The ids of a search in the order the bundle holds them, which `matched_ids` does not keep.
@@ -880,6 +1103,7 @@ fn in_order(sort: &str) -> Vec<String> {
         .iter()
         .filter(|entry| entry["search"]["mode"] == "match")
         .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+        .filter(|id| !id.starts_with("open-"))
         .collect()
 }
 

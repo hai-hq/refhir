@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 
 use postgres::{Client, NoTls};
 use refhir_database::Database;
-use refhir_fhir::{import_resource, install_package_dir, minir4_dir, run, Catalog};
+use refhir_fhir::{import_resource, install_package_dir, r4_dir, run, Catalog};
 use refhir_postgres::test_support::with_database;
 use refhir_postgres::PostgresPersistence;
 use serde_json::{json, Value};
@@ -81,6 +81,22 @@ const PREFIXES: &[(&str, [bool; 3])] = &[
     ("eb", [false, false, true]),
 ];
 
+/// Periods of an EpisodeOfCare, whose `date` is its `period`: a start and an end, either of which
+/// may be missing.
+#[allow(clippy::type_complexity)]
+const PERIODS: &[(&str, Option<&str>, Option<&str>)] = &[
+    // 2026-10-29T08:00:00Z up to 2026-10-31T12:00:01Z.
+    (
+        "ep-closed",
+        Some("2026-10-29T08:00:00Z"),
+        Some("2026-10-31T12:00:00Z"),
+    ),
+    // From 2026-10-29T08:00:00Z, and not ended.
+    ("ep-open-end", Some("2026-10-29T08:00:00Z"), None),
+    // Until 2026-10-31T12:00:01Z, with no start.
+    ("ep-open-start", None, Some("2026-10-31T12:00:00Z")),
+];
+
 fn observation(id: &str, written: &str) -> Value {
     json!({
         "resourceType": "Observation", "id": id, "status": "final", "code": {"text": "visit"},
@@ -116,7 +132,7 @@ fn a_date_search_compares_moments_on_postgres() {
     let store = PostgresPersistence::connect(&with_database(&admin_url, &database)).unwrap();
     let db = Database::open(Arc::new(store.clone())).unwrap();
     let catalog = RwLock::new(Catalog::empty());
-    install_package_dir(&store, &db, &catalog, minir4_dir()).unwrap();
+    install_package_dir(&store, &db, &catalog, r4_dir()).unwrap();
     let catalog = catalog.read().unwrap();
 
     import_resource(
@@ -128,8 +144,23 @@ fn a_date_search_compares_moments_on_postgres() {
     for (id, written) in SAME.iter().chain(EDGES) {
         import_resource(&db, &catalog, &observation(id, written)).expect(id);
     }
-    let search = |args: Value| -> Vec<String> {
-        let bundle = run(&db, &catalog, "Observation/search", &args)
+    for (id, start, end) in PERIODS {
+        let mut period = serde_json::Map::new();
+        for (name, value) in [("start", start), ("end", end)] {
+            if let Some(value) = value {
+                period.insert(name.to_string(), json!(value));
+            }
+        }
+        import_resource(
+            &db,
+            &catalog,
+            &json!({"resourceType": "EpisodeOfCare", "id": id, "status": "active",
+                "patient": {"reference": "Patient/p1"}, "period": period}),
+        )
+        .expect(id);
+    }
+    let search_type = |type_name: &str, args: Value| -> Vec<String> {
+        let bundle = run(&db, &catalog, &format!("{type_name}/search"), &args)
             .expect("search")
             .value;
         bundle["entry"]
@@ -139,6 +170,7 @@ fn a_date_search_compares_moments_on_postgres() {
             .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
             .collect()
     };
+    let search = |args: Value| search_type("Observation", args);
     let same: Vec<String> = sorted(SAME.iter().map(|(id, _)| id.to_string()).collect());
 
     // The window finds the same moments, whichever zone it and they are written in: the six writings
@@ -165,6 +197,27 @@ fn a_date_search_compares_moments_on_postgres() {
             }
         }
     }
+
+    // A period is the range between its ends, and one with no end, or no start, has not ended or
+    // has no beginning: found far from the dates it holds, by being open.
+    let periods = |query: &[&str]| -> Vec<String> {
+        sorted(search_type(
+            "EpisodeOfCare",
+            json!({"date": query.join("\u{1f}")}),
+        ))
+    };
+    assert_eq!(periods(&["lt2020-01-01"]), ["ep-open-start"]);
+    assert_eq!(periods(&["gt2030-01-01"]), ["ep-open-end"]);
+    assert_eq!(periods(&["eq2026-10"]), ["ep-closed"]);
+    assert_eq!(periods(&["ne2026-10"]), ["ep-open-end", "ep-open-start"]);
+    assert_eq!(
+        periods(&["ge2026-11-02T00:00:00Z", "lt2026-11-03T00:00:00Z"]),
+        ["ep-open-end"]
+    );
+    assert_eq!(
+        periods(&["ge2026-10-30T00:00:00Z", "lt2026-10-31T00:00:00Z"]),
+        ["ep-closed", "ep-open-end", "ep-open-start"]
+    );
 
     // Newest first, by the moment and not by the clock in the text.
     let newest_first = search(json!({"_sort": "-date", "_count": "50"}));

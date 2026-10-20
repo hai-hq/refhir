@@ -177,18 +177,28 @@ is every parameter of the type: `date` on an `Encounter` or an `Observation`, `c
 - **A date has no zone, and is read as UTC.** `2026-10-31` is the day that starts at
   `2026-10-31T00:00:00Z`. Ask for a day in another zone with its two times:
   `date=ge2026-11-01T00:00:00%2B01:00&date=lt2026-11-02T00:00:00%2B01:00`.
-- **The prefixes compare periods.** `eq` (the default, and `ap`, which is read as `eq`) finds what
-  overlaps the period the value names, and `ne` what does not. `gt` and `lt` take what reaches above
-  or below the value, so a year that holds days after a day is above that day; `sa` and `eb`
-  take only what lies wholly after or before it. `ge` and `le` are those and equal. A value to the
-  second is a period of one second, so `gt2026-10-31T22:30:00Z` does not find a time stored as
-  `2026-10-31T23:30:00+01:00`, which is the same second.
+- **The prefixes compare ranges.** A value stands for a range of time (a year, a month, a day, a
+  minute, a second), and so does each stored date, and a `Period` for the range between its ends.
+  `eq`, the default, finds what lies wholly inside the value, and `ne` what does not: `eq2026-10`
+  finds an Observation of `2026-10-31` and not one of `2026`, which reaches beyond the month.
+  `gt` and `lt` find what reaches above or below the value, so a year, which holds days after a
+  day, is above that day; `sa` and `eb` find only what lies wholly after or before it. `ge` and
+  `le` find what `gt` and `lt` find, and what lies wholly inside the value. `ap` finds what
+  overlaps the value. A value to the second is a range of one second, so `gt2026-10-31T22:30:00Z`
+  does not find a time stored as `2026-10-31T23:30:00+01:00`, which is the same second.
 - **A time with no zone** is read as UTC when it is a search value. A stored one is refused: FHIR
   asks for a zone with every time in a `dateTime`, a time with no zone names no moment, and a search
   by a moment could only guess. Writing `"effectiveDateTime": "2026-10-31T22:30:00"` is a `400`
   that names the element. A date with no time (`2026-10-31`) needs no zone.
-- **A period is searched at both ends**, each in the zone it was written in: an Encounter is found
-  by its `period.start` and by its `period.end`. A period with no end is found by its start.
+- **A period is the range between its ends**, each read in the zone it was written in. One with no
+  `end` has not ended, and one with no `start` has no beginning, so each runs without limit that
+  way: `gt2030-01-01` finds an Encounter that started in 2026 and has no `period.end`, as it finds a
+  period that is still going. An Encounter that has finished should say so with `period.end`:
+  without it, every window after its start finds it. A window of two values finds every period that
+  is going on at some moment in it:
+  `date=ge2026-10-30T00:00:00Z&date=lt2026-10-31T00:00:00Z`. Write a window as two times, not as
+  one day: `date=2026-10-31` finds only the periods wholly inside that day, and `ge2026-10-31`
+  leaves out one that ends on it, since neither reaches above the day.
 - **`_sort`** on a date, `_sort=date` or `_sort=-date`, orders by the moment each one starts, so the
   order is the same whatever zones were written. Dates that start at the same moment are in the
   order of their ids.

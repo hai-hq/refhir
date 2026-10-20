@@ -85,6 +85,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **A date search follows R4 for ranges: `eq`, `ne`, `ge`, `le`, and a period as a range.** A value
+  and a stored date each stand for a range of time (a year, a day, a second), and `eq` took any
+  overlap, so a stored `2026` was found by `eq2026-10-31`. `eq` now finds what lies wholly inside
+  the value and `ne` what does not, and `ge` and `le` find what `gt` and `lt` find and what lies
+  wholly inside the value (a month that ends with the day is no longer `ge` that day). A `Period`
+  was read as two separate points, its start and its end; it is now the range between them, and
+  one with no `end` has not ended and one with no `start` has no beginning, as R4 reads them. **An
+  Encounter stored with only `period.start` is now found by every window after its start**, since
+  it is going on; write `period.end` when it finishes. `ap` finds what overlaps the value. A
+  period with no end, or no start, that was saved before this release is found by `gt` and `ge`
+  (no end) or by `lt` and `le` (no start) only near the date it does have until it is written
+  again, since the index holds a key for the open end only from now on (see [Searching by a date
+  or a time](docs/fhir-api.md#searching-by-a-date-or-a-time)).
 - **A time with no zone is refused when it is stored.** `"effectiveDateTime": "2026-10-31T22:30:00"`
   was accepted, though FHIR asks for a zone with every time in a `dateTime`, and a search by a date
   read it as UTC whatever zone its writer meant. It is now a `400` that names the element. A date
