@@ -148,8 +148,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   it is going on; write `period.end` when it finishes. `ap` finds what overlaps the value. A
   period with no end, or no start, that was saved before this release is found by `gt` and `ge`
   (no end) or by `lt` and `le` (no start) only near the date it does have until it is written
-  again, since the index holds a key for the open end only from now on (see [Searching by a date
-  or a time](docs/fhir-api.md#searching-by-a-date-or-a-time)).
+  again, since the index holds a key for the open end only from now on (see
+  [Searching by a date or a time](docs/fhir-api.md#searching-by-a-date-or-a-time)).
 - **A date that does not exist is refused when it is stored.** A `date`, `dateTime` or `instant`
   with day `00` (`2026-10-00`), year `0000`, a sign before the year, or a day that is not one of its
   month (`2026-02-30`, `2023-02-29`) was accepted, and every one of them but year `0000` was a date
