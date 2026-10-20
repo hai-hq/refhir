@@ -1594,6 +1594,7 @@ dependencies = [
  "sha2 0.10.9",
  "tar",
  "tracing",
+ "unicode-normalization",
  "ureq",
  "uuid",
 ]
@@ -1671,6 +1672,7 @@ version = "0.0.2"
 dependencies = [
  "axum",
  "base64 0.22.1",
+ "flate2",
  "futures-util",
  "http-body-util",
  "jsonwebtoken",
@@ -1680,6 +1682,7 @@ dependencies = [
  "refhir-persistence",
  "refhir-sqlite",
  "refhir-types",
+ "ring",
  "rsa",
  "serde",
  "serde_json",

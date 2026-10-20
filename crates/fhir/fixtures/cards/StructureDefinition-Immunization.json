@@ -1,0 +1,73 @@
+{
+  "resourceType": "StructureDefinition",
+  "url": "http://hl7.org/fhir/StructureDefinition/Immunization",
+  "name": "Immunization",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Immunization",
+  "fhirVersion": "4.0.1",
+  "derivation": "specialization",
+  "snapshot": {
+    "element": [
+      {
+        "path": "Immunization",
+        "min": 0,
+        "max": "*"
+      },
+      {
+        "path": "Immunization.meta",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "Meta"
+          }
+        ]
+      },
+      {
+        "path": "Immunization.status",
+        "min": 1,
+        "max": "1",
+        "type": [
+          {
+            "code": "code"
+          }
+        ]
+      },
+      {
+        "path": "Immunization.vaccineCode",
+        "min": 1,
+        "max": "1",
+        "type": [
+          {
+            "code": "CodeableConcept"
+          }
+        ]
+      },
+      {
+        "path": "Immunization.patient",
+        "min": 1,
+        "max": "1",
+        "type": [
+          {
+            "code": "Reference",
+            "targetProfile": [
+              "http://hl7.org/fhir/StructureDefinition/Patient"
+            ]
+          }
+        ]
+      },
+      {
+        "path": "Immunization.occurrenceDateTime",
+        "min": 0,
+        "max": "1",
+        "type": [
+          {
+            "code": "dateTime"
+          }
+        ]
+      }
+    ]
+  }
+}

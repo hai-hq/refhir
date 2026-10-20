@@ -94,6 +94,14 @@ enabled = false
 # Or, for testing only (accepts any username, verifies nothing):
 # demo_login = true
 
+# SMART Health Cards. The server issues them (Patient/[id]/$health-cards-issue) when it has a key
+# to sign them with: an unencrypted PKCS#8 private key on P-256, in a PEM file. Make one with
+#   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out health-cards.pem
+# A card says where its public key is published, so public_url (above) is needed, and is required
+# on a bind that is not loopback. REFHIR_HEALTH_CARDS_KEY_FILE sets the same file.
+# [health_cards]
+# key_file = "/etc/refhir/health-cards.pem"
+
 [export]
 # Local NDJSON output for $export jobs.
 dir = "/data/export"

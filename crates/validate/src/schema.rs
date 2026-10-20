@@ -231,6 +231,26 @@ impl Structure {
             .collect()
     }
 
+    /// The slices of `element` itself. Where one slice holds a sliced child of its own (each
+    /// section of a Composition slicing its `entry`), the children of every such slice share one
+    /// path, so the slices are told apart by id: `Composition.section:results.entry:report` is a
+    /// slice of `Composition.section:results.entry` and of no other.
+    pub fn slices_of(&self, element: &ElementDef) -> Vec<(usize, &ElementDef)> {
+        let prefix = format!("{}:", element.id);
+        self.elements
+            .iter()
+            .enumerate()
+            .filter(|(_, other)| {
+                other.path == element.path
+                    && other.slice_name.is_some()
+                    && other
+                        .id
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|name| !name.contains('.'))
+            })
+            .collect()
+    }
+
     pub fn slice_children(&self, slice_index: usize) -> Vec<&ElementDef> {
         let slice = &self.elements[slice_index];
         let prefix = format!("{}.", slice.path);

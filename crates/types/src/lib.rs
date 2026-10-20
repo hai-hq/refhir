@@ -262,6 +262,19 @@ pub fn string_interval(prefix: &str) -> Interval {
     Interval::prefix(prefix.to_lowercase().into_bytes())
 }
 
+/// Keys of exactly this string, and no longer string that begins with it.
+pub fn string_exact(value: &str) -> Interval {
+    Interval::prefix(prefixable_key(value))
+}
+
+/// Keys from this string through every string that begins with `last`.
+pub fn string_span(first: &str, last: &str) -> Interval {
+    Interval {
+        start: first.to_lowercase().into_bytes(),
+        end: prefix_upper_bound(last.to_lowercase().as_bytes()),
+    }
+}
+
 /// Keys at or after this string. The match function still applies the prefix.
 pub fn string_at_least(prefix: &str) -> Interval {
     Interval {

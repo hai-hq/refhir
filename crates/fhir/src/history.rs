@@ -1,4 +1,5 @@
 use refhir_database::{Revision, Transaction};
+use refhir_persistence::DocumentLogEntry;
 use refhir_types::{Interval, Timestamp};
 use serde_json::{json, Value};
 
@@ -50,10 +51,18 @@ pub fn history(tx: &mut Transaction, model: &ResourceModel, id: &str) -> Result<
     }))
 }
 
+/// What a history's `_since` names: a version of the server's log, or a moment in time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Since {
+    Version(Timestamp),
+    /// Milliseconds since 1970.
+    Instant(i64),
+}
+
 pub fn type_history(
     tx: &mut Transaction,
     model: &ResourceModel,
-    since: Option<Timestamp>,
+    since: Option<Since>,
     count: Option<usize>,
     offset: usize,
 ) -> Result<Value, FhirError> {
@@ -64,7 +73,7 @@ pub fn type_history(
 pub fn system_history(
     tx: &mut Transaction,
     catalog: &Catalog,
-    since: Option<Timestamp>,
+    since: Option<Since>,
     count: Option<usize>,
     offset: usize,
 ) -> Result<Value, FhirError> {
@@ -78,12 +87,16 @@ pub fn system_history(
 fn log_bundle(
     tx: &Transaction,
     model: Option<&ResourceModel>,
-    since: Option<Timestamp>,
+    since: Option<Since>,
     count: Option<usize>,
     offset: usize,
     hide: Option<&str>,
 ) -> Result<Value, FhirError> {
-    let start = since.unwrap_or(Timestamp::ZERO);
+    let (start, from) = match since {
+        None => (Timestamp::ZERO, None),
+        Some(Since::Version(ts)) => (ts, None),
+        Some(Since::Instant(ms)) => (starting_point(tx, ms)?, Some(ms)),
+    };
     let rows = tx.log_since(start)?;
     let mut entries = Vec::new();
     for row in rows {
@@ -94,6 +107,11 @@ fn log_bundle(
         let Some(id) = row.id.id_str() else {
             continue;
         };
+        // A version that says it was written before the moment is not part of what came after it.
+        // A deletion says nothing of when, and stays: see `starting_point`.
+        if from.is_some_and(|from| written_at(&row).is_some_and(|at| at < from)) {
+            continue;
+        }
         let deleted = row.value.is_none();
         let rev = Revision {
             ts: row.ts,
@@ -124,6 +142,42 @@ fn log_bundle(
         "total": total,
         "entry": page
     }))
+}
+
+/// When a version of the log was written, if it says: the `meta.lastUpdated` it carries. A
+/// deletion carries nothing, and a version from before the server kept times has none.
+fn written_at(row: &DocumentLogEntry) -> Option<i64> {
+    let json: Value = serde_json::from_str(row.value.as_deref()?).ok()?;
+    crate::instant::parse(json.pointer("/meta/lastUpdated")?.as_str()?)
+}
+
+/// Where in the log to start to list what came after a moment. The log is in order of commit, and
+/// a deletion has no time of its own, so the start is just after the newest version that was
+/// written before the moment: a deletion that came after that version is listed, whether it came
+/// before the moment or after. Listing a deletion early is a harm no one is done by, where leaving
+/// one out would leave a client holding a resource that has gone. With no version before the
+/// moment, it is the start of the log.
+///
+/// The log is read from the end in windows that grow by four times, so asking about a recent
+/// moment reads a recent stretch and not the whole of it.
+fn starting_point(tx: &Transaction, moment: i64) -> Result<Timestamp, FhirError> {
+    let end = tx.begin_timestamp().as_u64();
+    let mut span: u64 = 256;
+    loop {
+        let start = Timestamp::from_u64(end.saturating_sub(span)).unwrap_or(Timestamp::ZERO);
+        // Newest first, so the first version before the moment is the newest one.
+        let rows = tx.log_since(start)?;
+        if let Some(row) = rows
+            .iter()
+            .find(|row| written_at(row).is_some_and(|at| at < moment))
+        {
+            return Ok(row.ts.succ().unwrap_or(row.ts));
+        }
+        if start == Timestamp::ZERO {
+            return Ok(Timestamp::ZERO);
+        }
+        span = span.saturating_mul(4);
+    }
 }
 
 fn history_entry(model: &ResourceModel, id: &str, rev: Revision) -> Value {

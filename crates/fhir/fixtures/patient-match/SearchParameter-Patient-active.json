@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/Patient-active",
+  "name": "active",
+  "status": "active",
+  "code": "active",
+  "base": ["Patient"],
+  "type": "token",
+  "expression": "Patient.active"
+}
