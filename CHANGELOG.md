@@ -12,6 +12,58 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **The terminology operations answer a `GET`.** R4 defines `$expand`, `$validate-code`, `$lookup`,
+  `$subsumes` and `$translate` as having no side effects, and they were `POST` only (a `GET`
+  answered `405`). Their parameters go in the query string (`url`, `filter`, `count` and `offset`
+  for `$expand`; `system`, `code`, `display`, `abstract` and so on for the rest), and the answer is
+  the one the `POST` gives. A `coding` or `codeableConcept` is still sent as a `POST`. See
+  [FHIR API](docs/fhir-api.md#terminology).
+- **Expansions are complete R4 ValueSets.** The ValueSet an expansion comes in has the `status` R4
+  requires (that of the value set expanded, `active` when it says nothing), and the expansion has
+  the required `timestamp` (the time the server produced it for the request), an `identifier`
+  (a `urn:uuid` made from what the expansion says), and in `expansion.parameter` what was asked that shaped
+  it (`filter`, `count`, `offset`, `activeOnly`). An entry carries `"inactive": true` when its code
+  system says the concept is inactive.
+- **`$expand` takes `activeOnly`.** `activeOnly=true` leaves out the codes whose code system calls
+  them inactive; the `total` counts what is left.
+- **The terminology operations answer at the instance.** `ValueSet/[id]/$expand` and
+  `/$validate-code`, `CodeSystem/[id]/$validate-code` and `/$subsumes`, and
+  `ConceptMap/[id]/$translate`, as `POST` or `GET`, with R4's instance forms (`CodeSystem/$lookup`
+  is the type only). The instance is a resource the server stores, and what is asked of it is asked
+  of the value set, code system or concept map its `url` names (`409` when a package defines that url
+  too, since the terminology cannot tell which is meant). A value set that came from a package
+  is expanded by `url`.
+- **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
+  and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include
+  of a code system whose `content` is `example`, and were refused for that. They now expand to the
+  concepts the server holds, and the expansion says it is only a sample with an `expansion.parameter`
+  named `<system>|<version>#CodeSystem.content` whose value is `example`, as R4 describes. A filter on
+  such a system, an exclusion of one, one with no concepts installed, and a `fragment` are still
+  refused. `$validate-code` agrees with `$expand`; a code outside the sample is `false` with a
+  message that says the list is only a sample, and the resource validator reports the code as one it
+  cannot check, not as an error.
+- **Expansions mark abstract codes.** An entry of `$expand` carries `"abstract": true` when its code
+  system marks the concept `notSelectable`, as HL7's v3 code systems do for their grouping concepts
+  (R4's `ValueSet.expansion.contains.abstract`). `coverage-type` flags `_ActCoverageTypeCode`,
+  `_ActHealthInsuranceTypeCode`, `_ActInsurancePolicyCode`, `_ActInsuranceTypeCode` and
+  `_ActProgramTypeCode`, and no other entry. `ValueSet/$validate-code` takes R4's `abstract` input:
+  `false` refuses an abstract code, `true` accepts it, and without it the code is valid and the
+  `message` says it is a grouping concept.
+- **A value set that waits on another package's code system is expanded when that package
+  arrives.** A package stores the expansions of its own value sets, made from its own resources,
+  so a value set that includes a code system (or a value set) that another package carries was
+  left with no expansion, and installing that other package later, or earlier, did not give it
+  one until the next rebuild. After any install, the value sets that have no expansion are tried
+  again, and the ones that can now be expanded are expanded and stored under the package whose
+  definition they are of. It is one attempt at each value set that has none (94 for the R4 and SDC
+  packages, about a sixth of a second) and not a rebuild.
+- **ISO 4217 currency codes are built in.** HL7 publishes `ValueSet/currencies` (the required
+  binding of `Money.currency`) as an include of `urn:iso:std:iso:4217` and no CodeSystem for it, so
+  the value set could not be expanded and a currency could not be checked. The server now installs the
+  code system itself, at start, once: the 178 active alphabetic codes with their numeric codes and
+  English names. `$expand` of `currencies` lists them, `$validate-code` accepts a real code and
+  refuses an unknown one, and a `Money` with an unknown `currency` is rejected. A database that
+  already has the R4 packages gets it at its next start, as the package `refhir.builtin.terminology`.
 - **`Patient/$summary`: an International Patient Summary.** `GET` or `POST` it on a patient (or on
   `Patient`, with an `identifier`) and it returns an IPS document Bundle: a Composition with
   allergies, problems and medications (always there, with `emptyReason` when there is nothing),
@@ -85,6 +137,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **With SMART, the terminology operations need the `read` permission, not `create`.** `$expand`,
+  `$expandability`, `$validate-code`, `$lookup`, `$subsumes` and `$translate` change nothing, but a
+  `POST` of one was authorised as a create, so a client with only `read` could not use them and
+  one with only `create` could. They are reads, as a `GET` of them is. A client that was given only
+  `create` for these resources to call them needs `read` now.
+- **Stored expansions are rebuilt once at the first start after this version**, so a database
+  that holds the R4 packages gains the expansions above. It is the same one-time rebuild an upgrade
+  has done before, and the next start finds nothing to do.
 - **A date search compares to the millisecond and in the zone a time is written in.** It compared
   in whole seconds, so two times in one second could not be told apart (`lt` on a time missed a time
   33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an

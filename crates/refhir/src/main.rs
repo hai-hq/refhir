@@ -1038,6 +1038,9 @@ fn install_packages(
     for spec in extra {
         refhir_fhir::install_package(store, db, catalog, spec)?;
     }
+    // What the packages refer to and none of them holds (ISO 4217 for `currencies`). A database
+    // that had the packages before this server carried it gets it here too.
+    refhir_fhir::install_builtin_terminology(store, db, catalog)?;
     Ok(())
 }
 

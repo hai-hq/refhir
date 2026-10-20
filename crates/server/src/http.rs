@@ -1,12 +1,13 @@
 //! HTTP FHIR mapped onto the operation registry.
 //! The router does not implement a second engine.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::Message;
-use axum::extract::{Extension, Path, Query, RawQuery, State, WebSocketUpgrade};
-use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::extract::{Extension, OriginalUri, Path, Query, RawQuery, State, WebSocketUpgrade};
+use axum::http::{header, HeaderMap, Request, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -239,12 +240,27 @@ pub fn app_parts(
         .route("/:resource_type/$behavior", post(behavior_type))
         .route("/:resource_type/$extract", post(extract_type))
         .route("/:resource_type/$install", post(install_op))
-        .route("/:resource_type/$expand", post(expand_op))
+        .route(
+            "/:resource_type/$expand",
+            post(expand_op).get(terminology_get),
+        )
         .route("/:resource_type/$expandability", post(expandability_op))
-        .route("/:resource_type/$validate-code", post(validate_code_op))
-        .route("/:resource_type/$lookup", post(lookup_op))
-        .route("/:resource_type/$translate", post(translate_op))
-        .route("/:resource_type/$subsumes", post(subsumes_op))
+        .route(
+            "/:resource_type/$validate-code",
+            post(validate_code_op).get(terminology_get),
+        )
+        .route(
+            "/:resource_type/$lookup",
+            post(lookup_op).get(terminology_get),
+        )
+        .route(
+            "/:resource_type/$translate",
+            post(translate_op).get(terminology_get),
+        )
+        .route(
+            "/:resource_type/$subsumes",
+            post(subsumes_op).get(terminology_get),
+        )
         .route("/:resource_type/$match", post(match_op))
         .route("/:resource_type/$export", post(export_type))
         .route(
@@ -255,6 +271,22 @@ pub fn app_parts(
         .route("/:resource_type/:id/_history", get(instance_history))
         .route("/:resource_type/:id/$meta", get(meta_get).post(meta_post))
         .route("/:resource_type/:id/$validate", post(validate_instance))
+        .route(
+            "/:resource_type/:id/$expand",
+            post(terminology_instance_post).get(terminology_get),
+        )
+        .route(
+            "/:resource_type/:id/$validate-code",
+            post(terminology_instance_post).get(terminology_get),
+        )
+        .route(
+            "/:resource_type/:id/$subsumes",
+            post(terminology_instance_post).get(terminology_get),
+        )
+        .route(
+            "/:resource_type/:id/$translate",
+            post(terminology_instance_post).get(terminology_get),
+        )
         .route("/:resource_type/:id/$populate", post(populate_instance))
         .route("/:resource_type/:id/$assemble", post(assemble_instance))
         .route(
@@ -1089,6 +1121,68 @@ async fn expand_op(
     terminology_op(app, resource_type, "$expand", body).await
 }
 
+/// What a `GET` of a terminology operation puts in the query string, as the arguments a `POST`
+/// body of plain JSON would hold: a parameter given twice counts once, as its first value.
+fn query_args(params: Vec<(String, String)>) -> serde_json::Map<String, Value> {
+    let mut args = serde_json::Map::new();
+    for (name, value) in params {
+        args.entry(name).or_insert(Value::String(value));
+    }
+    args
+}
+
+/// The operation a terminology route is for: the last segment of the path it matched.
+fn route_op(uri: &Uri) -> &str {
+    uri.path().rsplit('/').next().unwrap_or("")
+}
+
+/// The terminology operations have no side effects, so R4 allows each as a `GET` with its
+/// parameters in the query string, at the type or, with an `[id]` in the path, at an instance.
+/// (What cannot be a query parameter, a `coding` or a `codeableConcept`, is sent as a `POST`.)
+async fn terminology_get(
+    State(app): State<AppState>,
+    Path(path): Path<HashMap<String, String>>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<Vec<(String, String)>>,
+) -> Response {
+    let mut args = query_args(params);
+    if let Some(id) = path.get("id") {
+        args.insert(refhir_fhir::INSTANCE.into(), json!(id));
+    }
+    let resource_type = path.get("resource_type").cloned().unwrap_or_default();
+    terminology_call(app, resource_type, route_op(&uri), Value::Object(args)).await
+}
+
+/// A terminology operation sent to an instance, `ValueSet/[id]/$expand`, as a `POST`. The body
+/// may be empty: what is asked of is the instance, and nothing else is needed.
+async fn terminology_instance_post(
+    State(app): State<AppState>,
+    Path(path): Path<HashMap<String, String>>,
+    OriginalUri(uri): OriginalUri,
+    body: Bytes,
+) -> Response {
+    let mut args = if body.is_empty() {
+        json!({})
+    } else {
+        match parse_body(&body) {
+            Ok(value) => value,
+            Err(response) => return response,
+        }
+    };
+    let Some(object) = args.as_object_mut() else {
+        return outcome(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            "the parameters of an operation are a JSON object",
+        );
+    };
+    if let Some(id) = path.get("id") {
+        object.insert(refhir_fhir::INSTANCE.into(), json!(id));
+    }
+    let resource_type = path.get("resource_type").cloned().unwrap_or_default();
+    terminology_call(app, resource_type, route_op(&uri), args).await
+}
+
 async fn expandability_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
@@ -1145,6 +1239,10 @@ async fn terminology_op(app: AppState, resource_type: String, op: &str, body: By
         Ok(value) => value,
         Err(response) => return response,
     };
+    terminology_call(app, resource_type, op, args).await
+}
+
+async fn terminology_call(app: AppState, resource_type: String, op: &str, args: Value) -> Response {
     match execute(
         &app.db,
         &app.catalog,

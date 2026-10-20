@@ -1019,5 +1019,31 @@ mod tests {
             http_interaction("POST", "/ImplementationGuide/$install"),
             "install"
         );
+        // The terminology operations change nothing, so a GET and a POST are both reads, and a
+        // client with only `read` can use them.
+        for (method, path) in [
+            ("GET", "/ValueSet/$expand"),
+            ("POST", "/ValueSet/$expand"),
+            ("POST", "/ValueSet/$expandability"),
+            ("GET", "/ValueSet/$validate-code"),
+            ("POST", "/ValueSet/$validate-code"),
+            ("POST", "/CodeSystem/$validate-code"),
+            ("GET", "/CodeSystem/$lookup"),
+            ("POST", "/CodeSystem/$lookup"),
+            ("GET", "/CodeSystem/$subsumes"),
+            ("POST", "/CodeSystem/$subsumes"),
+            ("GET", "/ConceptMap/$translate"),
+            ("POST", "/ConceptMap/$translate"),
+            ("GET", "/ValueSet/vs1/$expand"),
+            ("POST", "/ValueSet/vs1/$expand"),
+            ("GET", "/ValueSet/vs1/$validate-code"),
+            ("POST", "/CodeSystem/cs1/$validate-code"),
+            ("GET", "/CodeSystem/cs1/$subsumes"),
+            ("POST", "/ConceptMap/cm1/$translate"),
+        ] {
+            assert_eq!(http_interaction(method, path), "read", "{method} {path}");
+        }
+        // Writing a terminology resource is still not a read.
+        assert_eq!(http_interaction("POST", "/ValueSet"), "create");
     }
 }
