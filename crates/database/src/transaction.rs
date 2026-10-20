@@ -262,6 +262,12 @@ impl Transaction {
         Ok(self.merge_scanned(index, &interval, persisted, |json| json.to_string()))
     }
 
+    /// How many intervals the backend reads in one statement (`index_ranges_text` splits a longer
+    /// list), so a caller can bound what a list costs in statements.
+    pub fn ranges_per_statement(&self) -> usize {
+        self.reader.ranges_per_statement()
+    }
+
     /// `index_range_text` for each of `intervals`: the rows of each, in a list of its own, and every
     /// interval recorded as read. Storage is asked for all of them at once where it can be, which
     /// is what a search narrowed to dozens of ranges needs.
@@ -276,6 +282,14 @@ impl Transaction {
         let scanned = self
             .reader
             .index_scan_ranges(index, self.begin_ts, intervals)?;
+        // A list too few would drop the last intervals' rows without a sign.
+        if scanned.len() != intervals.len() {
+            return Err(PersistError::Definite(format!(
+                "a read of {} index ranges came back with {} lists",
+                intervals.len(),
+                scanned.len()
+            )));
+        }
         Ok(scanned
             .into_iter()
             .zip(intervals)

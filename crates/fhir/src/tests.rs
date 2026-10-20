@@ -10638,7 +10638,7 @@ mod near_search {
             ("_summary", "bogus", "_summary"),
             ("_total", "bogus", "_total"),
             ("_include", "Location:bogus", "no search parameter"),
-            ("_include", "Bogus:partof", "not a resource type"),
+            ("_include", "Bogus:partof", "no Bogus resource type"),
             ("_include", "Location:name", "only a reference"),
             (
                 "_revinclude",
@@ -11357,8 +11357,9 @@ mod near_search {
         assert_eq!((work.searched, work.probed), (0, 0));
     }
 
-    /// `near`, `_lastUpdated` (the date index) and `_has` together: each narrows the same search,
-    /// and the answer is the search of the whole type's, entry for entry.
+    /// `near`, `_lastUpdated` (the date index) and `_has` together (a `_has` on `_lastUpdated`
+    /// too, which is an ordinary parameter of the type): each narrows the same search, and the
+    /// answer is the search of the whole type's, entry for entry.
     #[test]
     fn near_with_a_last_updated_window_and_has_answers_as_the_search_of_the_whole_type_did() {
         let harness = r4();
@@ -11438,13 +11439,70 @@ mod near_search {
                 reference(&harness, "Location", &query).unwrap(),
                 "{query:?}"
             );
-            // A `_has` on `_lastUpdated` is not a plain parameter of the type, so the search of the
-            // type answers it (as it always did); the others are asked of the places near.
-            let on_last_updated = query
-                .iter()
-                .any(|(name, _)| name.ends_with(":_lastUpdated"));
-            assert_eq!(work.searched == 0, !on_last_updated, "{query:?}");
+            assert_eq!(work.searched, 0, "{query:?}");
         }
+    }
+
+    /// A small circle is narrower than most parameters (a status every place has), but not than an
+    /// identifier, which names one place.
+    #[test]
+    fn near_reads_the_circle_unless_an_identifier_names_the_place() {
+        let harness = r4();
+        let mut directory = small_directory();
+        for resource in &mut directory {
+            if resource["resourceType"] == "Location" {
+                let id = resource["id"].as_str().unwrap().to_string();
+                resource["identifier"] = json!([{"system": "urn:directory", "value": id}]);
+            }
+        }
+        let places = directory
+            .iter()
+            .filter(|resource| resource["resourceType"] == "Location")
+            .count();
+        store_places(&harness, &directory);
+        // The identifier is read on its own range: one row, and the circle is only checked.
+        let named = [NEAR_LAGOS, ("identifier", "urn:directory|l005")];
+        let (bundle, work) = narrowed(&harness, &named);
+        assert_eq!(ids(&bundle), ["l005"]);
+        assert_eq!(work.rows, 1);
+        assert_eq!(bundle, reference(&harness, "Location", &named).unwrap());
+        // The same identifier outside the circle finds nothing, as it did.
+        let far = [NEAR_LAGOS, ("identifier", "urn:directory|l075")];
+        let (bundle, work) = narrowed(&harness, &far);
+        assert!(ids(&bundle).is_empty());
+        assert_eq!(work.rows, 1);
+        assert_eq!(bundle, reference(&harness, "Location", &far).unwrap());
+        // A status that every place has is the whole table: the circle is read instead.
+        let active = [NEAR_LAGOS, ("status", "active")];
+        let (bundle, work) = narrowed(&harness, &active);
+        assert!(work.rows < places, "{} rows of {places}", work.rows);
+        assert!(work.rows >= ids(&bundle).len());
+        assert_eq!(bundle, reference(&harness, "Location", &active).unwrap());
+    }
+
+    /// A row is decoded once: the documents of the places that are left are kept for the page, and
+    /// the rows that are not places are not looked at again.
+    #[test]
+    fn rows_are_decoded_once_and_only_the_places_left_are_kept() {
+        let harness = r4();
+        store_places(&harness, &small_directory());
+        let query = [NEAR_LAGOS, IN_NETWORK, ("_count", "5")];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert!(bundle["total"].as_u64().unwrap() > 5);
+        assert_eq!(work.searched, 0);
+        // Every row read was decoded once, to find the places left...
+        assert_eq!(work.decoded, work.rows);
+        // ...and checked once for that, and once more for each place that is left.
+        let places = work.checked - work.rows;
+        assert!(places > 0 && places <= work.rows, "{work:?}");
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    /// What `_has` may ask about one place at a time follows what a backend holds in a statement.
+    #[test]
+    fn the_places_asked_one_at_a_time_follow_the_statement_a_backend_holds() {
+        assert_eq!(crate::search::most_places_asked(200), 5000);
+        assert_eq!(crate::search::most_places_asked(50), 1250);
     }
 
     #[test]

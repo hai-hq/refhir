@@ -35,6 +35,20 @@ pub use tenant::{
 
 pub(crate) struct Inner {
     pub(crate) client: Conn,
+    /// The statements of `index_scan_ranges`, prepared once for this connection and kept, by their
+    /// text. A statement with dozens of alternatives is slow to plan, so one that is sent as text
+    /// each time is planned each time; a prepared one is planned for a few of its first runs and
+    /// then not at all.
+    ranges: std::collections::HashMap<String, postgres::Statement>,
+}
+
+impl Inner {
+    pub(crate) fn new(client: Conn) -> Self {
+        Self {
+            client,
+            ranges: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// A connection that is closed on a thread of its own.
@@ -172,11 +186,10 @@ impl PostgresPersistence {
             let announcer = announce::Announcer::new(interval, scope.channel(), owned.clone());
             let pool = Pool::new(
                 options.pool_size,
-                vec![Inner { client }],
+                vec![Inner::new(client)],
                 move || {
-                    connect_client_for(&factory_url, scope).map(|client| Inner {
-                        client: Conn::new(client),
-                    })
+                    connect_client_for(&factory_url, scope)
+                        .map(|client| Inner::new(Conn::new(client)))
                 },
                 |inner: &Inner| !inner.client.is_closed(),
             );
@@ -385,10 +398,16 @@ impl PersistenceReader for PostgresPersistence {
         })
     }
 
-    /// One statement for each `RANGES_PER_STATEMENT` intervals: the rows whose key is in any of them,
+    fn ranges_per_statement(&self) -> usize {
+        ARMS_PER_STATEMENT
+    }
+
+    /// One statement for each `ARMS_PER_STATEMENT` intervals: the rows whose key is in any of them,
     /// which an index range scan finds for each arm in turn, and then each row goes to the lists of
     /// the intervals that hold it. A search narrowed to dozens of ranges is one round trip, not
-    /// dozens.
+    /// dozens. The statement is as long as the next size up from the intervals there are, the rest
+    /// being arms that hold nothing, so that searches that differ in how many places they ask
+    /// about share one prepared statement (see `Inner::ranges`).
     fn index_scan_ranges(
         &self,
         index_id: &IndexId,
@@ -402,13 +421,23 @@ impl PersistenceReader for PostgresPersistence {
             let ts = i64_ts(read_timestamp)?;
             let id = index_id.as_bytes();
             let mut lists: Vec<Vec<IndexScanRow>> = vec![Vec::new(); intervals.len()];
-            for (chunk_no, chunk) in intervals.chunks(RANGES_PER_STATEMENT).enumerate() {
+            // What an arm that holds nothing is made of: a key is never at least this and below it.
+            let nothing: Vec<u8> = Vec::new();
+            for (chunk_no, chunk) in intervals.chunks(ARMS_PER_STATEMENT).enumerate() {
+                let size = STATEMENT_SIZES
+                    .into_iter()
+                    .find(|size| *size >= chunk.len())
+                    .unwrap_or(chunk.len());
                 let mut params: Vec<&(dyn ToSql + Sync)> = vec![&id, &ts];
-                let mut arms = Vec::with_capacity(chunk.len());
-                for interval in chunk {
+                let mut arms = Vec::with_capacity(size);
+                for at in 0..size {
                     let start = params.len() + 1;
-                    params.push(&interval.start);
-                    match &interval.end {
+                    let (from, to) = match chunk.get(at) {
+                        Some(interval) => (&interval.start, interval.end.as_ref()),
+                        None => (&nothing, Some(&nothing)),
+                    };
+                    params.push(from);
+                    match to {
                         Some(end) => {
                             arms.push(format!("(key >= ${start} AND key < ${})", start + 1));
                             params.push(end);
@@ -418,13 +447,25 @@ impl PersistenceReader for PostgresPersistence {
                 }
                 let sql = self.scan_sql(&format!("({})", arms.join(" OR ")), "ASC");
                 let mut guard = self.inner.lock()?;
-                let rows = guard.client.query(&sql, &params).map_err(definite)?;
+                let statement = match guard.ranges.get(&sql) {
+                    Some(statement) => statement.clone(),
+                    None => {
+                        let statement = guard.client.prepare(&sql).map_err(definite)?;
+                        // The texts that differ are the sizes, and which arms are open-ended.
+                        if guard.ranges.len() >= MAX_PREPARED_RANGES {
+                            guard.ranges.clear();
+                        }
+                        guard.ranges.insert(sql, statement.clone());
+                        statement
+                    }
+                };
+                let rows = guard.client.query(&statement, &params).map_err(definite)?;
                 drop(guard);
                 let scanned = rows
                     .iter()
                     .map(|row| scan_row(index_id, row))
                     .collect::<Result<Vec<_>, _>>()?;
-                let first = chunk_no * RANGES_PER_STATEMENT;
+                let first = chunk_no * ARMS_PER_STATEMENT;
                 for (slot, found) in lists[first..first + chunk.len()]
                     .iter_mut()
                     .zip(spread_rows(chunk, scanned))
@@ -1052,8 +1093,17 @@ fn sql_max_ts(scope: Scope) -> String {
 
 /// The most intervals one statement of `index_scan_ranges` holds. The planner works on every
 /// alternative of an `OR` and the time it takes grows faster than their number, so a longer list is
-/// several statements: past about fifty a range costs more than it saves in round trips.
-const RANGES_PER_STATEMENT: usize = 50;
+/// several statements: past about fifty a range costs more than it saves in round trips. (Its own
+/// name, not `refhir_persistence::RANGES_PER_STATEMENT`, which is what a backend that does not say
+/// otherwise holds: `ranges_per_statement` says this one.)
+const ARMS_PER_STATEMENT: usize = 50;
+
+/// How many arms a statement of `index_scan_ranges` has: the least of these that fits the
+/// intervals asked for, so that a few dozen different counts make a few different statements.
+const STATEMENT_SIZES: [usize; 7] = [1, 2, 4, 8, 16, 32, ARMS_PER_STATEMENT];
+
+/// Most statements of `index_scan_ranges` a connection keeps prepared.
+const MAX_PREPARED_RANGES: usize = 64;
 
 /// A row of the statement `scan_sql` makes, as the row `index_scan` returns.
 fn scan_row(index_id: &IndexId, row: &Row) -> Result<IndexScanRow, PersistError> {

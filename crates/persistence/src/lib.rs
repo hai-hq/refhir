@@ -360,6 +360,13 @@ pub trait PersistenceReader: Send + Sync {
             .collect()
     }
 
+    /// How many intervals one statement of `index_scan_ranges` holds on this backend, so that a
+    /// caller can count what a long list costs in statements and not in intervals. A backend that
+    /// splits a list into smaller statements than `RANGES_PER_STATEMENT` says so here.
+    fn ranges_per_statement(&self) -> usize {
+        RANGES_PER_STATEMENT
+    }
+
     /// The live rows of an index range as keys and document ids, in key order (`order`), at most
     /// `limit` of them: for each key the latest row at `read_timestamp`, unless that row is a
     /// tombstone. These are the rows `index_scan` returns, without the document each one is joined
@@ -3692,6 +3699,36 @@ pub mod conformance {
             }
         }
         assert!(listed > 300, "the exercise lists rows: {listed}");
+
+        // A backend rounds a list up to a statement size, or splits it at one, and the arms it pads
+        // with must add no row and lose none: lists of every length either side of those.
+        assert!(
+            (1..=RANGES_PER_STATEMENT).contains(&p.ranges_per_statement()),
+            "{}",
+            p.ranges_per_statement()
+        );
+        for length in [
+            1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 49, 50, 51, 100, 101, 127, 128, 129, 199, 200, 201,
+        ] {
+            let set: Vec<Interval> = (0..length)
+                .map(|n| {
+                    let key = format!("k|{:02}", 10 + n % 40);
+                    between(&key, &format!("{key}~"))
+                })
+                .collect();
+            for read_at in [14, 60] {
+                let each = rows(
+                    set.iter()
+                        .map(|interval| {
+                            p.index_scan(&index, at(read_at), interval, Order::Asc)
+                                .unwrap()
+                        })
+                        .collect(),
+                );
+                let together = rows(p.index_scan_ranges(&index, at(read_at), &set).unwrap());
+                assert_eq!(together, each, "{length} intervals read at {read_at}");
+            }
+        }
     }
 }
 

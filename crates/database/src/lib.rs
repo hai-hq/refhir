@@ -1784,4 +1784,104 @@ mod tests {
             self.inner.write_persistence_global(key, value)
         }
     }
+
+    /// A backend that answers a read of several ranges with a list too few.
+    struct ShortRanges(Arc<dyn PersistenceReader>);
+
+    impl PersistenceReader for ShortRanges {
+        fn load_documents(
+            &self,
+            range: TimestampRange,
+            order: Order,
+        ) -> Result<Vec<DocumentLogEntry>, PersistError> {
+            self.0.load_documents(range, order)
+        }
+        fn latest_document(
+            &self,
+            id: &DocumentId,
+            snapshot: Timestamp,
+        ) -> Result<Option<DocumentLogEntry>, PersistError> {
+            self.0.latest_document(id, snapshot)
+        }
+        fn previous_revision(
+            &self,
+            id: &DocumentId,
+            at: Timestamp,
+        ) -> Result<Option<DocumentLogEntry>, PersistError> {
+            self.0.previous_revision(id, at)
+        }
+        fn exact_revision(
+            &self,
+            id: &DocumentId,
+            ts: Timestamp,
+        ) -> Result<Option<DocumentLogEntry>, PersistError> {
+            self.0.exact_revision(id, ts)
+        }
+        fn document_history(
+            &self,
+            id: &DocumentId,
+            snapshot: Timestamp,
+        ) -> Result<Vec<DocumentLogEntry>, PersistError> {
+            self.0.document_history(id, snapshot)
+        }
+        fn index_scan(
+            &self,
+            index_id: &IndexId,
+            read_timestamp: Timestamp,
+            interval: &Interval,
+            order: Order,
+        ) -> Result<Vec<IndexScanRow>, PersistError> {
+            self.0.index_scan(index_id, read_timestamp, interval, order)
+        }
+        fn index_scan_ranges(
+            &self,
+            index_id: &IndexId,
+            read_timestamp: Timestamp,
+            intervals: &[Interval],
+        ) -> Result<Vec<Vec<IndexScanRow>>, PersistError> {
+            let mut lists = self
+                .0
+                .index_scan_ranges(index_id, read_timestamp, intervals)?;
+            lists.pop();
+            Ok(lists)
+        }
+        fn get_persistence_global(
+            &self,
+            key: PersistenceGlobalKey,
+        ) -> Result<Option<serde_json::Value>, PersistError> {
+            self.0.get_persistence_global(key)
+        }
+        fn max_ts(&self) -> Result<Option<Timestamp>, PersistError> {
+            self.0.max_ts()
+        }
+        fn load_index_writes(
+            &self,
+            range: TimestampRange,
+        ) -> Result<Vec<PersistenceIndexEntry>, PersistError> {
+            self.0.load_index_writes(range)
+        }
+    }
+
+    /// The lists of a read of several ranges are the ranges' own, one each: a backend that gives
+    /// one too few would lose the last range's rows without a sign, so it is an error.
+    #[test]
+    fn a_backend_that_answers_several_ranges_with_too_few_lists_is_refused() {
+        let persistence = SqlitePersistence::open_in_memory().unwrap();
+        let mut tx = Transaction::new(
+            Timestamp::from_u64(1).unwrap(),
+            Arc::new(ShortRanges(persistence.reader())),
+        );
+        let index = IndexId::new("t/by_name");
+        let ranges = [
+            Interval::prefix(b"a".to_vec()),
+            Interval::prefix(b"b".to_vec()),
+        ];
+        let err = tx.index_ranges_text(&index, &ranges).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("2 index ranges came back with 1 lists"),
+            "{err:?}"
+        );
+        // No range asked, no list answered.
+        assert!(tx.index_ranges_text(&index, &[]).unwrap().is_empty());
+    }
 }

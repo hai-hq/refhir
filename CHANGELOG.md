@@ -221,7 +221,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   took 0.4 s over 40,000 Locations and 0.7 s for 50 km. `Location.position` now has an index (a
   Z-order curve over latitude and longitude, in the byte-ordered keys SQLite and Postgres both
   hold, so no extension is needed), a search reads the few ranges of it that cover the circle, and
-  the places found are measured exactly as before. Over 40,000 Locations the same searches take
+  the places found are measured exactly as before (a search that also names an `identifier` reads
+  that identifier and only checks the circle, as it always read it). Over 40,000 Locations the same searches take
   5 ms on SQLite and 16 ms on Postgres (a 50 km search that finds 209 places, 14 ms and 42 ms).
   On Postgres the ranges are read in one statement, not one for each: a search sent 33 statements
   and now sends 2, and any search that is checked row by row over several index ranges gets the
@@ -255,12 +256,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   category took 4.5 s and now takes 52 ms; with a `_has` on the network, 8.7 s and now 61 ms; a 5 km
   circle with the `_has` on the network, 10.0 s and now 3 ms; and the directory search (`near`, both
   `_has`, an `_include` and two `_revinclude`), 15.0 s and now 199 ms, its CPU time falling from 4.2 s
-  to 0.15 s. Every Bundle is identical entry for entry. On Postgres 16 in a local container (3.5 ms a
-  statement) with 2,000 places the same searches went from 1.4 s to 46 ms, 1.2 s to 51 ms and 4.3 s
-  to 0.5 s (a multi-range statement there costs more to plan than to run, so it is the slowest part).
-  A `_has` that nothing else narrows still costs what the whole type costs, about 9 s at 10,000
-  places, and with thousands of places left it can cost more on Postgres than before (2.6 s against
-  1.1 s at 2,000 places).
+  to 0.15 s. Every Bundle is identical entry for entry. On Postgres 16 in a local container, with 2,000 places and the same
+  data for both, one request at a time on a machine at load about 15, the same searches went from
+  145 ms to 12 ms, 161 ms to 13 ms, and 446 ms to 38 ms for the directory search (the statements that
+  read many ranges are prepared once for each connection, so they are planned a few times and not
+  on every request). A `_has` that nothing else narrows still costs what the whole type costs,
+  about 9 s at 10,000 places on SQLite: it is asked of its places one at a time only while that is
+  25 statements or fewer (5,000 places on SQLite, 1,250 on Postgres), and past that is answered as
+  before.
 
 - **A control the server cannot apply is refused, not echoed.** `Location?_sort=bogus` answered
   `200` and its `self` link still said `_sort=bogus`, as if the order had been applied, though FHIR
