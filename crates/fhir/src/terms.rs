@@ -2,6 +2,7 @@
 
 use serde_json::{json, Value};
 
+use refhir_types::rfc3339;
 use refhir_validate::{ExpansionFailure, MemoryTerminology};
 
 use crate::catalog::Catalog;
@@ -18,23 +19,71 @@ pub fn operation(
         ("ValueSet", "$expand") => {
             let url = required(args, &["url"])?;
             let filter = optional(args, &["filter"]);
-            let offset = optional_usize(args, &["offset"]).unwrap_or(0);
+            let offset = optional_usize(args, &["offset"]);
             let count = optional_usize(args, &["count"]);
-            terms
-                .expand_page(url, filter, offset, count)
-                .ok_or_else(|| not_expandable(terms, url))
+            let active_only = optional_bool(args, &["activeOnly"]);
+            let mut expanded = terms
+                .expand_page_with(
+                    url,
+                    filter,
+                    active_only.unwrap_or(false),
+                    offset.unwrap_or(0),
+                    count,
+                )
+                .ok_or_else(|| not_expandable(terms, url))?;
+            if let Some(expansion) = expanded
+                .get_mut("expansion")
+                .and_then(|value| value.as_object_mut())
+            {
+                // What the caller asked that shaped it, which R4 says an expansion should list
+                // (and must, for the offset and count of a page).
+                let mut parameters = Vec::new();
+                if let Some(filter) = filter {
+                    parameters.push(json!({"name": "filter", "valueString": filter}));
+                }
+                if let Some(active_only) = active_only {
+                    parameters.push(json!({"name": "activeOnly", "valueBoolean": active_only}));
+                }
+                if let Some(count) = count {
+                    parameters.push(json!({"name": "count", "valueInteger": count}));
+                }
+                if let Some(offset) = offset {
+                    parameters.push(json!({"name": "offset", "valueInteger": offset}));
+                }
+                if !parameters.is_empty() {
+                    if let Some(Value::Array(own)) = expansion.remove("parameter") {
+                        parameters.extend(own);
+                    }
+                    expansion.insert("parameter".into(), Value::Array(parameters));
+                }
+            }
+            // The identifier names what the expansion says, as R4 has it, so two answers that say
+            // the same are the same expansion; the timestamp, which differs, is not part of it.
+            let identifier = expansion_identifier(&expanded);
+            if let Some(expansion) = expanded
+                .get_mut("expansion")
+                .and_then(|value| value.as_object_mut())
+            {
+                // R4 requires a timestamp: the time the expanding system produced the expansion,
+                // which is when this one was read out of what the server holds and filtered and
+                // paged for the caller.
+                expansion.insert("timestamp".into(), json!(rfc3339_now()));
+                expansion.insert("identifier".into(), json!(identifier));
+            }
+            Ok(expanded)
         }
         ("ValueSet", "$expandability") => Ok(expandability(terms, &all_urls(args))),
         ("ValueSet", "$validate-code") => {
             let url = required(args, &["url"])?;
             let (system, code, display) = code_parts(args)?;
             let system_version = optional(args, &["systemVersion", "system-version"]);
-            Ok(terms.validate_code(
+            Ok(terms.validate_code_as(
                 Some(url),
                 system.as_deref(),
                 system_version,
                 &code,
                 display.as_deref(),
+                optional_bool(args, &["abstract"]),
             ))
         }
         ("CodeSystem", "$validate-code") => {
@@ -46,7 +95,14 @@ pub fn operation(
                 .ok_or_else(|| FhirError::Invalid("system is required".into()))?;
             // `version` is the version of the code system, which this server keeps side by side.
             let version = optional(args, &["version"]);
-            Ok(terms.validate_code(None, Some(&system), version, &code, display.as_deref()))
+            Ok(terms.validate_code_as(
+                None,
+                Some(&system),
+                version,
+                &code,
+                display.as_deref(),
+                optional_bool(args, &["abstract"]),
+            ))
         }
         ("CodeSystem", "$lookup") => {
             let (system, code, _) = code_parts(args)?;
@@ -107,6 +163,87 @@ pub fn operation(
             "unsupported operation {type_name}/{op}"
         ))),
     }
+}
+
+/// The key a terminology operation sent to an instance (`ValueSet/[id]/$expand`) carries the id
+/// under. It is not `id`, which a Parameters resource has of its own.
+pub const INSTANCE: &str = "_instance";
+
+/// Whether R4 defines `op` on `type_name` at the instance level: `CodeSystem/$lookup` is only
+/// defined on the type.
+fn at_instance(type_name: &str, op: &str) -> bool {
+    matches!(
+        (type_name, op),
+        ("ValueSet", "$expand" | "$validate-code")
+            | ("CodeSystem", "$validate-code" | "$subsumes")
+            | ("ConceptMap", "$translate")
+    )
+}
+
+/// The arguments of an operation sent to an instance, as the operation takes them at the type
+/// level: the instance is a resource the server stores, and what is asked of it is asked of the
+/// value set, code system or concept map that its `url` names (and, for a code system, its
+/// `version`). Arguments that are not for an instance are returned as they are.
+pub fn resolve_instance(
+    tx: &mut refhir_database::Transaction,
+    catalog: &Catalog,
+    type_name: &str,
+    op: &str,
+    args: &Value,
+) -> Result<Value, FhirError> {
+    let Some(id) = args.get(INSTANCE).and_then(|value| value.as_str()) else {
+        return Ok(args.clone());
+    };
+    if !at_instance(type_name, op) {
+        return Err(FhirError::Unsupported(format!(
+            "{op} is not an operation of {type_name}/[id]"
+        )));
+    }
+    catalog.deny_response_read(type_name)?;
+    let resource = crate::ops::read(tx, catalog.get(type_name)?, id)?;
+    let url = resource
+        .get("url")
+        .and_then(|value| value.as_str())
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| {
+            FhirError::Invalid(format!(
+                "{type_name}/{id} has no url, which is what its terminology is known by"
+            ))
+        })?;
+    let mut resolved = args.clone();
+    if let Some(object) = resolved.as_object_mut() {
+        object.remove(INSTANCE);
+        object.insert("url".into(), json!(url));
+        // A code system is kept in each of its versions, and this is the one asked of. Its
+        // operations name it as `system` before `url`, so a `system` the caller sent is replaced.
+        if type_name == "CodeSystem" {
+            object.insert("system".into(), json!(url));
+            if let Some(version) = resource.get("version").and_then(|value| value.as_str()) {
+                object.insert("version".into(), json!(version));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// A `urn:uuid` made from the content of an expansion (a name-based UUID, version 5 in form):
+/// the same for the same value set, status, codes, flags and parameters, another when any differs.
+fn expansion_identifier(expanded: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(expanded.to_string().as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!("urn:uuid:{}", uuid::Uuid::from_bytes(bytes))
+}
+
+/// The current time as an RFC 3339 UTC instant, to the millisecond.
+fn rfc3339_now() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    rfc3339(ms)
 }
 
 /// A value set that cannot be expanded is a failed request, not an empty answer: HTTP 422, with
@@ -275,6 +412,37 @@ fn optional<'a>(args: &'a Value, names: &[&str]) -> Option<&'a str> {
                         return Some(text);
                     }
                 }
+            }
+        }
+    }
+    None
+}
+
+/// A boolean argument: a JSON boolean, `true` or `false` as text (a query string), or a
+/// `valueBoolean` parameter.
+fn optional_bool(args: &Value, names: &[&str]) -> Option<bool> {
+    let read = |value: &Value| match value {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => match text.as_str() {
+            "true" => Some(true),
+            "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    };
+    for name in names {
+        if let Some(flag) = args.get(*name).and_then(read) {
+            return Some(flag);
+        }
+    }
+    let parameters = parameters(args)?;
+    for name in names {
+        for parameter in parameters {
+            if parameter.get("name").and_then(|value| value.as_str()) != Some(*name) {
+                continue;
+            }
+            if let Some(flag) = parameter.get("valueBoolean").and_then(read) {
+                return Some(flag);
             }
         }
     }

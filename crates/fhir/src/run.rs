@@ -227,7 +227,8 @@ pub fn dispatch(
         op,
         "$expand" | "$expandability" | "$validate-code" | "$lookup" | "$translate" | "$subsumes"
     ) {
-        return crate::terms::operation(catalog, type_name, op, args);
+        let args = crate::terms::resolve_instance(tx, catalog, type_name, op, args)?;
+        return crate::terms::operation(catalog, type_name, op, &args);
     }
     if path == "system/history" {
         return history::system_history(

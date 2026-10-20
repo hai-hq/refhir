@@ -26,7 +26,7 @@ use refhir_fhir::{Catalog, ConformanceStore, FhirError, RunError};
 use refhir_persistence::{
     JobLease, JobStatus, JobStore, MemoryJobStore, PersistError, StoredJob, TimestampRange,
 };
-use refhir_types::{Order, Timestamp};
+use refhir_types::{rfc3339, Order, Timestamp};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
@@ -547,34 +547,6 @@ fn status_body(job: &StoredJob) -> Value {
         "createdAt": rfc3339(job.created_ms),
         "completedAt": job.completed_ms.map(rfc3339),
     })
-}
-
-/// Unix milliseconds as an RFC 3339 UTC instant.
-fn rfc3339(ms: u64) -> String {
-    let secs = ms / 1000;
-    let (year, month, day) = civil_from_days(secs / 86_400);
-    let rest = secs % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60,
-        ms % 1000
-    )
-}
-
-/// Days since 1970-01-01 as a civil date (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z % 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + u64::from(month <= 2);
-    (year, month, day)
 }
 
 /// Writes `{job id}.ndjson` under the export directory. It rewrites the file from scratch, so
@@ -1483,14 +1455,6 @@ mod tests {
         let headers = [("X-Api-Key".to_string(), "secret".to_string())];
         let err = http_post(&url, &headers, "{}").unwrap_err();
         assert!(err.contains("302"), "{err}");
-    }
-
-    #[test]
-    fn instants_are_rfc3339() {
-        assert_eq!(rfc3339(0), "1970-01-01T00:00:00.000Z");
-        assert_eq!(rfc3339(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
-        assert_eq!(rfc3339(951_782_400_000), "2000-02-29T00:00:00.000Z");
-        assert_eq!(rfc3339(4_102_444_799_999), "2099-12-31T23:59:59.999Z");
     }
 
     /// Poll the store until the job has finished.
