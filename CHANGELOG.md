@@ -137,6 +137,34 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- **A date search follows R4 for ranges: `eq`, `ne`, `ge`, `le`, and a period as a range.** A value
+  and a stored date each stand for a range of time (a year, a day, a second), and `eq` took any
+  overlap, so a stored `2026` was found by `eq2026-10-31`. `eq` now finds what lies wholly inside
+  the value and `ne` what does not, and `ge` and `le` find what `gt` and `lt` find and what lies
+  wholly inside the value (a month that ends with the day is no longer `ge` that day). A `Period`
+  was read as two separate points, its start and its end; it is now the range between them, and
+  one with no `end` has not ended and one with no `start` has no beginning, as R4 reads them. **An
+  Encounter stored with only `period.start` is now found by every window after its start**, since
+  it is going on; write `period.end` when it finishes. `ap` finds what overlaps the value. A
+  period with no end, or no start, that was saved before this release is found by `gt` and `ge`
+  (no end) or by `lt` and `le` (no start) only near the date it does have until it is written
+  again, since the index holds a key for the open end only from now on (see
+  [Searching by a date or a time](docs/fhir-api.md#searching-by-a-date-or-a-time)).
+- **A date that does not exist is refused when it is stored.** A `date`, `dateTime` or `instant`
+  with day `00` (`2026-10-00`), year `0000`, a sign before the year, or a day that is not one of its
+  month (`2026-02-30`, `2023-02-29`) was accepted, and every one of them but year `0000` was a date
+  that no search could read, so the resource was stored and nothing found it. It is now a `400`
+  that names the element, as R4 asks. `date=0000` in a search is a `400` too. Such a date that is
+  already stored stays stored, and is still found by no search.
+- **A time with no zone is refused when it is stored.** `"effectiveDateTime": "2026-10-31T22:30:00"`
+  was accepted, though FHIR asks for a zone with every time in a `dateTime`, and a search by a date
+  read it as UTC whatever zone its writer meant. It is now a `400` that names the element. A date
+  with no time (`2026-10-31`) still needs no zone, and a search value with no zone is still read as
+  UTC. A system that sends times with no zone has to say which zone they are in.
+- **`_sort` on a date orders by the moment, not by the text.** `_sort=date` put
+  `2026-10-31T22:30:00-05:00` (a time on 1 November, UTC) among the times of 31 October, and
+  `…T23:30:00+01:00` after `…T23:00:00Z` though it is earlier. It now orders by when each date
+  starts, so the order is the same whatever zone the times were written in.
 - **With SMART, the terminology operations need the `read` permission, not `create`.** `$expand`,
   `$expandability`, `$validate-code`, `$lookup`, `$subsumes` and `$translate` change nothing, but a
   `POST` of one was authorised as a create, so a client with only `read` could not use them and

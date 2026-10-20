@@ -73,6 +73,8 @@ fn unprocessable<T: std::fmt::Debug>(result: Result<T, RunError>) -> Value {
     }
 }
 
+mod date_search;
+
 fn patient(id: &str, active: bool, family: &str) -> Value {
     json!({
         "resourceType": "Patient",
@@ -11739,7 +11741,7 @@ fn a_time_asked_for_to_the_second_or_in_another_zone_finds_a_time_stored_to_the_
 }
 
 #[test]
-fn a_date_to_the_year_or_the_month_is_found_by_a_search_for_a_day_inside_it_or_around_it() {
+fn a_date_to_the_year_or_the_month_is_above_and_below_a_day_inside_it_and_is_not_equal_to_it() {
     let harness = ready();
     apply(
         &harness,
@@ -11777,10 +11779,11 @@ fn a_date_to_the_year_or_the_month_is_found_by_a_search_for_a_day_inside_it_or_a
         ids.sort();
         ids
     };
-    // A year holds every day of it, so it is on both sides of a day inside it. `f` and `g` are the
-    // same moment, 2026-10-19T04:30:00Z and 2026-10-19T03:30:00.5Z, a minute apart in the 19th.
-    assert_eq!(found("2026-10-18"), ["b", "c", "d"]);
-    assert_eq!(found("eq2026-10-19"), ["b", "c", "e", "f", "g"]);
+    // A year holds every day of it, so it is on both sides of a day inside it, but it is not equal
+    // to the day: `eq` takes what lies wholly inside the value. `f` and `g` are the moments
+    // 2026-10-19T04:30:00Z and 2026-10-19T03:30:00.5Z, an hour apart in the 19th.
+    assert_eq!(found("2026-10-18"), ["d"]);
+    assert_eq!(found("eq2026-10-19"), ["e", "f", "g"]);
     assert_eq!(found("ge2026-10-19"), ["b", "c", "e", "f", "g", "h"]);
     // `gt` and `lt` take what reaches above or below the day, so a year or a month that holds days
     // after it (or before it) is in; `sa` and `eb` take only what lies wholly beyond it.
@@ -11794,8 +11797,8 @@ fn a_date_to_the_year_or_the_month_is_found_by_a_search_for_a_day_inside_it_or_a
         ["a", "b", "c", "d", "e", "g"]
     );
     assert_eq!(found("ge2026-10-19T04:00:00Z"), ["b", "c", "e", "f", "h"]);
-    assert_eq!(found("2026-10-19T03:30:00Z"), ["b", "c", "e", "g"]);
-    assert_eq!(found("2026-10-18T23:30:00-05:00"), ["b", "c", "e", "f"]);
+    assert_eq!(found("2026-10-19T03:30:00Z"), ["g"]);
+    assert_eq!(found("2026-10-18T23:30:00-05:00"), ["f"]);
 }
 
 fn cards_harness() -> Harness {
