@@ -27,6 +27,7 @@ mod run;
 mod s3;
 mod sdc;
 mod search;
+mod spatial;
 mod summary;
 mod terms;
 

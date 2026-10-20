@@ -294,7 +294,75 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   Each tenant adds a writer, so give the Postgres server room for all of them together. See
   [Tenants on one database](docs/clustering.md#tenants-on-one-database).
 
+- **`_sort=near`, and the distance of each place `near` finds.** `Location?near=6.45|3.40|10|km&_sort=near`
+  returns the places nearest first (`-near`: farthest first, places the same distance away by id),
+  and every place a `near` search finds carries its distance in `entry.search.extension`, as the
+  FHIR `location-distance` extension (`valueDistance`, in kilometres, or miles when the search said
+  `mi`). Paging keeps the order across `next` links. A search that cannot be measured from one
+  point (no `near`, two of them, or a comma's alternatives) is refused as any other `_sort` that
+  cannot be applied (see Changed). See [FHIR API](docs/fhir-api.md#search).
+
 ### Changed
+
+- **`near` reads the places round the point, not every place.** The search used to read and
+  measure every Location, so its time grew with the table: `Location?near=6.60|3.35|10|km&_count=20`
+  took 0.4 s over 40,000 Locations and 0.7 s for 50 km. `Location.position` now has an index (a
+  Z-order curve over latitude and longitude, in the byte-ordered keys SQLite and Postgres both
+  hold, so no extension is needed), a search reads the few ranges of it that cover the circle, and
+  the places found are measured exactly as before (a search that also names an `identifier` reads
+  that identifier and only checks the circle, as it always read it). Over 40,000 Locations the same searches take
+  5 ms on SQLite and 16 ms on Postgres (a 50 km search that finds 209 places, 14 ms and 42 ms).
+  On Postgres the ranges are read in one statement, not one for each: a search sent 33 statements
+  and now sends 2, and any search that is checked row by row over several index ranges gets the
+  same. What a search finds is unchanged: the distance is still measured with the same formula, and
+  a place exactly at the distance is still in. **Schema migration 3 (4 in the shared tenant layout)
+  makes the first start after upgrading build the index** for the places already stored: it puts
+  `near` back to pending and queues a backfill, which the server runs as it starts, before it
+  answers requests. That takes about 5 seconds for 40,000 places on SQLite and about 3 minutes on
+  Postgres, which commits 16 places at a time. Until it is done `near` answers `400` (unsupported
+  search parameter) on a replica, and a replica waits for the migration as for any other. Back the
+  database up first, as for any migration ([Schema migrations](docs/migrations.md)); there is no
+  going back to an earlier release afterwards.
+- **`_has` is answered for the places the rest of the search leaves, and `_include` and `_revinclude`
+  are read for the whole page at once.** `Location?near=…&_has:OrganizationAffiliation:location:network=…` ran the
+  `OrganizationAffiliation` search over every affiliation in the database, built a Bundle of all of
+  them and read their references, whatever few places `near` had left: with 10,000 places it took
+  10 to 30 seconds, the same for a circle of 6 places as of 223, and the directory search that adds a
+  second `_has`, an `_include` and two `_revinclude` took about twenty. When the other parameters
+  leave up to a few thousand resources, each is now looked up in the index of the reference
+  (`OrganizationAffiliation.location`), and what refers to it is checked against `network=…`, so the
+  cost follows the places near and not the size of the database. An `_include` and a `_revinclude` read
+  what their rules lead to for every match of the page in one request to the database for each
+  rule, where each used one for each match. SQLite and Postgres answer such a read in one statement for each 200 and 50 index ranges
+  instead of one each. The answers are the same: a search that leaves many resources, a `_has` that is
+  not a plain parameter of the type (a chain, `_id`, a parameter the type lacks), and a server run with
+  `--references fhir` (where a reference can be a URL that an index lookup would not find) take the
+  search of the whole type, as before. **Numbers.** A directory of 10,000 places (and as many
+  organizations, services and affiliations) in a SQLite file, the releases before and after started
+  on copies of it, one request at a time on a busy machine (load average 90 to 240, so read the
+  ratios): `Location?near=6.6|3.35|100|km&_sort=near&_count=100` with a `_has` on the service
+  category took 4.5 s and now takes 52 ms; with a `_has` on the network, 8.7 s and now 61 ms; a 5 km
+  circle with the `_has` on the network, 10.0 s and now 3 ms; and the directory search (`near`, both
+  `_has`, an `_include` and two `_revinclude`), 15.0 s and now 199 ms, its CPU time falling from 4.2 s
+  to 0.15 s. Every Bundle is identical entry for entry. On Postgres 16 in a local container, with 2,000 places and the same
+  data for both, one request at a time on a machine at load about 15, the same searches went from
+  145 ms to 12 ms, 161 ms to 13 ms, and 446 ms to 38 ms for the directory search (the statements that
+  read many ranges are prepared once for each connection, so they are planned a few times and not
+  on every request). A `_has` that nothing else narrows still costs what the whole type costs,
+  about 9 s at 10,000 places on SQLite: it is asked of its places one at a time only while that is
+  25 statements or fewer (5,000 places on SQLite, 1,250 on Postgres), and past that is answered as
+  before.
+
+- **A control the server cannot apply is refused, not echoed.** `Location?_sort=bogus` answered
+  `200` and its `self` link still said `_sort=bogus`, as if the order had been applied, though FHIR
+  says that link holds the parameters the server used. The same held for `_sort` by a parameter
+  the server cannot order by (a number, a quantity, an age), `_summary` or `_total` with a value
+  they do not take, and an `_include` or `_revinclude` naming a resource type or parameter that
+  does not exist or is not a reference. Each is now a `400` that names it, unless the request has
+  `Prefer: handling=lenient`, which runs the search without it: it is not in the `self` or `next`
+  link, and the `OperationOutcome` entry says what was left out. `_sort=_id` sorts by the resource
+  id. **A client that sent such a term and relied on its being ignored now gets a `400`:** remove
+  it, or send `Prefer: handling=lenient`. See [FHIR API](docs/fhir-api.md#search).
 
 - **A running server holds what every request needs and an index of the rest, and reads the rest
   the first time a request uses it.** It used to hold every StructureDefinition, code system,

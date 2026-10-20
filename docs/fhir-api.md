@@ -64,6 +64,16 @@ resource gets its time the next time it is written.
 - Chaining (`Observation?subject:Patient.name=ann`), reverse chaining (`_has`), `_include` and
   `_revinclude`, and compartment search (`GET /Patient/123/Observation`) all work. Name the target
   type in a chain when a reference parameter can point at more than one type.
+- **`_has` is answered for the resources the rest of the search leaves**, not for the whole type.
+  `Location?near=6.6|3.35|5|km&_has:OrganizationAffiliation:location:network=Organization/n1`
+  looks up what refers to each place `near` finds, in the index of `OrganizationAffiliation.location`,
+  and checks `network` on those, so it costs what the places near cost and not what every
+  affiliation in the database costs, however many there are. `_include` and `_revinclude` read what
+  the rules lead to for every place of the page in one request to the database for each rule, not one
+  for each place. A search that
+  leaves a great many resources (a few thousand or more) asks the type once for everything that
+  matches instead, and so does a server that takes references as URLs (`--references fhir`); the
+  answer is the same either way.
 - A reference parameter takes `Type/id` or just the id: `Observation?patient=Patient/123` and
   `Observation?patient=123` return the same resources. A bare id is looked up as a reference to
   each type the parameter can point at in that resource: the types its `SearchParameter` lists as
@@ -105,6 +115,25 @@ resource gets its time the next time it is written.
   leave to be read, so a parameter whose index decides the match (`status`, `schedule`) keeps a
   search small, and one that has to be checked against each document (a date range) costs a little
   for every Slot it is checked against.
+- **`near` finds places by distance** (`Location?near=6.45|3.40|10|km`: latitude, longitude, then
+  the distance and its units). The units are kilometres when they are left out (`mi` is miles),
+  and a search that names no distance reaches 10. A place is found when it is no farther from the
+  point than the distance, a place exactly that far included. `near` is indexed, so a search reads the
+  places round the point and not every place, however many a directory holds. It combines with any
+  other parameter, and with a chain (`HealthcareService?location.near=…`).
+- **`_sort=near` orders the places by distance, nearest first** (`_sort=-near`: farthest first;
+  places the same distance away go by id). It needs one `near` in the search to measure from, so
+  it is an error with none, with two, or with a comma's alternatives. Paging keeps the order:
+  `_count` and the `next` link continue where the page ended. Every place a `near` search finds
+  carries its distance in the entry's `search.extension`, sorted or not, in the units the search
+  used (kilometres, or miles for `mi`):
+
+  ```json
+  "search": {"mode": "match", "extension": [{
+    "url": "http://hl7.org/fhir/StructureDefinition/location-distance",
+    "valueDistance": {"value": 4.98, "unit": "km",
+                      "system": "http://unitsofmeasure.org", "code": "km"}}]}
+  ```
 - `_include` and `_revinclude` take `Type:param` or `Type:param:TargetType`. The `:iterate` forms
   (`_include=Slot:schedule&_include:iterate=Schedule:actor`) apply a rule to the matches and to
   every resource the rules have added, until none is added. A search that would add more than
@@ -116,6 +145,14 @@ resource gets its time the next time it is written.
 - `_revinclude=*` is a `400`: name the parameter that points at the match. The escapes `\$` and
   `\|` in a search value are not interpreted.
 - An unknown search parameter is a `400`, not silently ignored.
+- **A control the server cannot apply is refused too, and never shown as if it had been.** The
+  `self` link of a search holds what the server used. So `_sort=bogus` (no such parameter),
+  `_sort` by a number, quantity or age parameter (the server orders by text, and by distance for
+  `near`), `_summary` or `_total` with a value they do not take, and an `_include` or
+  `_revinclude` that names a resource type or a parameter that does not exist, or one that is not a
+  reference, are a `400` that names the term. With `Prefer: handling=lenient` the search runs
+  without that term, which is not in the `self` or `next` links, and the Bundle's `OperationOutcome`
+  entry says what was left out. `_sort=_id` sorts by the resource id.
 - **A value that cannot be read as its parameter's type is a `400`, not an empty result.**
   `GET /Patient?birthdate=notadate` answers `invalid value "notadate" for search parameter
   birthdate on Patient: expected a date such as 2020, 2020-01, 2020-01-31 or
@@ -143,7 +180,7 @@ resource gets its time the next time it is written.
   a value it cannot read is set aside whole. The
   response carries `Preference-Applied: handling=lenient`, and every search response has `Vary:
   Prefer`, since the answer depends on it. `handling=strict` is the default, and any other value of
-  `handling` is read as that. Lenient is for the value of a search parameter only: an unknown
+  `handling` is read as that. Lenient is for the value of a search parameter and for the controls above only: an unknown
   parameter name, a bare id that a reference parameter cannot place, a `_filter` that does not
   parse, `_count`, `_offset` and `_cursor` are a `400` either way.
   It is not available to a conditional create, update or delete (a clause set aside widens what

@@ -101,6 +101,52 @@ pub struct LatestDocument {
     pub prev_ts: Option<Timestamp>,
 }
 
+/// The most intervals a backend is asked to put in one statement of
+/// `PersistenceReader::index_scan_ranges`, and so how many a caller has to give it to be sure it is
+/// given every interval of a long list at once. A backend may split a list into more statements: a
+/// statement with thousands of alternatives is slow to prepare, and SQLite refuses an expression
+/// nested a thousand deep.
+pub const RANGES_PER_STATEMENT: usize = 200;
+
+/// What a read of several intervals at once turns into: the rows, whichever interval they were
+/// found for, given to the list of every interval that holds their key. List `n` is that of
+/// `intervals[n]`, in the order the rows came.
+///
+/// A search over hundreds of places has hundreds of intervals that do not touch, and every row is in
+/// one of them, which sorting the intervals once finds by bisection; asking each interval about
+/// each row costs as many comparisons as there are rows times intervals. Intervals that overlap, or
+/// are given twice, are asked one by one, as a row may be in several lists.
+pub fn spread_rows(intervals: &[Interval], rows: Vec<IndexScanRow>) -> Vec<Vec<IndexScanRow>> {
+    let mut lists: Vec<Vec<IndexScanRow>> = vec![Vec::new(); intervals.len()];
+    let mut order: Vec<usize> = (0..intervals.len()).collect();
+    order.sort_by(|&left, &right| intervals[left].start.cmp(&intervals[right].start));
+    let apart = order.windows(2).all(|pair| {
+        intervals[pair[0]]
+            .end
+            .as_ref()
+            .is_some_and(|end| *end <= intervals[pair[1]].start)
+    });
+    if apart {
+        for row in rows {
+            let after = order.partition_point(|&n| intervals[n].start <= row.key);
+            if let Some(&n) = after.checked_sub(1).and_then(|last| order.get(last)) {
+                if intervals[n].contains(&row.key) {
+                    lists[n].push(row);
+                }
+            }
+        }
+    } else {
+        for row in rows {
+            for (list, interval) in lists.iter_mut().zip(intervals) {
+                if interval.contains(&row.key) {
+                    list.push(row.clone());
+                }
+            }
+        }
+    }
+    lists
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexScanRow {
     pub key: Vec<u8>,
@@ -293,6 +339,33 @@ pub trait PersistenceReader: Send + Sync {
         interval: &Interval,
         order: Order,
     ) -> Result<Vec<IndexScanRow>, PersistError>;
+
+    /// `index_scan`, in key order, for each of `intervals`: item `n` of the result holds the rows
+    /// of `intervals[n]`, so a key that is in several intervals is in several lists, and an
+    /// interval that holds no row has an empty one.
+    ///
+    /// The default reads them one at a time, which is right for a backend where a read is cheap. A
+    /// backend where each read is a trip to a server should override it to read them all in one,
+    /// as a search that is narrowed to dozens of ranges (a circle round a point) would otherwise
+    /// spend its time waiting for the round trips.
+    fn index_scan_ranges(
+        &self,
+        index_id: &IndexId,
+        read_timestamp: Timestamp,
+        intervals: &[Interval],
+    ) -> Result<Vec<Vec<IndexScanRow>>, PersistError> {
+        intervals
+            .iter()
+            .map(|interval| self.index_scan(index_id, read_timestamp, interval, Order::Asc))
+            .collect()
+    }
+
+    /// How many intervals one statement of `index_scan_ranges` holds on this backend, so that a
+    /// caller can count what a long list costs in statements and not in intervals. A backend that
+    /// splits a list into smaller statements than `RANGES_PER_STATEMENT` says so here.
+    fn ranges_per_statement(&self) -> usize {
+        RANGES_PER_STATEMENT
+    }
 
     /// The live rows of an index range as keys and document ids, in key order (`order`), at most
     /// `limit` of them: for each key the latest row at `read_timestamp`, unless that row is a
@@ -3544,6 +3617,211 @@ pub mod conformance {
             4 + 1 + 40,
             "a, b, c, e plus the hot key plus forty"
         );
+    }
+
+    /// `index_scan_ranges` lists, for each interval, exactly the rows `index_scan` does for it, at
+    /// any read timestamp, whether the intervals are disjoint, overlap, are open at the end, hold
+    /// nothing, or are not there at all. Run after `exercise_index_scan_ids`, on the same database,
+    /// whose rows have been rewritten, moved and deleted.
+    pub fn exercise_index_scan_ranges(p: &dyn Persistence) {
+        let index = IndexId::new("scan_ids/by_name");
+        let at = |n: u64| Timestamp::from_u64(n).unwrap();
+        let open = |start: &str| Interval {
+            start: start.as_bytes().to_vec(),
+            end: None,
+        };
+        let between = |start: &str, end: &str| Interval {
+            start: start.as_bytes().to_vec(),
+            end: Some(end.as_bytes().to_vec()),
+        };
+        let sets: Vec<Vec<Interval>> = vec![
+            vec![],
+            vec![Interval::all()],
+            vec![Interval::prefix(b"nothing".to_vec())],
+            // Disjoint, given out of key order, with the last one open.
+            vec![
+                Interval::prefix(b"k".to_vec()),
+                between("a|d1", "c"),
+                between("h", "i"),
+                open("zzz"),
+            ],
+            // Overlapping, and one inside another, so a row is in several lists.
+            vec![
+                Interval::prefix(b"b".to_vec()),
+                between("b|d3", "c"),
+                Interval::all(),
+                Interval::prefix(b"k|1".to_vec()),
+            ],
+            // The same interval twice.
+            vec![between("a", "c"), between("a", "c")],
+            // More intervals than a backend puts in one statement, each over a key of its own, so
+            // that the lists of the later statements are the ones that must line up.
+            (0..crate::RANGES_PER_STATEMENT * 2 + 50)
+                .map(|n| {
+                    let key = format!("k|{:02}", 10 + n % 40);
+                    between(&key, &format!("{key}~"))
+                })
+                .collect(),
+        ];
+        // A row as it is compared: its key, document, revision and text.
+        type Seen = (Vec<u8>, DocumentId, Timestamp, String);
+        let rows = |lists: Vec<Vec<IndexScanRow>>| -> Vec<Vec<Seen>> {
+            lists
+                .into_iter()
+                .map(|list| {
+                    list.into_iter()
+                        .map(|row| {
+                            (
+                                row.key,
+                                row.document.id,
+                                row.document.ts,
+                                row.document.value,
+                            )
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let mut listed = 0;
+        for read_at in [9, 10, 11, 12, 13, 14, 20, 30, 44, 45, 60] {
+            for set in &sets {
+                let each = rows(
+                    set.iter()
+                        .map(|interval| {
+                            p.index_scan(&index, at(read_at), interval, Order::Asc)
+                                .unwrap()
+                        })
+                        .collect(),
+                );
+                let together = rows(p.index_scan_ranges(&index, at(read_at), set).unwrap());
+                assert_eq!(together, each, "read at {read_at}, {set:?}");
+                listed += each.iter().map(Vec::len).sum::<usize>();
+            }
+        }
+        assert!(listed > 300, "the exercise lists rows: {listed}");
+
+        // A backend rounds a list up to a statement size, or splits it at one, and the arms it pads
+        // with must add no row and lose none: lists of every length either side of those.
+        assert!(
+            (1..=RANGES_PER_STATEMENT).contains(&p.ranges_per_statement()),
+            "{}",
+            p.ranges_per_statement()
+        );
+        for length in [
+            1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 49, 50, 51, 100, 101, 127, 128, 129, 199, 200, 201,
+        ] {
+            let set: Vec<Interval> = (0..length)
+                .map(|n| {
+                    let key = format!("k|{:02}", 10 + n % 40);
+                    between(&key, &format!("{key}~"))
+                })
+                .collect();
+            for read_at in [14, 60] {
+                let each = rows(
+                    set.iter()
+                        .map(|interval| {
+                            p.index_scan(&index, at(read_at), interval, Order::Asc)
+                                .unwrap()
+                        })
+                        .collect(),
+                );
+                let together = rows(p.index_scan_ranges(&index, at(read_at), &set).unwrap());
+                assert_eq!(together, each, "{length} intervals read at {read_at}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::*;
+
+    fn row(key: &[u8]) -> IndexScanRow {
+        IndexScanRow {
+            key: key.to_vec(),
+            document: LatestDocument {
+                ts: Timestamp::from_u64(1).unwrap(),
+                id: DocumentId::new(TabletId::new("t"), key),
+                value: String::new(),
+                prev_ts: None,
+            },
+        }
+    }
+
+    /// Every row to the lists of the intervals that hold it, asked one interval at a time.
+    fn asked_one_by_one(intervals: &[Interval], rows: &[IndexScanRow]) -> Vec<Vec<IndexScanRow>> {
+        intervals
+            .iter()
+            .map(|interval| {
+                rows.iter()
+                    .filter(|row| interval.contains(&row.key))
+                    .cloned()
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rows_go_to_the_intervals_that_hold_them_as_asking_each_one_would_say() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let interval = |start: u64, end: Option<u64>| Interval {
+            start: vec![start as u8],
+            end: end.map(|end| vec![end as u8]),
+        };
+        for round in 0..400 {
+            // Keys in the order a read returns them: ascending, and each once.
+            let mut keys: Vec<u64> = (0..60).filter(|_| next(3) != 0).collect();
+            keys.sort_unstable();
+            let rows: Vec<IndexScanRow> = keys.iter().map(|key| row(&[*key as u8])).collect();
+            let intervals: Vec<Interval> = match round % 4 {
+                // Apart, given in no order, some of them empty or holding nothing.
+                0 => {
+                    let mut edges: Vec<u64> = (0..12).map(|_| next(64)).collect();
+                    edges.sort_unstable();
+                    edges.dedup();
+                    let mut found: Vec<Interval> = edges
+                        .chunks(2)
+                        .filter(|pair| pair.len() == 2)
+                        .map(|pair| interval(pair[0], Some(pair[1])))
+                        .collect();
+                    if round % 8 == 0 {
+                        found.push(interval(edges.last().copied().unwrap_or(0) + 1, None));
+                    }
+                    found.reverse();
+                    found
+                }
+                // Overlapping.
+                1 => (0..8)
+                    .map(|_| {
+                        let start = next(60);
+                        interval(start, Some(start + next(30)))
+                    })
+                    .collect(),
+                // The same interval more than once.
+                2 => {
+                    let start = next(40);
+                    vec![interval(start, Some(start + 15)); 3]
+                }
+                // Open ended, and one inside another.
+                _ => vec![
+                    interval(next(30), None),
+                    interval(next(60), Some(64)),
+                    interval(0, None),
+                ],
+            };
+            assert_eq!(
+                spread_rows(&intervals, rows.clone()),
+                asked_one_by_one(&intervals, &rows),
+                "round {round}: {intervals:?}"
+            );
+        }
+        assert!(spread_rows(&[], vec![row(b"a")]).is_empty());
     }
 }
 

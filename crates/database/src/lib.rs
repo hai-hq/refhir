@@ -896,6 +896,93 @@ mod tests {
         .unwrap();
     }
 
+    /// Reading several ranges of an index at once gives each range what reading it alone does,
+    /// the transaction's own staged writes included, and records every one as read.
+    #[test]
+    fn several_ranges_read_at_once_are_each_what_the_range_alone_is() {
+        let by_name = IndexId::new("t/by_name");
+        let put_named = |tx: &mut Transaction, id: &str, name: &str, prev: Option<Timestamp>| {
+            let key = (by_name.clone(), format!("{name}|{id}").into_bytes());
+            tx.stage_put(Put {
+                tablet: tablet(),
+                id: id.into(),
+                json: json!({"id": id, "name": name}),
+                new_keys: vec![key.clone()],
+                old_keys: if prev.is_some() { vec![key] } else { vec![] },
+                prev_ts: prev,
+            })
+            .unwrap();
+        };
+        let db = memory_db();
+        let mut seed = db.begin();
+        for (id, name) in [("d1", "ann"), ("d2", "bea"), ("d3", "cy"), ("d4", "dee")] {
+            put_named(&mut seed, id, name, None);
+        }
+        db.commit(seed).unwrap();
+
+        let ranges = [
+            Interval::prefix(b"d".to_vec()),
+            Interval::prefix(b"a".to_vec()),
+            // Overlaps both of the others' neighbours, and holds a row of two intervals.
+            Interval {
+                start: b"b".to_vec(),
+                end: Some(b"dee|d4\x01".to_vec()),
+            },
+            Interval::prefix(b"nobody".to_vec()),
+        ];
+        let ids = |lists: &[Vec<ScannedText>]| -> Vec<Vec<String>> {
+            lists
+                .iter()
+                .map(|list| {
+                    list.iter()
+                        .map(|row| row.id.id_str().unwrap().to_string())
+                        .collect()
+                })
+                .collect()
+        };
+        // First in transactions that have written nothing, then in ones that have staged documents
+        // into two of the ranges. Each range alone is read in one transaction, and all at once in
+        // another.
+        let open = |staged: bool| {
+            let mut tx = db.begin();
+            if staged {
+                put_named(&mut tx, "d5", "ann2", None);
+                put_named(&mut tx, "d6", "dora", None);
+            }
+            tx
+        };
+        for staged in [false, true] {
+            let mut alone = open(staged);
+            let each: Vec<Vec<ScannedText>> = ranges
+                .iter()
+                .map(|range| alone.index_range_text(&by_name, range.clone()).unwrap())
+                .collect();
+            let mut at_once = open(staged);
+            let together = at_once.index_ranges_text(&by_name, &ranges).unwrap();
+            let keys = |lists: &[Vec<ScannedText>]| -> Vec<Vec<Vec<u8>>> {
+                lists
+                    .iter()
+                    .map(|list| list.iter().map(|row| row.key.clone()).collect())
+                    .collect()
+            };
+            assert_eq!(ids(&together), ids(&each), "staged {staged}");
+            assert_eq!(keys(&together), keys(&each), "staged {staged}");
+            // The same reads are recorded: a write into any of the ranges wakes a subscriber.
+            assert_eq!(at_once.read_set(), alone.read_set());
+            let found = ids(&together);
+            assert!(found[3].is_empty());
+            assert!(found[2].len() >= 2);
+            // The staged documents are in the ranges that hold their keys, and in no other.
+            assert_eq!(found[0].contains(&"d6".to_string()), staged);
+            assert_eq!(found[1].contains(&"d5".to_string()), staged);
+            assert!(!found[3].contains(&"d6".to_string()));
+        }
+        // A transaction that reads none reads nothing.
+        let mut tx = db.begin();
+        assert!(tx.index_ranges_text(&by_name, &[]).unwrap().is_empty());
+        assert_eq!(*tx.read_set(), ReadSet::default());
+    }
+
     #[test]
     fn readonly_commit_does_not_publish() {
         let db = memory_db();
@@ -1696,5 +1783,105 @@ mod tests {
         ) -> Result<(), PersistError> {
             self.inner.write_persistence_global(key, value)
         }
+    }
+
+    /// A backend that answers a read of several ranges with a list too few.
+    struct ShortRanges(Arc<dyn PersistenceReader>);
+
+    impl PersistenceReader for ShortRanges {
+        fn load_documents(
+            &self,
+            range: TimestampRange,
+            order: Order,
+        ) -> Result<Vec<DocumentLogEntry>, PersistError> {
+            self.0.load_documents(range, order)
+        }
+        fn latest_document(
+            &self,
+            id: &DocumentId,
+            snapshot: Timestamp,
+        ) -> Result<Option<DocumentLogEntry>, PersistError> {
+            self.0.latest_document(id, snapshot)
+        }
+        fn previous_revision(
+            &self,
+            id: &DocumentId,
+            at: Timestamp,
+        ) -> Result<Option<DocumentLogEntry>, PersistError> {
+            self.0.previous_revision(id, at)
+        }
+        fn exact_revision(
+            &self,
+            id: &DocumentId,
+            ts: Timestamp,
+        ) -> Result<Option<DocumentLogEntry>, PersistError> {
+            self.0.exact_revision(id, ts)
+        }
+        fn document_history(
+            &self,
+            id: &DocumentId,
+            snapshot: Timestamp,
+        ) -> Result<Vec<DocumentLogEntry>, PersistError> {
+            self.0.document_history(id, snapshot)
+        }
+        fn index_scan(
+            &self,
+            index_id: &IndexId,
+            read_timestamp: Timestamp,
+            interval: &Interval,
+            order: Order,
+        ) -> Result<Vec<IndexScanRow>, PersistError> {
+            self.0.index_scan(index_id, read_timestamp, interval, order)
+        }
+        fn index_scan_ranges(
+            &self,
+            index_id: &IndexId,
+            read_timestamp: Timestamp,
+            intervals: &[Interval],
+        ) -> Result<Vec<Vec<IndexScanRow>>, PersistError> {
+            let mut lists = self
+                .0
+                .index_scan_ranges(index_id, read_timestamp, intervals)?;
+            lists.pop();
+            Ok(lists)
+        }
+        fn get_persistence_global(
+            &self,
+            key: PersistenceGlobalKey,
+        ) -> Result<Option<serde_json::Value>, PersistError> {
+            self.0.get_persistence_global(key)
+        }
+        fn max_ts(&self) -> Result<Option<Timestamp>, PersistError> {
+            self.0.max_ts()
+        }
+        fn load_index_writes(
+            &self,
+            range: TimestampRange,
+        ) -> Result<Vec<PersistenceIndexEntry>, PersistError> {
+            self.0.load_index_writes(range)
+        }
+    }
+
+    /// The lists of a read of several ranges are the ranges' own, one each: a backend that gives
+    /// one too few would lose the last range's rows without a sign, so it is an error.
+    #[test]
+    fn a_backend_that_answers_several_ranges_with_too_few_lists_is_refused() {
+        let persistence = SqlitePersistence::open_in_memory().unwrap();
+        let mut tx = Transaction::new(
+            Timestamp::from_u64(1).unwrap(),
+            Arc::new(ShortRanges(persistence.reader())),
+        );
+        let index = IndexId::new("t/by_name");
+        let ranges = [
+            Interval::prefix(b"a".to_vec()),
+            Interval::prefix(b"b".to_vec()),
+        ];
+        let err = tx.index_ranges_text(&index, &ranges).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("2 index ranges came back with 1 lists"),
+            "{err:?}"
+        );
+        // No range asked, no list answered.
+        assert!(tx.index_ranges_text(&index, &[]).unwrap().is_empty());
     }
 }

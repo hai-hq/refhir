@@ -310,7 +310,11 @@ pub(crate) fn compartment_resources(
     let mut query = BTreeMap::new();
     query.insert(param.clone(), format!("Patient/{patient_id}"));
     // Newest first, and no more than `limit`: a sorted search keeps only the page it is asked for.
-    query.insert("_sort".to_string(), "-_lastUpdated".to_string());
+    // A type whose catalog has no `_lastUpdated` parameter cannot be sorted by it, and a search
+    // refuses a sort it cannot apply.
+    if model.ready_param("_lastUpdated").is_some() {
+        query.insert("_sort".to_string(), "-_lastUpdated".to_string());
+    }
     query.insert("_count".to_string(), limit.to_string());
     let found = search::search(tx, catalog, model, &query)?;
     Ok(found

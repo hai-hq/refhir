@@ -95,6 +95,10 @@ To go back, restore the backup taken in step 1.
 |---|---|---|
 | 1 | `baseline` | The schema of the last release that created its tables at startup. |
 | 2 | `governance` | Adds `usage_daily`, `request_log`, `audit_log` (hash-chained) and `governance_members`, which record what each caller used, the recent requests, who touched which resource, and how many servers share the database. Purely additive. |
+| 3 | `near_index` | Changes no table. The `near` search parameter now has an index of its own (see [FHIR API](fhir-api.md#search)), and a place stored by an earlier release has no key in it, so the migration puts `near` back to pending and queues a backfill for the type that holds it. The server runs the backfill as it starts, before it answers requests (`/readyz` says starting): it takes seconds for tens of thousands of places on SQLite and minutes on Postgres, and a replica answers `near` with `400` (unsupported search parameter) until it is done. A database with no places has nothing to index. |
 
 A replica on a database that a previous release's primary still owns waits for the primary to
-apply version 2, as it would for any later migration: it never runs DDL itself.
+apply the migrations this build knows, as it would for any later one: it never runs DDL itself.
+A database that holds [tenants](clustering.md) in one shared layout is numbered on its own (row-level
+security is its version 3), and its version 4 is `near_index`, which does for each tenant what
+version 3 does above.
