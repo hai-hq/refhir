@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-21
+
 ### Added
 
 - **`POST [base]/ChargeItemDefinition/[id]/$apply`.** It answered `405`. It now takes `chargeItem`
@@ -698,6 +700,7 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/hai-hq/refhir/compare/v0.0.2...v0.1.0
 [0.0.2]: https://github.com/hai-hq/refhir/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/hai-hq/refhir/releases/tag/v0.0.1
