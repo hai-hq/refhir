@@ -261,6 +261,115 @@ is every parameter of the type: `date` on an `Encounter` or an `Observation`, `c
 | `$expandability` | `ValueSet` | Which value sets cannot be expanded, and why |
 | `$install` | `ImplementationGuide` | Install a package at runtime. With SMART it needs `system/*.write` |
 | `$populate`, `$extract`, `$assemble`, `$next-question`, `$behavior` | `Questionnaire`, `QuestionnaireResponse` | Structured Data Capture 4.0.0 |
+| `$apply` | `ChargeItemDefinition/[id]` | Prices a ChargeItem under a definition. See [Pricing a charge item](#pricing-a-charge-item-chargeitemdefinitionapply) |
+| `$submit` | `Claim`, `CoverageEligibilityRequest` | Stores a claim, pre-authorisation or eligibility request and answers with a response that says it is queued. See [Submitting a claim](#submitting-a-claim-or-an-eligibility-request) |
+
+### Pricing a charge item: `ChargeItemDefinition/$apply`
+
+`POST [base]/ChargeItemDefinition/[id]/$apply` takes the FHIR R4 `Parameters` `chargeItem` (a
+`valueReference` to a `ChargeItem` in this store, as `ChargeItem/[id]`) and, optionally, `account` (a
+`valueReference` to an `Account`). It works out what the ChargeItem costs under the definition and
+answers with a draft `Invoice` that is not stored. R4 says only that the answer is "Any" resource, so
+this is the choice made here: an Invoice is what the resource page says these prices are for, its line has
+price components of the shape the definition's have, and the `account` is the Invoice's.
+
+```bash
+curl -s -X POST http://localhost:8080/ChargeItemDefinition/consultation/\$apply -H 'content-type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [{"name": "chargeItem", "valueReference": {"reference": "ChargeItem/visit-1"}}]
+}'
+```
+
+```json
+{
+  "resourceType": "Invoice", "status": "draft",
+  "subject": {"reference": "Patient/ada"},
+  "lineItem": [{"sequence": 1, "chargeItemReference": {"reference": "ChargeItem/visit-1"},
+    "priceComponent": [
+      {"type": "base", "amount": {"value": 15000, "currency": "NGN"}},
+      {"type": "surcharge", "code": {"text": "after hours"}, "factor": 0.25, "amount": {"value": 3750, "currency": "NGN"}}]}],
+  "totalNet": {"value": 18750, "currency": "NGN"},
+  "totalGross": {"value": 18750, "currency": "NGN"}
+}
+```
+
+- **Conditions.** `applicability` of the definition and of a `propertyGroup` is FHIRPath (`text/fhirpath`,
+  which is what a condition with no `language` is), with the ChargeItem as `%context` and its references
+  followed with `resolve()`: `%context.subject.resolve().birthDate > today() - 14 years`. A reference is
+  followed only to a type the token may read; to any other it leads nowhere, as if the resource were not
+  there, so a price never tells what is in a record the caller may not see. Every condition
+  of the definition must be true, or it does not apply to this ChargeItem and the answer is a `422`
+  `OperationOutcome` (`business-rule`) that names the condition. A group is used when every condition of
+  its own is true, and a group with none always is. A condition the server cannot decide (another
+  language such as `text/cql`, no `expression`, one that does not parse or run, or one that is not true or
+  false) is a `422` that says which, and is never taken as true: a price for a condition nobody checked
+  would be a wrong price.
+- **Amounts.** The Invoice line has the price components of the groups that apply, as the definition gives
+  them. A component with a `factor` and no `amount` is that fraction of the base price, and the Invoice
+  has the amount worked out beside the `factor`. `totalNet` is the base price plus surcharges, less
+  deductions and discounts (written positive or negative: both are taken off), and `totalGross` adds
+  tax. `informational` components are shown and never added (one that is a `factor` and has no base price
+  to take it of is shown without an amount). There is one base price: two `base` components that apply,
+  in one group or two, are a `422` that names both, because nothing says which is the price and adding
+  them would charge for both. Amounts are added as decimals, not rounded, and keep the currency of the
+  definition; they are as exact as the JSON numbers they are read from (about 15 significant digits, as
+  everywhere in this server). Amounts in two currencies are a `422`, because no rate is guessed, and so
+  is a sum too large to hold. The ChargeItem's `quantity` is not applied, since the definition does not
+  say what its prices are for. With no base price (no group applies) there is a line and no totals: no
+  price.
+- **Not found.** An `[id]` that is not a definition is a `404`. A `chargeItem` or `account` that does not
+  exist is a `422`: the request is well formed, and what it names is not there. A parameter that is
+  missing, is not a reference, or refers to a resource of another type is a `400`. The body is JSON: XML
+  is a `415`.
+- **Access.** With SMART the token needs to be able to read the definition, the ChargeItem and, if one is
+  named, the Account: the operation writes nothing, so reading is enough. A token that is limited to one
+  patient cannot use it, since it prices a ChargeItem the path does not name. It is not available over
+  `/sync`.
+
+### Submitting a claim or an eligibility request
+
+`POST [base]/Claim/$submit` takes FHIR R4's `Parameters` with one `resource`: a `Claim`, or a `Bundle` of
+them. (A Claim, or a Bundle, as the body itself is accepted too, as R4 allows when the resource is the
+only input.) A Claim says in `use` whether it is a claim, a pre-authorisation (`preauthorization`) or a
+pre-determination (`predetermination`). `POST [base]/CoverageEligibilityRequest/$submit` is the same for
+eligibility requests.
+
+A server that stores records is not the payer that decides them, so the operation does what a server can:
+it checks and stores what was submitted, as a transaction would, and answers with a response that says it
+was received and is waiting. The response is a `ClaimResponse` (or a `CoverageEligibilityResponse`) with
+
+- `outcome` `queued`, and `status` `active`;
+- `request`, a reference to the stored Claim (`Claim/[id]`);
+- `patient`, `insurer` and, as R4 gives them, `use`, `type` and `subType` of a Claim, or `purpose` and
+  `servicedDate` or `servicedPeriod` of an eligibility request, copied from the request, and `requestor`
+  from its `provider`;
+- `created`, the time of the request, and a `disposition` that says it is waiting.
+
+The response is stored like any other resource, and creating it is announced like any other create: a
+[Subscription](#subscriptions) on `ClaimResponse?outcome=queued` tells whoever adjudicates that a claim
+has come, and `GET [base]/ClaimResponse?request=Claim/[id]` finds the response to a claim. The
+adjudicator decides by updating the response (`outcome` `complete`, the `item`s and their `adjudication`,
+`preAuthRef` for an approval).
+
+A `Bundle` may hold Claims, Bundles that each hold a Claim, and the resources they refer to (a
+`Patient`, a `Coverage`). Each is stored as a new resource, and an entry refers to another by its
+`fullUrl` (`urn:uuid:...`), as in a transaction; a `fullUrl` names an entry only inside its own Bundle, so
+Bundles inside the Bundle may each use the same one for their own Patient (the server gives them
+separate ones), and the same `fullUrl` on two entries of one Bundle is a `400`. An entry with its own
+`request` (`POST` with `ifNoneExist`, or `PUT`) is stored as it says, which keeps a `Patient` from being
+made again each time. A request that `ifNoneExist` finds already stored is not a new one: the answer is
+the response it already has, and no second response is made for the adjudicator to decide. A submission
+holds at most 500 resources, and Bundles may be nested three deep.
+What comes back follows what went in: a Claim gets its `ClaimResponse`, and a Bundle gets a `collection`
+Bundle with one response for each Claim, in the order they were submitted. A submission is one
+transaction: if anything in it is invalid, a reference names something that does not exist, or the token
+may not write it, nothing is stored, and the answer says why (`400` with the validator's `OperationOutcome`
+and, in a Bundle, the position of the entry).
+
+With SMART, the token needs to be able to create everything the submission writes: the Claim, the response
+type, and every other type in the Bundle (or to update it, for a `PUT` entry; a `PUT` with a query, which
+creates when nothing matches, needs to create as well). A token that is limited to
+one patient cannot submit. `$submit` is not available over `/sync`.
 
 ### Documents
 
@@ -511,6 +620,8 @@ is written:
 |--------|------|
 | `strict` (default) | The reference must be a relative `Type/id`, and its target must exist in the snapshot the write sees. Inside a transaction Bundle, an entry may refer to another entry by `fullUrl` |
 | `fhir` | Absolute URLs and targets that are not on this server are allowed. A type outside the element's `targetProfile` is still rejected |
+
+Every element that can hold a reference is checked, the ones that may hold something else instead as well: `ChargeItem.productReference`, `Invoice.lineItem.chargeItemReference` and `MedicationRequest.medicationReference` are refused when what they name does not exist, and an element that holds a `CodeableConcept` (`productCodeableConcept`) or nothing is not asked for a reference. That is every such element of every resource, not only the billing ones: `Task.input.valueReference`, `Communication.payload.contentReference`, `QuestionnaireResponse.item.answer.valueReference` and `Parameters.parameter.valueReference` must name something on this server too (or, under `fhir`, anything). As everywhere under `strict`, a reference to a contained resource (`#med1`, as in a `MedicationRequest` with its `Medication` inside it) is refused: write the resource and name it.
 
 ## Resource ids
 

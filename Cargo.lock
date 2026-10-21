@@ -1590,6 +1590,7 @@ dependencies = [
  "refhir-types",
  "refhir-validate",
  "rusqlite",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",

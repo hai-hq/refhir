@@ -599,6 +599,8 @@ impl Catalog {
         annotate_install(&mut statement);
         annotate_patient_operations(&mut statement);
         crate::patient_match::annotate_capability(&mut statement);
+        crate::submit::annotate_capability(&mut statement);
+        crate::apply::annotate_capability(&mut statement);
         statement
     }
 }
@@ -635,6 +637,35 @@ fn annotate_install(statement: &mut Value) {
                 "name": "install",
                 "definition": "https://refhir.dev/OperationDefinition/ImplementationGuide-install"
             }]);
+        }
+    }
+}
+
+/// Say in a CapabilityStatement that `resource_type` has the operation `name`, whose definition is
+/// `definition`, besides any it already lists.
+pub(crate) fn add_operation(
+    statement: &mut Value,
+    resource_type: &str,
+    name: &str,
+    definition: &str,
+) {
+    let Some(resources) = statement
+        .pointer_mut("/rest/0/resource")
+        .and_then(|value| value.as_array_mut())
+    else {
+        return;
+    };
+    for resource in resources {
+        if resource.get("type").and_then(|value| value.as_str()) != Some(resource_type) {
+            continue;
+        }
+        let operation = json!({"name": name, "definition": definition});
+        match resource
+            .get_mut("operation")
+            .and_then(|value| value.as_array_mut())
+        {
+            Some(operations) => operations.push(operation),
+            None => resource["operation"] = json!([operation]),
         }
     }
 }
@@ -975,8 +1006,17 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
         let Some(relative) = path.strip_prefix(&prefix) else {
             continue;
         };
-        // A choice (`value[x]`) is stored under a name this path does not spell, so it cannot be
-        // followed.
+        // A choice (`product[x]`) is stored under the name of the type it holds, so a Reference
+        // in one is `productReference`. Only the last segment of a path can be a choice.
+        let choice = relative.strip_suffix("[x]");
+        let spelled;
+        let relative = match choice {
+            Some(name) => {
+                spelled = format!("{name}Reference");
+                spelled.as_str()
+            }
+            None => relative,
+        };
         if relative.is_empty() || relative.contains("[x]") {
             continue;
         }
@@ -1002,8 +1042,9 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
             })
             .unwrap_or_default();
         // `min` is the element's own: at least one value *if its parent is present*. That is
-        // only a requirement of the resource for a top-level element.
-        let min = if nested {
+        // only a requirement of the resource for a top-level element, and never one for a choice,
+        // whose other types can fill it instead.
+        let min = if nested || choice.is_some() {
             0
         } else {
             element

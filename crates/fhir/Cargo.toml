@@ -16,6 +16,7 @@ refhir-persistence = { path = "../persistence" }
 refhir-types = { path = "../types" }
 refhir-sdc = { path = "../sdc" }
 serde = { workspace = true }
+rust_decimal = "1"
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

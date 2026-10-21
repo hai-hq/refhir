@@ -32,6 +32,11 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         ) {
             return "read";
         }
+        // `$apply` works out a price and stores nothing. Only a POST is the operation; any other
+        // method on the path is not one, and is judged as what the method is.
+        if op == "$apply" && method == "POST" {
+            return "read";
+        }
     }
     match method {
         "GET" | "HEAD" => {
@@ -216,6 +221,25 @@ fn letters_allow(letters: &str, interaction: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_apply_is_a_read_only_as_a_post() {
+        assert_eq!(
+            http_interaction("POST", "/ChargeItemDefinition/d/$apply"),
+            "read"
+        );
+        // Any other method on the path is not the operation, and is judged as what it is.
+        assert_eq!(http_interaction("PUT", "/Patient/$apply"), "update");
+        assert_eq!(http_interaction("PATCH", "/Patient/$apply"), "update");
+        assert_eq!(http_interaction("DELETE", "/Patient/$apply"), "delete");
+        assert_eq!(http_interaction("GET", "/Patient/p/$apply"), "read");
+    }
+
+    #[test]
+    fn a_submit_and_an_apply_are_not_operations_a_live_query_can_run() {
+        assert!(interaction_for("$submit", false).is_err());
+        assert!(interaction_for("$apply", false).is_err());
+    }
 
     #[test]
     fn a_match_is_a_search_only_as_a_post() {

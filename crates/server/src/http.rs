@@ -262,6 +262,7 @@ pub fn app_parts(
             post(subsumes_op).get(terminology_get),
         )
         .route("/:resource_type/$match", post(match_op))
+        .route("/:resource_type/$submit", post(submit_op))
         .route("/:resource_type/$export", post(export_type))
         .route(
             "/:resource_type/$summary",
@@ -295,6 +296,7 @@ pub fn app_parts(
         )
         .route("/:resource_type/:id/$behavior", post(behavior_instance))
         .route("/:resource_type/:id/$extract", post(extract_instance))
+        .route("/:resource_type/:id/$apply", post(apply_op))
         .route("/:resource_type/:id/$everything", get(everything))
         .route("/:resource_type/:id/$document", get(document_op))
         .route(
@@ -1213,6 +1215,89 @@ async fn translate_op(
     body: Bytes,
 ) -> Response {
     terminology_op(app, resource_type, "$translate", body).await
+}
+
+/// `POST [base]/Claim/$submit` (and `CoverageEligibilityRequest/$submit`): the body is the
+/// `Parameters` with a `resource`, or the Claim or Bundle itself, as R4 allows when that is the
+/// only input. It writes the request, whatever it came with and the response, so the token needs
+/// to be allowed to create each of them, not only the type in the path.
+async fn submit_op(
+    State(app): State<AppState>,
+    Path(resource_type): Path<String>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
+    body: Bytes,
+) -> Response {
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let update_creates = app.catalog.read().expect("catalog").update_create();
+    let writes = refhir_fhir::submission_writes(&resource_type, &resource, update_creates);
+    if let Some(response) = crate::auth::require_scopes(&app, &headers, &writes) {
+        return response;
+    }
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/$submit"),
+        json!({"resource": resource}),
+    )
+    .await
+    {
+        Ok(result) => resource_response(
+            StatusCode::OK,
+            result.value,
+            None,
+            prefer_xml(&headers, &params),
+        ),
+        Err(err) => error_response(err),
+    }
+}
+
+/// `POST [base]/ChargeItemDefinition/[id]/$apply`: the body is the operation's `Parameters`
+/// (`chargeItem`, and `account` if there is one). It reads a ChargeItem and an Account the path does
+/// not name, so the token needs to be able to read them, and it answers an Invoice that is not
+/// stored. The body is JSON: the XML that `parse_body` reads does not make these Parameters.
+async fn apply_op(
+    State(app): State<AppState>,
+    Path((resource_type, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.first() == Some(&b'<') {
+        return outcome(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "not-supported",
+            "$apply takes its Parameters as JSON; XML is not supported",
+        );
+    }
+    let resource = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        crate::auth::require_scopes(&app, &headers, &refhir_fhir::apply_reads(&resource))
+    {
+        return response;
+    }
+    // The conditions of a definition follow references, and only what the token may read is theirs
+    // to follow: the engine is told the token's scopes, as an SDC operation is.
+    let mut args = json!({"id": id, "resource": resource});
+    stamp_sdc(&app, &headers, &mut args);
+    match execute(
+        &app.db,
+        &app.catalog,
+        &app.store,
+        &format!("{resource_type}/$apply"),
+        args,
+    )
+    .await
+    {
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Err(err) => error_response(err),
+    }
 }
 
 /// `POST [base]/Patient/$match`: the body is the operation's `Parameters`, and what the engine makes

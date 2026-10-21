@@ -9365,6 +9365,351 @@ fn a_transaction_creates_what_a_nested_reference_names_before_the_resource_that_
     );
 }
 
+fn charge_item(extra: Value) -> Value {
+    let mut item = json!({
+        "resourceType": "ChargeItem", "status": "billable",
+        "code": {"text": "consultation"}, "subject": {"reference": "Patient/pat"}
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        item[key] = value.clone();
+    }
+    item
+}
+
+fn invoice(line_items: Value) -> Value {
+    json!({"resourceType": "Invoice", "status": "draft", "lineItem": line_items})
+}
+
+#[test]
+fn a_reference_inside_a_choice_element_is_checked_like_the_rest() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": {"resourceType": "Patient", "id": "pat"}}),
+    );
+    apply(
+        &harness,
+        "Medication/create",
+        json!({"resource": {"resourceType": "Medication", "id": "para"}}),
+    );
+    apply(
+        &harness,
+        "ChargeItem/create",
+        json!({"resource": charge_item(json!({"id": "visit"}))}),
+    );
+    let create = |resource: Value| {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        run_op(&harness, &path, &json!({"resource": resource}))
+    };
+
+    // `ChargeItem.product[x]` and `Invoice.lineItem.chargeItem[x]` are Reference | CodeableConcept.
+    // One that exists is fine.
+    create(charge_item(
+        json!({"productReference": {"reference": "Medication/para"}}),
+    ))
+    .unwrap();
+    create(invoice(
+        json!([{"chargeItemReference": {"reference": "ChargeItem/visit"}}]),
+    ))
+    .unwrap();
+    // One that does not exist is refused, wherever it sits, and the message names the element.
+    let missing = create(charge_item(
+        json!({"productReference": {"reference": "Medication/nope"}}),
+    ))
+    .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("productReference Medication/nope does not exist"),
+        "{missing}"
+    );
+    let missing = create(invoice(json!([
+        {"chargeItemReference": {"reference": "ChargeItem/visit"}},
+        {"chargeItemReference": {"reference": "ChargeItem/nope"}}
+    ])))
+    .unwrap_err();
+    assert!(
+        missing
+            .to_string()
+            .contains("lineItem.chargeItemReference ChargeItem/nope does not exist"),
+        "{missing}"
+    );
+    // The same goes for an update.
+    let stored = create(invoice(
+        json!([{"chargeItemReference": {"reference": "ChargeItem/visit"}}]),
+    ))
+    .unwrap()
+    .value;
+    let mut changed = stored.clone();
+    changed["lineItem"][0]["chargeItemReference"]["reference"] = json!("ChargeItem/nope");
+    let id = stored["id"].as_str().unwrap().to_string();
+    let missing = run_op(
+        &harness,
+        "Invoice/update",
+        &json!({"id": id, "resource": changed}),
+    )
+    .unwrap_err();
+    assert!(missing.to_string().contains("does not exist"), "{missing}");
+    // The type has to be one the element allows.
+    let wrong = create(charge_item(
+        json!({"productReference": {"reference": "ChargeItem/visit"}}),
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(wrong, RunError::Fhir(FhirError::Invalid(_))),
+        "{wrong}"
+    );
+    // A choice is not required to be a reference: its other types fill it, and an element that
+    // holds none needs nothing.
+    create(charge_item(
+        json!({"productCodeableConcept": {"text": "paracetamol"}}),
+    ))
+    .unwrap();
+    create(invoice(
+        json!([{"chargeItemCodeableConcept": {"text": "consultation"}}]),
+    ))
+    .unwrap();
+    create(charge_item(json!({}))).unwrap();
+
+    // Under the `fhir` policy a reference may point at something this server does not hold.
+    harness
+        .catalog
+        .write()
+        .unwrap()
+        .set_reference_policy(ReferencePolicy::Fhir);
+    create(charge_item(
+        json!({"productReference": {"reference": "Medication/nope"}}),
+    ))
+    .unwrap();
+    create(invoice(
+        json!([{"chargeItemReference": {"reference": "ChargeItem/nope"}}]),
+    ))
+    .unwrap();
+}
+
+#[test]
+fn a_transaction_creates_what_a_choice_reference_names_before_the_resource_that_names_it() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": {"resourceType": "Patient", "id": "pat"}}),
+    );
+    let item = "urn:uuid:44444444-4444-4444-8444-444444444444";
+    let bundle = |reference: &str| {
+        json!({
+            "resourceType": "Bundle", "type": "transaction",
+            "entry": [
+                // The Invoice comes first and names the ChargeItem in a choice element.
+                {"request": {"method": "POST", "url": "Invoice"},
+                 "resource": invoice(json!([{"chargeItemReference": {"reference": reference}}]))},
+                {"fullUrl": item, "request": {"method": "POST", "url": "ChargeItem"},
+                 "resource": charge_item(json!({}))}
+            ]
+        })
+    };
+    let response = apply(
+        &harness,
+        "Bundle/transaction",
+        json!({"resource": bundle(item)}),
+    );
+    let item_id = response["entry"][1]["resource"]["id"].as_str().unwrap();
+    assert_eq!(
+        response["entry"][0]["resource"]["lineItem"][0]["chargeItemReference"]["reference"],
+        format!("ChargeItem/{item_id}")
+    );
+    // A urn:uuid no entry carries the fullUrl of is a reference to nothing, and the whole
+    // transaction is refused.
+    let lost = run_op(
+        &harness,
+        "Bundle/transaction",
+        &json!({"resource": bundle("urn:uuid:55555555-5555-4555-8555-555555555555")}),
+    )
+    .unwrap_err();
+    assert!(matches!(lost, RunError::Fhir(_)), "{lost}");
+    let found = apply(&harness, "Invoice/search", json!({}));
+    assert_eq!(found["total"], 1, "the refused transaction wrote nothing");
+}
+
+#[test]
+fn a_reference_in_a_choice_element_of_any_resource_is_checked_not_only_billing() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    for resource in [
+        json!({"resourceType": "Patient", "id": "pat"}),
+        json!({"resourceType": "Medication", "id": "para"}),
+    ] {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        apply(&harness, &path, json!({"resource": resource}));
+    }
+    let create = |resource: Value| {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        run_op(&harness, &path, &json!({"resource": resource}))
+    };
+    let refused = |result: Result<crate::run::RunResult, RunError>, said: &str| {
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(said), "{err}");
+    };
+
+    // What a Task is asked to work on is a choice (`Task.input.value[x]`).
+    let task = |reference: &str| {
+        json!({"resourceType": "Task", "status": "requested", "intent": "order",
+            "input": [{"type": {"text": "subject"}, "valueReference": {"reference": reference}}]})
+    };
+    create(task("Patient/pat")).unwrap();
+    refused(
+        create(task("Patient/nobody")),
+        "input.valueReference Patient/nobody does not exist",
+    );
+
+    // So is what a Communication carries (`Communication.payload.content[x]`), which may be any
+    // resource, and so is the answer to a question of a form, which is the same element kind.
+    let message = |reference: &str| {
+        json!({"resourceType": "Communication", "status": "completed",
+            "payload": [{"contentReference": {"reference": reference}}]})
+    };
+    create(message("Patient/pat")).unwrap();
+    refused(
+        create(message("Patient/nobody")),
+        "payload.contentReference Patient/nobody does not exist",
+    );
+
+    // A medication held in the resource itself is a reference to something that is not on the
+    // server, which is what `strict` refuses for every element: the Medication has to be written.
+    let request = |reference: &str| {
+        json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+            "subject": {"reference": "Patient/pat"},
+            "contained": [{"resourceType": "Medication", "id": "med1"}],
+            "medicationReference": {"reference": reference}})
+    };
+    refused(create(request("#med1")), "must be a relative reference");
+    create(json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+        "subject": {"reference": "Patient/pat"}, "medicationReference": {"reference": "Medication/para"}}))
+    .unwrap();
+    harness
+        .catalog
+        .write()
+        .unwrap()
+        .set_reference_policy(ReferencePolicy::Fhir);
+    create(request("#med1")).unwrap();
+}
+
+fn claim_response(currency: &str) -> Value {
+    json!({
+        "resourceType": "ClaimResponse", "status": "active",
+        "type": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/claim-type", "code": "institutional"}]},
+        "use": "claim", "created": "2026-10-19",
+        "patient": {"reference": "Patient/pat"}, "insurer": {"reference": "Organization/insurer"},
+        "outcome": "queued",
+        "item": [{"itemSequence": 1, "adjudication": [{
+            "category": {"coding": [{"system": "http://terminology.hl7.org/CodeSystem/adjudication", "code": "submitted"}]},
+            "amount": {"value": 12500, "currency": currency}
+        }]}]
+    })
+}
+
+/// What `$validate` found wrong with `resource`: the issues that are not information, and not the
+/// missing narrative that every resource written without one gets a warning for.
+fn validation_issues(harness: &Harness, resource: &Value) -> Vec<Value> {
+    let outcome = apply(
+        harness,
+        &format!("{}/$validate", resource["resourceType"].as_str().unwrap()),
+        json!({"resource": resource}),
+    );
+    outcome["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["severity"] != "information")
+        .filter(|issue| {
+            !issue["diagnostics"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("dom-6")
+        })
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn a_currency_is_one_of_the_codes_of_iso_4217() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    for resource in [
+        json!({"resourceType": "Patient", "id": "pat"}),
+        json!({"resourceType": "Organization", "id": "insurer", "name": "An insurer"}),
+    ] {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        apply(&harness, &path, json!({"resource": resource}));
+    }
+    let currency = "ClaimResponse.item[0].adjudication[0].amount.currency";
+    let create = |currency: &str| {
+        run_op(
+            &harness,
+            "ClaimResponse/create",
+            &json!({"resource": claim_response(currency)}),
+        )
+    };
+
+    // The R4 package does not carry ISO 4217, so the value set of currencies cannot be expanded
+    // and the code is only a warning: any text is accepted as a currency.
+    let before = validation_issues(&harness, &claim_response("NRA"));
+    assert!(
+        before.iter().all(|issue| issue["severity"] == "warning"
+            && issue["diagnostics"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be expanded")),
+        "{before:?}"
+    );
+    assert!(!before.is_empty(), "the warning the code system fixes");
+    create("NRA").unwrap();
+
+    // The code system the server carries is stored once, and a start that finds it does nothing.
+    for _ in 0..2 {
+        crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    }
+
+    // A currency that exists is accepted, and says nothing.
+    assert_eq!(
+        validation_issues(&harness, &claim_response("NGN")),
+        Vec::<Value>::new()
+    );
+    create("NGN").unwrap();
+    for code in ["USD", "EUR", "GBP", "XAF", "XXX"] {
+        create(code).unwrap();
+    }
+    // One that does not is refused, and the outcome names the element.
+    let refused = validation_issues(&harness, &claim_response("NRA"));
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0]["severity"], "error");
+    assert_eq!(refused[0]["code"], "code-invalid");
+    assert_eq!(refused[0]["expression"][0], currency);
+    let Err(RunError::Fhir(FhirError::Outcome(outcome))) = create("NRA") else {
+        panic!("a currency that is not one was stored");
+    };
+    let errors: Vec<&Value> = outcome["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["severity"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{outcome}");
+    assert_eq!(errors[0]["expression"][0], currency);
+    // Codes are case sensitive, as ISO 4217's are, and a retired currency is not one.
+    for code in ["ngn", "Ngn", "DEM", ""] {
+        assert!(
+            matches!(create(code), Err(RunError::Fhir(_))),
+            "{code:?} is not a currency"
+        );
+    }
+    let found = apply(&harness, "ClaimResponse/search", json!({}));
+    assert_eq!(found["total"], 7, "NRA before, then NGN and five more");
+}
+
 #[test]
 fn the_versions_of_a_code_system_in_a_package_each_expand_their_own_value_sets() {
     let harness = empty();

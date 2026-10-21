@@ -12,6 +12,35 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **`POST [base]/ChargeItemDefinition/[id]/$apply`.** It answered `405`. It now takes `chargeItem`
+  (and optionally `account`) as FHIR R4's `Parameters` and answers with a draft `Invoice`, not stored,
+  that prices the ChargeItem under the definition: the definition's `applicability` conditions are
+  evaluated as FHIRPath with the ChargeItem as `%context` (every one of the definition's must be true,
+  or the answer is a `422` that names it), and the price components of each `propertyGroup` whose
+  conditions are true are put on the line. `totalNet` is the base price plus surcharges less
+  deductions and discounts, and `totalGross` adds tax; `informational` components are only shown.
+  Amounts are added as decimals, keep the definition's currency, and are never converted: two
+  currencies are a `422`, as are two base prices that apply and a sum too large to hold. A condition
+  follows a reference only to a type the token may read. R4 leaves the answer as "Any" resource, so the Invoice is a choice, made
+  because its line has price components shaped like the definition's. A definition that is not there is
+  a `404`, a ChargeItem or Account that is not there a `422`. With SMART the token needs to read the
+  definition, the ChargeItem and the Account; a token limited to one patient cannot use it. See
+  [FHIR API](docs/fhir-api.md#pricing-a-charge-item-chargeitemdefinitionapply).
+- **`POST [base]/Claim/$submit` and `POST [base]/CoverageEligibilityRequest/$submit`.** Both answered
+  `405`. They now take FHIR R4's `Parameters` with a `resource`, a `Claim` or `CoverageEligibilityRequest`
+  or a `Bundle` of them (or that resource as the body), store them with whatever the Bundle brings
+  (entries refer to each other by `fullUrl`, as in a transaction), and answer with a `ClaimResponse` or
+  `CoverageEligibilityResponse` that has `outcome` `queued`, `status` `active`, `request` pointing at the
+  stored request, and `patient`, `insurer` and `use` (or `purpose`) copied from it. FHIR leaves the
+  deciding to the payer, and a server is not one, so this is the choice made here: the response is stored
+  and announced like any other create, a Subscription on `ClaimResponse?outcome=queued` tells whoever
+  adjudicates, and they update the response with the decision. A submission is one transaction, so a
+  request that is invalid, or names something that does not exist, stores nothing and is answered with the
+  validator's errors. A request that `ifNoneExist` finds already stored is answered with the response it
+  has, and no second one is made. Bundles inside the Bundle each have their own `fullUrl`s. The token
+  needs to be able to create every type the submission writes (a `PUT` with a query creates, so it counts). The
+  CapabilityStatement lists the operations. See
+  [FHIR API](docs/fhir-api.md#submitting-a-claim-or-an-eligibility-request).
 - **The terminology operations answer a `GET`.** R4 defines `$expand`, `$validate-code`, `$lookup`,
   `$subsumes` and `$translate` as having no side effects, and they were `POST` only (a `GET`
   answered `405`). Their parameters go in the query string (`url`, `filter`, `count` and `offset`
@@ -249,6 +278,24 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   read every kind of resource of the compartment or the document regardless of the token.
 - The built-in Patient compartment holds `MedicationStatement` and `Immunization`, for a server
   with no `CompartmentDefinition` installed.
+
+### Fixed
+
+- **A reference inside a choice element is checked like every other.** `--references strict` (the
+  default) refused a missing target for `Invoice.account` or `Observation.focus`, and saved
+  `Invoice.lineItem.chargeItemReference` = `ChargeItem/nope` and `ChargeItem.productReference` =
+  `Medication/nope`, because an element that FHIR lets hold a reference or something else
+  (`xxx[x]`) was never looked at. Every such element is now checked: the target must exist (or, in a
+  transaction Bundle, be named by the `fullUrl` of an entry), and be a type the element allows. As
+  everywhere else under `strict`, a reference to a contained resource (`#id`) is refused, so a
+  `MedicationRequest` whose `medicationReference` is `#med1` is now refused too. This is every
+  such element of every resource, not only the billing ones: a `Task` input, a `Communication`
+  payload, a `QuestionnaireResponse` answer or a `Parameters` value that is a reference must name
+  something on this server as well.
+  `--references fhir` stays lenient. A resource that already holds a dangling reference of this
+  kind is not changed, but a later update that keeps it is refused. See
+  [FHIR API](docs/fhir-api.md#reference-checking).
+
 
 ## [0.0.2] - 2026-10-19
 

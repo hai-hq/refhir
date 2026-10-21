@@ -596,7 +596,7 @@ fn entry_status(err: &FhirError) -> &'static str {
     }
 }
 
-fn operation_outcome(code: &str, diagnostics: &str) -> Value {
+pub(crate) fn operation_outcome(code: &str, diagnostics: &str) -> Value {
     json!({
         "resourceType": "OperationOutcome",
         "issue": [{
