@@ -8,8 +8,9 @@ use std::sync::RwLock;
 
 use refhir_database::{CommitError, Database, IndexPut};
 use refhir_persistence::{
-    same_expression, ConformanceStore, InstallError, InstallOutcome, NewExpansion, NewPackage,
-    NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows, ParamStatus,
+    compare_versions, same_expression, ConformanceStore, ExpansionChange, InstallError,
+    InstallOutcome, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
+    NewTerminology, PackageRows, ParamStatus, RetiredParam, StoredBackfill, StoredPackage,
 };
 use refhir_types::{IndexId, Interval, Order, Timestamp};
 use refhir_validate::TerminologyBuilder;
@@ -17,6 +18,7 @@ use serde_json::Value;
 
 use crate::catalog::{pending_index_keys, Catalog};
 use crate::catalog::{CatalogClock, CatalogStamp};
+use crate::conform::tombstone_index;
 use crate::error::FhirError;
 use crate::extract;
 use crate::run::MAX_OCC_FAILURES;
@@ -37,6 +39,17 @@ pub fn r4_dir() -> &'static Path {
 
 pub fn extra_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/extra"))
+}
+
+/// A small `Patient` for `$match`: the elements it compares (identifier, name, birth date, gender,
+/// telecom, contact, link) and the search parameters that find a candidate (`identifier`, `name`,
+/// `active`, `birthdate`). It stands alone, so it is not installed with `minir4_dir`, which has its
+/// own `Patient`. A test that does not need the whole release loads this instead.
+pub fn patient_match_dir() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/patient-match"
+    ))
 }
 
 pub fn version_clash_dir() -> &'static Path {
@@ -88,6 +101,22 @@ pub fn expression_clash_dir() -> &'static Path {
     ))
 }
 
+/// The International Patient Summary package as the registry serves it: `hl7.fhir.uv.ips` 2.0.1
+/// for R4, with its profiles, value sets, `$summary` definition and example summaries.
+pub fn ips_package() -> &'static Path {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/ips/hl7.fhir.uv.ips-2.0.1.tgz"
+    ))
+}
+
+/// A tiny package for the tests of SMART Health Cards over HTTP: a Patient and an Immunization,
+/// with the search a card needs. The whole R4 release holds far more than such a test uses, and
+/// loading it is most of what the test costs.
+pub fn cards_dir() -> &'static Path {
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/cards"))
+}
+
 pub fn sdc_dir() -> &'static Path {
     Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/sdc"))
 }
@@ -131,9 +160,10 @@ pub(crate) struct PendingBackfill {
 }
 
 impl PendingBackfill {
-    /// Queue the backfill jobs. Call this after the catalog that writers use has been
-    /// published: the watermark is read here, and backfill leaves documents newer than it to
-    /// writers, which only index a parameter once the catalog knows it.
+    /// Queue the backfill jobs. Call this after the catalog that writers use has been published:
+    /// the watermark is read here, and backfill leaves documents newer than it to writers, which
+    /// only index a parameter once the catalog knows it. A process that stops before this leaves
+    /// parameters pending without a job, which [`run_backfills`] queues at the next start.
     pub(crate) fn create(
         &self,
         store: &dyn ConformanceStore,
@@ -149,6 +179,88 @@ impl PendingBackfill {
             .map_err(FhirError::from)?;
         Ok(())
     }
+}
+
+/// Remove the packages that newer versions replaced, which a store keeps out of every list but
+/// leaves stored until now (see `ConformanceStore::collect_superseded`), after clearing the index
+/// of each search parameter that only they defined.
+///
+/// Call it once, when the process starts and before its installs, and nowhere else: a replica
+/// serves from the catalog it loaded until the search parameters of the install that replaced the
+/// packages have their index and it loads the next, and reads what the catalog it has points at,
+/// so what is removed must have been replaced a whole process lifetime ago, not by the install
+/// before this one. It does nothing while a search parameter still waits for its index, for the
+/// same reason.
+///
+/// Nothing that is left stored is in force, so a failure is no reason to stop what the caller is
+/// doing: it is said, and the same removal is tried at the next start, with the packages still
+/// there to say what it was.
+pub fn collect_superseded(store: &dyn ConformanceStore, db: &Database, catalog: &RwLock<Catalog>) {
+    if catalog.read().expect("catalog").has_pending_parameters() {
+        return;
+    }
+    let retired = match store.retired_parameters() {
+        Ok(retired) => retired,
+        Err(err) => {
+            tracing::warn!(
+                target: "refhir_engine",
+                "could not tell which packages that newer versions replaced can be removed: {err}"
+            );
+            return;
+        }
+    };
+    let mut cleared = true;
+    for RetiredParam { base, code } in retired {
+        if let Err(err) = tombstone_index(db, &base, &code) {
+            tracing::warn!(
+                target: "refhir_engine",
+                "could not clear the index of search parameter {base}.{code}, which is no longer \
+                 defined; the package that defined it is kept until it can be: {err}"
+            );
+            cleared = false;
+        }
+    }
+    if cleared {
+        if let Err(err) = store.collect_superseded() {
+            tracing::warn!(
+                target: "refhir_engine",
+                "could not remove the packages that newer versions replaced; they are kept until \
+                 the next start: {err}"
+            );
+        }
+    }
+}
+
+/// The newest version of `name` in `installed` that is newer than `version`, if there is one.
+/// The newest version of a package is the one in force, so installing an older one changes
+/// nothing.
+pub(crate) fn newer_version<'a>(
+    installed: &'a [StoredPackage],
+    name: &str,
+    version: &str,
+) -> Option<&'a str> {
+    installed
+        .iter()
+        .filter(|package| package.name == name)
+        .map(|package| package.version.as_str())
+        .filter(|held| compare_versions(held, version).is_gt())
+        .max_by(|left, right| compare_versions(left, right))
+}
+
+/// Whether `installed` holds `name` at `version` or a newer one, so that installing it adds nothing.
+pub(crate) fn held_at_least(installed: &[StoredPackage], name: &str, version: &str) -> bool {
+    installed
+        .iter()
+        .any(|package| package.name == name && compare_versions(&package.version, version).is_ge())
+}
+
+/// What is said when a package is not installed because a newer version of it is.
+pub(crate) fn note_newer_installed(name: &str, version: &str, newer: &str) {
+    tracing::warn!(
+        target: "refhir_engine",
+        "not installing {name}@{version}: {name}@{newer} is installed, and the newest version of a \
+         package is the one in force"
+    );
 }
 
 /// Store a package without rebuilding the catalog, for installing several in a row. The caller
@@ -176,6 +288,13 @@ fn stage_package(
         .find(|package| package.name == name && package.version == version)
     {
         reopen_unsupported(store, db, package.id)?;
+        if publish_now {
+            publish(store, catalog)?;
+        }
+        return Ok(None);
+    }
+    if let Some(newer) = newer_version(&installed, &name, &version) {
+        note_newer_installed(&name, &version, newer);
         if publish_now {
             publish(store, catalog)?;
         }
@@ -354,6 +473,9 @@ fn finish_staging(
 ) -> Result<Option<PendingBackfill>, FhirError> {
     if publish_now {
         publish(store, catalog)?;
+        if outcome.inserted {
+            expand_waiting(store, catalog);
+        }
     }
     // Installing a large package takes a while; say where the time went. The readings are taken
     // in quick succession, and a monotonic clock on a virtual machine can read slightly earlier
@@ -401,7 +523,10 @@ pub fn run_backfills(
     db: &Database,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let jobs = store.load_backfills().map_err(FhirError::from)?;
+    let mut jobs = store.load_backfills().map_err(FhirError::from)?;
+    if requeue_stranded_backfills(store, db, &jobs)? {
+        jobs = store.load_backfills().map_err(FhirError::from)?;
+    }
     let mut refreshed = false;
     // A resource type with no document has nothing to index, and installing a package into a
     // database that holds no resources yet leaves a job for every type it adds parameters to.
@@ -471,6 +596,53 @@ pub fn run_backfills(
     Ok(())
 }
 
+/// Queue a backfill for each search parameter that is pending and has no unfinished job, and say
+/// whether any was queued. An install stores a package before it queues the jobs (they follow the
+/// publish), so one that stopped in between, killed while the catalog was rebuilt, leaves its
+/// parameters pending for good: the package is there, so installing it again does nothing. Where
+/// the old parameter was replaced by a new one, as when an expression changed, the parameter would
+/// not be searchable at all.
+fn requeue_stranded_backfills(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    jobs: &[StoredBackfill],
+) -> Result<bool, FhirError> {
+    let mut stranded: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
+    for parameter in store.load_search_parameters().map_err(FhirError::from)? {
+        if parameter.status != ParamStatus::Pending {
+            continue;
+        }
+        let covered = jobs.iter().any(|job| {
+            !job.done && job.package_id == parameter.package_id && job.tablet == parameter.base
+        });
+        if !covered {
+            stranded
+                .entry(parameter.package_id)
+                .or_default()
+                .insert(parameter.base);
+        }
+    }
+    if stranded.is_empty() {
+        return Ok(false);
+    }
+    let watermark = db
+        .latest_ts()
+        .to_i64()
+        .map_err(|_| FhirError::Storage("watermark timestamp does not fit".into()))?;
+    for (package_id, bases) in stranded {
+        let bases: Vec<String> = bases.into_iter().collect();
+        tracing::warn!(
+            target: "refhir_engine",
+            "search parameters of package {package_id} on {} were waiting for an index with no job to build it; queueing one",
+            bases.join(", ")
+        );
+        store
+            .insert_backfills(package_id, watermark, &bases)
+            .map_err(FhirError::from)?;
+    }
+    Ok(true)
+}
+
 /// [`publish`] for a change that only moved search parameters from pending to ready, which is all
 /// a backfill changes: the parameters are read and compiled again, and the rest of the catalog,
 /// which is what takes the time to build, is kept.
@@ -520,6 +692,7 @@ pub(crate) fn finish_install(
             "rebuilt the catalog in {:.1?}",
             started.elapsed()
         );
+        expand_waiting(store, catalog);
         for backfill in pending {
             backfill.create(store, db)?;
         }
@@ -528,6 +701,54 @@ pub(crate) fn finish_install(
     let finished = finish();
     result?;
     finished
+}
+
+/// After packages are installed and the catalog is loaded again: give an expansion to the value
+/// sets that had none and now can have, because a package brought what they waited on, and store
+/// each under the package whose definition it is of. A package stores the expansions of its own
+/// value sets only, so without this a value set in one package that includes a code system of
+/// another would stay unexpandable, whichever of the two came first, until the next full rebuild.
+///
+/// The packages are installed whether or not this succeeds, so a failure is logged and not
+/// returned: the value sets stay as they were, and the next install tries them again.
+pub(crate) fn expand_waiting(store: &dyn ConformanceStore, catalog: &RwLock<Catalog>) {
+    let started = std::time::Instant::now();
+    let updates = catalog
+        .write()
+        .expect("catalog")
+        .terms_mut()
+        .expand_waiting();
+    let changes: Vec<ExpansionChange> = updates
+        .into_iter()
+        .filter_map(|update| {
+            Some(ExpansionChange {
+                package_id: update.scope?,
+                url: update.url,
+                json: Some(update.document?.to_string()),
+            })
+        })
+        .collect();
+    if changes.is_empty() {
+        return;
+    }
+    let stored = store
+        .apply_expansions(&changes)
+        .map_err(FhirError::from)
+        .and_then(|()| announce_terminology(store));
+    match stored {
+        Ok(()) => tracing::info!(
+            target: "refhir_engine",
+            "expanded {} value sets that were waiting for a package, in {:.1?}",
+            changes.len(),
+            started.elapsed()
+        ),
+        Err(err) => tracing::warn!(
+            target: "refhir_engine",
+            error = %err,
+            "expanded {} value sets that were waiting for a package, but could not store them",
+            changes.len()
+        ),
+    }
 }
 
 pub(crate) fn publish(
@@ -1092,7 +1313,17 @@ pub(crate) fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
     }
     // Read for the release the package is for, as the catalog and a rebuild read it, so that what a
     // rebuild gives is what is stored here.
-    let expansions = expansion_rows(expanded, &fhir_version);
+    expanded.set_release(Some(fhir_version.as_str()));
+    let expansions = expanded
+        .expansion_documents()
+        .filter_map(|document| {
+            let url = document.get("url")?.as_str()?.to_string();
+            Some(NewExpansion {
+                url,
+                json: document.to_string(),
+            })
+        })
+        .collect();
     Ok(NewPackage {
         name,
         version,
@@ -1102,25 +1333,6 @@ pub(crate) fn read_package(path: &Path) -> Result<NewPackage, FhirError> {
         terminology: terminology_rows,
         expansions,
     })
-}
-
-/// The stored expansion of every value set that `expanded` holds and can expand, for the release
-/// the package is for.
-pub(crate) fn expansion_rows(
-    mut expanded: TerminologyBuilder,
-    fhir_version: &str,
-) -> Vec<NewExpansion> {
-    expanded.set_release(Some(fhir_version));
-    expanded
-        .expansion_documents()
-        .filter_map(|document| {
-            let url = document.get("url")?.as_str()?.to_string();
-            Some(NewExpansion {
-                url,
-                json: document.to_string(),
-            })
-        })
-        .collect()
 }
 
 pub(crate) fn package_root(path: &Path) -> Result<PathBuf, FhirError> {

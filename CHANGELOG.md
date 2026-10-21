@@ -41,27 +41,246 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   needs to be able to create every type the submission writes (a `PUT` with a query creates, so it counts). The
   CapabilityStatement lists the operations. See
   [FHIR API](docs/fhir-api.md#submitting-a-claim-or-an-eligibility-request).
-- **ISO 4217 currency codes.** A currency that is not a code of ISO 4217 is now refused where it is
-  written (`Money.currency`, which FHIR binds to ISO 4217 and the R4 core package does not carry).
-  `PUT ClaimResponse/z` with an adjudication `amount.currency` of `NRA` answers with an
-  `OperationOutcome` that names `ClaimResponse.item[0].adjudication[0].amount.currency`, and `NGN`
-  is accepted and no longer warns that the value set of currencies cannot be expanded. ReFHIR
-  stores the code system (178 codes, from the list SIX Group published on 2026-09-17) and R4's
-  value set of currencies itself, once, at the first start that knows them: no download and no
-  prepared file are involved, and a server that already has its packages stores them at its next
-  start. A package that carries a newer `urn:iso:std:iso:4217` is used in preference. See
+- **The terminology operations answer a `GET`.** R4 defines `$expand`, `$validate-code`, `$lookup`,
+  `$subsumes` and `$translate` as having no side effects, and they were `POST` only (a `GET`
+  answered `405`). Their parameters go in the query string (`url`, `filter`, `count` and `offset`
+  for `$expand`; `system`, `code`, `display`, `abstract` and so on for the rest), and the answer is
+  the one the `POST` gives. A `coding` or `codeableConcept` is still sent as a `POST`. See
   [FHIR API](docs/fhir-api.md#terminology).
+- **Expansions are complete R4 ValueSets.** The ValueSet an expansion comes in has the `status` R4
+  requires (that of the value set expanded, `active` when it says nothing), and the expansion has
+  the required `timestamp` (the time the server produced it for the request), an `identifier`
+  (a `urn:uuid` made from what the expansion says), and in `expansion.parameter` what was asked that shaped
+  it (`filter`, `count`, `offset`, `activeOnly`). An entry carries `"inactive": true` when its code
+  system says the concept is inactive.
+- **`$expand` takes `activeOnly`.** `activeOnly=true` leaves out the codes whose code system calls
+  them inactive; the `total` counts what is left.
+- **The terminology operations answer at the instance.** `ValueSet/[id]/$expand` and
+  `/$validate-code`, `CodeSystem/[id]/$validate-code` and `/$subsumes`, and
+  `ConceptMap/[id]/$translate`, as `POST` or `GET`, with R4's instance forms (`CodeSystem/$lookup`
+  is the type only). The instance is a resource the server stores, and what is asked of it is asked
+  of the value set, code system or concept map its `url` names (`409` when a package defines that url
+  too, since the terminology cannot tell which is meant). A value set that came from a package
+  is expanded by `url`.
+- **HL7's service categories and service types expand.** `http://hl7.org/fhir/ValueSet/service-category`
+  and `service-type` (and `program` and `appointment-cancellation-reason`) are a whole-system include
+  of a code system whose `content` is `example`, and were refused for that. They now expand to the
+  concepts the server holds, and the expansion says it is only a sample with an `expansion.parameter`
+  named `<system>|<version>#CodeSystem.content` whose value is `example`, as R4 describes. A filter on
+  such a system, an exclusion of one, one with no concepts installed, and a `fragment` are still
+  refused. `$validate-code` agrees with `$expand`; a code outside the sample is `false` with a
+  message that says the list is only a sample, and the resource validator reports the code as one it
+  cannot check, not as an error.
+- **Expansions mark abstract codes.** An entry of `$expand` carries `"abstract": true` when its code
+  system marks the concept `notSelectable`, as HL7's v3 code systems do for their grouping concepts
+  (R4's `ValueSet.expansion.contains.abstract`). `coverage-type` flags `_ActCoverageTypeCode`,
+  `_ActHealthInsuranceTypeCode`, `_ActInsurancePolicyCode`, `_ActInsuranceTypeCode` and
+  `_ActProgramTypeCode`, and no other entry. `ValueSet/$validate-code` takes R4's `abstract` input:
+  `false` refuses an abstract code, `true` accepts it, and without it the code is valid and the
+  `message` says it is a grouping concept.
+- **A value set that waits on another package's code system is expanded when that package
+  arrives.** A package stores the expansions of its own value sets, made from its own resources,
+  so a value set that includes a code system (or a value set) that another package carries was
+  left with no expansion, and installing that other package later, or earlier, did not give it
+  one until the next rebuild. After any install, the value sets that have no expansion are tried
+  again, and the ones that can now be expanded are expanded and stored under the package whose
+  definition they are of. It is one attempt at each value set that has none (94 for the R4 and SDC
+  packages, about a sixth of a second) and not a rebuild.
+- **ISO 4217 currency codes are built in.** HL7 publishes `ValueSet/currencies` (the required
+  binding of `Money.currency`) as an include of `urn:iso:std:iso:4217` and no CodeSystem for it, so
+  the value set could not be expanded and a currency could not be checked. The server now installs the
+  code system itself, at start, once: the 178 active alphabetic codes with their numeric codes and
+  English names. `$expand` of `currencies` lists them, `$validate-code` accepts a real code and
+  refuses an unknown one, and a `Money` with an unknown `currency` is rejected. A database that
+  already has the R4 packages gets it at its next start, as the package `refhir.builtin.terminology`.
+- **`Patient/$summary`: an International Patient Summary.** `GET` or `POST` it on a patient (or on
+  `Patient`, with an `identifier`) and it returns an IPS document Bundle: a Composition with
+  allergies, problems and medications (always there, with `emptyReason` when there is nothing),
+  and immunizations, laboratory results and procedures (left out when empty), each with a table
+  in its text, together with the patient's own resources and what they point at. It holds only
+  what the caller's scopes let them read, and never another patient. With the IPS package
+  installed, the summary validates against the IPS profiles. See
+  [Patient summary](docs/patient-summary.md).
+- **`Patient/[id]/$health-cards-issue`: SMART Health Cards.** With a P-256 key in
+  `[health_cards].key_file` (or `REFHIR_HEALTH_CARDS_KEY_FILE`), the server signs cards that hold the
+  patient's name and birth date and the resources asked for by `credentialType`, shrunk as the card
+  format asks, and publishes the public key at `/health-cards/.well-known/jwks.json`. `_since` holds
+  a card to what was written at or after it. See [SMART Health Cards](docs/health-cards.md).
+- **`meta.lastUpdated`, `_lastUpdated`, and history by date.** The server sets `meta.lastUpdated` on
+  every version it writes, to the millisecond, in UTC. `_lastUpdated` finds resources by it (it
+  matched nothing before, because nothing was ever set), and `_since` on a type's or the server's
+  history takes a date and time as FHIR has it (it was a `400` for anything but a version id). A
+  version id still works. Versions written before this release have no time: they are not found by
+  `_lastUpdated`, and get one the next time they are written. A deletion has no time, so a history
+  by date lists a deletion from just before the date, never leaves one out. See
+  [When a resource was written](docs/fhir-api.md#when-a-resource-was-written).
+- **A guide to SMART Health Links**, with a script that fetches a summary, encrypts it and
+  makes the link, and a host for the links (`link-host`, below). The server does not host links: a
+  separate host holds the encrypted files, so the key is never on a server that holds the record.
+  See [SMART Health Links](docs/health-links.md).
+- **A link host to run, as a package of its own.** `link-host` is a [Hono](https://hono.dev) server in
+  TypeScript that stores the encrypted files of SMART Health Links in Postgres, or in a SQLite file for
+  one machine with no database server, and answers whoever opens a link. It never has a key, so a host
+  that is broken into holds nothing that can be read. `link-host/deploy` starts it with Caddy, which
+  gets and renews an HTTPS certificate, and Postgres (`compose.yaml`) or a SQLite volume
+  (`compose.sqlite.yaml`), from one `.env` file. The host:
+  - **Keeps nothing on its own disk** with Postgres, so any number of copies run against one
+    database, and a new one may start before the old one stops. With SQLite several copies share the
+    file on one machine, and `refhir-link-host backup` copies it while they run. Either way a guess at
+    a passcode is counted once whichever copy receives it: in a transaction on the link's row in
+    Postgres, and by running again a change that finds the link changed under it in SQLite. The schema
+    is made on first start.
+  - **Clears away what has ended.** The encrypted files of a link that expired, was switched off or ran
+    out of attempts are deleted, and the record is kept for 30 days so its owner can read who asked.
+    A link without an `expiresAt` lasts 30 days, and the answer says when.
+  - **Limits how often it is asked**: by address, by link, for owners, for making links, and a caller
+    who keeps getting a token wrong is shut out. Requests, headers, time and concurrency are bounded.
+  - **Says who may make links**: a clients file with a token (or its hash) and limits for each,
+    addresses the owner routes or a client are tied to, and `REQUIRE_PASSCODE`. Owner routes cannot
+    be called from another site's page unless it is named.
+  - **Says what it does**: a JSON line for each request and event, naming a link by its first eight
+    characters and logging nothing that opens one; the address, browser and outcome of each caller in
+    the link's access list; `/readyz`, which fails when the database cannot be written; `/metrics`;
+    and a stop that tells the balancer first and then finishes what it is answering.
+  - **Can be changed in code**: `authenticate`, `authorizeCreate`, `authorizeManifest` (to check who a
+    recipient is), `onEvent`, and a `store` that another database can stand in for.
+
+- **`POST [base]/Patient/$match`.** A server that is asked whether it already holds a person used
+  to answer `405`. It now takes FHIR R4's `Parameters` (`resource`, `onlyCertainMatches`, `count`)
+  and answers a `searchset` Bundle, best first, with a `search.score` and the `match-grade`
+  extension on each entry: `certain` for an identifier with the same system and value, `probable`
+  for the same name, full birth date and a phone number or email address, `possible` for the same
+  name and full birth date. Names ignore case, accents and order (a family name written as a given
+  name matches), phone numbers ignore spacing and whether they have a country code (`+234`, or the
+  `0` of a national number, is Nigeria's), and a different birth date is not a match. A Patient that
+  is not active is never returned, and a match on one that another replaced (`link` type
+  `replaced-by`) is the Patient that replaced it, followed through up to five links in the store,
+  `probable` at the most and never `certain`. `onlyCertainMatches` returns nothing when more than
+  one Patient is a potential match. Each entry says what it was found by in `match-evidence`
+  extensions on `search`: the name, birth date, identifier, phone number or email address that
+  matched (the last three as the request wrote them, so a caller can tell which of its own phone
+  numbers matched), and the replaced Patient a match came through. The request is JSON: an XML body
+  is refused with a `415`. The CapabilityStatement lists the operation on `Patient`. A scope that
+  may search Patients may use it; a token limited to one patient may not. See
+  [FHIR API](docs/fhir-api.md#finding-a-patient-patientmatch).
+
+### Changed
+
+- **A newer version of a package takes the place of the older version.** A package at a higher
+  version used to be stored next to the one the database held, and what both defined stayed in
+  force: a version that changed a search parameter's expression stopped the server from starting
+  (`search parameter ChargeItem.status expression conflicts with an installed package`), one that
+  gave a parameter another code left the old code answering beside the new, one that left a
+  parameter out kept it, and a profile that a new version changed could lose to the older one's.
+  The newest version of a package is now the one in force, and the database holds one version of
+  each package: installing a newer one replaces the older one, and the older one's profiles, value
+  sets, code systems and search parameters are removed at the next start, which is how a replica
+  can go on reading them until it has moved to the new catalog. A search parameter the new version
+  defines again takes its definition, and the resources already stored are indexed again for it
+  when its expression, type or targets changed (before the server answers requests, or before
+  `$install` returns); one that did not change is left as it was. A parameter whose code changed is searched by the new code only,
+  a parameter the version leaves out is no longer accepted or listed in the CapabilityStatement,
+  and what was indexed under a code that is gone is cleared. The same holds for a package that
+  another package depends on. Other packages are never replaced, and a clash between a parameter
+  and one of theirs still refuses the install. Installing the same version again, or a version
+  older than the one the database holds, changes nothing, so a server can be started again on an
+  earlier release of its package. An install that fails leaves the database on the version it had,
+  and a search parameter that an install left waiting for its index (it stopped before the
+  backfill was queued) is queued at the next start. A version written differently but meaning the
+  same, such as `0.10` for `0.10.0`, replaces the one installed. A replica keeps answering from its
+  previous catalog until the primary has finished indexing: it still finds what the replaced
+  version held, and answers a parameter whose expression changed from an index that is being
+  rebuilt. A shared Postgres package leaves the shared catalog when the last tenant that had it has
+  given it up. Resources of a type that only the older
+  version defined stay in the database but are not served.
+  See [Upgrading a package](docs/configuration.md#upgrading-a-package).
+- **A date search follows R4 for ranges: `eq`, `ne`, `ge`, `le`, and a period as a range.** A value
+  and a stored date each stand for a range of time (a year, a day, a second), and `eq` took any
+  overlap, so a stored `2026` was found by `eq2026-10-31`. `eq` now finds what lies wholly inside
+  the value and `ne` what does not, and `ge` and `le` find what `gt` and `lt` find and what lies
+  wholly inside the value (a month that ends with the day is no longer `ge` that day). A `Period`
+  was read as two separate points, its start and its end; it is now the range between them, and
+  one with no `end` has not ended and one with no `start` has no beginning, as R4 reads them. **An
+  Encounter stored with only `period.start` is now found by every window after its start**, since
+  it is going on; write `period.end` when it finishes. `ap` finds what overlaps the value. A
+  period with no end, or no start, that was saved before this release is found by `gt` and `ge`
+  (no end) or by `lt` and `le` (no start) only near the date it does have until it is written
+  again, since the index holds a key for the open end only from now on (see
+  [Searching by a date or a time](docs/fhir-api.md#searching-by-a-date-or-a-time)).
+- **A date that does not exist is refused when it is stored.** A `date`, `dateTime` or `instant`
+  with day `00` (`2026-10-00`), year `0000`, a sign before the year, or a day that is not one of its
+  month (`2026-02-30`, `2023-02-29`) was accepted, and every one of them but year `0000` was a date
+  that no search could read, so the resource was stored and nothing found it. It is now a `400`
+  that names the element, as R4 asks. `date=0000` in a search is a `400` too. Such a date that is
+  already stored stays stored, and is still found by no search.
+- **A time with no zone is refused when it is stored.** `"effectiveDateTime": "2026-10-31T22:30:00"`
+  was accepted, though FHIR asks for a zone with every time in a `dateTime`, and a search by a date
+  read it as UTC whatever zone its writer meant. It is now a `400` that names the element. A date
+  with no time (`2026-10-31`) still needs no zone, and a search value with no zone is still read as
+  UTC. A system that sends times with no zone has to say which zone they are in.
+- **`_sort` on a date orders by the moment, not by the text.** `_sort=date` put
+  `2026-10-31T22:30:00-05:00` (a time on 1 November, UTC) among the times of 31 October, and
+  `…T23:30:00+01:00` after `…T23:00:00Z` though it is earlier. It now orders by when each date
+  starts, so the order is the same whatever zone the times were written in.
+- **With SMART, the terminology operations need the `read` permission, not `create`.** `$expand`,
+  `$expandability`, `$validate-code`, `$lookup`, `$subsumes` and `$translate` change nothing, but a
+  `POST` of one was authorised as a create, so a client with only `read` could not use them and
+  one with only `create` could. They are reads, as a `GET` of them is. A client that was given only
+  `create` for these resources to call them needs `read` now.
+- **Stored expansions are rebuilt once at the first start after this version**, so a database
+  that holds the R4 packages gains the expansions above. It is the same one-time rebuild an upgrade
+  has done before, and the next start finds nothing to do.
+- **A date search compares to the millisecond and in the zone a time is written in.** It compared
+  in whole seconds, so two times in one second could not be told apart (`lt` on a time missed a time
+  33 ms before it), and it read `+01:00` and `Z` as the same, so a time with an offset was found an
+  hour or more away from where it is. A value that is a date, or that has no fraction, still
+  stands for all of the day or the second it names.
+- **`gt` and `lt` on a date follow FHIR.** `gt2026-10-18` found a resource that ended after the
+  day's end, and `lt` one that began before the day's start, as `sa` and `eb` did: a period or a
+  day that straddles the value was left out. `gt` and `lt` now take what reaches beyond the value;
+  `sa` and `eb` take only what lies wholly beyond it.
+- **A slice's minimum and maximum are checked.** A profile that asks for at least one value in a
+  slice (an IPS section a summary must have, say) now fails a resource that has none, and one that
+  allows a slice once fails a resource that has it twice. A slice that is told apart by a profile
+  is still not checked.
+- **A health card's `iss` is an address a verifier can reach.** The server refuses to start with a
+  signing key on a non-loopback address when no `public_url` is set, and says so when `public_url`
+  is not `https`. `credentialType` takes the clinical types the summary holds, and no other.
+- **`Patient/$summary` and `$health-cards-issue` read a bounded part of a record.** Each kind is
+  read newest first, up to 2,000 resources, and a section holds the 100 most recently written.
+- **`$document` for a token tied to one patient holds nothing of another patient.** A reference
+  that names a host (`http://other.example/Patient/1`) is no longer taken as a resource of this
+  server.
+- **A date search no longer misses a time because of how the time is written.** The index was
+  read in the order of the text, which is not the order of time: `ge2026-10-18T04:45:53Z` found
+  nothing where a time was stored as `...:53.065Z` (a `.` sorts before a `Z`), and a time in another
+  zone was cut off the same way. A date search now reads every day it could reach, and a date
+  written to the year or the month is read by its own key, and the comparison above decides.
+- **A resource inside a Bundle entry is validated as the resource it is.** `entry.resource` (and
+  any other element that holds a whole resource, such as a Parameters part) was checked as the
+  abstract `Resource`, so every element of every entry was "unknown" and a Bundle with entries
+  could not be validated. It is now checked against its own type, the profiles the entry's slice
+  names and the ones it states in `meta.profile`. HL7's own example IPS summaries now validate.
+- **A narrative is checked, not refused.** `txt-1` and `txt-2` use FHIR's `htmlChecks()`, which
+  the server did not implement, so `$validate` of any resource with a narrative failed with
+  "unsupported function htmlChecks". It now checks that the narrative is one `div` in the XHTML
+  namespace with only the basic formatting elements, no script and some text.
+- **A complex extension is validated by the values inside it,** as is anything else a profile
+  slices: the `value[x]` of a part of an extension (the `lang` and `content` of a translation)
+  was looked for under that literal name and reported missing. Slices of an element that sits
+  inside a slice of its parent (each section of a Composition slicing its `entry`) are now told
+  apart, and no longer applied to every value of the element.
+- **`$document` returns a valid document.** It has an `identifier`, a `timestamp` and a `urn:uuid`
+  `fullUrl` for each entry, references that point at them, and holds what the Composition's
+  resources reference as well as what it references itself, each once. A document of more than
+  1000 resources is a `422`.
+- **`$everything` and `$document` hold only what the caller's scopes let them read.** They used to
+  read every kind of resource of the compartment or the document regardless of the token.
+- The built-in Patient compartment holds `MedicationStatement` and `Immunization`, for a server
+  with no `CompartmentDefinition` installed.
 
 ### Fixed
 
-- **An `_include` or `_revinclude` that cannot follow anything is refused, and no longer echoed as if it
-  had been applied.** `GET /HealthcareService?_id=gp&_revinclude=ChargeItemDefinition:context`, where
-  `context` is a token parameter, answered `200` with nothing included and the rule in the Bundle's
-  `self` link. A rule has to name a reference parameter of a resource type the server has: otherwise
-  the search is a `400` that names the rule and why, and with `Prefer: handling=lenient` the rule is set
-  aside, left out of `self`, and reported in the Bundle's `OperationOutcome` entry, as a value that cannot
-  be read already was. `_include=*`, the `:iterate` forms and every rule that follows a reference work as
-  before. See [FHIR API](docs/fhir-api.md#search).
 - **A reference inside a choice element is checked like every other.** `--references strict` (the
   default) refused a missing target for `Invoice.account` or `Observation.focus`, and saved
   `Invoice.lineItem.chargeItemReference` = `ChargeItem/nope` and `ChargeItem.productReference` =
@@ -76,6 +295,7 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `--references fhir` stays lenient. A resource that already holds a dangling reference of this
   kind is not changed, but a later update that keeps it is refused. See
   [FHIR API](docs/fhir-api.md#reference-checking).
+
 
 ## [0.0.2] - 2026-10-19
 
@@ -149,7 +369,75 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   Each tenant adds a writer, so give the Postgres server room for all of them together. See
   [Tenants on one database](docs/clustering.md#tenants-on-one-database).
 
+- **`_sort=near`, and the distance of each place `near` finds.** `Location?near=6.45|3.40|10|km&_sort=near`
+  returns the places nearest first (`-near`: farthest first, places the same distance away by id),
+  and every place a `near` search finds carries its distance in `entry.search.extension`, as the
+  FHIR `location-distance` extension (`valueDistance`, in kilometres, or miles when the search said
+  `mi`). Paging keeps the order across `next` links. A search that cannot be measured from one
+  point (no `near`, two of them, or a comma's alternatives) is refused as any other `_sort` that
+  cannot be applied (see Changed). See [FHIR API](docs/fhir-api.md#search).
+
 ### Changed
+
+- **`near` reads the places round the point, not every place.** The search used to read and
+  measure every Location, so its time grew with the table: `Location?near=6.60|3.35|10|km&_count=20`
+  took 0.4 s over 40,000 Locations and 0.7 s for 50 km. `Location.position` now has an index (a
+  Z-order curve over latitude and longitude, in the byte-ordered keys SQLite and Postgres both
+  hold, so no extension is needed), a search reads the few ranges of it that cover the circle, and
+  the places found are measured exactly as before (a search that also names an `identifier` reads
+  that identifier and only checks the circle, as it always read it). Over 40,000 Locations the same searches take
+  5 ms on SQLite and 16 ms on Postgres (a 50 km search that finds 209 places, 14 ms and 42 ms).
+  On Postgres the ranges are read in one statement, not one for each: a search sent 33 statements
+  and now sends 2, and any search that is checked row by row over several index ranges gets the
+  same. What a search finds is unchanged: the distance is still measured with the same formula, and
+  a place exactly at the distance is still in. **Schema migration 3 (4 in the shared tenant layout)
+  makes the first start after upgrading build the index** for the places already stored: it puts
+  `near` back to pending and queues a backfill, which the server runs as it starts, before it
+  answers requests. That takes about 5 seconds for 40,000 places on SQLite and about 3 minutes on
+  Postgres, which commits 16 places at a time. Until it is done `near` answers `400` (unsupported
+  search parameter) on a replica, and a replica waits for the migration as for any other. Back the
+  database up first, as for any migration ([Schema migrations](docs/migrations.md)); there is no
+  going back to an earlier release afterwards.
+- **`_has` is answered for the places the rest of the search leaves, and `_include` and `_revinclude`
+  are read for the whole page at once.** `Location?near=…&_has:OrganizationAffiliation:location:network=…` ran the
+  `OrganizationAffiliation` search over every affiliation in the database, built a Bundle of all of
+  them and read their references, whatever few places `near` had left: with 10,000 places it took
+  10 to 30 seconds, the same for a circle of 6 places as of 223, and the directory search that adds a
+  second `_has`, an `_include` and two `_revinclude` took about twenty. When the other parameters
+  leave up to a few thousand resources, each is now looked up in the index of the reference
+  (`OrganizationAffiliation.location`), and what refers to it is checked against `network=…`, so the
+  cost follows the places near and not the size of the database. An `_include` and a `_revinclude` read
+  what their rules lead to for every match of the page in one request to the database for each
+  rule, where each used one for each match. SQLite and Postgres answer such a read in one statement for each 200 and 50 index ranges
+  instead of one each. The answers are the same: a search that leaves many resources, a `_has` that is
+  not a plain parameter of the type (a chain, `_id`, a parameter the type lacks), and a server run with
+  `--references fhir` (where a reference can be a URL that an index lookup would not find) take the
+  search of the whole type, as before. **Numbers.** A directory of 10,000 places (and as many
+  organizations, services and affiliations) in a SQLite file, the releases before and after started
+  on copies of it, one request at a time on a busy machine (load average 90 to 240, so read the
+  ratios): `Location?near=6.6|3.35|100|km&_sort=near&_count=100` with a `_has` on the service
+  category took 4.5 s and now takes 52 ms; with a `_has` on the network, 8.7 s and now 61 ms; a 5 km
+  circle with the `_has` on the network, 10.0 s and now 3 ms; and the directory search (`near`, both
+  `_has`, an `_include` and two `_revinclude`), 15.0 s and now 199 ms, its CPU time falling from 4.2 s
+  to 0.15 s. Every Bundle is identical entry for entry. On Postgres 16 in a local container, with 2,000 places and the same
+  data for both, one request at a time on a machine at load about 15, the same searches went from
+  145 ms to 12 ms, 161 ms to 13 ms, and 446 ms to 38 ms for the directory search (the statements that
+  read many ranges are prepared once for each connection, so they are planned a few times and not
+  on every request). A `_has` that nothing else narrows still costs what the whole type costs,
+  about 9 s at 10,000 places on SQLite: it is asked of its places one at a time only while that is
+  25 statements or fewer (5,000 places on SQLite, 1,250 on Postgres), and past that is answered as
+  before.
+
+- **A control the server cannot apply is refused, not echoed.** `Location?_sort=bogus` answered
+  `200` and its `self` link still said `_sort=bogus`, as if the order had been applied, though FHIR
+  says that link holds the parameters the server used. The same held for `_sort` by a parameter
+  the server cannot order by (a number, a quantity, an age), `_summary` or `_total` with a value
+  they do not take, and an `_include` or `_revinclude` naming a resource type or parameter that
+  does not exist or is not a reference. Each is now a `400` that names it, unless the request has
+  `Prefer: handling=lenient`, which runs the search without it: it is not in the `self` or `next`
+  link, and the `OperationOutcome` entry says what was left out. `_sort=_id` sorts by the resource
+  id. **A client that sent such a term and relied on its being ignored now gets a `400`:** remove
+  it, or send `Prefer: handling=lenient`. See [FHIR API](docs/fhir-api.md#search).
 
 - **A running server holds what every request needs and an index of the rest, and reads the rest
   the first time a request uses it.** It used to hold every StructureDefinition, code system,

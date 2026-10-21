@@ -824,6 +824,45 @@ async fn the_audit_trail_records_who_did_what_to_which_resource() {
 }
 
 #[tokio::test]
+async fn a_patient_match_is_audited_as_an_operation_and_not_by_what_it_looked_for() {
+    let rig = rig(observing(), true);
+    let acme = rig.token("acme", &["user/Patient.read", "user/Patient.write"]);
+    let mut known = patient("ignored");
+    known["identifier"] = json!([{"system": "urn:example:id", "value": "SECRET-ID-42"}]);
+    assert_eq!(
+        rig.call("POST", "/Patient", Some(known), Some(&acme))
+            .await
+            .status,
+        StatusCode::CREATED
+    );
+    let asked = json!({"resourceType": "Parameters", "parameter": [{"name": "resource", "resource": {
+        "resourceType": "Patient", "identifier": [{"system": "urn:example:id", "value": "SECRET-ID-42"}]}}]});
+    let found = rig
+        .call("POST", "/Patient/$match", Some(asked), Some(&acme))
+        .await;
+    assert_eq!(found.status, StatusCode::OK, "{}", found.body);
+    assert_eq!(found.body["total"], 1);
+
+    let rows = rig.audit().await;
+    let matched: Vec<_> = rows
+        .iter()
+        .filter(|row| row.detail.as_deref() == Some("$match"))
+        .collect();
+    assert_eq!(matched.len(), 1, "{rows:?}");
+    let row = matched[0];
+    assert_eq!(
+        (row.action.as_str(), row.subtype.as_str()),
+        ("E", "operation")
+    );
+    assert_eq!(row.resource_type.as_deref(), Some("Patient"));
+    assert_eq!((row.status, row.outcome), (200, 0));
+    assert_eq!(row.principal, "client:acme");
+    // What it looked for names a person, and is in no row.
+    assert_eq!(row.query, None);
+    assert!(!format!("{rows:?}").contains("SECRET-ID-42"));
+}
+
+#[tokio::test]
 async fn what_was_refused_at_the_door_is_audited_with_whoever_asked() {
     let rig = rig(observing(), true);
     let narrow = rig.token("acme", &["user/Patient.read"]);

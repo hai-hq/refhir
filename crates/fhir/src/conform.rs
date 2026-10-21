@@ -36,6 +36,7 @@ pub fn commit_operation(
         return crate::npm::install_operation(store, db, catalog, args).map_err(RunError::Fhir);
     }
     preflight(store, catalog, path, args).map_err(RunError::Fhir)?;
+    check_instance(store, db, path, args).map_err(RunError::Fhir)?;
     let result = {
         let guard = catalog.read().expect("catalog");
         run::run(db, &guard, path, args)?
@@ -749,7 +750,7 @@ fn terminology_urls(resources: &[Value]) -> Vec<String> {
 ///
 /// The change is applied to the live catalog in place under its write lock, together with the
 /// stored expansions, so two writers cannot each rebuild from what the other has not applied.
-fn apply_terminology(
+pub(crate) fn apply_terminology(
     store: &dyn ConformanceStore,
     catalog: &std::sync::RwLock<crate::catalog::Catalog>,
     local_id: i64,
@@ -930,7 +931,7 @@ fn sync_expansions(store: &dyn ConformanceStore) -> Result<(), FhirError> {
     Ok(())
 }
 
-fn tombstone_index(db: &Database, base: &str, code: &str) -> Result<(), FhirError> {
+pub(crate) fn tombstone_index(db: &Database, base: &str, code: &str) -> Result<(), FhirError> {
     for _ in 0..=MAX_OCC_FAILURES {
         match tombstone_once(db, base, code) {
             Ok(()) => return Ok(()),
@@ -1128,6 +1129,59 @@ fn previous_body(
     let document = DocumentId::new(TabletId::new(tablet), id.as_bytes());
     let previous = db.reader().previous_revision(&document, at)?;
     Ok(previous.and_then(|entry| entry.value))
+}
+
+/// A terminology operation sent to an instance (`ValueSet/[id]/$expand`) is asked of what the
+/// instance's `url` names, and the terminology holds one answer for a url: the definition in use.
+/// When a package defines that url too, that may be the package's and not the instance, so the
+/// request is refused and the caller asked to use the url, rather than answered for another
+/// definition. (A code system that names its own version is told apart by it.)
+fn check_instance(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    path: &str,
+    args: &Value,
+) -> Result<(), FhirError> {
+    let Some(id) = args
+        .get(crate::terms::INSTANCE)
+        .and_then(|value| value.as_str())
+    else {
+        return Ok(());
+    };
+    let Some((type_name, _)) = path.split_once('/') else {
+        return Ok(());
+    };
+    if !matches!(type_name, "ValueSet" | "CodeSystem" | "ConceptMap") {
+        return Ok(());
+    }
+    // An instance that is not stored is reported by the operation itself.
+    let Some(resource) = live_json(db, type_name, id)? else {
+        return Ok(());
+    };
+    let Some(url) = resource
+        .get("url")
+        .and_then(|value| value.as_str())
+        .filter(|url| !url.is_empty())
+    else {
+        return Ok(());
+    };
+    if type_name == "CodeSystem" && resource.get("version").is_some() {
+        return Ok(());
+    }
+    let url = canonical_url(url);
+    let defined_by: BTreeSet<i64> = store
+        .load_terminology_for(&[url.to_string()])?
+        .into_iter()
+        .filter(|row| row.resource_type == type_name && canonical_url(&row.url) == url)
+        .map(|row| row.package_id)
+        .collect();
+    if defined_by.len() > 1 {
+        return Err(FhirError::Conflict(format!(
+            "{type_name}/{id} has the url {url}, which a package defines too, and the terminology \
+             answers for one definition of a url, so it cannot tell which is meant: ask for it by url"
+        )));
+    }
+    Ok(())
 }
 
 fn live_json(db: &Database, type_name: &str, id: &str) -> Result<Option<Value>, FhirError> {

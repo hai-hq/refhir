@@ -1,108 +1,110 @@
-//! Terminology that FHIR binds to and its packages do not carry.
+//! Terminology the server carries itself.
 //!
-//! Some bindings are to code systems that belong to someone else and are not distributed with the
-//! specification: `Money.currency` is bound to ISO 4217, whose codes the R4 core package never
-//! includes. Without them the value set `http://hl7.org/fhir/ValueSet/currencies` cannot be
-//! expanded, and a currency that is not one is only a warning. The code systems here are small,
-//! and are stored as a package of their own, so they are one more version of a code system among
-//! the others (a package a deployment installs with a newer list is used in preference).
+//! The FHIR packages a server installs refer to code systems that no package holds: HL7 publishes
+//! `ValueSet/currencies` as a whole-system include of ISO 4217, `Money.currency` is bound to it
+//! (`required`), and there is no CodeSystem for it in R4 core, in SDC, or in the terminology
+//! package. Without one, the value set cannot be expanded, a code cannot be checked against it, and
+//! a client that expands every value set a form binds is left with an error.
+//!
+//! These are installed like a package: stored under their own name and version, so that they are
+//! there for a database that already had the R4 packages, and installed once. The value sets that
+//! were waiting for them are expanded as they arrive, by the incremental path a code system that
+//! is written uses, which reads only those value sets and does not load the catalog again. (Any
+//! package, installed before or after, is also followed by a pass over the value sets that have
+//! no expansion; see `package::expand_waiting`. This one need not wait for that.)
+//! Changing what they hold is a new version, which a database takes in addition to the old one.
 
 use std::sync::RwLock;
-use std::time::Duration;
 
 use refhir_database::Database;
 use refhir_persistence::{ConformanceStore, NewPackage};
-use refhir_validate::TerminologyBuilder;
 use serde_json::Value;
 
 use crate::catalog::Catalog;
+use crate::conform::apply_terminology;
 use crate::error::FhirError;
-use crate::package::{expansion_rows, stage_new_package, terminology_row};
+use crate::npm::packages_installed;
+use crate::package::{announce_terminology, stage_new_package, terminology_row};
 
-/// ISO 4217's alphabetic codes, as SIX Group (its maintenance agency) published them on the date
-/// the code system's `version` gives.
-const ISO_4217: &str = include_str!("../terminology/CodeSystem-iso4217.json");
+/// The name the built-in terminology is stored under, with the version of what it holds.
+pub const BUILTIN_PACKAGE: &str = "refhir.builtin.terminology@1.0.0";
 
-/// R4's value set of currencies, which the core package defines and cannot expand for want of the
-/// code system above. Stored beside it, the package can: a value set that two packages define is
-/// answered by the one that has an expansion.
-const CURRENCIES: &str = include_str!("../terminology/ValueSet-currencies.json");
+/// The resources the package holds. ISO 4217 is the active alphabetic currency codes, with their
+/// numeric codes and English names.
+const RESOURCES: [&str; 1] = [include_str!("../builtin/CodeSystem-iso4217.json")];
 
-/// The package the built-in code systems are stored as. Its version changes when a code system in
-/// it does, and the server then stores the new one next to the old.
-const PACKAGE: &str = "refhir.terminology";
-const VERSION: &str = "2026.9.17";
-/// The FHIR release the code systems are for: the one this server serves.
-const RELEASE: &str = "4.0.1";
-
-/// The package of built-in code systems, with the version the server would store.
-fn package() -> Result<NewPackage, FhirError> {
+fn builtin_package() -> Result<NewPackage, FhirError> {
+    let (name, version) = BUILTIN_PACKAGE
+        .split_once('@')
+        .expect("the built-in package is name@version");
     let mut terminology = Vec::new();
-    let mut expanded = TerminologyBuilder::for_package(None);
-    for (name, text) in [("ISO 4217", ISO_4217), ("currencies", CURRENCIES)] {
+    for text in RESOURCES {
         let resource: Value = serde_json::from_str(text)
-            .map_err(|err| FhirError::Invalid(format!("built-in {name}: {err}")))?;
+            .map_err(|err| FhirError::Invalid(format!("built-in terminology: {err}")))?;
         terminology.push(terminology_row(&resource)?);
-        expanded.add_resource(0, resource);
     }
     Ok(NewPackage {
-        name: PACKAGE.into(),
-        version: VERSION.into(),
-        fhir_version: RELEASE.into(),
+        name: name.to_string(),
+        version: version.to_string(),
+        // The release these code systems are read for, which is the only one this server serves.
+        fhir_version: "4.0.1".to_string(),
         structure_definitions: Vec::new(),
         search_parameters: Vec::new(),
         terminology,
-        expansions: expansion_rows(expanded, RELEASE),
+        // A code system has no expansion of its own, and the value sets that include it are in
+        // other packages, whose expansions are made when it arrives.
+        expansions: Vec::new(),
     })
 }
 
-/// Store the built-in code systems unless this version of them is stored already, and publish
-/// them. It says whether it stored them.
-///
-/// It is cheap to call on every start: the answer is one read of the list of packages. Publishing
-/// rebuilds the catalog, which is the cost of it, so a database that is about to be given the
-/// packages of its release uses [`stage_builtin_terminology`] and lets their publish include
-/// these.
+/// Install the built-in terminology, unless this database has it or has no other package. A
+/// database that has already expanded every value set it holds gains the expansions that were
+/// waiting for it.
 pub fn install_builtin_terminology(
     store: &dyn ConformanceStore,
     db: &Database,
     catalog: &RwLock<Catalog>,
-) -> Result<bool, FhirError> {
-    store_builtin(store, db, catalog, true)
-}
-
-/// [`install_builtin_terminology`] without the publish: stored, and in the catalog at the next
-/// publish, which is the one that ends installing the packages of the release.
-pub fn stage_builtin_terminology(
-    store: &dyn ConformanceStore,
-    db: &Database,
-    catalog: &RwLock<Catalog>,
-) -> Result<bool, FhirError> {
-    store_builtin(store, db, catalog, false)
-}
-
-fn store_builtin(
-    store: &dyn ConformanceStore,
-    db: &Database,
-    catalog: &RwLock<Catalog>,
-    publish_now: bool,
-) -> Result<bool, FhirError> {
-    let installed = store.load_packages().map_err(FhirError::from)?;
-    if installed
-        .iter()
-        .any(|package| package.name == PACKAGE && package.version == VERSION)
-    {
-        return Ok(false);
+) -> Result<(), FhirError> {
+    if packages_installed(store, &[BUILTIN_PACKAGE])? {
+        return Ok(());
     }
-    // The package has no search parameters, so there is no backfill to queue for it.
-    stage_new_package(
+    // With no other package there is nothing that refers to it, and a replica starts serving once
+    // any package is stored: it must not be left with only this. A server that is given its
+    // packages later has it at its next start.
+    if store.load_packages()?.is_empty() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let package = builtin_package()?;
+    let urls: Vec<String> = package
+        .terminology
+        .iter()
+        .map(|row| row.url.clone())
+        .collect();
+    let (name, version) = (package.name.clone(), package.version.clone());
+    // Not published: the catalog is brought up to date below, as it is for a code system that is
+    // written, which reads only the value sets that include what arrives and does not load the
+    // whole catalog again.
+    let pending = stage_new_package(
         store,
         db,
         catalog,
-        package()?,
-        Duration::ZERO,
-        "built in",
-        publish_now,
+        package,
+        started.elapsed(),
+        "read",
+        false,
     )?;
-    Ok(true)
+    // The value sets that were waiting for what this carries are in other packages, and are
+    // expanded now, without the catalog being loaded again.
+    let package_id = store
+        .load_packages()?
+        .into_iter()
+        .find(|package| package.name == name && package.version == version)
+        .map(|package| package.id)
+        .ok_or_else(|| FhirError::Storage(format!("{name}@{version} was not stored")))?;
+    apply_terminology(store, catalog, package_id, &urls, &[])?;
+    if let Some(pending) = pending {
+        pending.create(store, db)?;
+    }
+    announce_terminology(store)
 }

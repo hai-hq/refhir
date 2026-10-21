@@ -27,6 +27,20 @@ updates:
       site-minor-and-patch:
         update-types: [minor, patch]
 
+  - package-ecosystem: npm
+    directory: /link-host
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      link-host-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /link-host
+    schedule:
+      interval: weekly
+
   - package-ecosystem: gomod
     directory: /clients/go
     schedule:

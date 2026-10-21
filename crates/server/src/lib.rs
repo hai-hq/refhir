@@ -5,6 +5,7 @@ mod cluster;
 mod governance;
 mod graphql;
 mod health;
+mod health_cards;
 mod http;
 mod jobs;
 mod sync;
@@ -25,6 +26,7 @@ pub use governance::{
     AuditConfig, Cidr, ClientRate, Costs, Governance, GovernanceConfig, ProxyConfig, QuotaConfig,
     QuotaLimits, RateLimitConfig, RequestLogConfig,
 };
+pub use health_cards::IssuerKey;
 pub use http::{
     app, app_parts, app_with, AppState, ServerConfig, SharedGovernanceStore, DEFAULT_PAGE_SIZE,
 };
@@ -134,5 +136,9 @@ async fn shutdown_signal() {
 mod billing_tests;
 #[cfg(test)]
 mod booking_tests;
+#[cfg(test)]
+mod match_tests;
+#[cfg(test)]
+mod near_tests;
 #[cfg(test)]
 mod tests;

@@ -124,6 +124,188 @@ fn terminology(store: &PostgresPersistence) -> Vec<(i64, String)> {
         .collect()
 }
 
+/// A newer version of a package that tenants share replaces the search parameters of the tenant
+/// that installs it, and of no other: another tenant keeps the version it has until it installs the
+/// newer one, which it is given from the copy that was built.
+#[test]
+fn a_newer_version_of_a_shared_package_replaces_the_older_one_for_the_tenant_that_installs_it() {
+    let Some(admin) = test_url("shared package versions") else {
+        return;
+    };
+    let url = shared(&admin, "tver", &["a", "b"]);
+    let (a, b) = (open(&url, "a"), open(&url, "b"));
+    let rows = |store: &PostgresPersistence| -> Vec<(String, String, ParamStatus, i64)> {
+        let mut rows: Vec<_> = store
+            .load_search_parameters()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.code.starts_with("versioned-"))
+            .map(|row| {
+                (
+                    row.code,
+                    row.expression.unwrap_or_default(),
+                    row.status,
+                    row.package_id,
+                )
+            })
+            .collect();
+        rows.sort_by(|left, right| left.0.cmp(&right.0));
+        rows
+    };
+    let codes = |list: &[refhir_persistence::PendingParam]| -> Vec<String> {
+        list.iter().map(|param| param.code.clone()).collect()
+    };
+    // The versions of the package a tenant has, and the packages its definitions and expansions of
+    // it are stored under.
+    let versions = |store: &PostgresPersistence| -> Vec<String> {
+        store
+            .load_packages()
+            .unwrap()
+            .into_iter()
+            .filter(|package| package.name == "versioned")
+            .map(|package| package.version)
+            .collect()
+    };
+    let owners = |store: &PostgresPersistence| -> (Vec<i64>, Vec<i64>) {
+        let mut definitions: Vec<i64> = store
+            .load_structure_definitions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.contains("/versioned/"))
+            .map(|row| row.package_id)
+            .collect();
+        let mut expansions: Vec<i64> = store
+            .load_expansions()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.url.contains("/versioned/"))
+            .map(|row| row.package_id)
+            .collect();
+        definitions.sort();
+        definitions.dedup();
+        expansions.sort();
+        expansions.dedup();
+        (definitions, expansions)
+    };
+    let first = demo("versioned", "4.0.1");
+    let (one_a, _) = install(&a, &first, "one").unwrap();
+    a.mark_base_ready(one_a.package_id, "Patient").unwrap();
+    let (one_b, _) = install(&b, &first, "one").unwrap();
+    assert_eq!(rows(&a).len(), 3);
+    assert_eq!(rows(&b).len(), 3);
+
+    // 2.0.0 keeps one parameter, changes another, and leaves the third out.
+    let mut second = demo("versioned", "4.0.1");
+    second.version = "2.0.0".into();
+    second.search_parameters.truncate(2);
+    second.search_parameters[1].expression = Some("Patient.changed".into());
+    let (two_a, reads) = install(&a, &second, "two").unwrap();
+    assert_eq!(reads, 1);
+    assert_eq!(codes(&two_a.newly_pending), ["versioned-code1"]);
+    let retired = |store: &PostgresPersistence| -> Vec<String> {
+        store
+            .retired_parameters()
+            .unwrap()
+            .into_iter()
+            .map(|param| param.code)
+            .collect()
+    };
+    // What only the replaced version defines.
+    assert_eq!(retired(&a), ["versioned-code2"]);
+    let held = rows(&a);
+    assert_eq!(
+        held,
+        [
+            (
+                "versioned-code0".to_string(),
+                "Patient.extension0".to_string(),
+                ParamStatus::Ready,
+                two_a.package_id
+            ),
+            (
+                "versioned-code1".to_string(),
+                "Patient.changed".to_string(),
+                ParamStatus::Pending,
+                two_a.package_id
+            ),
+        ]
+    );
+    assert_eq!(versions(&a), ["2.0.0"]);
+    assert_eq!(owners(&a), (vec![two_a.package_id], vec![two_a.package_id]));
+    // The other tenant is as it was: the shared copy of 1.0.0 is still its package.
+    let untouched = rows(&b);
+    assert_eq!(untouched.len(), 3);
+    assert!(untouched.iter().all(|row| row.3 == one_b.package_id));
+    assert_eq!(versions(&b), ["1.0.0"]);
+    assert_eq!(owners(&b), (vec![one_b.package_id], vec![one_b.package_id]));
+
+    // The replaced version is out of every list of the tenant that replaced it, but still there to
+    // read by key, for a process that serves from the catalog it loaded before. Collected, the
+    // tenant has given up its link to the shared copy, which stays for the tenant that still has it.
+    let shared_packages = |version: &str| {
+        count(
+            &url,
+            &format!(
+                "SELECT count(*) FROM packages \
+                 WHERE instance_id = 0 AND name = 'versioned' AND version = '{version}'"
+            ),
+        )
+    };
+    let shared_rows = |package: i64| {
+        count(
+            &url,
+            &format!(
+                "SELECT (SELECT count(*) FROM base_search_parameters WHERE package_id = {package}) \
+                      + (SELECT count(*) FROM base_expansions WHERE package_id = {package}) \
+                      + (SELECT count(*) FROM structure_definitions \
+                         WHERE instance_id = 0 AND package_id = {package}) \
+                      + (SELECT count(*) FROM terminology \
+                         WHERE instance_id = 0 AND package_id = {package})"
+            ),
+        )
+    };
+    let definition = "http://example.org/versioned/sd/0";
+    assert!(a
+        .load_structure_definition_json(one_a.package_id, definition)
+        .unwrap()
+        .is_some());
+    a.collect_superseded().unwrap();
+    assert_eq!(versions(&a), ["2.0.0"]);
+    assert_eq!(shared_packages("1.0.0"), 1);
+    assert!(shared_rows(one_a.package_id) > 0);
+    assert!(b
+        .load_structure_definition_json(one_b.package_id, definition)
+        .unwrap()
+        .is_some());
+    assert_eq!(versions(&b), ["1.0.0"]);
+
+    // It is given the newer version from the copy, and has not marked any of its own parameters
+    // ready, so each of the two it keeps is waiting for its index.
+    let (two_b, reads) = install(&b, &second, "two").unwrap();
+    assert_eq!(reads, 0);
+    assert!(two_b.shared);
+    assert_eq!(
+        codes(&two_b.newly_pending),
+        ["versioned-code0", "versioned-code1"]
+    );
+    assert_eq!(retired(&b), ["versioned-code2"]);
+    assert_eq!(rows(&b).len(), 2);
+    assert_eq!(versions(&b), ["2.0.0"]);
+    assert_eq!(owners(&b), (vec![two_b.package_id], vec![two_b.package_id]));
+    // And the first is not disturbed by it.
+    assert_eq!(rows(&a), held);
+
+    // The last tenant to give the older version up takes the shared copy of it out of the catalog,
+    // with what it held there, and the newer version is still there for both.
+    b.collect_superseded().unwrap();
+    assert_eq!(versions(&b), ["2.0.0"]);
+    assert_eq!(shared_packages("1.0.0"), 0);
+    assert_eq!(shared_rows(one_a.package_id), 0);
+    assert_eq!(shared_packages("2.0.0"), 1);
+    assert!(shared_rows(two_a.package_id) > 0);
+    assert_eq!(rows(&a), held);
+}
+
 #[test]
 fn tenants_share_one_copy_of_a_package_and_the_second_never_reads_it() {
     let Some(admin) = test_url("shared catalog") else {
@@ -845,4 +1027,224 @@ fn a_shared_copy_that_lost_rows_is_not_given_to_another_tenant() {
         b.load_packages().unwrap().is_empty(),
         "tenant b was given a damaged package"
     );
+}
+
+/// A database in the shared layout with tenants `a` and `c`, in which `a` has installed 1.0.0 of a
+/// package that tenants share and then 2.0.0, so that 1.0.0 is a package `a` gives up the next time
+/// it collects, and the last tenant to do so removes it from the shared catalog. Returns the URL,
+/// both tenants, the 1.0.0 package as `a` installed it, and its id.
+fn a_shared_package_that_a_has_replaced(
+    admin: &str,
+    tag: &str,
+) -> (
+    String,
+    PostgresPersistence,
+    PostgresPersistence,
+    NewPackage,
+    i64,
+) {
+    let url = shared(admin, tag, &["a", "c"]);
+    let (a, c) = (open(&url, "a"), open(&url, "c"));
+    let first = demo("raced", "4.0.1");
+    let (one, _) = install(&a, &first, "one").unwrap();
+    let mut second = demo("raced", "4.0.1");
+    second.version = "2.0.0".into();
+    install(&a, &second, "two").unwrap();
+    (url, a, c, first, one.package_id)
+}
+
+/// Waits until `blocked` sessions of the database are waiting for a lock, which is how a test knows
+/// that a statement it started is held up where it means it to be.
+fn wait_for_sessions_blocked(url: &str, blocked: i64) {
+    let started = Instant::now();
+    loop {
+        let waiting = count(
+            url,
+            "SELECT count(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        );
+        if waiting == blocked {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{waiting} sessions are waiting for a lock, not {blocked}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// How many rows of the shared catalog the package holds: its parameters, expansions, definitions
+/// and terminology, and its own row.
+fn shared_catalog_rows(url: &str, package: i64) -> i64 {
+    count(
+        url,
+        &format!(
+            "SELECT (SELECT count(*) FROM base_search_parameters WHERE package_id = {package}) \
+                  + (SELECT count(*) FROM base_expansions WHERE package_id = {package}) \
+                  + (SELECT count(*) FROM structure_definitions \
+                     WHERE instance_id = 0 AND package_id = {package}) \
+                  + (SELECT count(*) FROM terminology \
+                     WHERE instance_id = 0 AND package_id = {package}) \
+                  + (SELECT count(*) FROM packages WHERE instance_id = 0 AND id = {package})"
+        ),
+    )
+}
+
+/// A tenant that is being given a shared package links it before it reads anything else of it, and
+/// the tenant that gives it up locks it before it removes anything. When the link comes first the
+/// removal waits for it, finds that a tenant has the package, and leaves it whole.
+#[test]
+fn a_tenant_given_a_shared_package_keeps_it_from_the_tenant_that_gives_it_up() {
+    let Some(admin) = test_url("shared package race, activation first") else {
+        return;
+    };
+    let (url, a, c, first, package) = a_shared_package_that_a_has_replaced(&admin, "traceact");
+    let held = shared_catalog_rows(&url, package);
+    assert!(held > 1);
+
+    // A lock on a table of the shared catalog holds the activation up after it has linked the
+    // package, where it counts what the copy holds.
+    let mut locker = client(&url);
+    locker
+        .batch_execute("BEGIN; LOCK TABLE base_search_parameters IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    std::thread::scope(|scope| {
+        let given = scope.spawn(|| install(&c, &first, "one").unwrap());
+        wait_for_sessions_blocked(&url, 1);
+        let collected = scope.spawn(|| a.collect_superseded().unwrap());
+        // The removal waits for the lock on the package that the link holds.
+        wait_for_sessions_blocked(&url, 2);
+        assert!(!collected.is_finished());
+        locker.batch_execute("COMMIT").unwrap();
+        collected.join().unwrap();
+        let (outcome, reads) = given.join().unwrap();
+        assert_eq!(
+            outcome.package_id, package,
+            "c was given the copy that was there"
+        );
+        assert!(outcome.shared);
+        assert_eq!(reads, 0, "c did not build a copy of its own");
+    });
+
+    assert_eq!(
+        shared_catalog_rows(&url, package),
+        held,
+        "the shared copy is whole"
+    );
+    assert_eq!(
+        c.load_packages()
+            .unwrap()
+            .into_iter()
+            .map(|package| (package.name, package.version, package.id))
+            .collect::<Vec<_>>(),
+        [("raced".to_string(), "1.0.0".to_string(), package)]
+    );
+    assert!(c
+        .load_structure_definition_json(package, "http://example.org/raced/sd/0")
+        .unwrap()
+        .is_some());
+    // The tenant that gave it up has only the newer version.
+    let versions: Vec<_> = a
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .map(|package| package.version)
+        .collect();
+    assert_eq!(versions, ["2.0.0"]);
+}
+
+/// The other order: the removal has locked the package, and a tenant that is being given it waits
+/// for the removal, finds that the package is not there, and is given a copy built anew.
+#[test]
+fn a_tenant_given_a_shared_package_that_is_being_removed_gets_a_copy_built_anew() {
+    let Some(admin) = test_url("shared package race, removal first") else {
+        return;
+    };
+    let (url, a, c, first, package) = a_shared_package_that_a_has_replaced(&admin, "tracerem");
+    assert!(shared_catalog_rows(&url, package) > 1);
+
+    // A lock on a table of the shared catalog holds the removal up after it has locked the package
+    // and begun to remove what it holds.
+    let mut locker = client(&url);
+    locker
+        .batch_execute("BEGIN; LOCK TABLE base_expansions IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    std::thread::scope(|scope| {
+        let collected = scope.spawn(|| a.collect_superseded().unwrap());
+        wait_for_sessions_blocked(&url, 1);
+        let given = scope.spawn(|| install(&c, &first, "one").unwrap());
+        // The link waits for the lock the removal holds on the package.
+        wait_for_sessions_blocked(&url, 2);
+        assert!(!given.is_finished());
+        locker.batch_execute("COMMIT").unwrap();
+        collected.join().unwrap();
+        let (outcome, reads) = given.join().unwrap();
+        assert_ne!(
+            outcome.package_id, package,
+            "c was not given the copy that was removed"
+        );
+        assert!(outcome.shared);
+        assert_eq!(reads, 1, "c built the copy from the package");
+    });
+
+    assert_eq!(
+        shared_catalog_rows(&url, package),
+        0,
+        "the removed copy is gone"
+    );
+    let held = c.load_packages().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(
+        (held[0].name.as_str(), held[0].version.as_str()),
+        ("raced", "1.0.0")
+    );
+    assert_ne!(held[0].id, package);
+    assert!(c
+        .load_structure_definition_json(held[0].id, "http://example.org/raced/sd/0")
+        .unwrap()
+        .is_some());
+}
+
+/// A tenant gives up a shared package and the package leaves the shared catalog in one
+/// transaction. When the removal fails the tenant still has its link, so that the next collection
+/// finds the package again; if the link were gone, nothing would name a package nobody has.
+#[test]
+fn a_removal_of_a_shared_package_that_fails_leaves_the_tenant_its_link() {
+    let Some(admin) = test_url("shared package removal that fails") else {
+        return;
+    };
+    let (url, a, _c, _first, package) = a_shared_package_that_a_has_replaced(&admin, "tracefail");
+    let held = shared_catalog_rows(&url, package);
+    let links = |url: &str| {
+        count(
+            url,
+            &format!("SELECT count(*) FROM tenant_packages WHERE package_id = {package}"),
+        )
+    };
+    assert_eq!(links(&url), 1);
+
+    // Something in the database refuses to let the package's parameters go.
+    client(&url)
+        .batch_execute(
+            "CREATE FUNCTION refuse_removal() RETURNS trigger LANGUAGE plpgsql AS \
+             $f$ BEGIN RAISE EXCEPTION 'removal refused'; END $f$; \
+             CREATE TRIGGER refuse_removal BEFORE DELETE ON base_search_parameters \
+             FOR EACH ROW EXECUTE FUNCTION refuse_removal()",
+        )
+        .unwrap();
+    assert!(a.collect_superseded().is_err());
+    assert_eq!(
+        links(&url),
+        1,
+        "the tenant gave the package up, and it is still there"
+    );
+    assert_eq!(shared_catalog_rows(&url, package), held);
+
+    client(&url)
+        .batch_execute("DROP TRIGGER refuse_removal ON base_search_parameters")
+        .unwrap();
+    a.collect_superseded().unwrap();
+    assert_eq!(links(&url), 0);
+    assert_eq!(shared_catalog_rows(&url, package), 0);
 }

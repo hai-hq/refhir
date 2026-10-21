@@ -1,0 +1,57 @@
+# The same host on one machine with no database server: it keeps its links in a SQLite file, and Caddy
+# gets and renews the certificate and passes requests on to it.
+#
+#   1. Point a DNS name at this machine and open ports 80 and 443.
+#   2. Make a .env file beside this one:  DOMAIN=links.example.org
+#                                         ADMIN_TOKEN=<a secret: openssl rand -base64 32>
+#   3. docker compose -f compose.sqlite.yaml up -d
+#
+# Links and their files are in the `shl-data` volume. To back it up while the host runs:
+#   docker compose -f compose.sqlite.yaml exec link-host node dist/server.js backup /data/backup.db
+#   docker compose cp link-host:/data/backup.db ./backup.db
+# which copies the whole database as it is at one moment. Copying the links.db file itself is not a
+# backup while the host is running: some of it is in the links.db-wal file beside it. For more than one
+# machine, use compose.yaml, which has Postgres.
+services:
+  link-host:
+    build: ..
+    restart: unless-stopped
+    environment:
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in the .env file}
+      PUBLIC_URL: https://${DOMAIN:?set DOMAIN in the .env file}
+      DATABASE_URL: sqlite:///data/links.db
+      # Caddy is the one proxy, so the caller is the address it saw.
+      TRUST_PROXY: "1"
+      # Time for Caddy to see that it is going before it stops listening.
+      SHUTDOWN_DELAY_SECONDS: "3"
+    volumes:
+      - shl-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - link-host
+
+volumes:
+  shl-data:
+  caddy-data:
+  caddy-config:

@@ -56,16 +56,20 @@ const PATTERNS: &[Pattern] = &[
         regex: r"^[ \r\n\tA-Za-z0-9+/=]*$",
     },
     Pattern {
+        // As in R4: a year from 0001 to 9999 with no sign, a month from 01 and a day from 01. That
+        // a day is one of its month is checked after the pattern (`day_exists`).
         code: "date",
-        regex: r"^-?[0-9]{4}(-(0[1-9]|1[0-2])(-(0[0-9]|[1-2][0-9]|3[0-1]))?)?$",
+        regex: r"^([0-9]([0-9]([0-9][1-9]|[1-9]0)|[1-9]00)|[1-9]000)(-(0[1-9]|1[0-2])(-(0[1-9]|[1-2][0-9]|3[0-1]))?)?$",
     },
     Pattern {
         code: "dateTime",
-        regex: r"^-?[0-9]{4}(-(0[1-9]|1[0-2])(-(0[0-9]|[1-2][0-9]|3[0-1])(T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|(\+|-)((0[0-9]|1[0-3]):[0-5][0-9]|14:00))?)?)?)?$",
+        // As in R4: a time has seconds and a zone. A time with no zone names no moment, and a
+        // search by date compares moments, so it is refused rather than read as some zone.
+        regex: r"^([0-9]([0-9]([0-9][1-9]|[1-9]0)|[1-9]00)|[1-9]000)(-(0[1-9]|1[0-2])(-(0[1-9]|[1-2][0-9]|3[0-1])(T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|(\+|-)((0[0-9]|1[0-3]):[0-5][0-9]|14:00)))?)?)?$",
     },
     Pattern {
         code: "instant",
-        regex: r"^-?[0-9]{4}-(0[1-9]|1[0-2])-(0[0-9]|[1-2][0-9]|3[0-1])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|(\+|-)((0[0-9]|1[0-3]):[0-5][0-9]|14:00))$",
+        regex: r"^([0-9]([0-9]([0-9][1-9]|[1-9]0)|[1-9]00)|[1-9]000)-(0[1-9]|1[0-2])-(0[1-9]|[1-2][0-9]|3[0-1])T([01][0-9]|2[0-3]):[0-5][0-9]:([0-5][0-9]|60)(\.[0-9]+)?(Z|(\+|-)((0[0-9]|1[0-3]):[0-5][0-9]|14:00))$",
     },
     Pattern {
         code: "time",
@@ -151,12 +155,27 @@ pub fn check_primitive(schema: &Schema, code: &str, value: &Json) -> Option<Stri
             let pattern = schema
                 .primitive_regex(other)
                 .unwrap_or_else(|| builtin(other).unwrap_or(r#"^[\s\S]*$"#));
-            if regex_match(pattern, text) {
+            let calendar = !matches!(other, "date" | "dateTime" | "instant") || day_exists(text);
+            if regex_match(pattern, text) && calendar {
                 None
             } else {
                 Some(format!("invalid {other}"))
             }
         }
+    }
+}
+
+/// Whether the day a date, a dateTime or an instant names is one of its month, in that year. R4's
+/// pattern allows 31 days in every month, so `2026-02-30` passes it; no search can read a date
+/// that does not exist, and it names no moment. A year, or a year and a month, has no day to check.
+fn day_exists(text: &str) -> bool {
+    let mut parts = text.split(['-', 'T']);
+    let (Some(year), Some(month), Some(day)) = (parts.next(), parts.next(), parts.next()) else {
+        return true;
+    };
+    match (year.parse::<i32>(), month.parse::<u8>(), day.parse::<u8>()) {
+        (Ok(year), Ok(month), Ok(day)) => day <= refhir_fhirpath::days_in_month(year, month),
+        _ => true,
     }
 }
 

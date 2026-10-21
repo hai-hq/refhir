@@ -40,6 +40,7 @@ pub(crate) fn create_with(
 ) -> Result<Value, FhirError> {
     expect_type(model, &resource)?;
     strip_server_meta(&mut resource);
+    stamp_last_updated(&mut resource);
     let id = match (policy, resource.get("id").and_then(|value| value.as_str())) {
         (IdPolicy::Keep, Some(id)) => {
             if !valid_id(id) {
@@ -74,6 +75,20 @@ pub(crate) fn create_with(
         prev_ts: None,
     })?;
     Ok(resource)
+}
+
+/// `meta.lastUpdated` says when this version was written: the time the server saw the write, kept
+/// with the version and indexed, so it can be searched on and listed by in history. A value the
+/// client sent is replaced, on a create and on an update alike.
+fn stamp_last_updated(resource: &mut Value) {
+    let now = crate::instant::format(crate::instant::now_ms());
+    let Some(object) = resource.as_object_mut() else {
+        return;
+    };
+    let meta = object.entry("meta").or_insert_with(|| json!({}));
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("lastUpdated".into(), json!(now));
+    }
 }
 
 /// `meta.versionId` and `meta.lastUpdated` belong to the server; a create ignores the client's.
@@ -146,6 +161,7 @@ pub fn update_status(
         other => other?,
     };
     check_version(current.ts, if_match, &resource)?;
+    stamp_last_updated(&mut resource);
     require_references(tx, catalog, model, &resource)?;
     check_instance(tx, catalog, &resource)?;
     let (old_keys, new_keys) = {

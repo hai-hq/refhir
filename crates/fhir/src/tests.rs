@@ -17,9 +17,10 @@ use crate::error::FhirError;
 use crate::extract::ReferenceId;
 use crate::npm::{install_package, install_with, PackageFetcher};
 use crate::package::{
-    cross_version_dir, expression_clash_dir, extension_copies_dir, extra_dir, install_package_dir,
-    minir4_dir, newer_terminology_dir, publish, r4_dir, r4_examples_dir, run_backfills, sdc_dir,
-    stage_package_deferred, stage_package_dir, version_clash_dir,
+    cards_dir, collect_superseded, cross_version_dir, expression_clash_dir, extension_copies_dir,
+    extra_dir, finish_install, install_package_dir, ips_package, minir4_dir, newer_terminology_dir,
+    publish, r4_dir, r4_examples_dir, run_backfills, sdc_dir, stage_package_deferred,
+    stage_package_dir, version_clash_dir,
 };
 use crate::run::{run, RunError};
 
@@ -71,6 +72,8 @@ fn unprocessable<T: std::fmt::Debug>(result: Result<T, RunError>) -> Value {
         other => panic!("expected an unprocessable request, got {other:?}"),
     }
 }
+
+mod date_search;
 
 fn patient(id: &str, active: bool, family: &str) -> Value {
     json!({
@@ -1359,7 +1362,7 @@ fn json_files_that_are_not_objects_do_not_stop_an_install() {
 }
 
 #[test]
-fn a_dependency_newer_than_the_installed_version_installs_next_to_it() {
+fn a_dependency_newer_than_the_installed_version_replaces_it() {
     let lib1 = dep_package("example.lib", "1.0.0", &[]);
     let lib2 = dep_package("example.lib", "2.0.0", &[]);
     let app = dep_package("example.app", "1.0.0", &[("example.lib", "2.0.0")]);
@@ -1378,11 +1381,7 @@ fn a_dependency_newer_than_the_installed_version_installs_next_to_it() {
     .unwrap();
     assert_eq!(
         installed_packages(&db),
-        [
-            "example.app@1.0.0",
-            "example.lib@1.0.0",
-            "example.lib@2.0.0"
-        ]
+        ["example.app@1.0.0", "example.lib@2.0.0"]
     );
     for dir in [lib1, lib2, app, cache] {
         let _ = std::fs::remove_dir_all(dir);
@@ -1390,7 +1389,7 @@ fn a_dependency_newer_than_the_installed_version_installs_next_to_it() {
 }
 
 #[test]
-fn another_version_of_an_installed_root_package_installs_next_to_it() {
+fn a_newer_version_of_an_installed_root_package_replaces_it() {
     let v1 = dep_package("example.ig", "1.0.0", &[]);
     let v2 = dep_package("example.ig", "2.0.0", &[]);
     let db = empty();
@@ -1405,10 +1404,7 @@ fn another_version_of_an_installed_root_package_installs_next_to_it() {
         &cache,
     )
     .unwrap();
-    assert_eq!(
-        installed_packages(&db),
-        ["example.ig@1.0.0", "example.ig@2.0.0"]
-    );
+    assert_eq!(installed_packages(&db), ["example.ig@2.0.0"]);
     for dir in [v1, v2, cache] {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1849,6 +1845,880 @@ fn an_experimental_parameter_yields_to_a_real_one_from_another_package() {
             Some("Patient.extension('real').value")
         );
     }
+}
+
+/// A package `name` at `version` that depends on `deps` and holds string search parameters on
+/// Patient, each as (name, code, expression). The name makes the parameter's URL, so a later
+/// version that gives the same name defines the same canonical again.
+fn parameter_package(
+    name: &str,
+    version: &str,
+    deps: &[(&str, &str)],
+    parameters: &[(&str, &str, &str)],
+) -> PathBuf {
+    let dir = dep_package(name, version, deps);
+    for (parameter, code, expression) in parameters {
+        std::fs::write(
+            dir.join(format!("SearchParameter-{parameter}.json")),
+            json!({
+                "resourceType": "SearchParameter",
+                "url": format!("http://example.org/SearchParameter/{parameter}"),
+                "name": parameter,
+                "status": "active",
+                "description": parameter,
+                "code": code,
+                "base": ["Patient"],
+                "type": "string",
+                "expression": expression
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+fn upgrade_package(version: &str, parameters: &[(&str, &str, &str)]) -> PathBuf {
+    parameter_package("example.upgrade", version, &[], parameters)
+}
+
+fn install_dir(harness: &Harness, dir: &Path) -> Result<(), FhirError> {
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, dir)
+}
+
+/// The search parameters the example packages hold, as (code, expression, version of the package
+/// that holds it), and whether each is ready to be searched.
+fn upgrade_parameters(harness: &Harness) -> Vec<(String, String, String)> {
+    let versions: BTreeMap<i64, String> = harness
+        .store
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .map(|package| (package.id, format!("{}@{}", package.name, package.version)))
+        .collect();
+    let mut rows: Vec<_> = harness
+        .store
+        .load_search_parameters()
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.url.starts_with("http://example.org/SearchParameter/"))
+        .map(|row| {
+            assert_eq!(
+                row.status,
+                refhir_persistence::ParamStatus::Ready,
+                "{} is not ready",
+                row.code
+            );
+            (
+                row.code,
+                row.expression.unwrap_or_default(),
+                versions[&row.package_id].clone(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn upgrade_row(code: &str, expression: &str, version: &str) -> (String, String, String) {
+    (
+        code.to_string(),
+        expression.to_string(),
+        format!("example.upgrade@{version}"),
+    )
+}
+
+fn search_total(harness: &Harness, code: &str, value: &str) -> u64 {
+    run_op(harness, "Patient/search", &json!({ code: value }))
+        .map(|result| result.value["total"].as_u64().unwrap())
+        .unwrap_or_else(|err| panic!("{code}={value}: {err:?}"))
+}
+
+/// What a search for `code` is refused with.
+fn refusal(harness: &Harness, code: &str) -> String {
+    match run_op(harness, "Patient/search", &json!({ code: "x" })).map(|result| result.value) {
+        Err(RunError::Fhir(FhirError::Invalid(message))) => message,
+        other => panic!("{code} should be refused, got {other:?}"),
+    }
+}
+
+/// The search parameters of Patient that the CapabilityStatement lists.
+fn advertised(harness: &Harness) -> Vec<String> {
+    let statement = harness.catalog.read().unwrap().capability_statement();
+    statement["rest"][0]["resource"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["type"] == "Patient")
+        .unwrap()["searchParam"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|param| param["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// How many index entries there are under `index`.
+fn index_entries(harness: &Harness, index: &str) -> usize {
+    harness
+        .db
+        .reader()
+        .index_scan(
+            &IndexId::new(index),
+            harness.db.latest_ts(),
+            &refhir_types::Interval::all(),
+            Order::Asc,
+        )
+        .unwrap()
+        .len()
+}
+
+fn remove_dirs(dirs: &[&Path]) {
+    for dir in dirs {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A patient with a family name and a birth date, the two things the small R4 package lets a
+/// string search parameter read.
+fn born(id: &str, family: &str, birth_date: &str) -> Value {
+    let mut resource = patient(id, true, family);
+    resource["birthDate"] = json!(birth_date);
+    resource
+}
+
+#[test]
+fn a_newer_package_version_gives_a_search_parameter_its_new_expression() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    assert_eq!(search_total(&harness, "label", "1990"), 0);
+
+    // The same URL and code, another expression: the server takes it, and serves that one.
+    let v2 = upgrade_package("0.2.0", &[("label", "label", "Patient.birthDate")]);
+    install_dir(&harness, &v2).unwrap();
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("label", "Patient.birthDate", "0.2.0")]
+    );
+    // A resource that was there is indexed for it, and no longer found by what the old one made.
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 0);
+    // A resource created after is indexed for it, and one that is updated is again.
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p2", "Jones", "2001-02-03")}),
+    );
+    assert_eq!(search_total(&harness, "label", "2001"), 1);
+    apply(
+        &harness,
+        "Patient/update",
+        json!({"id": "p1", "resource": born("p1", "Brown", "1985-01-01")}),
+    );
+    assert_eq!(search_total(&harness, "label", "1985"), 1);
+    assert_eq!(search_total(&harness, "label", "1990"), 0);
+    assert_eq!(search_total(&harness, "label", "Brown"), 0);
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_package_version_that_gives_a_search_parameter_another_code_is_searched_by_that_code() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    assert!(advertised(&harness).contains(&"label".to_string()));
+    let entries = index_entries(&harness, "Patient/label");
+    assert!(entries > 0);
+
+    let v2 = upgrade_package("0.2.0", &[("label", "alias", "Patient.name")]);
+    install_dir(&harness, &v2).unwrap();
+    // The old code is refused, as any parameter the server does not have, and the new one finds
+    // what was there.
+    let message = refusal(&harness, "label");
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+    assert_eq!(search_total(&harness, "alias", "Smith"), 1);
+    // Only the new code is advertised, and nothing is left under the old one.
+    let names = advertised(&harness);
+    assert!(names.contains(&"alias".to_string()), "{names:?}");
+    assert!(!names.contains(&"label".to_string()), "{names:?}");
+    // The old index is kept until the package that defined it is collected, for a process that
+    // still serves from the catalog it loaded before; then nothing is left under the old code.
+    assert_eq!(index_entries(&harness, "Patient/label"), entries);
+    assert_eq!(index_entries(&harness, "Patient/alias"), entries);
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
+    assert_eq!(index_entries(&harness, "Patient/label"), 0);
+    assert_eq!(index_entries(&harness, "Patient/alias"), entries);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("alias", "Patient.name", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_search_parameter_that_a_newer_package_version_leaves_out_is_gone() {
+    let harness = ready();
+    let kept = ("label", "label", "Patient.name");
+    let v1 = upgrade_package("0.1.0", &[kept, ("nick", "nick", "Patient.birthDate")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    assert!(index_entries(&harness, "Patient/nick") > 0);
+
+    let v2 = upgrade_package("0.2.0", &[kept]);
+    install_dir(&harness, &v2).unwrap();
+    let message = refusal(&harness, "nick");
+    assert!(
+        message.contains("unsupported search parameter nick"),
+        "{message}"
+    );
+    assert!(!advertised(&harness).contains(&"nick".to_string()));
+    assert!(index_entries(&harness, "Patient/nick") > 0);
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
+    assert_eq!(index_entries(&harness, "Patient/nick"), 0);
+    // The one it kept is as it was: nothing was indexed again for it, so no backfill was queued
+    // for the package that holds it.
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    let current = harness
+        .store
+        .load_packages()
+        .unwrap()
+        .into_iter()
+        .find(|package| package.name == "example.upgrade")
+        .unwrap()
+        .id;
+    assert!(harness
+        .store
+        .load_backfills()
+        .unwrap()
+        .iter()
+        .all(|job| job.package_id != current));
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("label", "Patient.name", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn installing_an_older_package_version_again_changes_nothing() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    let v2 = upgrade_package("0.2.0", &[("label", "alias", "Patient.birthDate")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    install_dir(&harness, &v2).unwrap();
+    let before = installed_packages(&harness);
+
+    // Once it is installed already (a server started on its first release again), and through
+    // the registry, which is never asked for it.
+    install_dir(&harness, &v1).unwrap();
+    let cache = temp_dir("upgrade-again");
+    install_with(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        "example.upgrade@0.1.0",
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    install_with(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        v1.to_str().unwrap(),
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(installed_packages(&harness), before);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("alias", "Patient.birthDate", "0.2.0")]
+    );
+    let message = refusal(&harness, "label");
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+    assert_eq!(search_total(&harness, "alias", "1990"), 1);
+
+    // And a database that never had the older version does not take it.
+    let fresh = ready();
+    install_dir(&fresh, &v2).unwrap();
+    install_dir(&fresh, &v1).unwrap();
+    install_with(
+        &fresh.store,
+        &fresh.db,
+        &fresh.catalog,
+        "example.upgrade@0.1.0",
+        &registry(&[]),
+        &cache,
+    )
+    .unwrap();
+    assert!(!installed_packages(&fresh).contains(&"example.upgrade@0.1.0".to_string()));
+    assert_eq!(
+        upgrade_parameters(&fresh),
+        [upgrade_row("alias", "Patient.birthDate", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2, &cache]);
+}
+
+#[test]
+fn a_package_version_that_cannot_be_installed_leaves_the_database_on_the_one_it_has() {
+    let harness = ready();
+    let v1 = upgrade_package(
+        "0.1.0",
+        &[
+            ("label", "label", "Patient.name"),
+            ("nick", "nick", "Patient.birthDate"),
+        ],
+    );
+    let other = parameter_package(
+        "example.other",
+        "1.0.0",
+        &[],
+        &[("other", "other", "Patient.identifier")],
+    );
+    install_dir(&harness, &v1).unwrap();
+    install_dir(&harness, &other).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    let held = upgrade_parameters(&harness);
+    let packages = installed_packages(&harness);
+
+    // It disagrees with itself, and it disagrees with another package.
+    let within = upgrade_package(
+        "0.2.0",
+        &[
+            ("label", "label", "Patient.birthDate"),
+            ("one", "nick", "Patient.name"),
+            ("two", "nick", "Patient.identifier"),
+        ],
+    );
+    let against = upgrade_package(
+        "0.2.0",
+        &[
+            ("label", "label", "Patient.birthDate"),
+            ("other", "other", "Patient.name"),
+        ],
+    );
+    for broken in [&within, &against] {
+        let err = install_dir(&harness, broken).unwrap_err().to_string();
+        assert!(
+            err.contains("conflicts") || err.contains("different expressions"),
+            "{err}"
+        );
+        assert_eq!(installed_packages(&harness), packages);
+        assert_eq!(upgrade_parameters(&harness), held);
+        assert_eq!(search_total(&harness, "label", "Smith"), 1);
+        assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    }
+
+    // A server that starts again reads what is there, and either release of the package starts it.
+    let reopened = Catalog::open(&harness.store).unwrap();
+    let found = run(
+        &harness.db,
+        &reopened,
+        "Patient/search",
+        &json!({"label": "Smith"}),
+    )
+    .unwrap();
+    assert_eq!(found.value["total"], 1);
+    install_dir(&harness, &v1).unwrap();
+    assert_eq!(upgrade_parameters(&harness), held);
+    let fixed = upgrade_package("0.2.0", &[("label", "label", "Patient.birthDate")]);
+    install_dir(&harness, &fixed).unwrap();
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    let message = refusal(&harness, "nick");
+    assert!(
+        message.contains("unsupported search parameter nick"),
+        "{message}"
+    );
+    remove_dirs(&[&v1, &other, &within, &against, &fixed]);
+}
+
+#[test]
+fn a_newer_version_of_a_dependency_replaces_the_search_parameters_of_the_installed_one() {
+    let harness = ready();
+    let lib1 = parameter_package(
+        "example.lib",
+        "1.0.0",
+        &[],
+        &[("label", "label", "Patient.name")],
+    );
+    let lib2 = parameter_package(
+        "example.lib",
+        "2.0.0",
+        &[],
+        &[("label", "label", "Patient.birthDate")],
+    );
+    let app = dep_package("example.app", "1.0.0", &[("example.lib", "2.0.0")]);
+    install_dir(&harness, &lib1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    let cache = temp_dir("upgrade-dependency");
+    install_with(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        app.to_str().unwrap(),
+        &registry(&[("example.lib", "2.0.0", &lib2)]),
+        &cache,
+    )
+    .unwrap();
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 0);
+    remove_dirs(&[&lib1, &lib2, &app, &cache]);
+}
+
+/// Version `version` of a package of one profile of Patient that requires the element `required`
+/// (it has as many elements in every version), a code system of colors, and the value set of them
+/// (and, with `extra`, a second value set).
+fn profile_package(version: &str, required: &str, colors: &[&str], extra: bool) -> PathBuf {
+    let dir = dep_package("example.profiles", version, &[]);
+    let elements: Vec<Value> = [
+        ("identifier", "Identifier", "*"),
+        ("name", "HumanName", "*"),
+        ("active", "boolean", "1"),
+        ("birthDate", "date", "1"),
+    ]
+    .iter()
+    .map(|(path, kind, max)| {
+        json!({"path": format!("Patient.{path}"), "min": if path == &required { 1 } else { 0 },
+               "max": max, "type": [{"code": kind}]})
+    })
+    .collect();
+    let mut snapshot = vec![json!({"path": "Patient", "min": 0, "max": "*"})];
+    snapshot.extend(elements);
+    std::fs::write(
+        dir.join("StructureDefinition-needs.json"),
+        json!({
+            "resourceType": "StructureDefinition",
+            "url": "http://example.org/StructureDefinition/needs",
+            "name": "Needs",
+            "status": "active",
+            "kind": "resource",
+            "abstract": false,
+            "type": "Patient",
+            "baseDefinition": "http://hl7.org/fhir/StructureDefinition/Patient",
+            "fhirVersion": "4.0.1",
+            "derivation": "constraint",
+            "snapshot": {"element": snapshot}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let concepts: Vec<Value> = colors.iter().map(|code| json!({"code": code})).collect();
+    std::fs::write(
+        dir.join("CodeSystem-colors.json"),
+        json!({"resourceType": "CodeSystem", "url": "http://example.org/colors",
+               "name": "Colors", "status": "active", "content": "complete", "concept": concepts})
+        .to_string(),
+    )
+    .unwrap();
+    let sets: &[&str] = if extra {
+        &["colors", "extra"]
+    } else {
+        &["colors"]
+    };
+    for set in sets {
+        std::fs::write(
+            dir.join(format!("ValueSet-{set}.json")),
+            json!({"resourceType": "ValueSet", "url": format!("http://example.org/ValueSet/{set}"),
+                   "status": "active",
+                   "compose": {"include": [{"system": "http://example.org/colors"}]}})
+            .to_string(),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_newer_package_version_replaces_the_profiles_and_value_sets_of_the_older_one() {
+    let harness = ready();
+    let profile = "http://example.org/StructureDefinition/needs";
+    let patient_with = |active: bool, born: bool| {
+        let mut resource = json!({"resourceType": "Patient", "meta": {"profile": [profile]}});
+        if active {
+            resource["active"] = json!(true);
+        }
+        if born {
+            resource["birthDate"] = json!("1990-05-05");
+        }
+        resource
+    };
+    // How many errors validating a patient against the profile reports.
+    let errors = |resource: Value| -> usize {
+        run_op(
+            &harness,
+            "Patient/$validate",
+            &json!({"resource": resource}),
+        )
+        .unwrap()
+        .value["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|issue| issue["severity"] == "error")
+            .count()
+    };
+    let expanded = |set: &str| -> Result<Vec<String>, Value> {
+        let outcome = run_op(
+            &harness,
+            "ValueSet/$expand",
+            &json!({"url": format!("http://example.org/ValueSet/{set}")}),
+        );
+        match outcome {
+            Ok(result) => {
+                let mut codes: Vec<String> = result.value["expansion"]["contains"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["code"].as_str().unwrap().to_string())
+                    .collect();
+                codes.sort();
+                Ok(codes)
+            }
+            Err(err) => Err(unprocessable::<()>(Err(err))),
+        }
+    };
+
+    let v1 = profile_package("0.1.0", "active", &["red", "blue"], true);
+    install_dir(&harness, &v1).unwrap();
+    assert_eq!(errors(patient_with(true, false)), 0);
+    assert!(errors(patient_with(false, true)) > 0);
+    assert_eq!(expanded("colors").unwrap(), ["blue", "red"]);
+    assert_eq!(expanded("extra").unwrap(), ["blue", "red"]);
+
+    // 0.2.0 requires another element of the profile, which has as many elements as it had, holds
+    // other colors, and leaves a value set out. The profile is the new one, and so are the codes.
+    let v2 = profile_package("0.2.0", "birthDate", &["red", "green"], false);
+    install_dir(&harness, &v2).unwrap();
+    assert!(errors(patient_with(true, false)) > 0);
+    assert_eq!(errors(patient_with(false, true)), 0);
+    assert_eq!(expanded("colors").unwrap(), ["green", "red"]);
+    let missing = expanded("extra").unwrap_err();
+    assert_eq!(missing["issue"][0]["code"], "not-supported");
+    assert_eq!(
+        installed_packages(&harness)
+            .iter()
+            .filter(|name| name.starts_with("example.profiles"))
+            .collect::<Vec<_>>(),
+        ["example.profiles@0.2.0"]
+    );
+
+    // Installing the first version again does not bring it back, and the second starts again.
+    install_dir(&harness, &v1).unwrap();
+    assert_eq!(errors(patient_with(false, true)), 0);
+    assert_eq!(expanded("colors").unwrap(), ["green", "red"]);
+    let reopened = Catalog::open(&harness.store).unwrap();
+    let outcome = run(
+        &harness.db,
+        &reopened,
+        "Patient/$validate",
+        &json!({"resource": patient_with(false, true)}),
+    )
+    .unwrap();
+    assert!(outcome.value["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|issue| issue["severity"] != "error"));
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_search_parameter_that_a_newer_package_version_adds_finds_the_resources_already_stored() {
+    let harness = ready();
+    let kept = ("label", "label", "Patient.name");
+    let v1 = upgrade_package("0.1.0", &[kept]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    let version = apply(&harness, "Patient/read", json!({"id": "p1"}))["meta"]["versionId"].clone();
+
+    // 0.2.0 adds a parameter. Until its index is built it is refused, not answered from half of
+    // one; once it is, the resource that was already there is found, and it was not written again.
+    let v2 = upgrade_package("0.2.0", &[kept, ("nick", "nick", "Patient.birthDate")]);
+    stage_package_dir(&harness.store, &harness.db, &harness.catalog, &v2).unwrap();
+    let message = refusal(&harness, "nick");
+    assert!(!message.is_empty());
+    run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 1);
+    assert_eq!(
+        apply(&harness, "Patient/read", json!({"id": "p1"}))["meta"]["versionId"],
+        version
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_changed_parameter_whose_install_stopped_before_its_backfill_was_queued_is_indexed_at_the_next_run(
+) {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+
+    // The install stores 0.2.0 and publishes its catalog, and the process stops before it queues
+    // the backfill: the old parameter is gone, the new one waits for an index nothing will build.
+    let v2 = upgrade_package("0.2.0", &[("label", "label", "Patient.birthDate")]);
+    let follow_up = stage_package_deferred(&harness.store, &harness.db, &harness.catalog, &v2)
+        .unwrap()
+        .expect("the changed parameter waits for its index");
+    publish(&harness.store, &harness.catalog).unwrap();
+    drop(follow_up);
+    assert!(harness
+        .store
+        .load_backfills()
+        .unwrap()
+        .iter()
+        .all(|job| job.done));
+    let message = refusal(&harness, "label");
+    assert!(!message.is_empty());
+
+    // The next start queues the job, and the parameter is searched by the new expression.
+    run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(search_total(&harness, "label", "1990"), 1);
+    assert_eq!(search_total(&harness, "label", "Smith"), 0);
+    assert_eq!(
+        upgrade_parameters(&harness),
+        [upgrade_row("label", "Patient.birthDate", "0.2.0")]
+    );
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_catalog_loaded_before_an_upgrade_answers_as_it_did_until_the_replaced_package_is_collected() {
+    let harness = ready();
+    let label_v1 = upgrade_package("0.1.0", &[("label", "label", "Patient.name")]);
+    let profile_v1 = profile_package("0.1.0", "active", &["red", "blue"], false);
+    install_dir(&harness, &label_v1).unwrap();
+    install_dir(&harness, &profile_v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    // What a replica holds: a catalog loaded before the upgrade, that reads a definition from the
+    // store the first time it is used.
+    let store: Arc<dyn ConformanceStore> = Arc::new(harness.store.clone());
+    let source = Arc::new(crate::lazy::StoreSource::new(store.clone()));
+    let before = Catalog::open_from(store.as_ref(), Some(source)).unwrap();
+
+    // 0.2.0 gives the parameter another code and the profile another requirement.
+    let label_v2 = upgrade_package("0.2.0", &[("label", "alias", "Patient.name")]);
+    let profile_v2 = profile_package("0.2.0", "birthDate", &["red", "blue"], false);
+    install_dir(&harness, &label_v2).unwrap();
+    install_dir(&harness, &profile_v2).unwrap();
+
+    // The catalog in force has moved on.
+    let message = refusal(&harness, "label");
+    assert!(
+        message.contains("unsupported search parameter label"),
+        "{message}"
+    );
+    assert_eq!(search_total(&harness, "alias", "Smith"), 1);
+
+    // The one loaded before still has the old parameter, and finds what was indexed for it; and it
+    // reads the old profile, which it had not read, from rows that are still stored.
+    let found = run(
+        &harness.db,
+        &before,
+        "Patient/search",
+        &json!({"label": "Smith"}),
+    )
+    .unwrap();
+    assert_eq!(found.value["total"], 1);
+    let errors = |catalog: &Catalog, active: bool, born: bool| -> usize {
+        let mut resource = json!({"resourceType": "Patient",
+            "meta": {"profile": ["http://example.org/StructureDefinition/needs"]}});
+        if active {
+            resource["active"] = json!(true);
+        }
+        if born {
+            resource["birthDate"] = json!("1990-05-05");
+        }
+        run(
+            &harness.db,
+            catalog,
+            "Patient/$validate",
+            &json!({"resource": resource}),
+        )
+        .unwrap()
+        .value["issue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|issue| issue["severity"] == "error")
+            .count()
+    };
+    assert_eq!(errors(&before, true, false), 0);
+    assert!(errors(&before, false, true) > 0);
+    {
+        let current = harness.catalog.read().unwrap();
+        assert!(errors(&current, true, false) > 0);
+        assert_eq!(errors(&current, false, true), 0);
+    }
+
+    // Collected, the old index is cleared, and what the new catalog answers does not change.
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
+    assert_eq!(index_entries(&harness, "Patient/label"), 0);
+    assert_eq!(search_total(&harness, "alias", "Smith"), 1);
+    assert_eq!(errors(&harness.catalog.read().unwrap(), false, true), 0);
+    remove_dirs(&[&label_v1, &label_v2, &profile_v1, &profile_v2]);
+}
+
+#[test]
+fn nothing_is_collected_while_a_search_parameter_waits_for_its_index() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "alias", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": born("p1", "Smith", "1990-05-05")}),
+    );
+    // 0.2.0 drops the code and adds another, which is stored and published and has no index yet,
+    // so a replica is still on the catalog that has the code that went.
+    let v2 = upgrade_package("0.2.0", &[("nick", "nick", "Patient.birthDate")]);
+    let follow_up = stage_package_deferred(&harness.store, &harness.db, &harness.catalog, &v2)
+        .unwrap()
+        .expect("the new parameter waits for its index");
+    publish(&harness.store, &harness.catalog).unwrap();
+    follow_up.create(&harness.store, &harness.db).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
+    assert!(index_entries(&harness, "Patient/alias") > 0);
+    assert!(!harness.store.retired_parameters().unwrap().is_empty());
+
+    // Once the index is built it goes.
+    run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+    collect_superseded(&harness.store, &harness.db, &harness.catalog);
+    assert_eq!(index_entries(&harness, "Patient/alias"), 0);
+    assert!(harness.store.retired_parameters().unwrap().is_empty());
+    assert_eq!(search_total(&harness, "nick", "1990"), 1);
+    remove_dirs(&[&v1, &v2]);
+}
+
+#[test]
+fn a_collection_that_fails_does_not_stop_the_caller_and_is_tried_at_the_next_call() {
+    let harness = ready();
+    let v1 = upgrade_package("0.1.0", &[("label", "alias", "Patient.name")]);
+    install_dir(&harness, &v1).unwrap();
+    let v2 = upgrade_package("0.2.0", &[("nick", "nick", "Patient.birthDate")]);
+    install_dir(&harness, &v2).unwrap();
+    assert!(!harness.store.retired_parameters().unwrap().is_empty());
+
+    // The store refuses once: the call returns, and what the older version held is still stored.
+    let watched = WatchedStore::new(harness.store.clone());
+    watched.fail_collect_superseded.store(1, Ordering::SeqCst);
+    collect_superseded(&watched, &harness.db, &harness.catalog);
+    assert!(!harness.store.retired_parameters().unwrap().is_empty());
+
+    collect_superseded(&watched, &harness.db, &harness.catalog);
+    assert!(harness.store.retired_parameters().unwrap().is_empty());
+    remove_dirs(&[&v1, &v2]);
+}
+
+/// Version `version` of a package of one resource type, `Widget`, unless `defined` is false, and
+/// then of nothing at all.
+fn widget_package(version: &str, defined: bool) -> PathBuf {
+    let dir = dep_package("example.widgets", version, &[]);
+    if defined {
+        std::fs::write(
+            dir.join("StructureDefinition-Widget.json"),
+            json!({
+                "resourceType": "StructureDefinition",
+                "url": "http://example.org/StructureDefinition/Widget",
+                "name": "Widget",
+                "status": "active",
+                "kind": "resource",
+                "abstract": false,
+                "type": "Widget",
+                "fhirVersion": "4.0.1",
+                "derivation": "specialization",
+                "snapshot": {"element": [{"path": "Widget", "min": 0, "max": "*"}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_resource_type_that_a_newer_package_version_leaves_out_is_not_served_but_its_resources_stay() {
+    let harness = empty();
+    let v1 = widget_package("1.0.0", true);
+    install_dir(&harness, &v1).unwrap();
+    apply(
+        &harness,
+        "Widget/create",
+        json!({"resource": {"resourceType": "Widget", "id": "w1"}}),
+    );
+    assert_eq!(
+        apply(&harness, "Widget/read", json!({"id": "w1"}))["id"],
+        "w1"
+    );
+
+    let v2 = widget_package("2.0.0", false);
+    install_dir(&harness, &v2).unwrap();
+    let gone = run_op(&harness, "Widget/read", &json!({"id": "w1"})).map(|result| result.value);
+    assert!(
+        matches!(gone, Err(RunError::Fhir(FhirError::UnknownResource(_)))),
+        "{gone:?}"
+    );
+
+    // A later version that defines the type again serves what was stored.
+    let v3 = widget_package("3.0.0", true);
+    install_dir(&harness, &v3).unwrap();
+    assert_eq!(
+        apply(&harness, "Widget/read", json!({"id": "w1"}))["id"],
+        "w1"
+    );
+    remove_dirs(&[&v1, &v2, &v3]);
 }
 
 fn write_terms_package(dir: &std::path::Path) {
@@ -3623,6 +4493,186 @@ fn bundle_has_type(bundle: &Value, type_name: &str) -> bool {
         .unwrap()
         .iter()
         .any(|entry| entry["resource"]["resourceType"] == type_name)
+}
+
+/// Store resources as they are, in one commit, with no validation: for tests that need a shape
+/// the profiles in the harness would refuse (a Composition, a loop of references).
+fn store_resources(harness: &Harness, resources: Vec<Value>) {
+    let mut tx = harness.db.begin();
+    for resource in resources {
+        let type_name = resource["resourceType"].as_str().unwrap().to_string();
+        let id = resource["id"].as_str().unwrap().to_string();
+        tx.stage_put(Put {
+            tablet: TabletId::new(type_name.clone()),
+            id: id.clone(),
+            json: resource,
+            new_keys: vec![(IndexId::new(format!("{type_name}/by_id")), exact_key(&id))],
+            old_keys: Vec::new(),
+            prev_ts: None,
+        })
+        .unwrap();
+    }
+    harness.db.commit(tx).unwrap();
+}
+
+fn composition_of(id: &str, entries: &[&str]) -> Value {
+    json!({
+        "resourceType": "Composition",
+        "id": id,
+        "status": "final",
+        "type": {"text": "summary"},
+        "date": "2020-01-01",
+        "title": "summary",
+        "section": [{
+            "entry": entries.iter().map(|reference| json!({"reference": reference})).collect::<Vec<_>>()
+        }]
+    })
+}
+
+/// The whole R4 release, loaded once and shared by the tests that only read from it. Loading it is
+/// most of what such a test costs; a test that writes builds its own with `r4_ready`.
+fn shared_r4() -> &'static Harness {
+    static SHARED: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
+    SHARED.get_or_init(r4_ready)
+}
+
+/// A harness holding the whole R4 release, for tests that need types the small one lacks.
+fn r4_ready() -> Harness {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    harness
+}
+
+#[test]
+fn a_document_bundle_has_what_fhir_asks_of_one_and_its_references_resolve() {
+    let harness = r4_ready();
+    // The Patient is reached only through the Observation, which the Composition names in three
+    // forms: with a version, plain, and a contained one that is not a stored resource.
+    store_resources(
+        &harness,
+        vec![
+            patient("p1", true, "Ann"),
+            json!({
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": {"text": "pressure"},
+                "subject": {"reference": "Patient/p1"}
+            }),
+            composition_of(
+                "comp1",
+                &["Observation/o1/_history/1", "Observation/o1", "#note"],
+            ),
+        ],
+    );
+    let document = apply(&harness, "Composition/$document", json!({"id": "comp1"}));
+
+    assert_eq!(document["type"], "document");
+    assert!(document["identifier"]["value"]
+        .as_str()
+        .unwrap()
+        .starts_with("urn:uuid:"));
+    assert!(document["timestamp"].as_str().unwrap().ends_with('Z'));
+    let entries = document["entry"].as_array().unwrap();
+    let types: Vec<_> = entries
+        .iter()
+        .map(|entry| entry["resource"]["resourceType"].as_str().unwrap())
+        .collect();
+    assert_eq!(types, ["Composition", "Observation", "Patient"]);
+    let urls: Vec<_> = entries
+        .iter()
+        .map(|entry| entry["fullUrl"].as_str().unwrap())
+        .collect();
+    assert!(urls.iter().all(|url| url.starts_with("urn:uuid:")));
+
+    let section_entries = &entries[0]["resource"]["section"][0]["entry"];
+    assert_eq!(section_entries[0]["reference"], urls[1]);
+    assert_eq!(section_entries[1]["reference"], urls[1]);
+    assert_eq!(section_entries[2]["reference"], "#note");
+    assert_eq!(entries[1]["resource"]["subject"]["reference"], urls[2]);
+}
+
+#[test]
+fn a_document_holds_only_the_types_the_callers_scopes_let_them_read() {
+    let harness = r4_ready();
+    store_resources(
+        &harness,
+        vec![
+            patient("p1", true, "Ann"),
+            json!({"resourceType": "Observation", "id": "o1", "status": "final",
+                "code": {"text": "pressure"}, "subject": {"reference": "Patient/p1"}}),
+            composition_of("comp1", &["Observation/o1"]),
+        ],
+    );
+    let types_of = |args: Value| -> Vec<String> {
+        apply(&harness, "Composition/$document", args)["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                entry["resource"]["resourceType"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    };
+    assert_eq!(
+        types_of(json!({"id": "comp1"})),
+        ["Composition", "Observation", "Patient"]
+    );
+    assert_eq!(
+        types_of(
+            json!({"id": "comp1", "_readScopes": ["user/Composition.read", "user/Observation.read"]})
+        ),
+        ["Composition", "Observation"]
+    );
+    assert_eq!(
+        types_of(json!({"id": "comp1", "_readScopes": ["user/*.read"]})),
+        ["Composition", "Observation", "Patient"]
+    );
+}
+
+#[test]
+fn a_document_reads_a_loop_of_references_once() {
+    let harness = r4_ready();
+    let linked = |id: &str, other: &str| {
+        json!({
+            "resourceType": "Patient",
+            "id": id,
+            "link": [{"other": {"reference": format!("Patient/{other}")}, "type": "seealso"}]
+        })
+    };
+    store_resources(
+        &harness,
+        vec![
+            linked("a", "b"),
+            linked("b", "a"),
+            composition_of("comp1", &["Patient/a"]),
+        ],
+    );
+    let document = apply(&harness, "Composition/$document", json!({"id": "comp1"}));
+    assert_eq!(document["entry"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn a_document_that_would_hold_too_many_resources_is_refused_not_cut_short() {
+    let harness = r4_ready();
+    let mut resources = vec![composition_of("comp1", &["Patient/n0"])];
+    for number in 0..crate::document::MAX_RESOURCES + 5 {
+        resources.push(json!({
+            "resourceType": "Patient",
+            "id": format!("n{number}"),
+            "link": [{"other": {"reference": format!("Patient/n{}", number + 1)}, "type": "seealso"}]
+        }));
+    }
+    store_resources(&harness, resources);
+    let refused = unprocessable(run_op(
+        &harness,
+        "Composition/$document",
+        &json!({"id": "comp1"}),
+    ));
+    assert_eq!(refused["issue"][0]["code"], "too-costly");
 }
 
 #[test]
@@ -5827,24 +6877,40 @@ fn value_sets_that_cannot_expand_say_why() {
         assert!(text.contains(part), "{part} missing from {text}");
     }
 
-    // The service categories live in a CodeSystem whose content is `example`.
-    let categories = unprocessable(run_op(
+    // The insurance plan types live in a CodeSystem whose content is `fragment`: there is no
+    // telling which concepts it lacks, so including it whole is refused.
+    let plans = unprocessable(run_op(
         &harness,
         "ValueSet/$expand",
-        &json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+        &json!({"url": "http://hl7.org/fhir/ValueSet/insuranceplan-type"}),
     ));
-    let text = categories["issue"][0]["diagnostics"].as_str().unwrap();
+    let text = plans["issue"][0]["diagnostics"].as_str().unwrap();
     for part in [
-        "http://terminology.hl7.org/CodeSystem/service-category",
-        "'example'",
+        "http://hl7.org/fhir/ValueSet/insuranceplan-type expansion is not supported",
+        "http://terminology.hl7.org/CodeSystem/insurance-plan-type",
+        "'fragment'",
         "cannot be included whole",
     ] {
         assert!(text.contains(part), "{part} missing from {text}");
     }
     assert_eq!(
-        categories["issue"][0]["expression"][0],
+        plans["issue"][0]["expression"][0],
         "ValueSet.compose.include[0]"
     );
+
+    // BCP-47 is not installed, so there is nothing to list.
+    let languages = unprocessable(run_op(
+        &harness,
+        "ValueSet/$expand",
+        &json!({"url": "http://hl7.org/fhir/ValueSet/all-languages"}),
+    ));
+    let text = languages["issue"][0]["diagnostics"].as_str().unwrap();
+    for part in [
+        "http://hl7.org/fhir/ValueSet/all-languages expansion is not supported",
+        "code system urn:ietf:bcp:47 is not installed",
+    ] {
+        assert!(text.contains(part), "{part} missing from {text}");
+    }
 
     // Expansion that works is untouched.
     let gender = apply(
@@ -5859,7 +6925,212 @@ fn value_sets_that_cannot_expand_say_why() {
     let report = catalog.terms().unexpandable();
     let urls: Vec<&str> = report.iter().map(|(url, _)| url.as_str()).collect();
     assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/practitioner-role"));
-    assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/service-category"));
+    assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/insuranceplan-type"));
+    assert!(urls.contains(&"http://hl7.org/fhir/ValueSet/all-languages"));
+    // The service categories expand, flagged, so they are not among those that cannot.
+    assert!(!urls.contains(&"http://hl7.org/fhir/ValueSet/service-category"));
+}
+
+/// The codes of an expansion as `system|code`, and the `expansion.parameter` entries that say a code
+/// system was drawn on in part, as `name = value`. (The entries that say what was asked of the
+/// expansion are not these.)
+fn expansion_summary(expanded: &Value) -> (Vec<String>, Vec<String>) {
+    let codes = expanded["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}|{}",
+                entry["system"].as_str().unwrap_or(""),
+                entry["code"].as_str().unwrap()
+            )
+        })
+        .collect();
+    let parameters = expanded["expansion"]["parameter"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    item["name"]
+                        .as_str()
+                        .is_some_and(|name| name.ends_with("#CodeSystem.content"))
+                })
+                .map(|item| {
+                    format!(
+                        "{} = {}",
+                        item["name"].as_str().unwrap(),
+                        item["valueCode"].as_str().unwrap()
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    (codes, parameters)
+}
+
+fn validated(harness: &Harness, args: Value) -> (bool, Option<String>) {
+    let checked = apply(harness, "ValueSet/$validate-code", args);
+    let parameter = |name: &str| {
+        checked["parameter"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == name)
+            .cloned()
+    };
+    (
+        parameter("result").unwrap()["valueBoolean"]
+            .as_bool()
+            .unwrap(),
+        parameter("message").map(|item| item["valueString"].as_str().unwrap().to_string()),
+    )
+}
+
+#[test]
+fn a_value_set_over_a_whole_example_system_expands_and_says_it_is_not_complete() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let categories = "http://terminology.hl7.org/CodeSystem/service-category";
+    let types = "http://terminology.hl7.org/CodeSystem/service-type";
+
+    // HL7's service categories hold the 38 concepts the code system carries, and the expansion
+    // names the system that is only a sample, with the content mode that says so.
+    let expanded = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+    );
+    let (codes, parameters) = expansion_summary(&expanded);
+    assert_eq!(codes.len(), 38);
+    assert_eq!(expanded["expansion"]["total"], 38);
+    // R4 requires a timestamp: when the expansion was produced, here a moment ago.
+    let timestamp = expanded["expansion"]["timestamp"].as_str().unwrap();
+    let now = || {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        refhir_types::rfc3339(ms)
+    };
+    assert!(
+        timestamp.len() == 24 && timestamp.as_bytes()[10] == b'T' && timestamp.ends_with('Z'),
+        "{timestamp}"
+    );
+    // RFC 3339 instants of one length and zone sort as time does.
+    assert!(timestamp <= now().as_str(), "{timestamp} is in the future");
+    let earlier = refhir_types::rfc3339(
+        (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            .saturating_sub(10 * 60 * 1000),
+    );
+    assert!(timestamp >= earlier.as_str(), "{timestamp} is not recent");
+    assert_eq!(
+        parameters,
+        [format!("{categories}|4.0.1#CodeSystem.content = example")]
+    );
+    let display = |code: &str| {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["code"] == code)
+            .map(|entry| entry["display"].as_str().unwrap().to_string())
+    };
+    assert_eq!(display("17").as_deref(), Some("General Practice"));
+    assert_eq!(display("22").as_deref(), Some("Mental Health"));
+    assert!(codes.iter().all(|code| code.starts_with(categories)));
+
+    // So do the service types, and the other value sets that are only such an include.
+    let expanded = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-type"}),
+    );
+    let (codes, parameters) = expansion_summary(&expanded);
+    assert_eq!(codes.len(), 596);
+    assert!(codes.iter().all(|code| code.starts_with(types)));
+    assert_eq!(
+        parameters,
+        [format!("{types}|4.0.1#CodeSystem.content = example")]
+    );
+    for url in [
+        "http://hl7.org/fhir/ValueSet/program",
+        "http://hl7.org/fhir/ValueSet/appointment-cancellation-reason",
+    ] {
+        let (codes, parameters) =
+            expansion_summary(&apply(&harness, "ValueSet/$expand", json!({"url": url})));
+        assert!(!codes.is_empty(), "{url}");
+        assert_eq!(parameters.len(), 1, "{url}");
+    }
+
+    // A page of it carries the flag too, and a filter narrows what is listed.
+    let page = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category", "filter": "health", "count": 2}),
+    );
+    assert_eq!(page["expansion"]["contains"].as_array().unwrap().len(), 2);
+    assert_eq!(page["expansion"]["total"], 3);
+    assert_eq!(expansion_summary(&page).1.len(), 1);
+
+    // A value set whose code systems are complete carries no such flag.
+    let complete = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/organization-type"}),
+    );
+    assert_eq!(complete["expansion"]["total"], 12);
+    assert!(complete["expansion"].get("parameter").is_none());
+
+    // `$validate-code` agrees with `$expand`: a code it lists is in, and one it does not is out.
+    let in_set = |code: &str| {
+        validated(
+            &harness,
+            json!({"url": "http://hl7.org/fhir/ValueSet/service-category", "system": categories, "code": code}),
+        )
+    };
+    assert_eq!(in_set("17"), (true, None));
+    let (found, message) = in_set("999");
+    assert!(!found);
+    // It says that the sample is the reason, not that 999 is known to be wrong.
+    let message = message.unwrap();
+    assert!(
+        message.contains("not among the concepts listed") && message.contains("only some"),
+        "{message}"
+    );
+    // A code that is in another system is not among its codes either.
+    let (found, _) = validated(
+        &harness,
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category", "system": types, "code": "17"}),
+    );
+    assert!(!found);
+    // A value set that is complete says nothing of the kind about a code outside it.
+    let (found, message) = validated(
+        &harness,
+        json!({"url": "http://hl7.org/fhir/ValueSet/organization-type",
+               "system": "http://terminology.hl7.org/CodeSystem/organization-type", "code": "nope"}),
+    );
+    assert!(!found);
+    assert_eq!(message.as_deref(), Some("code is not in the value set"));
+
+    // The expansion was stored with its flag, so a server that reads it back says the same.
+    let before = expansion_summary(&apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+    ));
+    publish(&harness.store, &harness.catalog).unwrap();
+    let after = expansion_summary(&apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/service-category"}),
+    ));
+    assert_eq!(before, after);
+    assert_eq!(after.1.len(), 1);
 }
 
 #[test]
@@ -5876,7 +7147,10 @@ fn create_ignores_the_id_and_version_a_client_supplies() {
     let id = created.value["id"].as_str().unwrap().to_string();
     assert_ne!(id, "mine");
     assert_ne!(created.value["meta"]["versionId"], "999");
-    assert!(created.value["meta"].get("lastUpdated").is_none());
+    // The time is the server's: the one the client sent is not kept.
+    let written = created.value["meta"]["lastUpdated"].as_str().unwrap();
+    assert_ne!(written, "2000-01-01T00:00:00Z");
+    assert!(crate::instant::parse(written).unwrap() > crate::instant::parse("2020-01-01").unwrap());
     // Everything else the client said about meta stays.
     assert_eq!(created.value["meta"]["tag"][0]["code"], "kept");
     let missing = run_op(&db, "Patient/read", &json!({"id": "mine"})).unwrap_err();
@@ -6078,6 +7352,8 @@ struct WatchedStore {
     fail_apply_expansions: AtomicUsize,
     /// How many of the next reads of every terminology row to fail.
     fail_load_terminology: AtomicUsize,
+    /// How many of the next collections of replaced packages to fail.
+    fail_collect_superseded: AtomicUsize,
     /// Counter writes that announce a change to the other processes.
     fail_bump_catalog: AtomicUsize,
     fail_bump_terminology: AtomicUsize,
@@ -6100,6 +7376,7 @@ impl WatchedStore {
             fail_upsert_terminology: AtomicUsize::new(0),
             fail_apply_expansions: AtomicUsize::new(0),
             fail_load_terminology: AtomicUsize::new(0),
+            fail_collect_superseded: AtomicUsize::new(0),
             fail_bump_catalog: AtomicUsize::new(0),
             fail_bump_terminology: AtomicUsize::new(0),
             fail_row_reads: AtomicUsize::new(0),
@@ -6165,6 +7442,17 @@ impl ConformanceStore for WatchedStore {
     }
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
         self.inner.load_packages()
+    }
+    fn retired_parameters(&self) -> Result<Vec<refhir_persistence::RetiredParam>, PersistError> {
+        self.inner.retired_parameters()
+    }
+    fn collect_superseded(&self) -> Result<(), PersistError> {
+        if Self::should_fail(&self.fail_collect_superseded) {
+            return Err(PersistError::Definite(
+                "injected: collect superseded".into(),
+            ));
+        }
+        self.inner.collect_superseded()
     }
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
         self.definition_loads.fetch_add(1, Ordering::SeqCst);
@@ -6716,12 +8004,627 @@ fn expansions_stored_under_other_rules_are_rebuilt_once_at_the_next_start() {
     assert_eq!(rows[0].package_id, core);
     assert_eq!(
         serde_json::from_str::<Value>(&rows[0].json).unwrap()["rules"],
-        2
+        4
     );
     assert_expansions_match(&harness.store, "after the repair");
     // A second start finds nothing to do: the repair is not repeated.
     publish(&harness.store, &harness.catalog).unwrap();
     assert!(!harness.catalog.read().unwrap().expansions_stale());
+}
+
+/// The error issues `Invoice/$validate` finds in an invoice whose net total is `value` in `currency`.
+fn currency_errors(harness: &Harness, currency: &str) -> Vec<String> {
+    let checked = apply(
+        harness,
+        "Invoice/$validate",
+        json!({"resource": {"resourceType": "Invoice", "status": "draft",
+                            "totalNet": {"value": 15000, "currency": currency}}}),
+    );
+    checked["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| issue["severity"] == "error")
+        .map(|issue| issue["diagnostics"].as_str().unwrap_or("").to_string())
+        .collect()
+}
+
+/// The entries of an expansion as `code -> abstract`, for those that have a code.
+fn abstract_flags(expanded: &Value) -> std::collections::BTreeMap<String, bool> {
+    expanded["expansion"]["contains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            (
+                entry["code"].as_str().unwrap().to_string(),
+                entry["abstract"].as_bool().unwrap_or(false),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_expansion_marks_the_codes_its_system_does_not_let_you_select_as_abstract() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let coverage = "http://hl7.org/fhir/ValueSet/coverage-type";
+    let act_code = "http://terminology.hl7.org/CodeSystem/v3-ActCode";
+
+    // The v3 grouping concepts are in the expansion, flagged, and the codes that are meant to be
+    // chosen are not. ActCode says so with the `notSelectable` property, which is what R4's
+    // `abstract` on an expansion entry means.
+    let expanded = apply(&harness, "ValueSet/$expand", json!({"url": coverage}));
+    assert_eq!(expanded["expansion"]["total"], 58);
+    let flags = abstract_flags(&expanded);
+    assert_eq!(flags.len(), 58);
+    let abstract_codes: Vec<&str> = flags
+        .iter()
+        .filter(|(_, flagged)| **flagged)
+        .map(|(code, _)| code.as_str())
+        .collect();
+    assert_eq!(
+        abstract_codes,
+        [
+            "_ActCoverageTypeCode",
+            "_ActHealthInsuranceTypeCode",
+            "_ActInsurancePolicyCode",
+            "_ActInsuranceTypeCode",
+            "_ActProgramTypeCode"
+        ]
+    );
+    for code in ["HMO", "PPO", "PUBLICPOL", "pay"] {
+        assert_eq!(flags.get(code), Some(&false), "{code}");
+    }
+    // The flag is on the entry, as R4 puts it, and an entry that is not abstract says nothing.
+    let entries = expanded["expansion"]["contains"].as_array().unwrap();
+    let entry = |code: &str| entries.iter().find(|entry| entry["code"] == code).unwrap();
+    assert_eq!(entry("_ActCoverageTypeCode")["abstract"], true);
+    assert_eq!(entry("_ActCoverageTypeCode")["system"], act_code);
+    assert!(entry("HMO").get("abstract").is_none());
+
+    // A filter and a page still carry it.
+    let filtered = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": coverage, "filter": "ActCoverage"}),
+    );
+    assert_eq!(
+        abstract_flags(&filtered).get("_ActCoverageTypeCode"),
+        Some(&true)
+    );
+    let paged = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": coverage, "count": 1000}),
+    );
+    assert_eq!(abstract_flags(&paged), flags);
+
+    // A value set whose codes carry no such property flags nothing.
+    let types = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": "http://hl7.org/fhir/ValueSet/organization-type"}),
+    );
+    assert!(abstract_flags(&types).values().all(|flagged| !flagged));
+    assert!(!types.to_string().contains("abstract"));
+
+    // R4 lets a client say whether it is where an abstract code may be used (`abstract`). The
+    // code is a member of the value set either way; what changes is whether it is valid.
+    let check = |extra: Value| {
+        let mut args = json!({"url": coverage, "system": act_code, "code": "_ActCoverageTypeCode"});
+        for (name, value) in extra.as_object().unwrap() {
+            args[name] = value.clone();
+        }
+        validated(&harness, args)
+    };
+    // Said nothing: valid, with a hint that it is a grouping concept.
+    let (valid, message) = check(json!({}));
+    assert!(valid);
+    assert!(message.unwrap().contains("is abstract"));
+    // Said it is where such a code belongs: valid, nothing to add.
+    assert_eq!(check(json!({"abstract": true})), (true, None));
+    // Said it is not: not valid, and why.
+    let (valid, message) = check(json!({"abstract": false}));
+    assert!(!valid);
+    assert!(message.unwrap().contains("is abstract"));
+    // As a Parameters resource the same input is `valueBoolean`.
+    let as_parameters = apply(
+        &harness,
+        "ValueSet/$validate-code",
+        json!({"resourceType": "Parameters", "parameter": [
+            {"name": "url", "valueUri": coverage},
+            {"name": "system", "valueUri": act_code},
+            {"name": "code", "valueCode": "_ActCoverageTypeCode"},
+            {"name": "abstract", "valueBoolean": false}
+        ]}),
+    );
+    assert_eq!(as_parameters["parameter"][0]["valueBoolean"], false);
+    // A code that is selectable is valid whatever is said.
+    for extra in [
+        json!({}),
+        json!({"abstract": false}),
+        json!({"abstract": true}),
+    ] {
+        let mut args = json!({"url": coverage, "system": act_code, "code": "HMO"});
+        for (name, value) in extra.as_object().unwrap() {
+            args[name] = value.clone();
+        }
+        assert_eq!(validated(&harness, args), (true, None), "{extra}");
+    }
+
+    // The flag is stored with the expansion, so a server that reads it back says the same, and a
+    // rebuild from the stored resources makes the same documents.
+    publish(&harness.store, &harness.catalog).unwrap();
+    let reread = apply(&harness, "ValueSet/$expand", json!({"url": coverage}));
+    assert_eq!(abstract_flags(&reread), flags);
+    assert_expansions_match(&harness.store, "with abstract codes");
+}
+
+#[test]
+fn an_expansion_says_which_value_set_status_it_has_which_expansion_it_is_and_what_was_asked() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let url = "http://hl7.org/fhir/ValueSet/organization-type";
+    let defined: Value = serde_json::from_str(
+        &std::fs::read_to_string(r4_dir().join("ValueSet-organization-type.json")).unwrap(),
+    )
+    .unwrap();
+
+    // R4 requires a status of the ValueSet an expansion is in: the definition's own.
+    let plain = apply(&harness, "ValueSet/$expand", json!({"url": url}));
+    assert_eq!(plain["status"], defined["status"]);
+    assert!(defined["status"].is_string());
+    // The identifier names what the expansion says, a urn:uuid: the same for an answer that says
+    // the same, and another for one that says something else (a filtered one, a page).
+    let identifier = plain["expansion"]["identifier"].as_str().unwrap();
+    assert!(
+        identifier.starts_with("urn:uuid:") && identifier.len() == "urn:uuid:".len() + 36,
+        "{identifier}"
+    );
+    let again = apply(&harness, "ValueSet/$expand", json!({"url": url}));
+    assert_eq!(
+        again["expansion"]["identifier"],
+        plain["expansion"]["identifier"]
+    );
+    let narrower = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": url, "filter": "hospital"}),
+    );
+    assert_ne!(
+        narrower["expansion"]["identifier"],
+        plain["expansion"]["identifier"]
+    );
+    // Nothing was asked, so nothing is listed as asked.
+    assert!(plain["expansion"].get("parameter").is_none());
+
+    // What was asked that shaped the expansion is listed, as R4 says it should be, and a page
+    // says its offset and count.
+    let asked = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": url, "filter": "hospital", "count": 1, "offset": 0, "activeOnly": true}),
+    );
+    let parameters = asked["expansion"]["parameter"].as_array().unwrap();
+    for expected in [
+        json!({"name": "filter", "valueString": "hospital"}),
+        json!({"name": "activeOnly", "valueBoolean": true}),
+        json!({"name": "count", "valueInteger": 1}),
+        json!({"name": "offset", "valueInteger": 0}),
+    ] {
+        assert!(
+            parameters.contains(&expected),
+            "{expected} in {parameters:?}"
+        );
+    }
+    assert_eq!(parameters.len(), 4);
+    // `activeOnly` only says that inactive codes were left out, and none of these is inactive.
+    let all = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": url, "activeOnly": "true"}),
+    );
+    assert_eq!(all["expansion"]["total"], 12);
+    assert!(all["expansion"]["parameter"]
+        .as_array()
+        .unwrap()
+        .contains(&json!({"name": "activeOnly", "valueBoolean": true})));
+
+    // A value set that is not expanded from a definition with a status is `active`.
+    let bare = refhir_validate::MemoryTerminology::from_resources(&[
+        json!({"resourceType": "CodeSystem", "url": "http://example.org/s", "content": "complete",
+               "concept": [{"code": "a"}]}),
+        json!({"resourceType": "ValueSet", "url": "http://example.org/v",
+               "compose": {"include": [{"system": "http://example.org/s"}]}}),
+    ]);
+    assert_eq!(
+        bare.expand("http://example.org/v", None).unwrap()["status"],
+        "active"
+    );
+}
+
+#[test]
+fn an_answer_outside_a_sample_value_set_is_not_refused_but_one_outside_a_complete_one_is() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let questionnaire = |id: &str, value_set: &str| {
+        json!({"resource": {"resourceType": "Questionnaire", "id": id,
+               "url": format!("http://example.org/Questionnaire/{id}"), "status": "active",
+               "item": [{"linkId": "a", "text": "A", "type": "choice",
+                         "answerValueSet": value_set}]}})
+    };
+    let answer = |id: &str, system: &str, code: &str| {
+        run_op(
+            &harness,
+            "QuestionnaireResponse/create",
+            &json!({"resource": {"resourceType": "QuestionnaireResponse", "status": "completed",
+                "questionnaire": format!("http://example.org/Questionnaire/{id}"),
+                "item": [{"linkId": "a", "answer": [{"valueCoding":
+                    {"system": system, "code": code}}]}]}}),
+        )
+    };
+    apply(
+        &harness,
+        "Questionnaire/create",
+        questionnaire("sample", "http://hl7.org/fhir/ValueSet/service-type"),
+    );
+    apply(
+        &harness,
+        "Questionnaire/create",
+        questionnaire("complete", "http://hl7.org/fhir/ValueSet/organization-type"),
+    );
+
+    // A value set that lists only a sample of its code system cannot rule a code out, so a code
+    // that is not in the sample is not an answer outside the value set.
+    let stored = answer(
+        "sample",
+        "http://terminology.hl7.org/CodeSystem/service-type",
+        "not-in-the-sample",
+    );
+    assert!(stored.is_ok(), "{stored:?}");
+    // One that lists all of it can, and the answer is refused.
+    let refused = answer(
+        "complete",
+        "http://terminology.hl7.org/CodeSystem/organization-type",
+        "not-a-type",
+    );
+    assert!(refused.is_err(), "{refused:?}");
+    // A code that is in the sample, and one in the complete set, are both fine.
+    assert!(answer(
+        "sample",
+        "http://terminology.hl7.org/CodeSystem/service-type",
+        "1"
+    )
+    .is_ok());
+    assert!(answer(
+        "complete",
+        "http://terminology.hl7.org/CodeSystem/organization-type",
+        "prov"
+    )
+    .is_ok());
+}
+
+#[test]
+fn the_currencies_value_set_expands_over_the_iso_4217_codes_the_server_carries() {
+    let currencies = "http://hl7.org/fhir/ValueSet/currencies";
+    let iso = "urn:iso:std:iso:4217";
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+
+    // HL7 publishes no CodeSystem for ISO 4217, so with only its packages the value set cannot
+    // expand, and a Money cannot be checked.
+    let refused = unprocessable(run_op(
+        &harness,
+        "ValueSet/$expand",
+        &json!({"url": currencies}),
+    ));
+    let text = refused["issue"][0]["diagnostics"].as_str().unwrap();
+    assert!(
+        text.contains("code system urn:iso:std:iso:4217 is not installed"),
+        "{text}"
+    );
+    assert!(
+        currency_errors(&harness, "ZZZ").is_empty(),
+        "an unchecked code is not an error"
+    );
+
+    // The server installs the code system itself, and the value set that was waiting for it
+    // expands without any other package being touched.
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    let expanded = apply(&harness, "ValueSet/$expand", json!({"url": currencies}));
+    let (codes, parameters) = expansion_summary(&expanded);
+    assert_eq!(codes.len(), 178);
+    assert_eq!(expanded["expansion"]["total"], 178);
+    let unique: std::collections::BTreeSet<&String> = codes.iter().collect();
+    assert_eq!(unique.len(), codes.len(), "no duplicates");
+    for code in ["NGN", "USD", "GBP", "EUR", "GHS", "KES", "ZAR"] {
+        assert!(codes.contains(&format!("{iso}|{code}")), "{code}");
+    }
+    // The system is complete: nothing says the list is a sample.
+    assert!(parameters.is_empty(), "{parameters:?}");
+    let display = |expanded: &Value, code: &str| {
+        expanded["expansion"]["contains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["code"] == code)
+            .map(|entry| entry["display"].as_str().unwrap().to_string())
+    };
+    assert_eq!(display(&expanded, "NGN").as_deref(), Some("Nigerian Naira"));
+    assert_eq!(display(&expanded, "USD").as_deref(), Some("US Dollar"));
+
+    // A filter finds a currency by what it is called, and by its code.
+    let naira = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": currencies, "filter": "naira"}),
+    );
+    assert_eq!(expansion_summary(&naira).0, [format!("{iso}|NGN")]);
+    let by_code = apply(
+        &harness,
+        "ValueSet/$expand",
+        json!({"url": currencies, "filter": "ngn"}),
+    );
+    assert_eq!(expansion_summary(&by_code).0, [format!("{iso}|NGN")]);
+
+    // A real code is in the value set and an unknown one is not.
+    let check = |code: &str| {
+        validated(
+            &harness,
+            json!({"url": currencies, "system": iso, "code": code}),
+        )
+    };
+    assert_eq!(check("NGN"), (true, None));
+    assert_eq!(
+        check("ZZZ"),
+        (false, Some("code is not in the value set".to_string()))
+    );
+    let looked = apply(
+        &harness,
+        "CodeSystem/$validate-code",
+        json!({"url": iso, "code": "GHS"}),
+    );
+    assert_eq!(looked["parameter"][0]["valueBoolean"], true);
+
+    // So a Money that carries a currency is checked: a real one passes, an unknown one is refused.
+    assert!(currency_errors(&harness, "NGN").is_empty());
+    let refused = currency_errors(&harness, "ZZZ");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0].contains("ZZZ") && refused[0].contains("currencies"),
+        "{refused:?}"
+    );
+
+    // A write is checked the same way.
+    let invoice = |currency: &str| {
+        json!({"resource": {"resourceType": "Invoice", "status": "draft",
+                            "totalNet": {"value": 15000, "currency": currency}}})
+    };
+    assert!(run_op(&harness, "Invoice/create", &invoice("NGN")).is_ok());
+    let rejected = run_op(&harness, "Invoice/create", &invoice("ZZZ"));
+    assert!(rejected.is_err(), "{rejected:?}");
+
+    // Installing it again is not a second copy, and the answer does not change.
+    let packages = harness.store.load_packages().unwrap();
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert_eq!(harness.store.load_packages().unwrap().len(), packages.len());
+    assert_eq!(
+        packages
+            .iter()
+            .filter(
+                |package| format!("{}@{}", package.name, package.version) == crate::BUILTIN_PACKAGE
+            )
+            .count(),
+        1
+    );
+    let again = apply(&harness, "ValueSet/$expand", json!({"url": currencies}));
+    assert_eq!(expansion_summary(&again).0, codes);
+
+    // The expansion is stored, so a server that reads it back says the same.
+    publish(&harness.store, &harness.catalog).unwrap();
+    let reread = apply(&harness, "ValueSet/$expand", json!({"url": currencies}));
+    assert_eq!(expansion_summary(&reread).0, codes);
+    assert_expansions_match(&harness.store, "with the built-in terminology");
+}
+
+#[test]
+fn the_built_in_terminology_waits_for_a_package_that_could_refer_to_it() {
+    // A server with no package has nothing that refers to ISO 4217, and a replica that starts
+    // serving as soon as any package is stored must not be left with only this one.
+    let harness = empty();
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert!(harness.store.load_packages().unwrap().is_empty());
+
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, minir4_dir()).unwrap();
+    crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    let names: Vec<String> = harness
+        .store
+        .load_packages()
+        .unwrap()
+        .iter()
+        .map(|package| format!("{}@{}", package.name, package.version))
+        .collect();
+    assert!(
+        names.contains(&crate::BUILTIN_PACKAGE.to_string()),
+        "{names:?}"
+    );
+    assert_eq!(names.len(), 2, "{names:?}");
+}
+
+#[test]
+fn a_database_made_under_the_previous_rules_gains_the_value_sets_that_now_expand_at_its_next_start()
+{
+    // The previous version could not expand HL7's service categories, so it stored no expansion
+    // for them, and stored the rest under rules 2. Nothing else would ever add them: a start
+    // that finds expansions made under other rules rebuilds them all, once.
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let (categories, types) = (
+        "http://hl7.org/fhir/ValueSet/service-category",
+        "http://hl7.org/fhir/ValueSet/organization-type",
+    );
+    let change =
+        |package_id, url: &str, json: Option<String>| refhir_persistence::ExpansionChange {
+            package_id,
+            url: url.to_string(),
+            json,
+        };
+    let mut changes: Vec<_> = stored_rows(&harness, categories)
+        .iter()
+        .map(|row| change(row.package_id, categories, None))
+        .collect();
+    assert!(!changes.is_empty());
+    for row in stored_rows(&harness, types) {
+        let mut previous: Value = serde_json::from_str(&row.json).unwrap();
+        previous["rules"] = json!(2);
+        changes.push(change(row.package_id, types, Some(previous.to_string())));
+    }
+    harness.store.apply_expansions(&changes).unwrap();
+
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(harness.catalog.read().unwrap().expansions_stale());
+    unprocessable(run_op(
+        &harness,
+        "ValueSet/$expand",
+        &json!({"url": categories}),
+    ));
+
+    repair_conformance(&harness.store, &harness.db, &harness.catalog).unwrap();
+    assert!(!harness.catalog.read().unwrap().expansions_stale());
+    let expanded = apply(&harness, "ValueSet/$expand", json!({"url": categories}));
+    assert_eq!(expanded["expansion"]["total"], 38);
+    assert_eq!(expansion_summary(&expanded).1.len(), 1);
+    assert_expansions_match(&harness.store, "after the repair");
+    // The rows it wrote say so, and a second start finds nothing to repeat.
+    let stored: Value = serde_json::from_str(&stored_rows(&harness, categories)[0].json).unwrap();
+    assert_eq!(stored["rules"], 4);
+    assert_eq!(stored["incomplete"][0]["content"], "example");
+    publish(&harness.store, &harness.catalog).unwrap();
+    assert!(!harness.catalog.read().unwrap().expansions_stale());
+}
+
+/// A package of value sets that include a code system it does not carry (one of them through
+/// another value set), and a package of that code system.
+fn waiting_packages() -> (PathBuf, PathBuf) {
+    let system = "http://example.org/arrived";
+    let sets = dep_package("example.waiting.sets", "1.0.0", &[]);
+    let value_set = |file: &str, url: &str, include: Value| {
+        std::fs::write(
+            sets.join(file),
+            json!({"resourceType": "ValueSet", "url": url, "status": "active",
+                   "compose": {"include": [include]}})
+            .to_string(),
+        )
+        .unwrap();
+    };
+    value_set(
+        "ValueSet-waits.json",
+        "http://example.org/ValueSet/waits",
+        json!({"system": system}),
+    );
+    value_set(
+        "ValueSet-nested.json",
+        "http://example.org/ValueSet/nested",
+        json!({"valueSet": ["http://example.org/ValueSet/waits"]}),
+    );
+    // What no package carries stays as it was.
+    value_set(
+        "ValueSet-absent.json",
+        "http://example.org/ValueSet/absent",
+        json!({"system": "http://example.org/nobody-has-this"}),
+    );
+    let code_system = dep_package("example.waiting.system", "1.0.0", &[]);
+    std::fs::write(
+        code_system.join("CodeSystem-arrived.json"),
+        json!({"resourceType": "CodeSystem", "url": system, "status": "active",
+               "content": "complete", "concept": [{"code": "x"}, {"code": "y"}]})
+        .to_string(),
+    )
+    .unwrap();
+    (sets, code_system)
+}
+
+fn assert_waiting_value_sets_follow_what_arrived(harness: &Harness, when: &str) {
+    for url in [
+        "http://example.org/ValueSet/waits",
+        "http://example.org/ValueSet/nested",
+    ] {
+        let codes: Vec<_> = expansion_of(harness, url)
+            .iter()
+            .filter_map(|item| item["code"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(codes, ["x", "y"], "{url} {when}");
+    }
+    unprocessable(run_op(
+        harness,
+        "ValueSet/$expand",
+        &json!({"url": "http://example.org/ValueSet/absent"}),
+    ));
+}
+
+#[test]
+fn a_value_set_waiting_for_another_packages_code_system_is_expanded_when_the_two_are_together() {
+    // Installing a package stores the expansions of its own value sets, so the value sets here
+    // were stored with none; whichever package came first, the one that came second finds them.
+    for code_system_first in [false, true] {
+        let harness = empty();
+        let (sets, code_system) = waiting_packages();
+        let order = if code_system_first {
+            [&code_system, &sets]
+        } else {
+            [&sets, &code_system]
+        };
+        for dir in order {
+            install_package_dir(&harness.store, &harness.db, &harness.catalog, dir).unwrap();
+        }
+        let order = if code_system_first { "after" } else { "before" };
+        assert_waiting_value_sets_follow_what_arrived(
+            &harness,
+            &format!("the code system came {order} the value sets"),
+        );
+        // The expansions are stored, under the package whose value set it is, so a catalog loaded
+        // again from the store has them, and they are what a full rebuild would make.
+        publish(&harness.store, &harness.catalog).unwrap();
+        assert_waiting_value_sets_follow_what_arrived(&harness, "after the catalog was loaded");
+        let holder = package_id(&harness, "example.waiting.sets");
+        let rows = stored_rows(&harness, "http://example.org/ValueSet/waits");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].package_id, holder);
+        assert_expansions_match(&harness.store, "with value sets that waited");
+        assert!(harness
+            .catalog
+            .read()
+            .unwrap()
+            .terms()
+            .unexpandable_urls()
+            .iter()
+            .all(|url| url == "http://example.org/ValueSet/absent"));
+    }
+}
+
+#[test]
+fn packages_installed_together_are_followed_by_the_same_pass() {
+    // The install that stores several packages and loads the catalog once (a bundle, the
+    // packages an IG depends on) goes through the same pass afterwards.
+    let harness = empty();
+    let (sets, code_system) = waiting_packages();
+    let pending: Vec<_> = [&sets, &code_system]
+        .into_iter()
+        .filter_map(|dir| {
+            stage_package_deferred(&harness.store, &harness.db, &harness.catalog, dir).unwrap()
+        })
+        .collect();
+    finish_install(
+        &harness.store,
+        &harness.db,
+        &harness.catalog,
+        &pending,
+        Ok(()),
+    )
+    .unwrap();
+    assert_waiting_value_sets_follow_what_arrived(&harness, "installed together");
+    assert_expansions_match(&harness.store, "installed together");
 }
 
 #[test]
@@ -7766,12 +9669,9 @@ fn a_currency_is_one_of_the_codes_of_iso_4217() {
     create("NRA").unwrap();
 
     // The code system the server carries is stored once, and a start that finds it does nothing.
-    assert!(
-        crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
-    );
-    assert!(
-        !crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
-    );
+    for _ in 0..2 {
+        crate::install_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap();
+    }
 
     // A currency that exists is accepted, and says nothing.
     assert_eq!(
@@ -7808,35 +9708,6 @@ fn a_currency_is_one_of_the_codes_of_iso_4217() {
     }
     let found = apply(&harness, "ClaimResponse/search", json!({}));
     assert_eq!(found["total"], 7, "NRA before, then NGN and five more");
-}
-
-#[test]
-fn the_currency_codes_do_not_depend_on_which_package_came_first() {
-    // The order the packages came in does not change what the value set expands to. A first start
-    // stores the code systems first, with no publish of their own, and the one that ends
-    // installing the release's packages includes them.
-    let harness = empty();
-    assert!(
-        crate::stage_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
-    );
-    assert!(
-        !crate::stage_builtin_terminology(&harness.store, &harness.db, &harness.catalog).unwrap()
-    );
-    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
-    assert_eq!(
-        validation_issues(&harness, &claim_response("NGN")),
-        Vec::<Value>::new()
-    );
-    let refused = validation_issues(&harness, &claim_response("NRA"));
-    assert_eq!(refused.len(), 1, "{refused:?}");
-    assert_eq!(refused[0]["severity"], "error");
-    // The value set expands to the codes, which is what a client that offers a list asks for.
-    let expanded = apply(
-        &harness,
-        "ValueSet/$expand",
-        json!({"url": "http://hl7.org/fhir/ValueSet/currencies", "filter": "naira"}),
-    );
-    assert_eq!(expanded["expansion"]["contains"][0]["code"], "NGN");
 }
 
 #[test]
@@ -9872,4 +11743,3887 @@ mod sorted_pages {
             }
         }
     }
+}
+
+mod near_search {
+    use super::*;
+    use crate::catalog::{index_keys, CatalogClock};
+    use crate::resolve::TxHost;
+    use crate::search::{search_counted, search_handling, Handling, Work};
+    use crate::spatial::haversine_km;
+    use std::time::{Duration, Instant};
+
+    /// Nigeria's bounding box, where ByteNetwork's places are.
+    const SOUTH: f64 = 4.27;
+    const NORTH: f64 = 13.89;
+    const WEST: f64 = 2.67;
+    const EAST: f64 = 14.68;
+
+    const DISTANCE_EXTENSION: &str = "http://hl7.org/fhir/StructureDefinition/location-distance";
+
+    /// A small, fixed stream of numbers in [0, 1).
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        fn between(&mut self, low: f64, high: f64) -> f64 {
+            low + self.next() * (high - low)
+        }
+    }
+
+    fn location(id: &str, latitude: f64, longitude: f64) -> Value {
+        json!({
+            "resourceType": "Location", "id": id, "status": "active",
+            "name": format!("Place {id}"),
+            "position": {"latitude": latitude, "longitude": longitude}
+        })
+    }
+
+    /// Stores the resources, each as the type it says it is, a thousand to a transaction. They are
+    /// not validated, which costs far more than storing them, so a table of tens of thousands is
+    /// quick to make.
+    fn store_places(harness: &Harness, places: &[Value]) {
+        for batch in places.chunks(1000) {
+            let catalog = harness.catalog.read().unwrap();
+            let mut tx = harness.db.begin();
+            for resource in batch {
+                let model = catalog
+                    .get(resource["resourceType"].as_str().unwrap())
+                    .unwrap();
+                let keys = {
+                    let host = TxHost::new(&mut tx, &catalog);
+                    index_keys(catalog.path_model(), model, resource, &host).unwrap()
+                };
+                tx.stage_put(Put {
+                    tablet: model.tablet(),
+                    id: resource["id"].as_str().unwrap().to_string(),
+                    json: resource.clone(),
+                    new_keys: keys,
+                    old_keys: Vec::new(),
+                    prev_ts: None,
+                })
+                .unwrap();
+            }
+            harness.db.commit(tx).unwrap();
+        }
+    }
+
+    /// `count` places spread evenly over Nigeria, the same ones every run.
+    fn spread(count: usize) -> Vec<Value> {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        (0..count)
+            .map(|n| {
+                location(
+                    &format!("l{n:05}"),
+                    random.between(SOUTH, NORTH),
+                    random.between(WEST, EAST),
+                )
+            })
+            .collect()
+    }
+
+    fn query_params(query: &[(&str, &str)]) -> BTreeMap<String, String> {
+        query
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    fn search(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work, Duration) {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get("Location").unwrap();
+        let params = query_params(query);
+        let mut tx = harness.db.begin();
+        let started = Instant::now();
+        let (bundle, work) =
+            search_counted(&mut tx, &catalog, model, &params, Handling::Strict).unwrap();
+        (bundle, work, started.elapsed())
+    }
+
+    /// The best of a few runs, so a pause of the machine does not decide the answer.
+    fn fastest(harness: &Harness, query: &[(&str, &str)]) -> Duration {
+        (0..5)
+            .map(|_| search(harness, query).2)
+            .min()
+            .expect("a run")
+    }
+
+    /// The ids of the matches, in the order the bundle has them.
+    fn ids(bundle: &Value) -> Vec<String> {
+        bundle["entry"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// What `near` meant before it had an index, as it was written: the answer the index is held to.
+    fn near_before(resource: &Value, expected: &str) -> bool {
+        let Some(position) = resource.get("position") else {
+            return false;
+        };
+        let Some(lat) = position.get("latitude").and_then(|value| value.as_f64()) else {
+            return false;
+        };
+        let Some(lon) = position.get("longitude").and_then(|value| value.as_f64()) else {
+            return false;
+        };
+        let mut parts = expected.split('|');
+        let Some(query_lat) = parts.next().and_then(|text| text.parse::<f64>().ok()) else {
+            return false;
+        };
+        let Some(query_lon) = parts.next().and_then(|text| text.parse::<f64>().ok()) else {
+            return false;
+        };
+        let distance = parts
+            .next()
+            .and_then(|text| text.parse::<f64>().ok())
+            .unwrap_or(10.0);
+        let units = parts.next().unwrap_or("km");
+        let limit_km = if units == "mi" {
+            distance * 1.60934
+        } else {
+            distance
+        };
+        let radius = 6371.0;
+        let dlat = (query_lat - lat).to_radians();
+        let dlon = (query_lon - lon).to_radians();
+        let a = (dlat / 2.0).sin().powi(2)
+            + lat.to_radians().cos() * query_lat.to_radians().cos() * (dlon / 2.0).sin().powi(2);
+        2.0 * radius * a.sqrt().asin() <= limit_km
+    }
+
+    /// The places that `near_before` says match, sorted by id.
+    fn expected(places: &[Value], near: &str) -> Vec<String> {
+        let mut found: Vec<String> = places
+            .iter()
+            .filter(|place| near_before(place, near))
+            .map(|place| place["id"].as_str().unwrap().to_string())
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn found(harness: &Harness, near: &str) -> Vec<String> {
+        let (bundle, _, _) = search(harness, &[("near", near)]);
+        let mut found = ids(&bundle);
+        found.sort();
+        found
+    }
+
+    /// Places where a square round a circle bends or the index cannot say where they are: at the
+    /// poles and the antimeridian, off the map, and with no usable position at all.
+    fn awkward() -> Vec<Value> {
+        let mut places: Vec<Value> = [
+            ("pole-n", 89.95, 10.0),
+            ("pole-n2", 89.95, -170.0),
+            ("pole-90", 90.0, 0.0),
+            ("pole-s", -89.97, 100.0),
+            ("pole--90", -90.0, 45.0),
+            ("east", 0.1, 179.99),
+            ("west", 0.1, -179.99),
+            ("east-180", 0.0, 180.0),
+            ("west-180", 0.0, -180.0),
+            ("greenwich", 51.48, 0.0),
+            ("equator", 0.0, 0.0),
+            ("lat-over", 91.0, 5.0),
+            ("lat-under", -90.5, 5.0),
+            ("lon-over", 5.0, 181.0),
+            ("lon-under", 5.0, -200.0),
+        ]
+        .iter()
+        .map(|(id, latitude, longitude)| location(id, *latitude, *longitude))
+        .collect();
+        places.push(json!({"resourceType": "Location", "id": "nowhere"}));
+        places.push(json!({"resourceType": "Location", "id": "half",
+            "position": {"latitude": 6.5}}));
+        places.push(json!({"resourceType": "Location", "id": "text",
+            "position": {"latitude": "6.5", "longitude": "3.4"}}));
+        places
+    }
+
+    #[test]
+    fn near_finds_what_a_read_of_every_place_found() {
+        let harness = r4();
+        let mut places = awkward();
+        // A dense patch (Lagos), so that a circle holds hundreds of places and the edge of the
+        // circle matters, and the whole country, so most circles hold none.
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        for n in 0..1500 {
+            places.push(location(
+                &format!("lagos{n:04}"),
+                random.between(6.3, 6.7),
+                random.between(3.2, 3.7),
+            ));
+        }
+        places.extend(spread(1500));
+        store_places(&harness, &places);
+
+        let mut queries: Vec<String> = Vec::new();
+        for (latitude, longitude) in [
+            (6.5, 3.4),
+            (6.31, 3.21),
+            (9.06, 7.49),
+            (89.9, 10.0),
+            (89.99, 100.0),
+            (-89.9, 0.0),
+            (0.1, 179.995),
+            (0.0, -180.0),
+            (0.0, 180.0),
+            (51.48, 0.0),
+            (0.0, 0.0),
+            (6.5, 3.4),
+        ] {
+            for tail in [
+                "", "|1|km", "|5|km", "|10", "|10|km", "|25|km", "|60|km", "|10|mi", "|150|km",
+                "|500|km", "|2000|km", "|0|km",
+            ] {
+                queries.push(format!("{latitude}|{longitude}{tail}"));
+            }
+        }
+        // Centres anywhere, and one on each place the index cannot place, and queries that make
+        // no sense, which are read as they always were.
+        for round in 0..400 {
+            let (latitude, longitude) =
+                (random.between(-90.0, 90.0), random.between(-180.0, 180.0));
+            let distance = [5.0, 50.0, 400.0, 3000.0][round % 4];
+            queries.push(format!("{latitude}|{longitude}|{distance}|km"));
+        }
+        queries.extend(
+            [
+                "95|10|10|km",
+                "10|190|10|km",
+                "-95|10|1000|km",
+                "10|10|-5|km",
+                "10|10|16000|km",
+                "10|10|10000|mi",
+                "6.5|3.4||km",
+                "6.5|3.4|10|furlongs",
+                "91|5|10|km",
+                "5|181|10|km",
+            ]
+            .map(String::from),
+        );
+        let mut hits = 0;
+        for query in &queries {
+            let want = expected(&places, query);
+            hits += want.len();
+            assert_eq!(found(&harness, query), want, "near={query}");
+        }
+        assert!(hits > 20_000, "the queries find something: {hits}");
+    }
+
+    #[test]
+    fn a_small_near_reads_a_small_part_of_the_table() {
+        let harness = r4();
+        store_places(&harness, &spread(4000));
+        let (bundle, work, _) = search(&harness, &[("near", "6.60|3.35|10|km"), ("_count", "20")]);
+        assert!(bundle["total"].as_u64().unwrap() > 0);
+        assert_eq!(
+            bundle["total"],
+            expected(&spread(4000), "6.60|3.35|10|km").len()
+        );
+        // The index narrows the read to a few places round the point, and not to the table.
+        assert!(
+            work.rows * 40 < 4000,
+            "read {} of 4000 places for a circle of 10 km",
+            work.rows
+        );
+        assert_eq!(work.decoded, work.rows);
+        // And a circle that holds much of the table reads much of it, which is as it was.
+        let (_, wide, _) = search(&harness, &[("near", "9|8|600|km"), ("_count", "20")]);
+        assert!(wide.rows > 400, "{}", wide.rows);
+        // Other parameters do not make it wider: it is the narrowest read there is, even beside
+        // a status that every place has.
+        let (bundle, with_status, _) = search(
+            &harness,
+            &[
+                ("near", "6.60|3.35|10|km"),
+                ("status", "active"),
+                ("_count", "20"),
+            ],
+        );
+        assert_eq!(with_status.rows, work.rows);
+        assert_eq!(
+            bundle["total"],
+            expected(&spread(4000), "6.60|3.35|10|km").len()
+        );
+        // A circle too wide for an index to help (past a quarter of the way round the Earth) is
+        // read through whichever index is narrowest of what the search names, as it always was.
+        let (_, huge, _) = search(&harness, &[("near", "9|8|12000|km")]);
+        assert_eq!(huge.rows, 4000);
+    }
+
+    /// The distance between two places, as the search measures it.
+    fn km(from: (f64, f64), to: (f64, f64)) -> f64 {
+        haversine_km(to.0, to.1, from.0, from.1)
+    }
+
+    #[test]
+    fn a_place_exactly_at_the_radius_is_found_and_one_just_beyond_it_is_not() {
+        let harness = r4();
+        let centre: (f64, f64) = (6.5244, 3.3792);
+        let mut random = Random(0x1234_5678_9abc_def1);
+        let mut places = Vec::new();
+        for n in 0..60 {
+            // Places at every distance from nothing to far, in every direction.
+            let distance = [
+                0.0, 0.0005, 0.9, 4.99, 5.0, 9.999, 10.0, 10.001, 11.0, 200.0,
+            ][n % 10];
+            let bearing = random.between(0.0, std::f64::consts::TAU);
+            let latitude = centre.0 + (distance / 111.195) * bearing.cos();
+            let longitude =
+                centre.1 + (distance / (111.195 * centre.0.to_radians().cos())) * bearing.sin();
+            places.push(location(&format!("p{n:02}"), latitude, longitude));
+        }
+        store_places(&harness, &places);
+        for place in &places {
+            let id = place["id"].as_str().unwrap().to_string();
+            // The place as it is stored: a number does not always come back from JSON text as the
+            // very float that was written, and the search measures what comes back.
+            let stored = apply(&harness, "Location/read", json!({"id": id}));
+            let position = (
+                stored["position"]["latitude"].as_f64().unwrap(),
+                stored["position"]["longitude"].as_f64().unwrap(),
+            );
+            // The distance is the very number the search computes, written as text and read back,
+            // so the place is at the radius to the last digit: in at it, out a hair under it.
+            let exact = km(centre, position);
+            let at =
+                |radius: f64| found(&harness, &format!("{}|{}|{radius}|km", centre.0, centre.1));
+            assert!(
+                at(exact).contains(&id),
+                "{id} at {exact} km is at the radius"
+            );
+            assert!(at(exact.next_up()).contains(&id), "{id} just inside");
+            assert!(!at(exact.next_down()).contains(&id), "{id} just outside");
+            // A metre either side, which is what a client can tell.
+            assert!(at(exact + 0.001).contains(&id), "{id} a metre inside");
+            if exact > 0.002 {
+                assert!(!at(exact - 0.001).contains(&id), "{id} a metre outside");
+            }
+            // The same in miles.
+            let miles = exact / 1.60934;
+            let in_miles =
+                |radius: f64| found(&harness, &format!("{}|{}|{radius}|mi", centre.0, centre.1));
+            assert!(
+                in_miles(miles + 1e-6).contains(&id),
+                "{id} just inside, in miles"
+            );
+            if miles > 1e-5 {
+                assert!(
+                    !in_miles(miles - 1e-6).contains(&id),
+                    "{id} just outside, in miles"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_distance_is_in_kilometres_when_the_units_are_left_out() {
+        let harness = r4();
+        let centre: (f64, f64) = (6.5244, 3.3792);
+        // Ten kilometres is 6.2 miles, so a place at 9.9 km is within ten of either and within six
+        // miles only, and one at 10.1 km is within neither ten kilometres nor six miles.
+        let east = |km: f64| {
+            (
+                centre.0,
+                centre.1 + (km / (111.195 * centre.0.to_radians().cos())),
+            )
+        };
+        let places = [("near", 9.9), ("far", 10.1), ("farther", 16.0)]
+            .map(|(id, km)| location(id, east(km).0, east(km).1));
+        store_places(&harness, &places);
+        let query = |tail: &str| found(&harness, &format!("{}|{}{tail}", centre.0, centre.1));
+        // No distance: ten, in kilometres.
+        assert_eq!(query(""), ["near"]);
+        assert_eq!(query("||km"), ["near"]);
+        // A distance with no units is in kilometres, as R4 says, and not in miles.
+        assert_eq!(query("|10"), ["near"]);
+        assert_eq!(query("|10|"), ["near"]);
+        assert_eq!(query("|10|km"), ["near"]);
+        assert_eq!(query("|10.2"), ["far", "near"]);
+        assert_eq!(query("|16.5"), ["far", "farther", "near"]);
+        // Miles are read as miles: six are 9.66 km, and 6.2 are just under ten.
+        assert!(query("|6|mi").is_empty());
+        assert_eq!(query("|6.2|mi"), ["near"]);
+        assert_eq!(query("|6.3|mi"), ["far", "near"]);
+        assert_eq!(query("|10|mi"), ["far", "farther", "near"]);
+    }
+
+    #[test]
+    fn near_with_other_parameters_and_in_a_chain_answers_as_before() {
+        let harness = r4();
+        let mut places = awkward();
+        places.extend(spread(600));
+        // Half the places are closed, half have an organization.
+        for (n, place) in places.iter_mut().enumerate() {
+            place["status"] = json!(if n % 2 == 0 { "active" } else { "suspended" });
+            if n % 3 == 0 {
+                place["managingOrganization"] = json!({"reference": "Organization/o1"});
+            }
+        }
+        store_places(&harness, &places);
+        for (query, filter) in [
+            (
+                vec![("near", "9.06|7.49|300|km"), ("status", "active")],
+                (|place: &Value| place["status"] == "active") as fn(&Value) -> bool,
+            ),
+            (
+                vec![
+                    ("near", "9.06|7.49|500|km"),
+                    ("organization", "Organization/o1"),
+                ],
+                |place: &Value| place.get("managingOrganization").is_some(),
+            ),
+            (
+                vec![("near", "9.06|7.49|300|km"), ("status:not", "active")],
+                |place: &Value| place["status"] != "active",
+            ),
+        ] {
+            let mut want: Vec<String> = places
+                .iter()
+                .filter(|place| near_before(place, query[0].1) && filter(place))
+                .map(|place| place["id"].as_str().unwrap().to_string())
+                .collect();
+            want.sort();
+            let (bundle, _, _) = search(&harness, &query);
+            let mut got = ids(&bundle);
+            got.sort();
+            assert_eq!(got, want, "{query:?}");
+            assert!(!want.is_empty(), "{query:?}");
+        }
+        // The same points as the first of a chain: services at the places that are near.
+        for (n, place) in places.iter().take(40).enumerate() {
+            let id = place["id"].as_str().unwrap();
+            let service = json!({"resourceType": "HealthcareService", "id": format!("h{n}"),
+                "location": [{"reference": format!("Location/{id}")}]});
+            apply(
+                &harness,
+                "HealthcareService/create",
+                json!({"resource": service}),
+            );
+        }
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get("HealthcareService").unwrap();
+        let near = "6.5|3.4|3000|km";
+        let mut tx = harness.db.begin();
+        let bundle = search_handling(
+            &mut tx,
+            &catalog,
+            model,
+            &query_params(&[("location.near", near)]),
+            Handling::Strict,
+        )
+        .unwrap();
+        let mut got = ids(&bundle);
+        got.sort();
+        let mut want: Vec<String> = places
+            .iter()
+            .take(40)
+            .enumerate()
+            .filter(|(_, place)| near_before(place, near))
+            .map(|(n, _)| format!("h{n}"))
+            .collect();
+        want.sort();
+        assert_eq!(got, want);
+        assert!(!want.is_empty());
+    }
+
+    fn run(
+        harness: &Harness,
+        type_name: &str,
+        query: &[(&str, &str)],
+        handling: Handling,
+    ) -> Result<Value, FhirError> {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get(type_name).unwrap();
+        let mut tx = harness.db.begin();
+        search_handling(&mut tx, &catalog, model, &query_params(query), handling)
+    }
+
+    /// The query a `next` or `self` link of a bundle stands for.
+    fn params_of(bundle: &Value, relation: &str) -> Option<Vec<(String, String)>> {
+        let url = bundle["link"]
+            .as_array()?
+            .iter()
+            .find(|link| link["relation"] == relation)?["url"]
+            .as_str()?;
+        let (_, query) = url.split_once('?')?;
+        Some(
+            query
+                .split('&')
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (name.to_string(), value.to_string())
+                })
+                .collect(),
+        )
+    }
+
+    fn follow(harness: &Harness, bundle: &Value) -> Option<Value> {
+        let next = params_of(bundle, "next")?;
+        let query: Vec<(&str, &str)> = next
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        Some(run(harness, "Location", &query, Handling::Strict).unwrap())
+    }
+
+    /// The distance an entry says its place is from the point searched from, with its units.
+    fn distance_of(entry: &Value) -> (f64, String, String, String) {
+        let extensions = entry["search"]["extension"]
+            .as_array()
+            .expect("an extension");
+        assert_eq!(extensions.len(), 1, "{entry}");
+        assert_eq!(extensions[0]["url"], DISTANCE_EXTENSION);
+        let distance = &extensions[0]["valueDistance"];
+        (
+            distance["value"].as_f64().expect("a value"),
+            distance["unit"].as_str().unwrap().to_string(),
+            distance["system"].as_str().unwrap().to_string(),
+            distance["code"].as_str().unwrap().to_string(),
+        )
+    }
+
+    /// 300 places over Nigeria, and four more that sit on one another, so that distances tie.
+    fn places_to_sort() -> Vec<Value> {
+        let mut places = spread(300);
+        for id in ["tie-d", "tie-b", "tie-c", "tie-a"] {
+            places.push(location(id, 6.7, 3.5));
+        }
+        places
+    }
+
+    /// The ids of `places` within `km` of `centre`, nearest first, ties by id: the order
+    /// `_sort=near` is to give. `farthest_first` reverses the distances and not the ties.
+    fn by_distance(
+        places: &[Value],
+        centre: (f64, f64),
+        limit_km: f64,
+        farthest_first: bool,
+    ) -> Vec<(String, f64)> {
+        let mut found: Vec<(String, f64)> = places
+            .iter()
+            .map(|place| {
+                let position = (
+                    place["position"]["latitude"].as_f64().unwrap(),
+                    place["position"]["longitude"].as_f64().unwrap(),
+                );
+                (
+                    place["id"].as_str().unwrap().to_string(),
+                    km(centre, position),
+                )
+            })
+            .filter(|(_, distance)| *distance <= limit_km)
+            .collect();
+        found.sort_by(|left, right| {
+            let by_distance = left.1.total_cmp(&right.1);
+            let by_distance = if farthest_first {
+                by_distance.reverse()
+            } else {
+                by_distance
+            };
+            by_distance.then_with(|| left.0.cmp(&right.0))
+        });
+        found
+    }
+
+    #[test]
+    fn sorting_by_near_puts_the_nearest_first_and_a_distance_on_every_entry() {
+        let harness = r4();
+        let places = places_to_sort();
+        store_places(&harness, &places);
+        let centre = (6.60, 3.35);
+        let near = "6.60|3.35|250|km";
+        for (sort, farthest_first) in [("near", false), ("-near", true)] {
+            let want = by_distance(&places, centre, 250.0, farthest_first);
+            assert!(want.len() > 20, "{}", want.len());
+            let bundle = run(
+                &harness,
+                "Location",
+                &[("near", near), ("_sort", sort)],
+                Handling::Strict,
+            )
+            .unwrap();
+            assert_eq!(
+                ids(&bundle),
+                want.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>(),
+                "_sort={sort}"
+            );
+            // Every match says how far it is, in kilometres, as the search measures it.
+            let entries = bundle["entry"].as_array().unwrap();
+            assert_eq!(entries.len(), want.len());
+            for (entry, (id, distance)) in entries.iter().zip(&want) {
+                let (value, unit, system, code) = distance_of(entry);
+                assert!(
+                    (value - distance).abs() < 1e-6,
+                    "{id}: {value} is not {distance}"
+                );
+                assert_eq!(
+                    (unit.as_str(), system.as_str(), code.as_str()),
+                    ("km", "http://unitsofmeasure.org", "km")
+                );
+            }
+            // The self link keeps the sort, since it was applied.
+            let self_link = params_of(&bundle, "self").unwrap();
+            assert!(
+                self_link.contains(&("_sort".into(), sort.into())),
+                "{self_link:?}"
+            );
+        }
+        // The nearest is nearer than the next, and the four on top of one another go by id.
+        let nearest = by_distance(&places, centre, 250.0, false);
+        assert!(nearest.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+        let ties: Vec<&str> = nearest
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .filter(|id| id.starts_with("tie"))
+            .collect();
+        assert_eq!(ties, ["tie-a", "tie-b", "tie-c", "tie-d"]);
+        // Distances in miles, when the search was in miles.
+        let miles = run(
+            &harness,
+            "Location",
+            &[
+                ("near", "6.60|3.35|150|mi"),
+                ("_sort", "near"),
+                ("_count", "3"),
+            ],
+            Handling::Strict,
+        )
+        .unwrap();
+        for entry in miles["entry"].as_array().unwrap() {
+            let (value, unit, _, code) = distance_of(entry);
+            let id = entry["resource"]["id"].as_str().unwrap();
+            let position = places.iter().find(|place| place["id"] == id).unwrap();
+            let kilometres = km(
+                centre,
+                (
+                    position["position"]["latitude"].as_f64().unwrap(),
+                    position["position"]["longitude"].as_f64().unwrap(),
+                ),
+            );
+            assert_eq!((unit.as_str(), code.as_str()), ("mi", "[mi_i]"));
+            assert!((value - kilometres / 1.60934).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_sorted_near_keeps_its_order_across_pages() {
+        let harness = r4();
+        let places = places_to_sort();
+        store_places(&harness, &places);
+        let centre = (6.60, 3.35);
+        for (sort, farthest_first) in [("near", false), ("-near", true)] {
+            let want: Vec<String> = by_distance(&places, centre, 250.0, farthest_first)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            // Seven to a page: the four that tie fall across a page boundary for one of the sorts.
+            let mut bundle = run(
+                &harness,
+                "Location",
+                &[
+                    ("near", "6.60|3.35|250|km"),
+                    ("_sort", sort),
+                    ("_count", "7"),
+                ],
+                Handling::Strict,
+            )
+            .unwrap();
+            let mut read = ids(&bundle);
+            let mut pages = 1;
+            assert_eq!(bundle["total"], want.len());
+            while let Some(next) = follow(&harness, &bundle) {
+                // Each page is full but the last, says how many there are, and keeps its sort.
+                assert_eq!(bundle["entry"].as_array().unwrap().len(), 7);
+                assert_eq!(next["total"], want.len());
+                let kept = params_of(&next, "self").unwrap();
+                assert!(kept.contains(&("_sort".into(), sort.into())), "{kept:?}");
+                // A distance on every entry of every page.
+                for entry in next["entry"].as_array().unwrap() {
+                    distance_of(entry);
+                }
+                read.extend(ids(&next));
+                bundle = next;
+                pages += 1;
+            }
+            assert_eq!(read, want, "_sort={sort} over {pages} pages");
+            assert!(pages > 3, "{pages}");
+        }
+    }
+
+    #[test]
+    fn a_near_search_that_is_not_sorted_has_distances_too_and_includes_have_none() {
+        let harness = r4();
+        let mut places = vec![
+            json!({"resourceType": "Location", "id": "parent", "status": "active",
+            "name": "Campus"}),
+        ];
+        places.push({
+            let mut child = location("child", 6.52, 3.38);
+            child["partOf"] = json!({"reference": "Location/parent"});
+            child
+        });
+        store_places(&harness, &places);
+        let bundle = run(
+            &harness,
+            "Location",
+            &[("near", "6.5|3.4|20|km"), ("_include", "Location:partof")],
+            Handling::Strict,
+        )
+        .unwrap();
+        let entries = bundle["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        let child = entries
+            .iter()
+            .find(|e| e["resource"]["id"] == "child")
+            .unwrap();
+        let parent = entries
+            .iter()
+            .find(|e| e["resource"]["id"] == "parent")
+            .unwrap();
+        assert_eq!(child["search"]["mode"], "match");
+        distance_of(child);
+        // The place that was included was not found by distance, and has none.
+        assert_eq!(parent["search"], json!({"mode": "include"}));
+        // A search with no near has no distance; nor one with two (which point?), nor with a
+        // comma's alternatives.
+        for query in [
+            vec![("name", "Campus")],
+            vec![("near", "6.5|3.4|20|km"), ("near", "6.6|3.5|20|km")],
+            vec![("near", "6.5|3.4|20|km,6.6|3.5|20|km")],
+        ] {
+            // A repeated parameter is an AND, which the engine reads as it is joined.
+            let mut params = BTreeMap::new();
+            for (name, value) in &query {
+                crate::search::add_param(&mut params, name.to_string(), value.to_string());
+            }
+            let catalog = harness.catalog.read().unwrap();
+            let model = catalog.get("Location").unwrap();
+            let mut tx = harness.db.begin();
+            let bundle =
+                search_handling(&mut tx, &catalog, model, &params, Handling::Strict).unwrap();
+            for entry in bundle["entry"].as_array().unwrap() {
+                assert_eq!(entry["search"], json!({"mode": "match"}), "{query:?}");
+            }
+        }
+    }
+
+    fn self_url(bundle: &Value) -> String {
+        bundle["link"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|link| link["relation"] == "self")
+            .unwrap()["url"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn outcome_issues(bundle: &Value) -> Vec<Value> {
+        bundle["entry"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|entry| entry["search"]["mode"] == "outcome")
+            .flat_map(|entry| entry["resource"]["issue"].as_array().unwrap().clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_sort_the_server_cannot_apply_is_refused_when_strict_and_left_out_when_lenient() {
+        let harness = r4();
+        store_places(&harness, &places_to_sort());
+        // Strict: a 400 that names the parameter and the term.
+        for sort in ["bogus", "-bogus", "name,bogus", "+bogus"] {
+            let query = [("_sort", sort)];
+            let err = match run(&harness, "Location", &query, Handling::Strict) {
+                Err(FhirError::Invalid(message)) => message,
+                other => panic!("_sort={sort}: expected a refusal, got {other:?}"),
+            };
+            assert!(err.contains("_sort") && err.contains("bogus"), "{err}");
+            assert!(err.contains("Location"), "{err}");
+            // Lenient: the search runs, the link says what ran, and the outcome says why.
+            let bundle = run(&harness, "Location", &query, Handling::Lenient).unwrap();
+            let url = self_url(&bundle);
+            assert!(!url.contains("bogus"), "{url}");
+            let kept = sort != "bogus" && sort != "-bogus" && sort != "+bogus";
+            assert_eq!(url.contains("_sort=name"), kept, "{url}");
+            let issues = outcome_issues(&bundle);
+            assert_eq!(issues.len(), 1, "{bundle}");
+            assert_eq!(issues[0]["expression"], json!(["_sort"]));
+            assert_eq!(issues[0]["severity"], "warning");
+            assert!(issues[0]["diagnostics"].as_str().unwrap().contains("bogus"));
+            assert_eq!(bundle["total"], 304);
+        }
+        // What is left of the list is applied: the order is by name.
+        let bundle = run(
+            &harness,
+            "Location",
+            &[("_sort", "-name,bogus"), ("_count", "3")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert!(
+            self_url(&bundle).contains("_sort=-name"),
+            "{}",
+            self_url(&bundle)
+        );
+        let names: Vec<&str> = bundle["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Place tie-d", "Place tie-c", "Place tie-b"]);
+        // A page that follows keeps to what ran: no `_sort=bogus` in its link.
+        let next = params_of(&bundle, "next").unwrap();
+        assert!(
+            next.iter().all(|(_, value)| !value.contains("bogus")),
+            "{next:?}"
+        );
+        assert!(next.contains(&("_sort".into(), "-name".into())));
+        // A sort that is understood is kept, and so is every control that was applied.
+        for sort in [
+            "name",
+            "-name",
+            "status,-name",
+            "_id",
+            "-_lastUpdated",
+            "organization",
+            "-near",
+        ] {
+            let query: Vec<(&str, &str)> = if sort.ends_with("near") {
+                vec![("_sort", sort), ("near", "6.5|3.4|50|km")]
+            } else {
+                vec![("_sort", sort)]
+            };
+            let bundle = run(&harness, "Location", &query, Handling::Strict)
+                .unwrap_or_else(|err| panic!("_sort={sort}: {err}"));
+            assert!(
+                self_url(&bundle).contains(&format!("_sort={sort}")),
+                "{}",
+                self_url(&bundle)
+            );
+            assert!(outcome_issues(&bundle).is_empty());
+        }
+    }
+
+    #[test]
+    fn a_sort_by_something_that_is_not_ordered_as_text_is_not_pretended() {
+        let harness = r4();
+        store_places(&harness, &places_to_sort());
+        // `near` sorts by distance from a point, and with no one point there is nothing to measure.
+        for query in [
+            vec![("_sort", "near")],
+            vec![("_sort", "-near"), ("near", "6.5|3.4|10|km,6.6|3.5|10|km")],
+            vec![("_sort", "near"), ("name", "Place"), ("near", "bad")],
+        ] {
+            // The last has a `near` that cannot be read, which strict refuses first.
+            let strict = run(&harness, "Location", &query, Handling::Strict);
+            assert!(matches!(strict, Err(FhirError::Invalid(_))), "{query:?}");
+        }
+        let lenient = run(
+            &harness,
+            "Location",
+            &[("_sort", "near")],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert!(!self_url(&lenient).contains("near"));
+        let message = outcome_issues(&lenient)[0]["diagnostics"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("distance"), "{message}");
+        // A number, a quantity or an age has no order the index gives: refused, not ignored.
+        for (type_name, sort) in [
+            ("Observation", "value-quantity"),
+            ("Observation", "-value-quantity"),
+            ("Patient", "age"),
+        ] {
+            let query = [("_sort", sort)];
+            match run(&harness, type_name, &query, Handling::Strict) {
+                Err(FhirError::Invalid(message)) => {
+                    assert!(message.contains(sort.trim_start_matches('-')), "{message}");
+                    assert!(message.contains("cannot sort"), "{message}");
+                }
+                other => panic!("{type_name} _sort={sort}: {other:?}"),
+            }
+            let bundle = run(&harness, type_name, &query, Handling::Lenient).unwrap();
+            assert!(
+                !self_url(&bundle).contains("_sort"),
+                "{}",
+                self_url(&bundle)
+            );
+        }
+        // Full text and content have no values of a resource to order by either.
+        for sort in ["_text", "_content"] {
+            let query = [("_sort", sort)];
+            assert!(matches!(
+                run(&harness, "Observation", &query, Handling::Strict),
+                Err(FhirError::Invalid(_))
+            ));
+            let bundle = run(&harness, "Observation", &query, Handling::Lenient).unwrap();
+            assert!(
+                !self_url(&bundle).contains("_sort"),
+                "{}",
+                self_url(&bundle)
+            );
+        }
+        // The id is every resource's own, and sorts without a parameter for it.
+        let bundle = run(
+            &harness,
+            "Location",
+            &[("_sort", "-_id"), ("_count", "3")],
+            Handling::Strict,
+        )
+        .unwrap();
+        assert!(self_url(&bundle).contains("_sort=-_id"));
+    }
+
+    #[test]
+    fn the_other_controls_the_server_cannot_apply_are_held_to_the_same_rule() {
+        let harness = r4();
+        store_places(&harness, &places_to_sort());
+        for (name, value, why) in [
+            ("_summary", "bogus", "_summary"),
+            ("_total", "bogus", "_total"),
+            ("_include", "Location:bogus", "no search parameter"),
+            ("_include", "Bogus:partof", "no Bogus resource type"),
+            ("_include", "Location:name", "only a reference"),
+            (
+                "_revinclude",
+                "HealthcareService:bogus",
+                "no search parameter",
+            ),
+            ("_revinclude:iterate", "Location:name", "only a reference"),
+            ("_include:iterate", "Location:bogus", "no search parameter"),
+        ] {
+            let query = [(name, value)];
+            let err = match run(&harness, "Location", &query, Handling::Strict) {
+                Err(FhirError::Invalid(message)) => message,
+                other => panic!("{name}={value}: expected a refusal, got {other:?}"),
+            };
+            assert!(err.contains(name) && err.contains(why), "{err}");
+            let bundle = run(&harness, "Location", &query, Handling::Lenient).unwrap();
+            let url = self_url(&bundle);
+            assert!(!url.contains(name), "{name}={value}: {url}");
+            let issues = outcome_issues(&bundle);
+            assert_eq!(issues.len(), 1, "{name}={value}");
+            assert_eq!(issues[0]["expression"], json!([name]));
+        }
+        // One bad rule among good ones: the good ones stay, in the order they were given.
+        let bundle = run(
+            &harness,
+            "Location",
+            &[(
+                "_include",
+                "Location:partof,Location:bogus,Location:organization",
+            )],
+            Handling::Lenient,
+        )
+        .unwrap();
+        assert!(
+            self_url(&bundle).ends_with("_include=Location:partof,Location:organization"),
+            "{}",
+            self_url(&bundle)
+        );
+        // What is understood is kept, in the link and in the answer.
+        for (name, value) in [
+            ("_summary", "count"),
+            ("_summary", "text"),
+            ("_summary", "data"),
+            ("_summary", "true"),
+            ("_summary", "false"),
+            ("_total", "none"),
+            ("_total", "estimate"),
+            ("_total", "accurate"),
+            ("_include", "Location:partof"),
+            ("_include", "Location:*"),
+            ("_include", "*"),
+            ("_include:iterate", "Location:partof"),
+            ("_revinclude", "HealthcareService:location"),
+            ("_revinclude", "Location:partof"),
+            // A rule for another type of resource than the one searched is well formed.
+            ("_include", "Slot:schedule"),
+        ] {
+            let bundle = run(&harness, "Location", &[(name, value)], Handling::Strict)
+                .unwrap_or_else(|err| panic!("{name}={value}: {err}"));
+            assert!(
+                self_url(&bundle).contains(&format!("{name}={value}")),
+                "{name}={value}"
+            );
+        }
+        // A parameter that is not a control and is not known stays a refusal either way.
+        assert!(matches!(
+            run(&harness, "Location", &[("bogus", "x")], Handling::Lenient),
+            Err(FhirError::Invalid(_))
+        ));
+    }
+
+    /// A live query is woken by a write whose index keys land in what the search read. A `near`
+    /// search used to read every place, so any place that was written woke it; it reads the
+    /// ranges round its point, so a place that could change its answer does and no other does.
+    #[test]
+    fn a_live_near_search_is_woken_only_by_places_that_could_change_its_answer() {
+        let harness = r4();
+        store_places(
+            &harness,
+            &[
+                location("inside", 6.50, 3.40),
+                location("far", 9.06, 7.49),
+                json!({"resourceType": "Location", "id": "nowhere"}),
+            ],
+        );
+        let reads = run_op(
+            &harness,
+            "Location/search",
+            &json!({"near": "6.5|3.4|10|km"}),
+        )
+        .unwrap()
+        .reads;
+        // The keys a write of `resource` would commit, as readers of the database are told of them.
+        let woken = |resource: &Value| {
+            let catalog = harness.catalog.read().unwrap();
+            let model = catalog.get("Location").unwrap();
+            let mut tx = harness.db.begin();
+            let keys = {
+                let host = TxHost::new(&mut tx, &catalog);
+                index_keys(catalog.path_model(), model, resource, &host).unwrap()
+            };
+            reads.first_overlap(&keys).is_some()
+        };
+        // A place that arrives in the circle changes the answer, and so does one that leaves it (the
+        // keys it had are in the circle).
+        assert!(woken(&location("arrives", 6.51, 3.41)));
+        assert!(woken(&location("inside", 6.50, 3.40)));
+        // A place a few hundred kilometres away, or with no position, cannot.
+        assert!(!woken(&location("elsewhere", 12.0, 8.5)));
+        assert!(!woken(&location("far", 9.06, 7.49)));
+        assert!(!woken(
+            &json!({"resourceType": "Location", "id": "x", "name": "No position"})
+        ));
+        // A position the index cannot place is read by every `near`, as it is measured every time.
+        assert!(woken(&location("off-the-map", 95.0, 3.4)));
+    }
+
+    /// What the release that has the index does at its start, to a database the release before it
+    /// made: the places are stored and `near` is `ready`, and there is no key of the index for
+    /// any of them. The migration puts `near` back to `pending` with a backfill for Location, the
+    /// backfill indexes every place, and a search then finds what it found before the index.
+    #[test]
+    fn a_database_made_before_the_index_has_it_built_when_the_new_release_starts() {
+        let path = std::env::temp_dir().join(format!(
+            "refhir-near-upgrade-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let remove = || {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        };
+        remove();
+        let mut places = awkward();
+        let mut random = Random(0x0123_4567_89ab_cdef);
+        for n in 0..600 {
+            places.push(location(
+                &format!("lagos{n:04}"),
+                random.between(6.3, 6.7),
+                random.between(3.2, 3.7),
+            ));
+        }
+        places.extend(spread(600));
+        let queries = [
+            "6.5|3.4|10|km",
+            "6.5|3.4|25",
+            "6.45|3.38",
+            "9.06|7.49|300|km",
+            "89.9|10|50|km",
+            "0.1|179.995|100|km",
+            "6.5|3.4|10|mi",
+        ];
+        {
+            // The release that has the index makes the database and stores the places...
+            let store = SqlitePersistence::open(&path).unwrap();
+            let db = Database::open(Arc::new(store.clone())).unwrap();
+            let harness = Harness {
+                store,
+                db,
+                catalog: std::sync::RwLock::new(Catalog::empty()),
+            };
+            install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+            store_places(&harness, &places);
+            for query in queries {
+                assert_eq!(found(&harness, query), expected(&places, query), "{query}");
+            }
+        }
+        // ...and then it is made into what the release before left: no key of the index for any
+        // place, schema version 2, and no record that anything is owed.
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            let deleted = connection
+                .execute(
+                    "DELETE FROM indexes WHERE index_id = ?1",
+                    [b"Location/near".as_slice()],
+                )
+                .unwrap();
+            assert!(deleted > 1000, "the places were indexed: {deleted} keys");
+            connection
+                .execute_batch(
+                    "DELETE FROM schema_migrations WHERE version = 3; \
+                     DELETE FROM index_backfills; DELETE FROM backfill_parameter;",
+                )
+                .unwrap();
+            let ready: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM search_parameters \
+                     WHERE code = 'near' AND status = 'ready'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(ready, 1);
+        }
+
+        // The new release starts on it: the migration runs as the database opens.
+        let store = SqlitePersistence::open(&path).unwrap();
+        let db = Database::open(Arc::new(store.clone())).unwrap();
+        let (loaded, _) = Catalog::open_consistent(&store, CatalogClock::Latest).unwrap();
+        let harness = Harness {
+            store,
+            db,
+            catalog: std::sync::RwLock::new(loaded),
+        };
+        {
+            // `near` waits for its index: nothing searches by it until it is whole, and a place
+            // that is stored meanwhile is given its key at once.
+            let catalog = harness.catalog.read().unwrap();
+            assert!(catalog.has_pending_parameters());
+            let model = catalog.get("Location").unwrap();
+            assert!(model.ready_param("near").is_none());
+            assert!(model.pending_params().any(|param| param.name == "near"));
+        }
+        assert!(matches!(
+            run(&harness, "Location", &[("near", "6.5|3.4|10|km")], Handling::Strict),
+            Err(FhirError::Invalid(message)) if message.contains("unsupported search parameter near")
+        ));
+        let during = location("during", 6.5, 3.4);
+        apply(&harness, "Location/create", json!({"resource": during}));
+        let keys = harness
+            .db
+            .reader()
+            .index_scan(
+                &IndexId::new("Location/near"),
+                harness.db.latest_ts(),
+                &refhir_types::Interval::all(),
+                Order::Asc,
+            )
+            .unwrap();
+        assert_eq!(keys.len(), 1, "the place stored meanwhile has its key");
+
+        run_backfills(&harness.store, &harness.db, &harness.catalog).unwrap();
+
+        {
+            let catalog = harness.catalog.read().unwrap();
+            assert!(!catalog.has_pending_parameters());
+            assert!(catalog
+                .get("Location")
+                .unwrap()
+                .ready_param("near")
+                .is_some());
+        }
+        let placed = places
+            .iter()
+            .filter(|place| crate::spatial::position(place).is_some())
+            .count();
+        let keys = harness
+            .db
+            .reader()
+            .index_scan(
+                &IndexId::new("Location/near"),
+                harness.db.latest_ts(),
+                &refhir_types::Interval::all(),
+                Order::Asc,
+            )
+            .unwrap();
+        assert_eq!(
+            keys.len(),
+            placed + 1,
+            "every place that has a position is indexed once"
+        );
+        let mut now = places.clone();
+        now.push(location("during", 6.5, 3.4));
+        for query in queries {
+            assert_eq!(found(&harness, query), expected(&now, query), "{query}");
+        }
+        let (_, work, _) = search(&harness, &[("near", "9.06|7.49|20|km")]);
+        assert!(work.rows < 200, "the index is used: {} rows", work.rows);
+        drop(harness);
+
+        // And the next start has nothing to do: no job, `near` still ready.
+        let store = SqlitePersistence::open(&path).unwrap();
+        assert!(store.load_backfills().unwrap().iter().all(|job| job.done));
+        let (again, _) = Catalog::open_consistent(&store, CatalogClock::Latest).unwrap();
+        assert!(!again.has_pending_parameters());
+        remove();
+    }
+
+    /// What a provider directory holds for each of `count` organizations: a Location (spread over
+    /// Nigeria, managed by the organization), a HealthcareService of service category 17 at it, and an
+    /// OrganizationAffiliation of the organization in one network, at that place and for that service.
+    fn directory(count: usize) -> Vec<Value> {
+        let mut random = Random(0x2545_f491_4f6c_dd1d);
+        let mut resources = Vec::with_capacity(count * 4);
+        for n in 0..count {
+            let (org, place, service) =
+                (format!("o{n:05}"), format!("l{n:05}"), format!("h{n:05}"));
+            resources.push(
+                json!({"resourceType": "Organization", "id": org, "name": format!("Clinic {n}")}),
+            );
+            let mut at = location(
+                &place,
+                random.between(SOUTH, NORTH),
+                random.between(WEST, EAST),
+            );
+            at["managingOrganization"] = json!({"reference": format!("Organization/{org}")});
+            resources.push(at);
+            resources.push(json!({
+                "resourceType": "HealthcareService", "id": service, "active": true,
+                "providedBy": {"reference": format!("Organization/{org}")},
+                "location": [{"reference": format!("Location/{place}")}],
+                "category": [{"coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/service-category", "code": "17"}]}]
+            }));
+            resources.push(json!({
+                "resourceType": "OrganizationAffiliation", "id": format!("a{n:05}"), "active": true,
+                "network": [{"reference": "Organization/boolbyte-network"}],
+                "participatingOrganization": {"reference": format!("Organization/{org}")},
+                "location": [{"reference": format!("Location/{place}")}],
+                "healthcareService": [{"reference": format!("HealthcareService/{service}")}],
+                "code": [{"coding": [{"system": "http://example.org/role", "code": "member"}]}]
+            }));
+        }
+        resources
+    }
+
+    const IN_NETWORK: (&str, &str) = (
+        "_has:OrganizationAffiliation:location:network",
+        "Organization/boolbyte-network",
+    );
+    const OF_CATEGORY_17: (&str, &str) = (
+        "_has:HealthcareService:location:service-category",
+        "http://terminology.hl7.org/CodeSystem/service-category|17",
+    );
+
+    /// Times for ByteNetwork's directory search over a directory of `INTERNAL_BENCHMARK_PLACES`
+    /// (default 10,000) places. Run it with
+    /// `cargo test --release -p refhir-fhir --lib directory_benchmark -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a benchmark: prints times"]
+    fn directory_benchmark() {
+        let count: usize = std::env::var("INTERNAL_BENCHMARK_PLACES")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(10_000);
+        let harness = r4();
+        let started = Instant::now();
+        store_places(&harness, &directory(count));
+        eprintln!(
+            "stored a directory of {count} places in {:.1?}",
+            started.elapsed()
+        );
+        let near_100 = ("near", "6.6|3.35|100|km");
+        let near_5 = ("near", "6.6|3.35|5|km");
+        let sorted = ("_sort", "near");
+        let page = ("_count", "100");
+        let queries: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("near 100 km, sorted", vec![near_100, sorted, page]),
+            (
+                "+ has service category",
+                vec![near_100, sorted, page, OF_CATEGORY_17],
+            ),
+            ("+ has network", vec![near_100, sorted, page, IN_NETWORK]),
+            (
+                "near 5 km + has network",
+                vec![near_5, sorted, page, IN_NETWORK],
+            ),
+            (
+                "has network, no near, count 1",
+                vec![IN_NETWORK, ("_count", "1")],
+            ),
+            (
+                "the directory search",
+                vec![
+                    near_100,
+                    sorted,
+                    page,
+                    IN_NETWORK,
+                    OF_CATEGORY_17,
+                    ("_include", "Location:organization"),
+                    (
+                        "_revinclude",
+                        "HealthcareService:location,OrganizationAffiliation:location",
+                    ),
+                ],
+            ),
+        ];
+        for (label, query) in queries {
+            let (bundle, work, took) = search(&harness, &query);
+            let cheap = fastest(&harness, &query).min(took);
+            eprintln!(
+                "{label:<34} {cheap:>10.2?}  total {}  entries {}  {work:?}",
+                bundle["total"],
+                bundle["entry"].as_array().map_or(0, Vec::len)
+            );
+        }
+    }
+
+    /// The search as the whole type used to answer `_has`, to hold the search to.
+    fn reference(
+        harness: &Harness,
+        type_name: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Value, FhirError> {
+        let catalog = harness.catalog.read().unwrap();
+        let model = catalog.get(type_name).unwrap();
+        let mut tx = harness.db.begin();
+        crate::search::search_reference(&mut tx, &catalog, model, &query_params(query))
+    }
+
+    /// A directory in a small, awkward form. Sixty places round Lagos and thirty round Kano, each
+    /// with a Location. Most have a HealthcareService (of category 17, or 99 for some), a few have a
+    /// second one, most have an affiliation in the network, a few an affiliation in another network
+    /// as well, and one affiliation is at two places.
+    fn small_directory() -> Vec<Value> {
+        let mut random = Random(0x5eed_5eed_5eed_5eed);
+        let mut resources = Vec::new();
+        for n in 0..90usize {
+            let (latitude, longitude) = if n < 60 {
+                (random.between(6.3, 6.9), random.between(3.05, 3.65))
+            } else {
+                (random.between(11.7, 12.3), random.between(8.2, 8.8))
+            };
+            let place = format!("l{n:03}");
+            let mut at = location(&place, latitude, longitude);
+            at["managingOrganization"] = json!({"reference": format!("Organization/o{n:03}")});
+            resources.push(at);
+            let service = |id: String, code: &str| {
+                json!({"resourceType": "HealthcareService", "id": id, "active": true,
+                    "location": [{"reference": format!("Location/{place}")}],
+                    "category": [{"coding": [{
+                        "system": "http://terminology.hl7.org/CodeSystem/service-category",
+                        "code": code}]}]})
+            };
+            if n % 5 != 0 {
+                resources.push(service(
+                    format!("h{n:03}"),
+                    if n % 7 == 0 { "99" } else { "17" },
+                ));
+            }
+            if n % 11 == 0 {
+                resources.push(service(format!("h{n:03}b"), "99"));
+            }
+            let affiliation = |id: String, network: &str, places: &[String]| {
+                json!({"resourceType": "OrganizationAffiliation", "id": id, "active": true,
+                    "network": [{"reference": format!("Organization/{network}")}],
+                    "location": places.iter()
+                        .map(|place| json!({"reference": format!("Location/{place}")}))
+                        .collect::<Vec<_>>()})
+            };
+            if n % 4 != 0 {
+                let mut places = vec![place.clone()];
+                if n % 9 == 0 {
+                    places.push(format!("l{:03}", n + 1));
+                }
+                resources.push(affiliation(format!("a{n:03}"), "boolbyte-network", &places));
+            }
+            if n % 6 == 0 {
+                resources.push(affiliation(
+                    format!("x{n:03}"),
+                    "other-network",
+                    std::slice::from_ref(&place),
+                ));
+            }
+        }
+        resources
+    }
+
+    const NEAR_LAGOS: (&str, &str) = ("near", "6.6|3.35|40|km");
+
+    fn narrowed(harness: &Harness, query: &[(&str, &str)]) -> (Value, Work) {
+        let (bundle, work, _) = search(harness, query);
+        (bundle, work)
+    }
+
+    #[test]
+    fn has_asked_of_the_places_a_search_left_answers_as_the_search_of_the_whole_type_did() {
+        let harness = r4();
+        let directory = small_directory();
+        store_places(&harness, &directory);
+        let service_17 = (
+            "_has:HealthcareService:location:service-category",
+            "http://terminology.hl7.org/CodeSystem/service-category|17",
+        );
+        let either = (
+            "_has:HealthcareService:location:service-category",
+            "http://terminology.hl7.org/CodeSystem/service-category|17,\
+             http://terminology.hl7.org/CodeSystem/service-category|99",
+        );
+        let not_17 = (
+            "_has:HealthcareService:location:service-category:not",
+            "http://terminology.hl7.org/CodeSystem/service-category|17",
+        );
+        let bare_network = (
+            "_has:OrganizationAffiliation:location:network",
+            "boolbyte-network",
+        );
+        let other_network = (
+            "_has:OrganizationAffiliation:location:network",
+            "Organization/other-network",
+        );
+        let nobody = (
+            "_has:OrganizationAffiliation:location:network",
+            "Organization/nobody",
+        );
+        let unnetworked = (
+            "_has:OrganizationAffiliation:location:network:missing",
+            "true",
+        );
+        let networked = (
+            "_has:OrganizationAffiliation:location:network:missing",
+            "false",
+        );
+        let sorted = ("_sort", "near");
+        let queries: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("one has", vec![NEAR_LAGOS, IN_NETWORK]),
+            ("one has, sorted", vec![NEAR_LAGOS, IN_NETWORK, sorted]),
+            ("the other has", vec![NEAR_LAGOS, service_17]),
+            ("two has", vec![NEAR_LAGOS, IN_NETWORK, service_17, sorted]),
+            (
+                "two has, a page",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, sorted, ("_count", "5")],
+            ),
+            (
+                "two has, the page after",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    service_17,
+                    sorted,
+                    ("_count", "5"),
+                    ("_offset", "5"),
+                ],
+            ),
+            (
+                "two has, farthest first",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, ("_sort", "-near")],
+            ),
+            (
+                "two has, no total",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, ("_total", "none")],
+            ),
+            (
+                "two has, a count",
+                vec![NEAR_LAGOS, IN_NETWORK, service_17, ("_summary", "count")],
+            ),
+            ("alternatives", vec![NEAR_LAGOS, either]),
+            ("not", vec![NEAR_LAGOS, not_17]),
+            ("a bare id", vec![NEAR_LAGOS, bare_network]),
+            ("another network", vec![NEAR_LAGOS, other_network]),
+            ("a network nobody is in", vec![NEAR_LAGOS, nobody]),
+            ("missing", vec![NEAR_LAGOS, unnetworked]),
+            ("not missing", vec![NEAR_LAGOS, networked]),
+            (
+                "with includes",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    service_17,
+                    sorted,
+                    ("_count", "8"),
+                    ("_include", "Location:organization"),
+                    (
+                        "_revinclude",
+                        "HealthcareService:location,OrganizationAffiliation:location",
+                    ),
+                ],
+            ),
+            (
+                "an include rule with a target",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    sorted,
+                    ("_count", "6"),
+                    ("_revinclude", "OrganizationAffiliation:location:Location"),
+                ],
+            ),
+            (
+                "an include rule for a target the places are not",
+                vec![
+                    NEAR_LAGOS,
+                    IN_NETWORK,
+                    (
+                        "_revinclude",
+                        "OrganizationAffiliation:location:Organization",
+                    ),
+                ],
+            ),
+            (
+                "with another parameter",
+                vec![NEAR_LAGOS, IN_NETWORK, ("status", "active"), sorted],
+            ),
+            (
+                "with an id",
+                vec![("_id", "l000,l001,l002,l003"), IN_NETWORK],
+            ),
+            ("no near", vec![IN_NETWORK, service_17]),
+            (
+                "no near, sorted by name",
+                vec![IN_NETWORK, ("_sort", "name")],
+            ),
+            (
+                "round Kano",
+                vec![("near", "12|8.5|30|km"), IN_NETWORK, service_17, sorted],
+            ),
+            (
+                "round nothing",
+                vec![("near", "0|0|5|km"), IN_NETWORK, service_17],
+            ),
+            (
+                "a place that does not exist",
+                vec![("_id", "nobody"), IN_NETWORK],
+            ),
+        ];
+        let mut asked = 0;
+        for (label, query) in &queries {
+            let (bundle, work) = narrowed(&harness, query);
+            let want = reference(&harness, "Location", query).expect(label);
+            assert_eq!(bundle, want, "{label}");
+            assert_eq!(
+                work.searched, 0,
+                "{label}: asked of the places, not of the whole type"
+            );
+            asked += work.probed;
+        }
+        assert!(asked > 100, "the clauses were asked of the places: {asked}");
+        // Both ways say what they find, for the places that do and do not have what is asked.
+        let (bundle, _) = narrowed(&harness, &[NEAR_LAGOS, IN_NETWORK, service_17]);
+        let found = ids(&bundle);
+        assert!(found.len() > 10 && found.len() < 60, "{}", found.len());
+        for place in &directory {
+            if place["resourceType"] != "Location" {
+                continue;
+            }
+            let n: usize = place["id"].as_str().unwrap()[1..].parse().unwrap();
+            let lagos = n < 60;
+            // Its own affiliation, or the one of the place before it that is at two places.
+            let in_network = n % 4 != 0 || (n % 9 == 1 && (n - 1) % 4 != 0);
+            let category_17 = n % 5 != 0 && n % 7 != 0;
+            let near = lagos && near_before(place, "6.6|3.35|40|km");
+            let expect = near && in_network && category_17;
+            assert_eq!(
+                found.contains(&place["id"].as_str().unwrap().to_string()),
+                expect,
+                "l{n:03}"
+            );
+        }
+    }
+
+    #[test]
+    fn has_is_asked_only_of_the_places_inside_the_circle() {
+        // The ranges of the index that cover a circle hold places outside it, the corners of the
+        // square round it. Those are read and measured and turned away, and nothing is asked about
+        // them.
+        let harness = r4();
+        let mut resources = Vec::new();
+        // About 13 km from the centre, in a corner of the square that holds the circle of 10 km.
+        for (id, latitude, longitude) in [
+            ("centre", 6.6, 3.35),
+            ("corner-ne", 6.685, 3.435),
+            ("corner-nw", 6.685, 3.265),
+            ("corner-se", 6.515, 3.435),
+            ("corner-sw", 6.515, 3.265),
+        ] {
+            resources.push(location(id, latitude, longitude));
+            resources.push(json!({"resourceType": "OrganizationAffiliation",
+                "id": format!("a-{id}"),
+                "network": [{"reference": "Organization/boolbyte-network"}],
+                "location": [{"reference": format!("Location/{id}")}]}));
+        }
+        store_places(&harness, &resources);
+        let query = [("near", "6.6|3.35|10|km"), IN_NETWORK];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["centre"]);
+        assert!(
+            work.rows >= 5,
+            "the corners are in the ranges read: {work:?}"
+        );
+        assert_eq!((work.searched, work.probed), (0, 1), "{work:?}");
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    #[test]
+    fn has_asked_of_one_place_or_of_none() {
+        let harness = r4();
+        let directory = small_directory();
+        store_places(&harness, &directory);
+        // The exact place of one Location, so that a circle of a metre holds that one.
+        let place = directory
+            .iter()
+            .find(|place| place["id"] == "l001")
+            .unwrap();
+        let (latitude, longitude) = (
+            place["position"]["latitude"].as_f64().unwrap(),
+            place["position"]["longitude"].as_f64().unwrap(),
+        );
+        let here = format!("{latitude}|{longitude}|0.001|km");
+        let query = [("near", here.as_str()), IN_NETWORK, OF_CATEGORY_17];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["l001"]);
+        assert_eq!(bundle["total"], 1);
+        assert_eq!((work.searched, work.probed), (0, 2));
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        // A place that is near and has no service (n % 5 == 0).
+        let lonely = directory
+            .iter()
+            .find(|place| place["id"] == "l005")
+            .unwrap();
+        let there = format!(
+            "{}|{}|0.001|km",
+            lonely["position"]["latitude"].as_f64().unwrap(),
+            lonely["position"]["longitude"].as_f64().unwrap()
+        );
+        let query = [("near", there.as_str()), IN_NETWORK, OF_CATEGORY_17];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert!(ids(&bundle).is_empty());
+        assert_eq!(bundle["total"], 0);
+        assert_eq!(work.searched, 0);
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        // No place at all: nothing is asked.
+        let query = [("near", "0|0|1|km"), IN_NETWORK, OF_CATEGORY_17];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert!(ids(&bundle).is_empty());
+        assert_eq!((work.searched, work.probed), (0, 0));
+    }
+
+    /// `near`, `_lastUpdated` (the date index) and `_has` together (a `_has` on `_lastUpdated`
+    /// too, which is an ordinary parameter of the type): each narrows the same search, and the
+    /// answer is the search of the whole type's, entry for entry.
+    #[test]
+    fn near_with_a_last_updated_window_and_has_answers_as_the_search_of_the_whole_type_did() {
+        let harness = r4();
+        let mut directory = small_directory();
+        // The first thirty places, and their services, were written on the 1st; the rest on the 19th.
+        for resource in &mut directory {
+            if !matches!(
+                resource["resourceType"].as_str(),
+                Some("Location" | "HealthcareService")
+            ) {
+                continue;
+            }
+            let number: usize = resource["id"].as_str().unwrap()[1..4].parse().unwrap();
+            let written = if number < 30 {
+                "2026-10-01T12:00:00.000Z"
+            } else {
+                "2026-10-19T08:30:00.000Z"
+            };
+            resource["meta"] = json!({"lastUpdated": written});
+        }
+        store_places(&harness, &directory);
+        let late = ("_lastUpdated", "ge2026-10-10");
+        let early = ("_lastUpdated", "lt2026-10-10");
+        let services_late = (
+            "_has:HealthcareService:location:_lastUpdated",
+            "ge2026-10-10",
+        );
+        let services_early = (
+            "_has:HealthcareService:location:_lastUpdated",
+            "lt2026-10-10",
+        );
+        // The window splits the places near: nothing is lost and nothing is in both.
+        let (everyone, _) = narrowed(&harness, &[NEAR_LAGOS, ("_count", "200")]);
+        let (after, _) = narrowed(&harness, &[NEAR_LAGOS, late, ("_count", "200")]);
+        let (before, _) = narrowed(&harness, &[NEAR_LAGOS, early, ("_count", "200")]);
+        let mut both: Vec<String> = ids(&after).into_iter().chain(ids(&before)).collect();
+        both.sort();
+        let mut all = ids(&everyone);
+        all.sort();
+        assert_eq!(both, all);
+        assert!(!ids(&after).is_empty() && !ids(&before).is_empty());
+        for query in [
+            vec![NEAR_LAGOS, late, ("_count", "200")],
+            vec![NEAR_LAGOS, early, ("_sort", "near"), ("_count", "200")],
+            vec![
+                NEAR_LAGOS,
+                late,
+                IN_NETWORK,
+                OF_CATEGORY_17,
+                ("_count", "200"),
+            ],
+            vec![
+                NEAR_LAGOS,
+                ("_sort", "near"),
+                services_late,
+                ("_count", "200"),
+            ],
+            vec![
+                NEAR_LAGOS,
+                early,
+                services_early,
+                IN_NETWORK,
+                ("_sort", "-near"),
+            ],
+            vec![
+                NEAR_LAGOS,
+                late,
+                IN_NETWORK,
+                ("_sort", "near"),
+                ("_count", "7"),
+                ("_revinclude", "HealthcareService:location"),
+            ],
+        ] {
+            let (bundle, work) = narrowed(&harness, &query);
+            assert_eq!(
+                bundle,
+                reference(&harness, "Location", &query).unwrap(),
+                "{query:?}"
+            );
+            assert_eq!(work.searched, 0, "{query:?}");
+        }
+    }
+
+    /// A small circle is narrower than most parameters (a status every place has), but not than an
+    /// identifier, which names one place.
+    #[test]
+    fn near_reads_the_circle_unless_an_identifier_names_the_place() {
+        let harness = r4();
+        let mut directory = small_directory();
+        for resource in &mut directory {
+            if resource["resourceType"] == "Location" {
+                let id = resource["id"].as_str().unwrap().to_string();
+                resource["identifier"] = json!([{"system": "urn:directory", "value": id}]);
+            }
+        }
+        let places = directory
+            .iter()
+            .filter(|resource| resource["resourceType"] == "Location")
+            .count();
+        store_places(&harness, &directory);
+        // The identifier is read on its own range: one row, and the circle is only checked.
+        let named = [NEAR_LAGOS, ("identifier", "urn:directory|l005")];
+        let (bundle, work) = narrowed(&harness, &named);
+        assert_eq!(ids(&bundle), ["l005"]);
+        assert_eq!(work.rows, 1);
+        assert_eq!(bundle, reference(&harness, "Location", &named).unwrap());
+        // The same identifier outside the circle finds nothing, as it did.
+        let far = [NEAR_LAGOS, ("identifier", "urn:directory|l075")];
+        let (bundle, work) = narrowed(&harness, &far);
+        assert!(ids(&bundle).is_empty());
+        assert_eq!(work.rows, 1);
+        assert_eq!(bundle, reference(&harness, "Location", &far).unwrap());
+        // A status that every place has is the whole table: the circle is read instead.
+        let active = [NEAR_LAGOS, ("status", "active")];
+        let (bundle, work) = narrowed(&harness, &active);
+        assert!(work.rows < places, "{} rows of {places}", work.rows);
+        assert!(work.rows >= ids(&bundle).len());
+        assert_eq!(bundle, reference(&harness, "Location", &active).unwrap());
+    }
+
+    /// A row is decoded once: the documents of the places that are left are kept for the page, and
+    /// the rows that are not places are not looked at again.
+    #[test]
+    fn rows_are_decoded_once_and_only_the_places_left_are_kept() {
+        let harness = r4();
+        store_places(&harness, &small_directory());
+        let query = [NEAR_LAGOS, IN_NETWORK, ("_count", "5")];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert!(bundle["total"].as_u64().unwrap() > 5);
+        assert_eq!(work.searched, 0);
+        // Every row read was decoded once, to find the places left...
+        assert_eq!(work.decoded, work.rows);
+        // ...and checked once for that, and once more for each place that is left.
+        let places = work.checked - work.rows;
+        assert!(places > 0 && places <= work.rows, "{work:?}");
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    /// What `_has` may ask about one place at a time follows what a backend holds in a statement.
+    #[test]
+    fn the_places_asked_one_at_a_time_follow_the_statement_a_backend_holds() {
+        assert_eq!(crate::search::most_places_asked(200), 5000);
+        assert_eq!(crate::search::most_places_asked(50), 1250);
+    }
+
+    #[test]
+    fn has_does_not_cost_more_for_places_outside_the_circle() {
+        // The same directory round Lagos, then with two thousand places and everything that refers
+        // to them added a long way off. The search round Lagos reads what it read, and asks of the
+        // places it asked, and no more.
+        let harness = r4();
+        store_places(&harness, &small_directory());
+        let query = vec![
+            NEAR_LAGOS,
+            IN_NETWORK,
+            OF_CATEGORY_17,
+            ("_sort", "near"),
+            (
+                "_revinclude",
+                "HealthcareService:location,OrganizationAffiliation:location",
+            ),
+        ];
+        let (before, work_before) = narrowed(&harness, &query);
+        let mut far = Vec::new();
+        for n in 0..2000usize {
+            let place = format!("far{n:04}");
+            // Somewhere between Maiduguri and Sokoto, more than 500 km from Lagos.
+            far.push(location(
+                &place,
+                11.0 + (n % 40) as f64 * 0.05,
+                7.0 + (n / 40) as f64 * 0.1,
+            ));
+            far.push(
+                json!({"resourceType": "HealthcareService", "id": format!("fh{n:04}"),
+                "location": [{"reference": format!("Location/{place}")}],
+                "category": [{"coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/service-category",
+                    "code": "17"}]}]}),
+            );
+            far.push(
+                json!({"resourceType": "OrganizationAffiliation", "id": format!("fa{n:04}"),
+                "network": [{"reference": "Organization/boolbyte-network"}],
+                "location": [{"reference": format!("Location/{place}")}]}),
+            );
+        }
+        store_places(&harness, &far);
+        let (after, work_after) = narrowed(&harness, &query);
+        assert_eq!(after, before);
+        assert!(work_before.probed > 0);
+        assert_eq!(
+            (work_after.rows, work_after.probed, work_after.searched),
+            (work_before.rows, work_before.probed, work_before.searched)
+        );
+        assert_eq!(work_after.searched, 0);
+    }
+
+    #[test]
+    fn has_over_most_of_the_type_is_the_search_of_the_type_as_before() {
+        // Past what is worth asking one place at a time, the search for the type answers, and
+        // reads each place it leaves once.
+        let harness = r4();
+        let mut places: Vec<Value> = (0..5100)
+            .map(|n| {
+                location(
+                    &format!("p{n:05}"),
+                    6.0 + (n % 100) as f64 * 0.01,
+                    3.0 + (n / 100) as f64 * 0.01,
+                )
+            })
+            .collect();
+        places.push(
+            json!({"resourceType": "OrganizationAffiliation", "id": "a1",
+            "network": [{"reference": "Organization/boolbyte-network"}],
+            "location": [{"reference": "Location/p00007"}, {"reference": "Location/p05000"}]}),
+        );
+        store_places(&harness, &places);
+        let query = [IN_NETWORK, ("_count", "10")];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["p00007", "p05000"]);
+        assert_eq!(bundle["total"], 2);
+        assert_eq!((work.searched, work.probed), (1, 0));
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        // A narrower search over the same table is asked of its places.
+        let query = [("near", "6.07|3.0|2|km"), IN_NETWORK];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!(ids(&bundle), ["p00007"]);
+        assert_eq!(work.searched, 0);
+        assert!(work.probed >= 1);
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    #[test]
+    fn has_that_the_type_cannot_answer_one_place_at_a_time_is_answered_or_refused_as_before() {
+        let harness = r4();
+        store_places(&harness, &small_directory());
+        // What the search for the type refuses or reads its own way is left to it, and says the
+        // same: a parameter that does not exist, a chain, a type that is not a type, a modifier
+        // that is not one, a reference that is not one.
+        for (name, value) in [
+            ("_has:OrganizationAffiliation:location:bogus", "x"),
+            ("_has:OrganizationAffiliation:location:network.name", "x"),
+            ("_has:Bogus:location:network", "Organization/x"),
+            (
+                "_has:OrganizationAffiliation:bogus:network",
+                "Organization/x",
+            ),
+            (
+                "_has:OrganizationAffiliation:active:network",
+                "Organization/x",
+            ),
+            (
+                "_has:OrganizationAffiliation:location:network:bogus",
+                "Organization/x",
+            ),
+            ("_has:OrganizationAffiliation:location:active", "maybe"),
+            ("_has:OrganizationAffiliation:location:_id", "a001"),
+            // A `_has` inside a `_has`, which the search for the type answers or refuses itself.
+            (
+                "_has:OrganizationAffiliation:location:_has:Provenance:target:agent",
+                "Patient/x",
+            ),
+        ] {
+            let query = [NEAR_LAGOS, (name, value)];
+            let got = run(&harness, "Location", &query, Handling::Strict);
+            let want = reference(&harness, "Location", &query);
+            match (got, want) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{name}={value}"),
+                (Err(got), Err(want)) => {
+                    assert_eq!(got.to_string(), want.to_string(), "{name}={value}")
+                }
+                (got, want) => panic!("{name}={value}: {got:?} and {want:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_server_that_takes_references_as_urls_answers_has_the_old_way() {
+        // Under `--references fhir` a reference can be a URL, which looking a place up in the
+        // index would not find, so the search for the type answers, as it did.
+        let harness = r4();
+        let mut directory = small_directory();
+        directory.push(
+            json!({"resourceType": "OrganizationAffiliation", "id": "by-url",
+            "network": [{"reference": "Organization/boolbyte-network"}],
+            "location": [{"reference": "http://elsewhere.example/fhir/Location/l002"}]}),
+        );
+        store_places(&harness, &directory);
+        harness
+            .catalog
+            .write()
+            .unwrap()
+            .set_reference_policy(ReferencePolicy::Fhir);
+        let query = [NEAR_LAGOS, IN_NETWORK, ("_sort", "near")];
+        let (bundle, work) = narrowed(&harness, &query);
+        assert_eq!((work.searched, work.probed), (1, 0));
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+        assert!(ids(&bundle).contains(&"l002".to_string()));
+    }
+
+    #[test]
+    fn include_follows_each_reference_of_the_page_once_in_the_order_the_places_have() {
+        let harness = r4();
+        let mut directory = small_directory();
+        // Every tenth place is part of the next, which is often a match itself; and only the first
+        // forty-five of the organizations the places name are stored, so the rest point at nothing.
+        for resource in &mut directory {
+            if resource["resourceType"] != "Location" {
+                continue;
+            }
+            let n: usize = resource["id"].as_str().unwrap()[1..].parse().unwrap();
+            if n % 10 == 0 {
+                resource["partOf"] = json!({"reference": format!("Location/l{:03}", n + 1)});
+            }
+        }
+        for n in 0..45 {
+            directory.push(
+                json!({"resourceType": "Organization", "id": format!("o{n:03}"),
+                "name": format!("Clinic {n}")}),
+            );
+        }
+        store_places(&harness, &directory);
+        let by_id = |id: &str| directory.iter().find(|resource| resource["id"] == id);
+        for (rules, target) in [
+            ("Location:organization,Location:partof", None),
+            ("Location:partof,Location:organization", None),
+            ("Location:organization:Organization", Some("Organization")),
+            ("Location:partof:Location", Some("Location")),
+            ("Location:organization:Patient", Some("Patient")),
+        ] {
+            let query = [
+                NEAR_LAGOS,
+                ("_sort", "near"),
+                ("_count", "15"),
+                ("_include", rules),
+            ];
+            let (bundle, work) = narrowed(&harness, &query);
+            let entries = bundle["entry"].as_array().unwrap();
+            let page: Vec<&str> = entries
+                .iter()
+                .filter(|entry| entry["search"]["mode"] == "match")
+                .map(|entry| entry["resource"]["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(page.len(), 15);
+            // What the rules lead to, place by place and rule by rule, each resource once and none
+            // that is a match already or is not there.
+            let mut seen: Vec<String> = page.iter().map(|id| format!("Location/{id}")).collect();
+            let mut want: Vec<String> = Vec::new();
+            for place in &page {
+                let place = by_id(place).unwrap();
+                for rule in rules.split(',') {
+                    let field = if rule.contains("organization") {
+                        "managingOrganization"
+                    } else {
+                        "partOf"
+                    };
+                    let Some(reference) = place[field]["reference"].as_str() else {
+                        continue;
+                    };
+                    let type_name = reference.split('/').next().unwrap();
+                    if target.is_some_and(|target| target != type_name) {
+                        continue;
+                    }
+                    if seen.iter().any(|known| known == reference) {
+                        continue;
+                    }
+                    seen.push(reference.to_string());
+                    if by_id(reference.split('/').nth(1).unwrap()).is_some() {
+                        want.push(reference.to_string());
+                    }
+                }
+            }
+            let included: Vec<String> = entries
+                .iter()
+                .filter(|entry| entry["search"]["mode"] == "include")
+                .map(|entry| {
+                    format!(
+                        "{}/{}",
+                        entry["resource"]["resourceType"].as_str().unwrap(),
+                        entry["resource"]["id"].as_str().unwrap()
+                    )
+                })
+                .collect();
+            assert_eq!(included, want, "{rules}");
+            assert_eq!(work.searched, 0);
+            assert_eq!(
+                bundle,
+                reference(&harness, "Location", &query).unwrap(),
+                "{rules}"
+            );
+        }
+        // The page that has something to include has it, and the pointless rule has nothing.
+        let query = [
+            NEAR_LAGOS,
+            ("_count", "15"),
+            ("_include", "Location:organization"),
+        ];
+        let (bundle, _) = narrowed(&harness, &query);
+        assert!(bundle["entry"].as_array().unwrap().len() > 15);
+        let query = [
+            NEAR_LAGOS,
+            ("_count", "15"),
+            ("_include", "Location:organization:Patient"),
+        ];
+        let (bundle, _) = narrowed(&harness, &query);
+        assert_eq!(bundle["entry"].as_array().unwrap().len(), 15);
+    }
+
+    #[test]
+    fn revinclude_finds_what_refers_to_each_place_in_the_order_the_places_have() {
+        let harness = r4();
+        let directory = small_directory();
+        store_places(&harness, &directory);
+        let query = [
+            NEAR_LAGOS,
+            ("_sort", "near"),
+            ("_count", "12"),
+            (
+                "_revinclude",
+                "HealthcareService:location,OrganizationAffiliation:location",
+            ),
+        ];
+        let (bundle, _) = narrowed(&harness, &query);
+        let entries = bundle["entry"].as_array().unwrap();
+        let places: Vec<&str> = entries
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "match")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(places.len(), 12);
+        // For each place in turn, the rules in the order they were given, and under each the
+        // referrers by id (a place has two services, or two affiliations in different networks).
+        let mut want = Vec::new();
+        for place in &places {
+            for (kind, field) in [
+                ("HealthcareService", "location"),
+                ("OrganizationAffiliation", "location"),
+            ] {
+                let mut found: Vec<String> = directory
+                    .iter()
+                    .filter(|resource| resource["resourceType"] == kind)
+                    .filter(|resource| {
+                        resource[field].as_array().is_some_and(|list| {
+                            list.iter()
+                                .any(|item| item["reference"] == format!("Location/{place}"))
+                        })
+                    })
+                    .map(|resource| resource["id"].as_str().unwrap().to_string())
+                    .collect();
+                found.sort();
+                want.extend(found);
+            }
+        }
+        // A referrer already added for an earlier place is not added again: one affiliation is at two.
+        let mut once = Vec::new();
+        for id in want {
+            if !once.contains(&id) {
+                once.push(id);
+            }
+        }
+        let included: Vec<String> = entries
+            .iter()
+            .filter(|entry| entry["search"]["mode"] == "include")
+            .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(included, once);
+        assert!(included.len() > 12);
+        assert_eq!(bundle, reference(&harness, "Location", &query).unwrap());
+    }
+
+    /// ByteNetwork's directory search (near, two `_has`, an `_include` and two `_revinclude`) over a
+    /// directory of `INTERNAL_BENCHMARK_PLACES` (default 10,000) places answers in a hundred
+    /// milliseconds, and so does `near` with one `_has`. Run it with
+    /// `cargo test --release -p refhir-fhir --lib the_directory_search -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a directory of tens of thousands of places: run with --release, as the timing asks for"]
+    fn the_directory_search_answers_in_a_hundred_milliseconds() {
+        let count: usize = std::env::var("INTERNAL_BENCHMARK_PLACES")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(10_000);
+        let harness = r4();
+        store_places(&harness, &directory(count));
+        for query in [
+            vec![
+                ("near", "6.6|3.35|100|km"),
+                ("_sort", "near"),
+                ("_count", "100"),
+                IN_NETWORK,
+                OF_CATEGORY_17,
+                ("_include", "Location:organization"),
+                (
+                    "_revinclude",
+                    "HealthcareService:location,OrganizationAffiliation:location",
+                ),
+            ],
+            vec![
+                ("near", "6.6|3.35|100|km"),
+                ("_sort", "near"),
+                ("_count", "100"),
+                IN_NETWORK,
+            ],
+            vec![("near", "6.6|3.35|5|km"), ("_sort", "near"), IN_NETWORK],
+        ] {
+            let (bundle, work, _) = search(&harness, &query);
+            let took = fastest(&harness, &query);
+            eprintln!(
+                "{count} places, {} found: {took:.2?}  {work:?}",
+                bundle["total"]
+            );
+            assert_eq!(work.searched, 0, "{query:?}");
+            assert!(
+                took < Duration::from_millis(100),
+                "{query:?} took {took:.2?} over {count} places"
+            );
+        }
+    }
+
+    /// A query in a long run of searches over 40,000 places, as a provider directory sends.
+    #[test]
+    #[ignore = "40,000 places: run with --release, as the timing asks for"]
+    fn forty_thousand_places_answer_a_near_search_in_fifty_milliseconds() {
+        let harness = r4();
+        let started = Instant::now();
+        store_places(&harness, &spread(40_000));
+        eprintln!("stored 40,000 places in {:.1?}", started.elapsed());
+        for query in [
+            vec![("near", "6.60|3.35|10|km"), ("_count", "20")],
+            vec![
+                ("near", "6.60|3.35|10|km"),
+                ("_count", "20"),
+                ("_sort", "near"),
+            ],
+            vec![("near", "9.06|7.49|50|km"), ("_count", "20")],
+            vec![
+                ("near", "9.06|7.49|50|km"),
+                ("_count", "20"),
+                ("_sort", "near"),
+            ],
+            vec![("near", "6.60|3.35"), ("_count", "20")],
+            vec![
+                ("near", "6.60|3.35|10|km"),
+                ("status", "active"),
+                ("_count", "20"),
+            ],
+        ] {
+            let took = fastest(&harness, &query);
+            eprintln!("{query:?}: {took:.2?}");
+            assert!(
+                took < Duration::from_millis(50),
+                "{query:?} took {took:.2?} over 40,000 places"
+            );
+        }
+    }
+}
+
+/// Every issue of an outcome that makes a resource invalid.
+fn errors_of(outcome: &Value) -> Vec<&Value> {
+    outcome["issue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|issue| matches!(issue["severity"].as_str(), Some("error" | "fatal")))
+        .collect()
+}
+
+fn xhtml(inner: &str) -> String {
+    format!("<div xmlns=\"http://www.w3.org/1999/xhtml\">{inner}</div>")
+}
+
+#[test]
+fn a_narrative_is_checked_by_html_checks_not_refused_for_it() {
+    let harness = shared_r4();
+    let with = |div: String| {
+        json!({"resourceType": "Patient", "active": true,
+            "text": {"status": "generated", "div": div}})
+    };
+    let valid = apply(
+        harness,
+        "Patient/$validate",
+        json!({"resource": with(xhtml("<p>Ann <b>Smith</b></p>"))}),
+    );
+    assert!(errors_of(&valid).is_empty(), "{valid}");
+
+    // The rules say what a narrative may hold: no script, and some text.
+    for (label, div) in [
+        ("script", xhtml("<script>alert(1)</script>text")),
+        ("an event handler", xhtml("<p onclick=\"go()\">text</p>")),
+        ("no text", xhtml("<p></p>")),
+        ("no namespace", "<div>text</div>".to_string()),
+    ] {
+        let outcome = apply(harness, "Patient/$validate", json!({"resource": with(div)}));
+        let keys: Vec<_> = errors_of(&outcome)
+            .iter()
+            .map(|issue| {
+                issue["diagnostics"]
+                    .as_str()
+                    .unwrap()
+                    .split(':')
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            keys.contains(&"txt-1") || keys.contains(&"txt-2"),
+            "{label}: {outcome}"
+        );
+    }
+}
+
+#[test]
+fn a_resource_in_a_bundle_entry_is_validated_as_the_resource_it_is() {
+    let harness = shared_r4();
+    let bundle = |entry: Value| {
+        json!({"resourceType": "Bundle", "type": "collection",
+            "entry": [{"fullUrl": "urn:uuid:1", "resource": entry}]})
+    };
+    let valid = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": bundle(json!({"resourceType": "Patient", "active": true}))}),
+    );
+    assert!(errors_of(&valid).is_empty(), "{valid}");
+
+    // What is wrong with the entry is said at the entry, once.
+    let invalid = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": bundle(json!({"resourceType": "Patient", "active": "yes", "shoeSize": 9}))}),
+    );
+    let at: Vec<_> = errors_of(&invalid)
+        .iter()
+        .map(|issue| issue["expression"][0].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        at.contains(&"Bundle.entry[0].resource.shoeSize".to_string()),
+        "{at:?}"
+    );
+    assert!(
+        at.contains(&"Bundle.entry[0].resource.active".to_string()),
+        "{at:?}"
+    );
+    let mut unique = at.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), at.len(), "a finding is said once: {at:?}");
+
+    // An entry with no resourceType is not a resource at all.
+    let nameless = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": bundle(json!({"active": true}))}),
+    );
+    assert!(
+        errors_of(&nameless)
+            .iter()
+            .any(|issue| issue["diagnostics"] == "resourceType is required"),
+        "{nameless}"
+    );
+}
+
+#[test]
+fn a_complex_extension_on_a_primitive_is_checked_by_the_values_inside_it() {
+    let harness = shared_r4();
+    let translated = |parts: Value| {
+        json!({
+            "resourceType": "Observation", "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8480-6", "display": "Systolic",
+                "_display": {"extension": [{
+                    "url": "http://hl7.org/fhir/StructureDefinition/translation",
+                    "extension": parts
+                }]}}]}
+        })
+    };
+    // Each part holds its value under a key named for the type (`valueCode`), not under `value[x]`.
+    let valid = apply(
+        harness,
+        "Observation/$validate",
+        json!({"resource": translated(json!([
+            {"url": "lang", "valueCode": "nl"},
+            {"url": "content", "valueString": "Systolisch"}
+        ]))}),
+    );
+    assert!(errors_of(&valid).is_empty(), "{valid}");
+    // A part that has none is still refused.
+    let missing = apply(
+        harness,
+        "Observation/$validate",
+        json!({"resource": translated(json!([
+            {"url": "lang"},
+            {"url": "content", "valueString": "Systolisch"}
+        ]))}),
+    );
+    assert!(!errors_of(&missing).is_empty(), "{missing}");
+}
+
+/// The IPS package unpacked into a scratch directory, and the folder it unpacked to.
+fn unpacked_ips() -> (PathBuf, PathBuf) {
+    let scratch = temp_dir("ips");
+    let archive = std::fs::File::open(ips_package()).unwrap();
+    tar::Archive::new(flate2::read::GzDecoder::new(archive))
+        .unpack(&scratch)
+        .unwrap();
+    let package = scratch.join("package");
+    (scratch, package)
+}
+
+const IPS_BUNDLE_PROFILE: &str = "http://hl7.org/fhir/uv/ips/StructureDefinition/Bundle-uv-ips";
+
+#[test]
+fn hl7s_own_example_summaries_are_valid_against_the_ips_profiles() {
+    let harness = summary_ready();
+    let (scratch, package) = unpacked_ips();
+    let examples = [
+        "Bundle-bundle-minimal",
+        "Bundle-bundle-ips-all-sections",
+        "Bundle-IPS-examples-Bundle-01",
+        "Bundle-bundle-no-info-required-sections",
+        "Bundle-IPS-examples-Bundle-with-immunization",
+    ];
+    for name in examples {
+        let text =
+            std::fs::read_to_string(package.join("example").join(format!("{name}.json"))).unwrap();
+        let bundle: Value = serde_json::from_str(&text).unwrap();
+        let outcome = apply(
+            harness,
+            "Bundle/$validate",
+            json!({"resource": bundle, "profile": IPS_BUNDLE_PROFILE}),
+        );
+        assert!(errors_of(&outcome).is_empty(), "{name}: {outcome}");
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn an_ips_summary_that_breaks_the_profile_is_refused() {
+    let harness = summary_ready();
+    let (scratch, package) = unpacked_ips();
+    let text = std::fs::read_to_string(package.join("example/Bundle-bundle-minimal.json")).unwrap();
+    let mut bundle: Value = serde_json::from_str(&text).unwrap();
+    // The Composition leads a document. Without it the Bundle is not a summary.
+    bundle["entry"].as_array_mut().unwrap().remove(0);
+    let outcome = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": bundle, "profile": IPS_BUNDLE_PROFILE}),
+    );
+    assert!(!errors_of(&outcome).is_empty(), "{outcome}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+#[test]
+fn the_same_finding_in_each_item_of_a_list_is_reported_for_each_item() {
+    // The validator says a finding once when it reaches it twice, and an item of a list is not the
+    // same place as the one before it.
+    let harness = summary_ready();
+    let outcome = apply(
+        harness,
+        "Patient/$validate",
+        json!({"resource": {
+            "resourceType": "Patient",
+            "telecom": [
+                {"system": "bogus", "value": "1"},
+                {"system": "bogus", "value": "1"},
+                {"system": "bogus", "value": "1"}
+            ]
+        }}),
+    );
+    let places: Vec<String> = errors_of(&outcome)
+        .iter()
+        .map(|issue| issue["expression"][0].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        places,
+        [
+            "Patient.telecom[0].system",
+            "Patient.telecom[1].system",
+            "Patient.telecom[2].system"
+        ],
+        "{outcome}"
+    );
+}
+
+#[test]
+fn an_ips_summary_without_a_section_the_profile_requires_is_refused() {
+    const COMPOSITION_PROFILE: &str =
+        "http://hl7.org/fhir/uv/ips/StructureDefinition/Composition-uv-ips";
+    let harness = summary_ready();
+    let (scratch, package) = unpacked_ips();
+    let text = std::fs::read_to_string(package.join("example/Bundle-bundle-minimal.json")).unwrap();
+    let mut bundle: Value = serde_json::from_str(&text).unwrap();
+    // The IPS Composition requires its problems section (11450-4), whatever else it has.
+    let mut composition = bundle["entry"][0]["resource"].clone();
+    let sections = composition["section"].as_array().unwrap().clone();
+    assert_eq!(
+        sections.len(),
+        3,
+        "the example has the three required sections"
+    );
+    let without = |codes: &[&str]| -> Vec<Value> {
+        sections
+            .iter()
+            .filter(|section| {
+                let code = section["code"]["coding"][0]["code"].as_str().unwrap_or("");
+                !codes.contains(&code)
+            })
+            .cloned()
+            .collect()
+    };
+    let missing_slice = |outcome: &Value, name: &str| {
+        errors_of(outcome).iter().any(|issue| {
+            issue["diagnostics"]
+                .as_str()
+                .is_some_and(|text| text.contains(&format!("slice {name} requires at least 1")))
+        })
+    };
+
+    // Checked on its own against the profile, a Composition is refused for each required section it
+    // lacks, and by name.
+    composition["section"] = Value::Array(without(&["11450-4"]));
+    let outcome = apply(
+        harness,
+        "Composition/$validate",
+        json!({"resource": composition, "profile": COMPOSITION_PROFILE}),
+    );
+    assert!(missing_slice(&outcome, "sectionProblems"), "{outcome}");
+    assert!(!missing_slice(&outcome, "sectionAllergies"), "{outcome}");
+    composition["section"] = Value::Array(without(&["11450-4", "10160-0"]));
+    let outcome = apply(
+        harness,
+        "Composition/$validate",
+        json!({"resource": composition, "profile": COMPOSITION_PROFILE}),
+    );
+    assert!(missing_slice(&outcome, "sectionProblems"), "{outcome}");
+    assert!(missing_slice(&outcome, "sectionMedications"), "{outcome}");
+
+    // A slice that was there is not missing: the example's own Composition is whole.
+    let whole = apply(
+        harness,
+        "Composition/$validate",
+        json!({"resource": bundle["entry"][0]["resource"], "profile": COMPOSITION_PROFILE}),
+    );
+    assert!(errors_of(&whole).is_empty(), "{whole}");
+
+    // And in a summary that says it is one, as a Bundle entry.
+    composition["section"] = Value::Array(without(&["11450-4"]));
+    composition["meta"] = json!({"profile": [COMPOSITION_PROFILE]});
+    bundle["entry"][0]["resource"] = composition;
+    let outcome = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": bundle, "profile": IPS_BUNDLE_PROFILE}),
+    );
+    assert!(missing_slice(&outcome, "sectionProblems"), "{outcome}");
+    let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// A harness with the whole R4 release and the IPS package, holding a patient with a record, a
+/// second patient whose record must stay out of the first's summary, and one with no record. It is
+/// built once and shared, so a test that uses it must only read.
+fn summary_ready() -> &'static Harness {
+    static READY: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
+    READY.get_or_init(build_summary_harness)
+}
+
+fn build_summary_harness() -> Harness {
+    let harness = r4_ready();
+    let (scratch, package) = unpacked_ips();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, &package).unwrap();
+    let _ = std::fs::remove_dir_all(&scratch);
+    let create = |resource: Value| {
+        apply(
+            &harness,
+            &format!("{}/create", resource["resourceType"].as_str().unwrap()),
+            json!({"resource": resource}),
+        );
+    };
+    let patient_ref = |id: &str| json!({"reference": format!("Patient/{id}")});
+    let clinical = |system: &str, code: &str| json!({"coding": [{"system": system, "code": code}]});
+    create(json!({"resourceType": "Organization", "id": "org1", "name": "General Hospital"}));
+    create(json!({"resourceType": "Patient", "id": "p2", "name": [{"family": "Other"}]}));
+    create(json!({
+        "resourceType": "Patient", "id": "p1",
+        "identifier": [{"system": "http://hospital.example", "value": "mrn-p1"}],
+        "name": [{"family": "Lovelace", "given": ["Ada"]}],
+        "gender": "female", "birthDate": "1815-12-10",
+        "managingOrganization": {"reference": "Organization/org1"},
+        "link": [{"other": {"reference": "Patient/p2"}, "type": "seealso"}]
+    }));
+    create(
+        json!({"resourceType": "Patient", "id": "p3", "name": [{"family": "Empty"}], "gender": "unknown", "birthDate": "2000-01-01"}),
+    );
+    create(
+        json!({"resourceType": "Medication", "id": "med1", "code": {"text": "Salbutamol 100 micrograms inhaler"}}),
+    );
+    let condition_clinical = "http://terminology.hl7.org/CodeSystem/condition-clinical";
+    create(
+        json!({"resourceType": "Condition", "id": "c1", "clinicalStatus": clinical(condition_clinical, "active"),
+        "code": {"text": "Asthma"}, "subject": patient_ref("p1"), "onsetDateTime": "2010-05-01"}),
+    );
+    create(
+        json!({"resourceType": "Condition", "id": "c2", "clinicalStatus": clinical(condition_clinical, "resolved"),
+        "code": {"text": "Fractured wrist"}, "subject": patient_ref("p1")}),
+    );
+    create(
+        json!({"resourceType": "Condition", "id": "c3", "clinicalStatus": clinical(condition_clinical, "active"),
+        "code": {"text": "Someone else's diabetes"}, "subject": patient_ref("p2")}),
+    );
+    create(json!({"resourceType": "AllergyIntolerance", "id": "a1",
+        "clinicalStatus": clinical("http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical", "active"),
+        "code": {"text": "Penicillin"}, "patient": patient_ref("p1"), "criticality": "high",
+        "reaction": [{"manifestation": [{"text": "Hives"}]}]}));
+    create(
+        json!({"resourceType": "MedicationStatement", "id": "m1", "status": "active",
+        "medicationReference": {"reference": "Medication/med1"}, "subject": patient_ref("p1"),
+        "effectiveDateTime": "2024-01-01"}),
+    );
+    create(
+        json!({"resourceType": "MedicationStatement", "id": "m2", "status": "stopped",
+        "medicationCodeableConcept": {"text": "Amoxicillin"}, "subject": patient_ref("p1")}),
+    );
+    create(
+        json!({"resourceType": "Immunization", "id": "i1", "status": "completed",
+        "vaccineCode": {"text": "Influenza"}, "patient": patient_ref("p1"), "occurrenceDateTime": "2023-10-01"}),
+    );
+    create(
+        json!({"resourceType": "Observation", "id": "o1", "status": "final",
+        "category": [clinical("http://terminology.hl7.org/CodeSystem/observation-category", "laboratory")],
+        "code": {"text": "Hemoglobin"}, "subject": patient_ref("p1"), "effectiveDateTime": "2024-02-02",
+        "valueQuantity": {"value": 13.5, "unit": "g/dL"}}),
+    );
+    create(
+        json!({"resourceType": "Procedure", "id": "pr1", "status": "completed",
+        "code": {"text": "Appendectomy"}, "subject": patient_ref("p1"), "performedDateTime": "2000-03-04"}),
+    );
+    harness
+}
+
+fn summary_of(harness: &Harness, patient: &str) -> Value {
+    apply(harness, "Patient/$summary", json!({"id": patient}))
+}
+
+fn section_titles(summary: &Value) -> Vec<String> {
+    summary["entry"][0]["resource"]["section"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|section| section["title"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn entry_ids(summary: &Value) -> Vec<String> {
+    summary["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            let resource = &entry["resource"];
+            Some(format!(
+                "{}/{}",
+                resource["resourceType"].as_str()?,
+                resource["id"].as_str()?
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn a_summary_is_an_ips_document_of_that_patients_record_and_nothing_else() {
+    let harness = summary_ready();
+    let summary = summary_of(harness, "p1");
+
+    assert_eq!(summary["type"], "document");
+    assert_eq!(summary["meta"]["profile"][0], IPS_BUNDLE_PROFILE);
+    assert!(summary["identifier"]["value"]
+        .as_str()
+        .unwrap()
+        .starts_with("urn:uuid:"));
+    let composition = &summary["entry"][0]["resource"];
+    assert_eq!(composition["resourceType"], "Composition");
+    assert_eq!(composition["type"]["coding"][0]["code"], "60591-5");
+    assert_eq!(
+        section_titles(&summary),
+        [
+            "Allergies and Intolerances",
+            "Problem List",
+            "Medication Summary",
+            "Immunizations",
+            "Results",
+            "History of Procedures"
+        ]
+    );
+
+    // What the sections took: the active problem and the current medicine, not the resolved
+    // problem, the stopped medicine, or what belongs to another patient.
+    let ids = entry_ids(&summary);
+    for held in [
+        "Patient/p1",
+        "Condition/c1",
+        "AllergyIntolerance/a1",
+        "MedicationStatement/m1",
+        "Immunization/i1",
+        "Observation/o1",
+        "Procedure/pr1",
+        "Organization/org1",
+        "Medication/med1",
+    ] {
+        assert!(
+            ids.contains(&held.to_string()),
+            "{held} is in the summary: {ids:?}"
+        );
+    }
+    for left_out in [
+        "Condition/c2",
+        "Condition/c3",
+        "MedicationStatement/m2",
+        "Patient/p2",
+    ] {
+        assert!(
+            !ids.contains(&left_out.to_string()),
+            "{left_out} is not: {ids:?}"
+        );
+    }
+    let patient = summary["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["resource"]["id"] == "p1")
+        .unwrap();
+    assert!(
+        patient["resource"].get("link").is_none(),
+        "no link to another patient's record"
+    );
+
+    // Each section says in words what it holds.
+    let narrative = |title: &str| {
+        let sections = composition["section"].as_array().unwrap();
+        let section = sections
+            .iter()
+            .find(|section| section["title"] == title)
+            .unwrap();
+        section["text"]["div"].as_str().unwrap().to_string()
+    };
+    let problems = narrative("Problem List");
+    assert!(
+        problems.contains("Asthma") && problems.contains("2010-05-01"),
+        "{problems}"
+    );
+    assert!(!problems.contains("Fractured wrist"), "{problems}");
+    let medicines = narrative("Medication Summary");
+    assert!(
+        medicines.contains("Salbutamol 100 micrograms inhaler"),
+        "the Medication it points at is read: {medicines}"
+    );
+    assert!(narrative("Allergies and Intolerances").contains("Hives"));
+    assert!(narrative("Results").contains("13.5 g/dL"));
+    for title in section_titles(&summary) {
+        assert!(
+            refhir_fhirpath::html_checks(&narrative(&title)),
+            "{title} is valid narrative"
+        );
+    }
+
+    // The references in the document resolve inside it.
+    let entries = summary["entry"].as_array().unwrap();
+    let url_of = |type_name: &str, id: &str| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry["resource"]["resourceType"] == type_name && entry["resource"]["id"] == id
+            })
+            .map(|entry| entry["fullUrl"].clone())
+            .unwrap()
+    };
+    assert_eq!(composition["subject"]["reference"], url_of("Patient", "p1"));
+    assert_eq!(
+        composition["author"][0]["reference"],
+        url_of("Organization", "org1")
+    );
+    assert_eq!(
+        composition["section"][1]["entry"][0]["reference"],
+        url_of("Condition", "c1")
+    );
+
+    // The summary names its own profile, so it is checked against IPS as it stands: the way to
+    // validate it over HTTP, where a type-level validate takes no profile of its own.
+    let outcome = apply(harness, "Bundle/$validate", json!({"resource": summary}));
+    assert!(
+        errors_of(&outcome).is_empty(),
+        "the summary is a valid IPS document: {outcome}"
+    );
+    let mut headless = summary.clone();
+    headless["entry"].as_array_mut().unwrap().remove(0);
+    let outcome = apply(harness, "Bundle/$validate", json!({"resource": headless}));
+    assert!(
+        !errors_of(&outcome).is_empty(),
+        "it was held to the IPS profile, which wants its Composition: {outcome}"
+    );
+}
+
+#[test]
+fn a_required_section_with_nothing_in_it_says_so_and_an_optional_one_is_left_out() {
+    let harness = summary_ready();
+    let summary = summary_of(harness, "p3");
+    assert_eq!(
+        section_titles(&summary),
+        [
+            "Allergies and Intolerances",
+            "Problem List",
+            "Medication Summary"
+        ]
+    );
+    for section in summary["entry"][0]["resource"]["section"]
+        .as_array()
+        .unwrap()
+    {
+        assert_eq!(section["emptyReason"]["coding"][0]["code"], "unavailable");
+        assert!(section.get("entry").is_none());
+        assert!(section["text"]["div"]
+            .as_str()
+            .unwrap()
+            .contains("no information available"));
+    }
+    // The Composition has no id of its own, so the patient is the only entry that has one.
+    assert_eq!(entry_ids(&summary), ["Patient/p3"]);
+    let outcome = apply(
+        harness,
+        "Bundle/$validate",
+        json!({"resource": summary, "profile": IPS_BUNDLE_PROFILE}),
+    );
+    assert!(errors_of(&outcome).is_empty(), "{outcome}");
+}
+
+#[test]
+fn a_summary_names_its_patient_by_id_or_by_identifier() {
+    let harness = summary_ready();
+    let patient_of = |summary: &Value| {
+        summary["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["resource"]["resourceType"] == "Patient")
+            .unwrap()["resource"]["id"]
+            .clone()
+    };
+    let by_query = apply(
+        harness,
+        "Patient/$summary",
+        json!({"identifier": "http://hospital.example|mrn-p1"}),
+    );
+    assert_eq!(patient_of(&by_query), "p1");
+    let by_parameters = apply(
+        harness,
+        "Patient/$summary",
+        json!({"resource": {
+            "resourceType": "Parameters",
+            "parameter": [{"name": "identifier", "valueString": "http://hospital.example|mrn-p1"}]
+        }}),
+    );
+    assert_eq!(patient_of(&by_parameters), "p1");
+
+    let unknown = run_op(
+        harness,
+        "Patient/$summary",
+        &json!({"identifier": "http://hospital.example|nobody"}),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(unknown, RunError::Fhir(FhirError::NotFound(_))),
+        "{unknown:?}"
+    );
+    let unnamed = run_op(harness, "Patient/$summary", &json!({})).unwrap_err();
+    assert!(
+        matches!(unnamed, RunError::Fhir(FhirError::Invalid(_))),
+        "{unnamed:?}"
+    );
+    let missing = run_op(harness, "Patient/$summary", &json!({"id": "nobody"})).unwrap_err();
+    assert!(
+        matches!(missing, RunError::Fhir(FhirError::NotFound(_))),
+        "{missing:?}"
+    );
+    let wrong_type = run_op(harness, "Observation/$summary", &json!({"id": "o1"})).unwrap_err();
+    assert!(
+        matches!(wrong_type, RunError::Fhir(FhirError::Unsupported(_))),
+        "{wrong_type:?}"
+    );
+}
+
+#[test]
+fn a_summary_holds_only_what_the_callers_scopes_let_them_read() {
+    let harness = summary_ready();
+    let narrow = apply(
+        harness,
+        "Patient/$summary",
+        json!({
+            "id": "p1",
+            "_readScopes": ["patient/Patient.rs", "patient/Condition.rs"]
+        }),
+    );
+    let ids = entry_ids(&narrow);
+    assert!(ids.contains(&"Condition/c1".to_string()), "{ids:?}");
+    for unreadable in [
+        "AllergyIntolerance/a1",
+        "MedicationStatement/m1",
+        "Immunization/i1",
+        "Organization/org1",
+        "Medication/med1",
+    ] {
+        assert!(
+            !ids.contains(&unreadable.to_string()),
+            "{unreadable} is not readable: {ids:?}"
+        );
+    }
+    // A required section the token cannot read is not filled, and says nothing is available.
+    let allergies = &narrow["entry"][0]["resource"]["section"][0];
+    assert_eq!(allergies["title"], "Allergies and Intolerances");
+    assert_eq!(allergies["emptyReason"]["coding"][0]["code"], "unavailable");
+
+    let everything = apply(
+        harness,
+        "Patient/$everything",
+        json!({
+            "id": "p1",
+            "_readScopes": ["patient/Patient.rs", "patient/Condition.rs"]
+        }),
+    );
+    let types: std::collections::BTreeSet<_> = everything["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            entry["resource"]["resourceType"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        types,
+        ["Condition", "Patient"]
+            .map(String::from)
+            .into_iter()
+            .collect()
+    );
+}
+
+fn card_request(parameters: Value) -> Value {
+    json!({"resource": {"resourceType": "Parameters", "parameter": parameters}})
+}
+
+fn card_args(patient: &str, parameters: Value) -> Value {
+    let mut args = card_request(parameters);
+    args["id"] = json!(patient);
+    args
+}
+
+fn credential_type(uri: &str) -> Value {
+    json!({"name": "credentialType", "valueUri": uri})
+}
+
+const IMMUNIZATION_TYPE: &str = "https://smarthealth.cards#immunization";
+const LABORATORY_TYPE: &str = "https://smarthealth.cards#laboratory";
+
+#[test]
+fn a_card_holds_who_it_is_about_and_what_was_asked_and_nothing_more() {
+    let harness = summary_ready();
+    let issued = apply(
+        harness,
+        "Patient/$health-cards-issue",
+        card_args("p1", json!([credential_type("Immunization")])),
+    );
+    assert_eq!(issued["fhirVersion"], "4.0.1");
+    let credentials = issued["credentials"].as_array().unwrap();
+    assert_eq!(credentials.len(), 1);
+    let credential = &credentials[0];
+    assert_eq!(credential["types"], json!([IMMUNIZATION_TYPE]));
+
+    let bundle = &credential["bundle"];
+    assert_eq!(bundle["resourceType"], "Bundle");
+    assert_eq!(bundle["type"], "collection");
+    let entries = bundle["entry"].as_array().unwrap();
+    assert_eq!(
+        entries.len(),
+        2,
+        "the patient and the immunization: {bundle}"
+    );
+    assert_eq!(entries[0]["fullUrl"], "resource:0");
+    assert_eq!(entries[1]["fullUrl"], "resource:1");
+
+    // Who it is about: a name and a birth date, no more than the format asks.
+    assert_eq!(
+        entries[0]["resource"],
+        json!({
+            "resourceType": "Patient",
+            "name": [{"family": "Lovelace", "given": ["Ada"]}],
+            "birthDate": "1815-12-10"
+        })
+    );
+    // The immunization is as small as it can be, and points at the patient in the card.
+    let immunization = &entries[1]["resource"];
+    assert_eq!(immunization["resourceType"], "Immunization");
+    assert!(immunization.get("id").is_none() && immunization.get("meta").is_none());
+    assert!(immunization.get("text").is_none());
+    assert_eq!(immunization["patient"]["reference"], "resource:0");
+    // A concept that is only words keeps them: with them gone nothing would say what the vaccine was.
+    assert_eq!(immunization["vaccineCode"]["text"], "Influenza");
+    assert_eq!(immunization["occurrenceDateTime"], "2023-10-01");
+
+    // Where each resource came from, for the response that goes with the card.
+    assert_eq!(
+        credential["links"],
+        json!([
+            {"bundledResource": "resource:0", "hostedResource": "Patient/p1"},
+            {"bundledResource": "resource:1", "hostedResource": "Immunization/i1"}
+        ])
+    );
+    // What is in the card is a valid FHIR Bundle.
+    let outcome = apply(harness, "Bundle/$validate", json!({"resource": bundle}));
+    assert!(errors_of(&outcome).is_empty(), "{outcome}");
+}
+
+#[test]
+fn a_card_takes_the_kinds_named_by_type_or_by_the_legacy_uris_and_every_one_of_them() {
+    let harness = summary_ready();
+    let types_of = |parameters: Value| {
+        let issued = apply(
+            harness,
+            "Patient/$health-cards-issue",
+            card_args("p1", parameters),
+        );
+        let credentials = issued["credentials"].as_array().unwrap().clone();
+        credentials
+            .first()
+            .map(|credential| {
+                credential["bundle"]["entry"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| {
+                        entry["resource"]["resourceType"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        types_of(json!([credential_type(LABORATORY_TYPE)])),
+        ["Patient", "Observation"]
+    );
+    // Two kinds are "and": one card holds both.
+    assert_eq!(
+        types_of(json!([
+            credential_type("Immunization"),
+            credential_type("Procedure")
+        ])),
+        ["Patient", "Immunization", "Procedure"]
+    );
+    // A kind with nothing in the record means there is no card, not a card with less in it.
+    assert!(types_of(json!([
+        credential_type("Immunization"),
+        credential_type("DiagnosticReport")
+    ]))
+    .is_empty());
+    // A patient with no record has no card for any kind.
+    let none = apply(
+        harness,
+        "Patient/$health-cards-issue",
+        card_args("p3", json!([credential_type("Immunization")])),
+    );
+    assert_eq!(none["credentials"], json!([]));
+    // The legacy laboratory type carries its own credential type.
+    let lab = apply(
+        harness,
+        "Patient/$health-cards-issue",
+        card_args("p1", json!([credential_type(LABORATORY_TYPE)])),
+    );
+    assert_eq!(lab["credentials"][0]["types"], json!([LABORATORY_TYPE]));
+}
+
+#[test]
+fn a_card_says_of_the_patient_what_the_request_names() {
+    let harness = summary_ready();
+    let issued = apply(
+        harness,
+        "Patient/$health-cards-issue",
+        card_args(
+            "p1",
+            json!([
+                credential_type("Immunization"),
+                {"name": "includeIdentityClaim", "valueString": "Patient.gender"},
+                {"name": "includeIdentityClaim", "valueString": "Patient.identifier"}
+            ]),
+        ),
+    );
+    assert_eq!(
+        issued["credentials"][0]["bundle"]["entry"][0]["resource"],
+        json!({
+            "resourceType": "Patient",
+            "gender": "female",
+            "identifier": [{"system": "http://hospital.example", "value": "mrn-p1"}]
+        })
+    );
+}
+
+#[test]
+fn a_card_request_that_cannot_be_met_is_refused_and_says_why() {
+    let harness = summary_ready();
+    let refused = |args: Value| match run_op(harness, "Patient/$health-cards-issue", &args) {
+        Err(RunError::Fhir(err)) => err,
+        other => panic!("expected a refusal, got {other:?}"),
+    };
+    assert!(
+        matches!(refused(card_args("p1", json!([]))), FhirError::Invalid(message) if message.contains("credentialType is required"))
+    );
+    assert!(matches!(
+        refused(card_args("p1", json!([credential_type("https://smarthealth.cards#covid19")]))),
+        FhirError::Invalid(message) if message.contains("covid19")
+    ));
+    assert!(matches!(
+        refused(card_args("p1", json!([credential_type("Patient")]))),
+        FhirError::Invalid(_)
+    ));
+    assert!(matches!(
+        refused(card_args(
+            "p1",
+            json!([credential_type("Immunization"), {"name": "_since", "valueString": "last week"}])
+        )),
+        FhirError::Invalid(message) if message.contains("_since is not a date")
+    ));
+    assert!(matches!(
+        refused(card_args(
+            "p1",
+            json!([credential_type("Immunization"), {"name": "_since", "valueDateTime": "2024-01-01"}, {"name": "_since", "valueDateTime": "2025-01-01"}])
+        )),
+        FhirError::Invalid(message) if message.contains("given once")
+    ));
+    assert!(matches!(
+        refused(card_args(
+            "p1",
+            json!([credential_type("Immunization"), {"name": "includeIdentityClaim", "valueString": "Patient.photo"}])
+        )),
+        FhirError::Invalid(_)
+    ));
+    assert!(matches!(
+        refused(card_args(
+            "nobody",
+            json!([credential_type("Immunization")])
+        )),
+        FhirError::NotFound(_)
+    ));
+    assert!(matches!(
+        refused(json!({"id": "o1", "resource": {"resourceType": "Parameters", "parameter": []}})),
+        FhirError::Invalid(_)
+    ));
+    assert!(matches!(
+        run_op(
+            harness,
+            "Observation/$health-cards-issue",
+            &card_args("o1", json!([credential_type("Immunization")]))
+        ),
+        Err(RunError::Fhir(FhirError::Unsupported(_)))
+    ));
+}
+
+#[test]
+fn a_card_holds_only_what_the_callers_scopes_let_them_read() {
+    let harness = summary_ready();
+    let mut args = card_args("p1", json!([credential_type("Immunization")]));
+    args["_readScopes"] = json!(["patient/Patient.rs"]);
+    let issued = apply(harness, "Patient/$health-cards-issue", args);
+    assert_eq!(issued["credentials"], json!([]));
+}
+
+fn pause() {
+    // Times are in milliseconds, so two writes that a test wants apart are this far apart.
+    std::thread::sleep(std::time::Duration::from_millis(15));
+}
+
+fn moment() -> String {
+    crate::instant::format(crate::instant::now_ms())
+}
+
+fn written_at(resource: &Value) -> i64 {
+    crate::instant::parse(
+        resource["meta"]["lastUpdated"]
+            .as_str()
+            .expect("lastUpdated"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn every_version_says_when_it_was_written_whatever_wrote_it_and_the_clients_word_is_not_kept() {
+    let harness = ready();
+    let before = crate::instant::now_ms();
+    let mut body = patient("p1", true, "Ann");
+    body["meta"] = json!({"lastUpdated": "1999-01-01T00:00:00Z"});
+    let created = apply(&harness, "Patient/create", json!({"resource": body}));
+    let first = written_at(&created);
+    assert!(
+        first >= before && first <= crate::instant::now_ms(),
+        "the server's clock, not the client's"
+    );
+
+    let read = apply(&harness, "Patient/read", json!({"id": "p1"}));
+    assert_eq!(
+        read["meta"]["lastUpdated"], created["meta"]["lastUpdated"],
+        "what is kept is what was said"
+    );
+
+    // An update carries the time it was read with, and a client may claim another; neither is kept.
+    pause();
+    let mut changed = read.clone();
+    changed["active"] = json!(false);
+    let updated = apply(
+        &harness,
+        "Patient/update",
+        json!({"id": "p1", "resource": changed}),
+    );
+    let second = written_at(&updated);
+    assert!(second > first, "{second} after {first}");
+    let mut claimed = apply(&harness, "Patient/read", json!({"id": "p1"}));
+    claimed["meta"]["lastUpdated"] = json!("1999-01-01T00:00:00Z");
+    pause();
+    let third = written_at(&apply(
+        &harness,
+        "Patient/update",
+        json!({"id": "p1", "resource": claimed}),
+    ));
+    assert!(third > second);
+
+    // A patch, and a change of tags, are writes too.
+    pause();
+    let patched = apply(
+        &harness,
+        "Patient/patch",
+        json!({"id": "p1", "patch": [{"op": "replace", "path": "/active", "value": true}]}),
+    );
+    let fourth = written_at(&patched);
+    assert!(fourth > third);
+    pause();
+    apply(
+        &harness,
+        "Patient/$meta-add",
+        json!({"id": "p1", "resource": {"meta": {"tag": [{"system": "http://example.org/tags", "code": "vip"}]}}}),
+    );
+    let tagged = apply(&harness, "Patient/read", json!({"id": "p1"}));
+    assert!(written_at(&tagged) > fourth);
+    assert_eq!(
+        tagged["meta"]["tag"][0]["code"], "vip",
+        "the tag is kept beside the time"
+    );
+
+    // A transaction writes with the same clock.
+    pause();
+    apply(
+        &harness,
+        "Bundle/transaction",
+        json!({"resource": {"resourceType": "Bundle", "type": "transaction", "entry": [
+            {"resource": {"resourceType": "Patient", "name": [{"family": "Bee"}]}, "request": {"method": "POST", "url": "Patient"}}
+        ]}}),
+    );
+    let all = apply(&harness, "Patient/search", json!({}));
+    for entry in all["entry"].as_array().unwrap() {
+        assert!(written_at(&entry["resource"]) >= first);
+    }
+    assert_eq!(all["entry"].as_array().unwrap().len(), 2);
+
+    // Each version keeps its own time.
+    let first_version = created["meta"]["versionId"].as_str().unwrap().to_string();
+    let old = apply(
+        &harness,
+        "Patient/vread",
+        json!({"id": "p1", "versionId": first_version}),
+    );
+    assert_eq!(written_at(&old), first);
+    let history = apply(&harness, "Patient/history", json!({"id": "p1"}));
+    let times: Vec<i64> = history["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| written_at(&entry["resource"]))
+        .collect();
+    assert_eq!(times.len(), 5);
+    assert!(
+        times.windows(2).all(|pair| pair[0] > pair[1]),
+        "newest first, each its own time: {times:?}"
+    );
+}
+
+#[test]
+fn a_search_by_when_a_resource_was_written_finds_what_it_should_and_follows_an_update() {
+    let harness = r4_ready();
+    let ids = |query: Value| -> Vec<String> {
+        let found = apply(&harness, "Patient/search", query);
+        let mut ids: Vec<String> = found["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+    let create = |id: &str| {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": patient(id, true, "Ann")}),
+        )
+    };
+    let before = moment();
+    pause();
+    create("p1");
+    pause();
+    let between = moment();
+    pause();
+    create("p2");
+    pause();
+    let after = moment();
+
+    assert_eq!(
+        ids(json!({"_lastUpdated": format!("ge{before}")})),
+        ["p1", "p2"]
+    );
+    assert_eq!(ids(json!({"_lastUpdated": format!("ge{between}")})), ["p2"]);
+    assert_eq!(ids(json!({"_lastUpdated": format!("lt{between}")})), ["p1"]);
+    assert_eq!(
+        ids(json!({"_lastUpdated": format!("gt{after}")})),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        ids(json!({"_lastUpdated": format!("le{after}")})),
+        ["p1", "p2"]
+    );
+    // Twice is "and": a window.
+    assert_eq!(
+        ids(json!({"_lastUpdated": [format!("ge{before}"), format!("lt{between}")]})),
+        ["p1"]
+    );
+    // A date is the whole day.
+    assert_eq!(ids(json!({"_lastUpdated": "ge2000-01-01"})), ["p1", "p2"]);
+    assert_eq!(
+        ids(json!({"_lastUpdated": "le1999-12-31"})),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        ids(json!({"_lastUpdated": "gt2999-01-01"})),
+        Vec::<String>::new()
+    );
+    // With another parameter.
+    assert_eq!(
+        ids(json!({"_lastUpdated": format!("ge{before}"), "_id": "p2"})),
+        ["p2"]
+    );
+
+    // An update moves a resource to when it was updated, and it is no longer found where it was.
+    let mut changed = apply(&harness, "Patient/read", json!({"id": "p1"}));
+    changed["active"] = json!(false);
+    apply(
+        &harness,
+        "Patient/update",
+        json!({"id": "p1", "resource": changed}),
+    );
+    assert_eq!(ids(json!({"_lastUpdated": format!("ge{after}")})), ["p1"]);
+    assert_eq!(
+        ids(json!({"_lastUpdated": format!("lt{between}")})),
+        Vec::<String>::new()
+    );
+}
+
+/// A moment as a time in a zone, to the millisecond, second or minute: `2026-10-18T05:45:36+01:00`.
+/// Also where that time starts and ends, in milliseconds.
+fn written_in(ms: i64, offset_minutes: i64, width: &str) -> (String, i64, i64) {
+    let (start, size) = match width {
+        "ms" => (ms, 1),
+        "second" => (ms.div_euclid(1000) * 1000, 1000),
+        _ => (ms.div_euclid(60_000) * 60_000, 60_000),
+    };
+    let local = crate::instant::format(start + offset_minutes * 60_000);
+    let clock = match width {
+        "ms" => &local[..23],
+        "second" => &local[..19],
+        _ => &local[..16],
+    };
+    let zone = if offset_minutes == 0 {
+        "Z".to_string()
+    } else {
+        let sign = if offset_minutes < 0 { '-' } else { '+' };
+        let minutes = offset_minutes.abs();
+        format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+    };
+    (format!("{clock}{zone}"), start, start + size)
+}
+
+#[test]
+fn a_time_asked_for_to_the_second_or_in_another_zone_finds_a_time_stored_to_the_millisecond() {
+    // `lastUpdated` is kept to the millisecond, in UTC, and a search for it can say a minute, a
+    // second or a millisecond and can be in any zone. Dates are indexed as text, in text order,
+    // so a search that gets this wrong finds nothing where the data is, and does it quietly.
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, cards_dir()).unwrap();
+    let mut written = Vec::new();
+    for id in ["p1", "p2", "p3"] {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": {
+                "resourceType": "Patient",
+                "id": id,
+                "name": [{"family": "Ann"}]
+            }}),
+        );
+        let read = apply(&harness, "Patient/read", json!({"id": id}));
+        written.push((id, written_at(&read)));
+        pause();
+    }
+    // Times that do not fall on a second, so that a second and a millisecond are not the same.
+    assert!(written.iter().any(|(_, at)| at % 1000 != 0));
+
+    let found = |query: &str| -> Vec<String> {
+        let result = apply(&harness, "Patient/search", json!({"_lastUpdated": query}));
+        let mut ids: Vec<String> = result["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+    let mut asked = 0;
+    let anchor = written[1].1;
+    for offset in [0, 60, -300, 330, 840, -720] {
+        for width in ["ms", "second", "minute"] {
+            for shift in [-61_000, -1_500, -1, 0, 1, 1_500, 61_000] {
+                let (text, from, to) = written_in(anchor + shift, offset, width);
+                for prefix in ["eq", "ge", "gt", "le", "lt"] {
+                    // What each comparison means, from the specification and not from the code: a
+                    // time written to the millisecond is the one millisecond from `at`.
+                    let holds = |at: i64| {
+                        let end = at + 1;
+                        match prefix {
+                            "eq" => at < to && end > from,
+                            "ge" => end > from,
+                            "gt" => at >= to,
+                            "le" => at < to,
+                            _ => end <= from,
+                        }
+                    };
+                    let expected: Vec<&str> = written
+                        .iter()
+                        .filter(|(_, at)| holds(*at))
+                        .map(|(id, _)| *id)
+                        .collect();
+                    assert_eq!(
+                        found(&format!("{prefix}{text}")),
+                        expected,
+                        "{prefix}{text}: the writes are at {written:?}"
+                    );
+                    asked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(asked, 6 * 3 * 7 * 5);
+}
+
+#[test]
+fn a_date_to_the_year_or_the_month_is_above_and_below_a_day_inside_it_and_is_not_equal_to_it() {
+    let harness = ready();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": patient("p1", true, "Ann")}),
+    );
+    let dates = [
+        ("a", "2025-12"),
+        ("b", "2026"),
+        ("c", "2026-10"),
+        ("d", "2026-10-18"),
+        ("e", "2026-10-19"),
+        ("f", "2026-10-18T23:30:00-05:00"),
+        ("g", "2026-10-19T03:30:00.5Z"),
+        ("h", "2027"),
+    ];
+    for (id, date) in dates {
+        apply(
+            &harness,
+            "Observation/create",
+            json!({"resource": observation(id, "p1", date, "8480-6")}),
+        );
+    }
+    let found = |query: &str| -> Vec<String> {
+        let result = apply(&harness, "Observation/search", json!({"date": query}));
+        let mut ids: Vec<String> = result["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        ids.sort();
+        ids
+    };
+    // A year holds every day of it, so it is on both sides of a day inside it, but it is not equal
+    // to the day: `eq` takes what lies wholly inside the value. `f` and `g` are the moments
+    // 2026-10-19T04:30:00Z and 2026-10-19T03:30:00.5Z, an hour apart in the 19th.
+    assert_eq!(found("2026-10-18"), ["d"]);
+    assert_eq!(found("eq2026-10-19"), ["e", "f", "g"]);
+    assert_eq!(found("ge2026-10-19"), ["b", "c", "e", "f", "g", "h"]);
+    // `gt` and `lt` take what reaches above or below the day, so a year or a month that holds days
+    // after it (or before it) is in; `sa` and `eb` take only what lies wholly beyond it.
+    assert_eq!(found("gt2026-10-18"), ["b", "c", "e", "f", "g", "h"]);
+    assert_eq!(found("sa2026-10-18"), ["e", "f", "g", "h"]);
+    assert_eq!(found("le2026-10-18"), ["a", "b", "c", "d"]);
+    assert_eq!(found("lt2026-10-18"), ["a", "b", "c"]);
+    assert_eq!(found("eb2026-10-18"), ["a"]);
+    assert_eq!(
+        found("lt2026-10-19T04:00:00Z"),
+        ["a", "b", "c", "d", "e", "g"]
+    );
+    assert_eq!(found("ge2026-10-19T04:00:00Z"), ["b", "c", "e", "f", "h"]);
+    assert_eq!(found("2026-10-19T03:30:00Z"), ["g"]);
+    assert_eq!(found("2026-10-18T23:30:00-05:00"), ["f"]);
+}
+
+fn cards_harness() -> Harness {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, cards_dir()).unwrap();
+    harness
+}
+
+fn seeded(harness: &Harness, resource: Value) {
+    apply(
+        harness,
+        &format!("{}/create", resource["resourceType"].as_str().unwrap()),
+        json!({"resource": resource}),
+    );
+}
+
+fn resource_keys(bundle: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = bundle["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}/{}",
+                entry["resource"]["resourceType"].as_str().unwrap(),
+                entry["resource"]["id"].as_str().unwrap_or("-")
+            )
+        })
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn a_document_for_a_caller_limited_to_one_patient_leaves_other_patients_out() {
+    let harness = cards_harness();
+    // A links to B, as a merged or duplicate record does. B is made first: a reference has a target.
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "pb", "name": [{"family": "Bee"}]}),
+    );
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "pa", "name": [{"family": "A"}],
+            "link": [{"other": {"reference": "Patient/pb"}, "type": "seealso"}]}),
+    );
+    seeded(
+        &harness,
+        json!({"resourceType": "Composition", "id": "ca", "status": "final",
+            "type": {"text": "Summary"}, "subject": {"reference": "Patient/pa"},
+            "date": "2026-10-18", "title": "A"}),
+    );
+    let everyone = apply(&harness, "Composition/$document", json!({"id": "ca"}));
+    assert_eq!(
+        resource_keys(&everyone),
+        ["Composition/ca", "Patient/pa", "Patient/pb"],
+        "without a limit the document follows the link"
+    );
+    let limited = apply(
+        &harness,
+        "Composition/$document",
+        json!({"id": "ca", "_patientCompartment": "Patient/pa"}),
+    );
+    assert_eq!(
+        resource_keys(&limited),
+        ["Composition/ca", "Patient/pa"],
+        "a caller limited to A does not get B"
+    );
+    assert!(
+        !limited.to_string().contains("Bee"),
+        "nothing of B is in it: {limited}"
+    );
+}
+
+#[test]
+fn a_card_is_asked_for_a_clinical_type_and_for_nothing_else_the_compartment_lists() {
+    // This catalog's Patient compartment lists Patient (by `link`), Immunization and Composition, as
+    // R4's does Patient, and much besides.
+    let harness = cards_harness();
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]}),
+    );
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "p2", "name": [{"family": "Two"}],
+            "link": [{"other": {"reference": "Patient/p1"}, "type": "seealso"}]}),
+    );
+    let asked = |kind: &str| {
+        run_op(
+            &harness,
+            "Patient/$health-cards-issue",
+            &card_args("p1", json!([credential_type(kind)])),
+        )
+    };
+    for kind in ["Patient", "Composition"] {
+        match asked(kind) {
+            Err(RunError::Fhir(FhirError::Invalid(message))) => {
+                assert!(
+                    message.contains(kind) && message.contains("name one of"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("Immunization"),
+                    "it says what is allowed: {message}"
+                );
+            }
+            other => panic!("{kind} is not a thing a card holds: {other:?}"),
+        }
+    }
+    let none = asked("Immunization").expect("a clinical type is taken");
+    assert_eq!(
+        none.value,
+        json!({"credentials": []}),
+        "and with none of it, there is no card"
+    );
+}
+
+#[test]
+fn a_section_holds_the_latest_of_what_there_is_and_a_read_is_bounded_and_newest_first() {
+    let harness = cards_harness();
+    seeded(
+        &harness,
+        json!({"resourceType": "Patient", "id": "p1", "name": [{"family": "One"}]}),
+    );
+    let vaccine = |id: &str| {
+        json!({"resourceType": "Immunization", "id": id, "status": "completed",
+            "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "140"}]},
+            "patient": {"reference": "Patient/p1"}, "occurrenceDateTime": "2024-01-01"})
+    };
+    for number in 0..105 {
+        seeded(&harness, vaccine(&format!("i{number:03}")));
+    }
+    pause();
+    seeded(&harness, vaccine("newest"));
+
+    let summary = apply(&harness, "Patient/$summary", json!({"id": "p1"}));
+    let shots: Vec<String> = resource_keys(&summary)
+        .into_iter()
+        .filter(|key| key.starts_with("Immunization/"))
+        .collect();
+    assert_eq!(
+        shots.len(),
+        100,
+        "a long record is a summary, and not an error"
+    );
+    assert!(
+        shots.contains(&"Immunization/newest".to_string()),
+        "the latest is kept"
+    );
+
+    let catalog = harness.catalog.read().unwrap();
+    let mut tx = harness.db.begin();
+    let three = crate::summary::compartment_resources(
+        &mut tx,
+        &catalog,
+        "p1",
+        "Immunization",
+        &|_| true,
+        3,
+    )
+    .unwrap();
+    assert_eq!(three.len(), 3, "no more than the limit is read");
+    assert_eq!(three[0]["id"], "newest", "and the newest come first");
+}
+
+/// `method url` of each entry of a history, newest first.
+fn history_of(harness: &Harness, path: &str, args: Value) -> Vec<String> {
+    apply(harness, path, args)["entry"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            format!(
+                "{} {}",
+                entry["request"]["method"].as_str().unwrap(),
+                entry["request"]["url"].as_str().unwrap()
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn history_by_date_lists_what_was_written_after_it_and_deletions_since_the_last_change_before() {
+    let harness = ready();
+    let create = |id: &str| {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": patient(id, true, "Ann")}),
+        )
+    };
+    // A resource made and deleted long before the moment, with writes after it and before the
+    // moment: its deletion is older than the last change before the moment, and is not listed.
+    create("z");
+    apply(&harness, "Patient/delete", json!({"id": "z"}));
+    pause();
+    create("a");
+    pause();
+    let b = create("b");
+    pause();
+    let at = moment();
+    pause();
+    create("c");
+    apply(&harness, "Patient/delete", json!({"id": "b"}));
+    pause();
+    let mut changed = apply(&harness, "Patient/read", json!({"id": "c"}));
+    changed["active"] = json!(false);
+    apply(
+        &harness,
+        "Patient/update",
+        json!({"id": "c", "resource": changed}),
+    );
+
+    // Newest first: the update of `c`, the deletion of `b`, the creation of `c`, then the first two.
+    assert_eq!(
+        history_of(&harness, "Patient/history", json!({})),
+        [
+            "PUT Patient/c",
+            "DELETE Patient/b",
+            "POST Patient/c",
+            "POST Patient/b",
+            "POST Patient/a",
+            "DELETE Patient/z",
+            "POST Patient/z"
+        ]
+    );
+    // After the moment: the two writes of `c`, and the deletion of `b`, which came in between.
+    assert_eq!(
+        history_of(&harness, "Patient/history", json!({"_since": at})),
+        ["PUT Patient/c", "DELETE Patient/b", "POST Patient/c"]
+    );
+    // The same for the whole server, and with the offset a client may write the moment with.
+    assert_eq!(
+        history_of(&harness, "system/history", json!({"_since": at})),
+        ["PUT Patient/c", "DELETE Patient/b", "POST Patient/c"]
+    );
+    // Before everything is everything; after everything is nothing.
+    assert_eq!(
+        history_of(
+            &harness,
+            "Patient/history",
+            json!({"_since": "2000-01-01T00:00:00Z"})
+        )
+        .len(),
+        7
+    );
+    assert_eq!(
+        history_of(&harness, "Patient/history", json!({"_since": "2000-01-01"})).len(),
+        7
+    );
+    assert!(history_of(
+        &harness,
+        "Patient/history",
+        json!({"_since": "2999-01-01T00:00:00Z"})
+    )
+    .is_empty());
+    // A version id, which the server's own clients give, still means what it did: inclusive.
+    let b_version = b["meta"]["versionId"].as_str().unwrap();
+    assert_eq!(
+        history_of(&harness, "Patient/history", json!({"_since": b_version})),
+        [
+            "PUT Patient/c",
+            "DELETE Patient/b",
+            "POST Patient/c",
+            "POST Patient/b"
+        ]
+    );
+    // What is not a moment is refused, and says what is.
+    for bad in ["yesterday", "2026-13-40", "2026-10-18T25:00:00Z", ""] {
+        match run_op(&harness, "Patient/history", &json!({"_since": bad})) {
+            Err(RunError::Fhir(FhirError::Invalid(message))) => {
+                assert!(message.contains("invalid _since"), "{message}")
+            }
+            other => panic!("{bad:?} should be refused, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn history_by_date_lists_a_deletion_that_came_just_before_it_rather_than_miss_one_that_came_after()
+{
+    let harness = ready();
+    let create = |id: &str| {
+        apply(
+            &harness,
+            "Patient/create",
+            json!({"resource": patient(id, true, "Ann")}),
+        )
+    };
+    create("a");
+    apply(&harness, "Patient/delete", json!({"id": "a"}));
+    pause();
+    let at = moment();
+    pause();
+    create("b");
+    // A deletion carries no time, so it cannot be told from one after the moment: the log is read
+    // from the last change that came before the moment, and the deletion is after that change.
+    assert_eq!(
+        history_of(&harness, "Patient/history", json!({"_since": at})),
+        ["POST Patient/b", "DELETE Patient/a"]
+    );
+}
+
+#[test]
+fn a_card_for_what_is_new_holds_what_was_written_since_and_nothing_else() {
+    let harness = r4_ready();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": {"resourceType": "Patient", "id": "p1", "name": [{"family": "Ann"}], "birthDate": "1990-01-01"}}),
+    );
+    let shot = |id: &str, date: &str| {
+        apply(
+            &harness,
+            "Immunization/create",
+            json!({"resource": {"resourceType": "Immunization", "id": id, "status": "completed",
+                "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "140"}]},
+                "patient": {"reference": "Patient/p1"}, "occurrenceDateTime": date}}),
+        )
+    };
+    shot("old", "2020-01-01");
+    pause();
+    let at = moment();
+    pause();
+    shot("new", "2024-05-05");
+    let dates = |since: Option<&str>| -> Vec<String> {
+        let mut parameters = vec![credential_type("Immunization")];
+        if let Some(since) = since {
+            parameters.push(json!({"name": "_since", "valueDateTime": since}));
+        }
+        let issued = apply(
+            &harness,
+            "Patient/$health-cards-issue",
+            card_args("p1", json!(parameters)),
+        );
+        issued["credentials"][0]["bundle"]["entry"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .skip(1)
+                    .map(|entry| {
+                        entry["resource"]["occurrenceDateTime"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .map(|mut found: Vec<String>| {
+                found.sort();
+                found
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(dates(None), ["2020-01-01", "2024-05-05"]);
+    assert_eq!(dates(Some(&at)), ["2024-05-05"]);
+    assert_eq!(
+        dates(Some("2000-01-01")),
+        ["2020-01-01", "2024-05-05"],
+        "a date alone is where it starts"
+    );
+    assert!(
+        dates(Some("2999-01-01T00:00:00Z")).is_empty(),
+        "nothing new is no card"
+    );
 }

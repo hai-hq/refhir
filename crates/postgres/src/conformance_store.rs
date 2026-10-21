@@ -1,10 +1,11 @@
 use postgres::Transaction;
 use refhir_persistence::{
-    plan_package_parameters, ConformanceStore, ExpansionChange, InstallError, InstallOutcome,
-    InstalledParam, NewExpansion, NewPackage, NewSearchParameter, NewStructureDefinition,
-    NewTerminology, PackageRows, ParamStatus, PendingParam, PersistError, PersistenceGlobalKey,
-    PoolGuard, StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow,
-    StoredSearchParameter, StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
+    compare_versions, not_in_packages, plan_package_parameters, superseded_package_ids,
+    ConformanceStore, ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion,
+    NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows,
+    ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, PoolGuard, RetiredParam,
+    StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow, StoredSearchParameter,
+    StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
 
 use crate::scope::Scope;
@@ -107,11 +108,21 @@ fn link_package(
     package_id: i64,
     owner: i32,
 ) -> Result<(), PersistError> {
+    try_link_package(tx, tenant, package_id, owner).map_err(definite)
+}
+
+/// [`link_package`], with the error as the database gave it, for a caller that has to tell a package
+/// that is no longer there (a foreign key violation) from any other failure.
+fn try_link_package(
+    tx: &mut Transaction<'_>,
+    tenant: i32,
+    package_id: i64,
+    owner: i32,
+) -> Result<(), postgres::Error> {
     tx.execute(
         "INSERT INTO tenant_packages (instance_id, package_id, owner) VALUES ($1, $2, $3)",
         &[&tenant, &package_id, &owner],
-    )
-    .map_err(definite)?;
+    )?;
     Ok(())
 }
 
@@ -151,75 +162,103 @@ fn sql_find_package(scope: Scope) -> String {
     }
 }
 
-fn sql_load_structure_definitions(scope: Scope) -> String {
+/// The condition for the end of a `WHERE` that already has one, leaving out the rows of the
+/// `replaced` packages.
+fn and_not_in(column: &str, replaced: &[i64]) -> String {
+    not_in_packages(column, replaced)
+        .map_or_else(String::new, |condition| format!(" AND {condition}"))
+}
+
+/// The `WHERE` of a statement that has none, leaving out the rows of the `replaced` packages.
+fn where_not_in(column: &str, replaced: &[i64]) -> String {
+    not_in_packages(column, replaced)
+        .map_or_else(String::new, |condition| format!(" WHERE {condition}"))
+}
+
+fn sql_load_structure_definitions(scope: Scope, replaced: &[i64]) -> String {
     match scope {
-        Scope::Classic => "SELECT package_id, url, type_name, kind, is_abstract, json \
-                           FROM structure_definitions ORDER BY package_id, url"
-            .into(),
+        Scope::Classic => format!(
+            "SELECT package_id, url, type_name, kind, is_abstract, json \
+             FROM structure_definitions{} ORDER BY package_id, url",
+            where_not_in("package_id", replaced)
+        ),
         Scope::Tenant(id) => format!(
             "SELECT d.package_id, d.url, d.type_name, d.kind, d.is_abstract, d.json \
              FROM tenant_packages t JOIN structure_definitions d \
                ON d.instance_id = t.owner AND d.package_id = t.package_id \
-             WHERE t.instance_id = {id} ORDER BY t.seq, d.url"
+             WHERE t.instance_id = {id}{} ORDER BY t.seq, d.url",
+            and_not_in("t.package_id", replaced)
         ),
     }
 }
 
-fn sql_load_search_parameters(scope: Scope) -> String {
+fn sql_load_search_parameters(scope: Scope, replaced: &[i64]) -> String {
     match scope {
-        Scope::Classic => "SELECT package_id, url, base, code, param_type, expression, status, json \
-                           FROM search_parameters ORDER BY package_id, base, code"
-            .into(),
+        Scope::Classic => format!(
+            "SELECT package_id, url, base, code, param_type, expression, status, json \
+             FROM search_parameters{} ORDER BY package_id, base, code",
+            where_not_in("package_id", replaced)
+        ),
         Scope::Tenant(id) => format!(
             "SELECT s.package_id, s.url, s.base, s.code, s.param_type, s.expression, s.status, s.json \
              FROM tenant_packages t JOIN search_parameters s \
                ON s.instance_id = t.instance_id AND s.package_id = t.package_id \
-             WHERE t.instance_id = {id} ORDER BY t.seq, s.base, s.code"
+             WHERE t.instance_id = {id}{} ORDER BY t.seq, s.base, s.code",
+            and_not_in("t.package_id", replaced)
         ),
     }
 }
 
-fn sql_load_terminology(scope: Scope) -> String {
+fn sql_load_terminology(scope: Scope, replaced: &[i64]) -> String {
     match scope {
-        Scope::Classic => "SELECT package_id, resource_type, url, json FROM terminology \
-                           ORDER BY package_id, url"
-            .into(),
+        Scope::Classic => format!(
+            "SELECT package_id, resource_type, url, json FROM terminology{} \
+             ORDER BY package_id, url",
+            where_not_in("package_id", replaced)
+        ),
         Scope::Tenant(id) => format!(
             "SELECT m.package_id, m.resource_type, m.url, m.json \
              FROM tenant_packages t JOIN terminology m \
                ON m.instance_id = t.owner AND m.package_id = t.package_id \
-             WHERE t.instance_id = {id} ORDER BY t.seq, m.url"
+             WHERE t.instance_id = {id}{} ORDER BY t.seq, m.url",
+            and_not_in("t.package_id", replaced)
         ),
     }
 }
 
 /// The terminology rows with the urls in `$1`, a bare url also matching its versions.
-fn sql_load_terminology_for(scope: Scope) -> String {
+fn sql_load_terminology_for(scope: Scope, replaced: &[i64]) -> String {
     match scope {
-        Scope::Classic => "SELECT package_id, resource_type, url, json FROM terminology \
-                           WHERE (url = ANY($1) OR split_part(url, '|', 1) = ANY($1)) \
-                           ORDER BY package_id, url"
-            .into(),
+        Scope::Classic => format!(
+            "SELECT package_id, resource_type, url, json FROM terminology \
+             WHERE (url = ANY($1) OR split_part(url, '|', 1) = ANY($1)){} \
+             ORDER BY package_id, url",
+            and_not_in("package_id", replaced)
+        ),
         Scope::Tenant(id) => format!(
             "SELECT m.package_id, m.resource_type, m.url, m.json \
              FROM tenant_packages t JOIN terminology m \
                ON m.instance_id = t.owner AND m.package_id = t.package_id \
-             WHERE t.instance_id = {id} \
+             WHERE t.instance_id = {id}{} \
                AND (m.url = ANY($1) OR split_part(m.url, '|', 1) = ANY($1)) \
-             ORDER BY t.seq, m.url"
+             ORDER BY t.seq, m.url",
+            and_not_in("t.package_id", replaced)
         ),
     }
 }
 
-fn sql_load_expansions(scope: Scope) -> String {
+fn sql_load_expansions(scope: Scope, replaced: &[i64]) -> String {
     match scope {
-        Scope::Classic => "SELECT package_id, url, json FROM value_set_expansion \
-                           ORDER BY package_id, url"
-            .into(),
+        Scope::Classic => format!(
+            "SELECT package_id, url, json FROM value_set_expansion{} \
+             ORDER BY package_id, url",
+            where_not_in("package_id", replaced)
+        ),
         Scope::Tenant(id) => format!(
             "SELECT e.package_id, e.url, e.json FROM tenant_packages t JOIN value_set_expansion e \
                ON e.instance_id = t.instance_id AND e.package_id = t.package_id \
-             WHERE t.instance_id = {id} ORDER BY t.seq, e.url"
+             WHERE t.instance_id = {id}{} ORDER BY t.seq, e.url",
+            and_not_in("t.package_id", replaced)
         ),
     }
 }
@@ -254,6 +293,34 @@ fn expansion_from(row: &postgres::Row) -> StoredExpansion {
 }
 
 impl PostgresPersistence {
+    /// Every package the tenant has, or the database has, the ones a newer version of the same
+    /// name has replaced included.
+    fn all_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let rows = guard
+                .client
+                .query(&sql_load_packages(self.scope), &[])
+                .map_err(definite)?;
+            Ok(rows
+                .iter()
+                .map(|row| StoredPackage {
+                    id: row.get(0),
+                    name: row.get(1),
+                    version: row.get(2),
+                    fhir_version: row.get(3),
+                })
+                .collect())
+        })
+    }
+
+    /// The ids of the packages a newer version has replaced. Their rows stay stored until
+    /// [`ConformanceStore::collect_superseded`] removes them, so a process that still serves from
+    /// the catalog it loaded before can read them by key, and every list leaves them out.
+    fn superseded_ids(&self) -> Result<Vec<i64>, PersistError> {
+        Ok(superseded_package_ids(&self.all_packages()?))
+    }
+
     /// Read `select` (a `SELECT` of a table keyed by `(package_id, url)`) a page at a time, in key
     /// order, and hand each page to `visit`. A connection is taken for the query of each page
     /// only, so none is held while `visit` works on the rows, which for a catalog load is seconds
@@ -269,9 +336,15 @@ impl PostgresPersistence {
         visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
         debug_assert!(matches!(self.scope, Scope::Classic));
-        let first = format!("{select} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
+        let replaced = self.superseded_ids()?;
+        let (wher, and) = (
+            where_not_in("package_id", &replaced),
+            and_not_in("package_id", &replaced),
+        );
+        let first =
+            format!("{select}{wher} ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}");
         let next = format!(
-            "{select} WHERE (package_id, url) > ($1, $2) \
+            "{select} WHERE (package_id, url) > ($1, $2){and} \
              ORDER BY package_id, url LIMIT {CONFORMANCE_PAGE_ROWS}"
         );
         let mut after: Option<(i64, String)> = None;
@@ -381,17 +454,6 @@ impl PostgresPersistence {
         if digest.as_deref() != Some(content) {
             return Ok(Shared::Different);
         }
-        // The copy is whole: it holds what it was built with. A tenant is not given a package that
-        // is damaged, since every tenant added later would be given it too.
-        let recorded: Option<String> = shared.get(2);
-        let found = shared_row_counts(&mut tx, package_id)?;
-        if recorded.as_deref() != Some(found.as_str()) {
-            return Err(InstallError::Persist(PersistError::Definite(format!(
-                "the shared copy of {name}@{version} is damaged: it was built with {} (definitions, \
-                 terminology, search parameters, expansions) and holds {found}",
-                recorded.as_deref().unwrap_or("no count")
-            ))));
-        }
         if let Some(row) = tx
             .query_opt(&sql_first_fhir_version(scope), &[])
             .map_err(definite)?
@@ -404,7 +466,29 @@ impl PostgresPersistence {
                 });
             }
         }
-        link_package(&mut tx, tenant, package_id, 0)?;
+        // Read before the package is linked, so that the package is not among them.
+        let (superseded, predecessors) = replaced_by(&mut tx, scope, name, version)?;
+        // The link comes before anything else of the package's rows is read: the foreign key to the
+        // package locks its row, so a tenant that gives the package up cannot remove it from under
+        // this, and one that already did makes the link fail, which is a package that is not there.
+        match try_link_package(&mut tx, tenant, package_id, 0) {
+            Ok(()) => {}
+            Err(err) if err.code() == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {
+                return Ok(Shared::Missing);
+            }
+            Err(err) => return Err(definite(err).into()),
+        }
+        // The copy is whole: it holds what it was built with. A tenant is not given a package that
+        // is damaged, since every tenant added later would be given it too.
+        let recorded: Option<String> = shared.get(2);
+        let found = shared_row_counts(&mut tx, package_id)?;
+        if recorded.as_deref() != Some(found.as_str()) {
+            return Err(InstallError::Persist(PersistError::Definite(format!(
+                "the shared copy of {name}@{version} is damaged: it was built with {} (definitions, \
+                 terminology, search parameters, expansions) and holds {found}",
+                recorded.as_deref().unwrap_or("no count")
+            ))));
+        }
         // The tenant's own search parameters, planned against what it has as an install would.
         let rows = tx
             .query(
@@ -425,7 +509,13 @@ impl PostgresPersistence {
                 json: row.get(6),
             });
         }
-        let newly_pending = insert_search_parameters(&mut tx, scope, package_id, &parameters)?;
+        let newly_pending = insert_search_parameters(
+            &mut tx,
+            scope,
+            package_id,
+            &parameters,
+            (&predecessors, &superseded),
+        )?;
         tx.execute(
             &format!(
                 "INSERT INTO value_set_expansion ({}package_id, url, json) \
@@ -562,7 +652,11 @@ impl PostgresPersistence {
         url_of: impl Fn(&T) -> String,
         visit: &mut dyn FnMut(Vec<T>) -> Result<(), PersistError>,
     ) -> Result<(), PersistError> {
+        let replaced = self.superseded_ids()?;
         for (package_id, owner) in self.tenant_packages(tenant)? {
+            if replaced.contains(&package_id) {
+                continue;
+            }
             let instance = if shared { owner } else { tenant };
             let held = format!("instance_id = {instance} AND package_id = {package_id}");
             let first = format!(
@@ -707,22 +801,12 @@ impl ConformanceStore for PostgresPersistence {
     }
 
     fn load_packages(&self) -> Result<Vec<StoredPackage>, PersistError> {
-        crate::off_runtime(|| {
-            let mut guard = self.inner.lock()?;
-            let rows = guard
-                .client
-                .query(&sql_load_packages(self.scope), &[])
-                .map_err(definite)?;
-            Ok(rows
-                .iter()
-                .map(|row| StoredPackage {
-                    id: row.get(0),
-                    name: row.get(1),
-                    version: row.get(2),
-                    fhir_version: row.get(3),
-                })
-                .collect())
-        })
+        let all = self.all_packages()?;
+        let replaced = superseded_package_ids(&all);
+        Ok(all
+            .into_iter()
+            .filter(|package| !replaced.contains(&package.id))
+            .collect())
     }
 
     fn load_structure_definition_json(
@@ -755,10 +839,11 @@ impl ConformanceStore for PostgresPersistence {
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {
         crate::off_runtime(|| {
+            let replaced = self.superseded_ids()?;
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(&sql_load_structure_definitions(self.scope), &[])
+                .query(&sql_load_structure_definitions(self.scope, &replaced), &[])
                 .map_err(definite)?;
             Ok(rows.iter().map(structure_definition_from).collect())
         })
@@ -790,10 +875,11 @@ impl ConformanceStore for PostgresPersistence {
 
     fn load_search_parameters(&self) -> Result<Vec<StoredSearchParameter>, PersistError> {
         crate::off_runtime(|| {
+            let replaced = self.superseded_ids()?;
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(&sql_load_search_parameters(self.scope), &[])
+                .query(&sql_load_search_parameters(self.scope, &replaced), &[])
                 .map_err(definite)?;
             rows.iter()
                 .map(|row| {
@@ -815,10 +901,11 @@ impl ConformanceStore for PostgresPersistence {
 
     fn load_terminology(&self) -> Result<Vec<StoredTerminology>, PersistError> {
         crate::off_runtime(|| {
+            let replaced = self.superseded_ids()?;
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(&sql_load_terminology(self.scope), &[])
+                .query(&sql_load_terminology(self.scope, &replaced), &[])
                 .map_err(definite)?;
             Ok(rows.iter().map(terminology_from).collect())
         })
@@ -855,10 +942,11 @@ impl ConformanceStore for PostgresPersistence {
             if urls.is_empty() {
                 return Ok(Vec::new());
             }
+            let replaced = self.superseded_ids()?;
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(&sql_load_terminology_for(self.scope), &[&urls])
+                .query(&sql_load_terminology_for(self.scope, &replaced), &[&urls])
                 .map_err(definite)?;
             Ok(rows.iter().map(terminology_from).collect())
         })
@@ -956,10 +1044,11 @@ impl ConformanceStore for PostgresPersistence {
 
     fn load_expansions(&self) -> Result<Vec<StoredExpansion>, PersistError> {
         crate::off_runtime(|| {
+            let replaced = self.superseded_ids()?;
             let mut guard = self.inner.lock()?;
             let rows = guard
                 .client
-                .query(&sql_load_expansions(self.scope), &[])
+                .query(&sql_load_expansions(self.scope, &replaced), &[])
                 .map_err(definite)?;
             Ok(rows.iter().map(expansion_from).collect())
         })
@@ -986,6 +1075,68 @@ impl ConformanceStore for PostgresPersistence {
                 visit,
             ),
         }
+    }
+
+    fn retired_parameters(&self) -> Result<Vec<RetiredParam>, PersistError> {
+        let replaced = self.superseded_ids()?;
+        if replaced.is_empty() {
+            return Ok(Vec::new());
+        }
+        crate::off_runtime(|| {
+            let (in_s, in_t) = (self.scope.and_in("s"), self.scope.and_in("t"));
+            let mut guard = self.inner.lock()?;
+            let rows = guard
+                .client
+                .query(
+                    &format!(
+                        "SELECT DISTINCT s.base, s.code FROM search_parameters s \
+                         WHERE {in_s}s.package_id = ANY($1) AND NOT EXISTS ( \
+                               SELECT 1 FROM search_parameters t \
+                               WHERE {in_t}t.base = s.base AND t.code = s.code \
+                                 AND NOT (t.package_id = ANY($1))) \
+                         ORDER BY s.base, s.code"
+                    ),
+                    &[&replaced],
+                )
+                .map_err(definite)?;
+            Ok(rows
+                .iter()
+                .map(|row| RetiredParam {
+                    base: row.get(0),
+                    code: row.get(1),
+                })
+                .collect())
+        })
+    }
+
+    fn collect_superseded(&self) -> Result<(), PersistError> {
+        let superseded = self.superseded_ids()?;
+        if superseded.is_empty() {
+            return Ok(());
+        }
+        // The packages the tenant shares with the others, which it gives up here and which may then
+        // be nobody's.
+        let shared: Vec<i64> = match self.scope {
+            Scope::Classic => Vec::new(),
+            Scope::Tenant(tenant) => self
+                .tenant_packages(tenant)?
+                .into_iter()
+                .filter(|(package_id, owner)| *owner == 0 && superseded.contains(package_id))
+                .map(|(package_id, _)| package_id)
+                .collect(),
+        };
+        crate::off_runtime(|| {
+            let _gate = self.gate();
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            self.fence(&mut tx)?;
+            // One transaction: the tenant's link to a shared package is what says the package has
+            // a holder, and once it is given up nothing but this removal would find the package.
+            delete_superseded(&mut tx, self.scope, &superseded)?;
+            drop_unlinked_shared(&mut tx, &shared)?;
+            tx.commit().map_err(definite)?;
+            Ok::<_, PersistError>(())
+        })
     }
 
     fn install_package(&self, package: &NewPackage) -> Result<InstallOutcome, InstallError> {
@@ -1653,8 +1804,9 @@ fn install_in_tx(
 /// A package the store already has (same name and version) takes only terminology, which is added
 /// to what it has, and expansions, which replace what it has. A package it does not have gets its
 /// definitions and search parameters too, and the search parameters are checked against the ones
-/// installed. Each call stores the rows it is given in statements of its own, so what is held at
-/// once is the rows of one call, however large the package.
+/// installed, except those of the versions of the same package it replaces, which stay stored until
+/// they are collected. Each call stores the rows it is given in statements of its own, so what is
+/// held at once is the rows of one call, however large the package.
 struct Installer<'a, 'c> {
     tx: &'a mut Transaction<'c>,
     scope: Scope,
@@ -1669,6 +1821,13 @@ struct Installer<'a, 'c> {
     expansions_cleared: bool,
     /// The most JSON text any one call was given.
     heaviest: usize,
+    /// The versions of this package that are in force, which this install replaces: their search
+    /// parameters take no part in a clash with the package's, and lend it their status when
+    /// they index the same. Empty for a package that was there before.
+    predecessors: Vec<i64>,
+    /// The packages that an earlier install replaced, whose rows are still stored: they are not
+    /// looked at when the package's search parameters are checked against what is installed.
+    superseded: Vec<i64>,
 }
 
 impl<'a, 'c> Installer<'a, 'c> {
@@ -1698,6 +1857,8 @@ impl<'a, 'c> Installer<'a, 'c> {
                 newly_pending: Vec::new(),
                 expansions_cleared: false,
                 heaviest: 0,
+                predecessors: Vec::new(),
+                superseded: Vec::new(),
             });
         }
         let current = tx
@@ -1712,6 +1873,7 @@ impl<'a, 'c> Installer<'a, 'c> {
                 });
             }
         }
+        let (superseded, predecessors) = replaced_by(tx, scope, name, version)?;
         let inserted = tx
             .query_one(
                 &format!(
@@ -1736,6 +1898,8 @@ impl<'a, 'c> Installer<'a, 'c> {
             newly_pending: Vec::new(),
             expansions_cleared: false,
             heaviest: 0,
+            predecessors,
+            superseded,
         })
     }
 
@@ -1792,7 +1956,13 @@ impl PackageRows for Installer<'_, '_> {
             return Ok(());
         }
         self.note(rows.iter().map(|row| row.json.len()).sum());
-        let pending = insert_search_parameters(self.tx, self.scope, self.package_id, rows)?;
+        let pending = insert_search_parameters(
+            self.tx,
+            self.scope,
+            self.package_id,
+            rows,
+            (&self.predecessors, &self.superseded),
+        )?;
         self.newly_pending.extend(pending);
         Ok(())
     }
@@ -1897,12 +2067,15 @@ fn insert_structure_definitions(
 
 /// Store the search parameters of a package, and say which of them wait for a backfill. What the
 /// rows already stored decide about each one (see [`plan_package_parameters`]) is read in one
-/// query for all of them, not one per parameter.
+/// query for all of them, not one per parameter. The rows of the `predecessors` packages are read as
+/// the ones the package replaces, and those of the `superseded` packages, which an earlier install
+/// replaced, are not read.
 fn insert_search_parameters(
     tx: &mut Transaction<'_>,
     scope: Scope,
     package_id: i64,
     parameters: &[NewSearchParameter],
+    (predecessors, superseded): (&[i64], &[i64]),
 ) -> Result<Vec<refhir_persistence::PendingParam>, InstallError> {
     if parameters.is_empty() {
         return Ok(Vec::new());
@@ -1912,25 +2085,32 @@ fn insert_search_parameters(
     let stored = tx
         .query(
             &format!(
-                "SELECT base, code, package_id, url, COALESCE(expression, ''), status, json \
+                "SELECT base, code, package_id, url, COALESCE(expression, ''), param_type, status, \
+                        json \
                  FROM search_parameters \
-                 WHERE {}(base, code) IN (SELECT * FROM UNNEST($1::text[], $2::text[]))",
+                 WHERE {}(base, code) IN (SELECT * FROM UNNEST($1::text[], $2::text[])) \
+                   AND NOT (package_id = ANY($3))",
                 scope.and()
             ),
-            &[&bases, &codes],
+            &[&bases, &codes, &superseded],
         )
         .map_err(definite)?
         .iter()
-        .map(|row| StoredParameterRow {
-            base: row.get(0),
-            code: row.get(1),
-            row: InstalledParam {
-                package_id: row.get(2),
-                url: row.get(3),
-                expression: row.get(4),
-                status: row.get(5),
-                json: row.get(6),
-            },
+        .map(|row| {
+            let package_id: i64 = row.get(2);
+            StoredParameterRow {
+                base: row.get(0),
+                code: row.get(1),
+                row: InstalledParam {
+                    package_id,
+                    url: row.get(3),
+                    expression: row.get(4),
+                    param_type: row.get(5),
+                    status: row.get(6),
+                    json: row.get(7),
+                    predecessor: predecessors.contains(&package_id),
+                },
+            }
         })
         .collect();
     let plan = plan_package_parameters(package_id, parameters, stored)?;
@@ -1960,6 +2140,169 @@ fn insert_search_parameters(
         insert_parameters(tx, ParameterTable::Own(scope), package_id, &rows)?;
     }
     Ok(plan.newly_pending)
+}
+
+/// What a package of this `name` and `version`, about to be stored, finds: the packages an earlier
+/// install replaced and that are still stored (superseded), and the versions of the package that
+/// the tenant has, in force, and older than `version` or ordering the same (a package of that exact
+/// version is not among them: it was found before), which this one replaces (its predecessors).
+fn replaced_by(
+    tx: &mut Transaction<'_>,
+    scope: Scope,
+    name: &str,
+    version: &str,
+) -> Result<(Vec<i64>, Vec<i64>), InstallError> {
+    let packages: Vec<StoredPackage> = tx
+        .query(&sql_load_packages(scope), &[])
+        .map_err(definite)?
+        .iter()
+        .map(|row| StoredPackage {
+            id: row.get(0),
+            name: row.get(1),
+            version: row.get(2),
+            fhir_version: row.get(3),
+        })
+        .collect();
+    let superseded = superseded_package_ids(&packages);
+    let predecessors = packages
+        .iter()
+        .filter(|package| {
+            package.name == name
+                && !superseded.contains(&package.id)
+                && compare_versions(&package.version, version).is_le()
+        })
+        .map(|package| package.id)
+        .collect();
+    Ok((superseded, predecessors))
+}
+
+/// Remove packages that newer versions replaced from the tenant, with everything they hold:
+/// definitions, search parameters, terminology, expansions, and the backfills that were queued for
+/// them.
+///
+/// Every statement is limited to the tenant's own rows. A package that every tenant shares keeps
+/// its definitions and terminology under the shared catalog (instance 0), which no tenant's
+/// statement reaches, so the tenant gives up its link to it and its own copies of what changes per
+/// tenant; [`drop_unlinked_shared`] removes the shared copy when no tenant has it.
+fn delete_superseded(
+    tx: &mut Transaction<'_>,
+    scope: Scope,
+    superseded: &[i64],
+) -> Result<(), PersistError> {
+    let and = scope.and();
+    for statement in [
+        format!("DELETE FROM search_parameters WHERE {and}package_id = ANY($1)"),
+        format!(
+            "DELETE FROM backfill_parameter WHERE {and}backfill_id IN \
+             (SELECT id FROM index_backfills WHERE {and}package_id = ANY($1))"
+        ),
+        format!("DELETE FROM index_backfills WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM value_set_expansion WHERE {and}package_id = ANY($1)"),
+    ] {
+        tx.execute(&statement, &[&superseded]).map_err(definite)?;
+    }
+    if let Scope::Tenant(tenant) = scope {
+        tx.execute(
+            &format!(
+                "DELETE FROM tenant_packages WHERE instance_id = {tenant} AND package_id = ANY($1)"
+            ),
+            &[&superseded],
+        )
+        .map_err(definite)?;
+    }
+    // The package's own rows go together with its row in the list of packages.
+    let own = [
+        format!("DELETE FROM structure_definitions WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM terminology WHERE {and}package_id = ANY($1)"),
+        format!("DELETE FROM packages WHERE {and}id = ANY($1)"),
+    ];
+    match scope {
+        Scope::Classic => {
+            for statement in &own {
+                tx.execute(statement, &[&superseded]).map_err(definite)?;
+            }
+        }
+        Scope::Tenant(_) => {
+            // A link of another tenant that still names the package stops the removal of its row
+            // with a foreign key violation. This crate never makes such a link (a tenant's own
+            // package is linked by that tenant alone) but the database permits it, and a tenant
+            // cannot see through its row policy whether there is one. Then the package's own rows
+            // stay, which that tenant reads through its link, and only they: the statements above
+            // are not undone, so this tenant has given up its link and what it held per tenant.
+            // Nothing removes the rows left once the other tenant gives the package up, since no
+            // statement of a tenant reaches another tenant's rows.
+            let mut attempt = tx.savepoint("drop_superseded").map_err(definite)?;
+            let mut kept = false;
+            for statement in &own {
+                match attempt.execute(statement, &[&superseded]) {
+                    Ok(_) => {}
+                    Err(err)
+                        if err.code()
+                            == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) =>
+                    {
+                        kept = true;
+                        break;
+                    }
+                    Err(err) => return Err(definite(err)),
+                }
+            }
+            if !kept {
+                attempt.commit().map_err(definite)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove from the catalog every tenant shares the packages in `candidates`, which this tenant
+/// has just given up, unless another tenant still has them. This tenant cannot see the others'
+/// links (its row policy hides them), so each package goes in a savepoint of its own and the
+/// foreign key from a link to the package says whether anyone still has it: then that one is
+/// undone. The last tenant to give a package up removes it.
+///
+/// A tenant that is being given the package links it before it reads anything else of it
+/// ([`PostgresPersistence::activate_shared`]), and the row is locked here before anything is
+/// removed, so the two cannot interleave: whichever comes second waits, and finds the other's
+/// outcome (a link to a package that was removed fails, and the tenant is given the package
+/// again from a copy built anew).
+fn drop_unlinked_shared(tx: &mut Transaction<'_>, candidates: &[i64]) -> Result<(), PersistError> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    // Only this transaction may write the shared catalog, and only from here on.
+    tx.batch_execute("SET LOCAL refhir.shared_writer = 'on'")
+        .map_err(definite)?;
+    for package_id in candidates {
+        let mut attempt = tx.savepoint("drop_shared").map_err(definite)?;
+        match drop_shared_package(&mut attempt, *package_id) {
+            Ok(()) => attempt.commit().map_err(definite)?,
+            Err(err) if err.code() == Some(&postgres::error::SqlState::FOREIGN_KEY_VIOLATION) => {}
+            Err(err) => return Err(definite(err)),
+        }
+    }
+    Ok(())
+}
+
+/// Remove a package from the catalog every tenant shares, with everything it holds there. Fails
+/// with a foreign key violation while a tenant has it.
+fn drop_shared_package(tx: &mut Transaction<'_>, package_id: i64) -> Result<(), postgres::Error> {
+    let held = tx.query_opt(
+        "SELECT 1 FROM packages WHERE instance_id = 0 AND id = $1 FOR UPDATE",
+        &[&package_id],
+    )?;
+    if held.is_none() {
+        return Ok(());
+    }
+    for statement in [
+        "DELETE FROM base_search_parameters WHERE package_id = $1",
+        "DELETE FROM base_expansions WHERE package_id = $1",
+        "DELETE FROM structure_definitions WHERE instance_id = 0 AND package_id = $1",
+        "DELETE FROM terminology WHERE instance_id = 0 AND package_id = $1",
+        "DELETE FROM packages WHERE instance_id = 0 AND id = $1",
+    ] {
+        tx.execute(statement, &[&package_id])?;
+    }
+    Ok(())
 }
 
 /// Where a run of search parameters goes: a tenant's (or a classic database's) own table, or the

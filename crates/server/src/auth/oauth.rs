@@ -26,69 +26,76 @@ const REFRESH_TTL: u64 = 60 * 60 * 24 * 30;
 
 pub fn configuration(app: &AppState, headers: &HeaderMap) -> Response {
     let issuer = issuer(app, headers);
-    json_response(
-        StatusCode::OK,
-        json!({
-            "issuer": issuer,
-            "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
-            "authorization_endpoint": format!("{issuer}/oauth/authorize"),
-            "token_endpoint": format!("{issuer}/oauth/token"),
-            "token_endpoint_auth_methods_supported": [
-                "client_secret_basic",
-                "client_secret_post",
-                "private_key_jwt"
-            ],
-            "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
-            "registration_endpoint": format!("{issuer}/oauth/register"),
-            "scopes_supported": [
-                "openid",
-                "profile",
-                "fhirUser",
-                "launch",
-                "launch/patient",
-                "launch/encounter",
-                "patient/*.read",
-                "patient/*.write",
-                "patient/*.rs",
-                "patient/*.cruds",
-                "user/*.read",
-                "user/*.write",
-                "user/*.rs",
-                "user/*.cruds",
-                "system/*.read",
-                "system/*.rs",
-                "system/*.cruds",
-                "offline_access",
-                "online_access"
-            ],
-            "response_types_supported": ["code"],
-            "management_endpoint": format!("{issuer}/oauth/manage"),
-            "introspection_endpoint": format!("{issuer}/oauth/introspect"),
-            "revocation_endpoint": format!("{issuer}/oauth/revoke"),
-            "code_challenge_methods_supported": ["S256"],
-            "capabilities": [
-                "launch-ehr",
-                "launch-standalone",
-                "authorize-post",
-                "client-public",
-                "client-confidential-symmetric",
-                "client-confidential-asymmetric",
-                "sso-openid-connect",
-                "context-banner",
-                "context-style",
-                "context-ehr-patient",
-                "context-ehr-encounter",
-                "context-standalone-patient",
-                "context-standalone-encounter",
-                "permission-offline",
-                "permission-online",
-                "permission-patient",
-                "permission-user",
-                "permission-v1",
-                "permission-v2"
-            ]
-        }),
-    )
+    let mut document = json!({
+        "issuer": issuer,
+        "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+        "authorization_endpoint": format!("{issuer}/oauth/authorize"),
+        "token_endpoint": format!("{issuer}/oauth/token"),
+        "token_endpoint_auth_methods_supported": [
+            "client_secret_basic",
+            "client_secret_post",
+            "private_key_jwt"
+        ],
+        "grant_types_supported": ["authorization_code", "client_credentials", "refresh_token"],
+        "registration_endpoint": format!("{issuer}/oauth/register"),
+        "scopes_supported": [
+            "openid",
+            "profile",
+            "fhirUser",
+            "launch",
+            "launch/patient",
+            "launch/encounter",
+            "patient/*.read",
+            "patient/*.write",
+            "patient/*.rs",
+            "patient/*.cruds",
+            "user/*.read",
+            "user/*.write",
+            "user/*.rs",
+            "user/*.cruds",
+            "system/*.read",
+            "system/*.rs",
+            "system/*.cruds",
+            "offline_access",
+            "online_access"
+        ],
+        "response_types_supported": ["code"],
+        "management_endpoint": format!("{issuer}/oauth/manage"),
+        "introspection_endpoint": format!("{issuer}/oauth/introspect"),
+        "revocation_endpoint": format!("{issuer}/oauth/revoke"),
+        "code_challenge_methods_supported": ["S256"],
+        "capabilities": [
+            "launch-ehr",
+            "launch-standalone",
+            "authorize-post",
+            "client-public",
+            "client-confidential-symmetric",
+            "client-confidential-asymmetric",
+            "sso-openid-connect",
+            "context-banner",
+            "context-style",
+            "context-ehr-patient",
+            "context-ehr-encounter",
+            "context-standalone-patient",
+            "context-standalone-encounter",
+            "permission-offline",
+            "permission-online",
+            "permission-patient",
+            "permission-user",
+            "permission-v1",
+            "permission-v2"
+        ]
+    });
+    // A server with a signing key issues SMART Health Cards, and says so here.
+    if app.config.health_cards.is_some() {
+        if let Some(capabilities) = document
+            .get_mut("capabilities")
+            .and_then(|capabilities| capabilities.as_array_mut())
+        {
+            capabilities.push(json!("health-cards"));
+        }
+    }
+    json_response(StatusCode::OK, document)
 }
 
 pub fn jwks(app: &AppState) -> Response {

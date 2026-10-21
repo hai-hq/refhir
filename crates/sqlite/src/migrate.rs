@@ -25,6 +25,11 @@ pub(crate) static MIGRATIONS: &[Migration] = &[
         name: "governance",
         sql: include_str!("../migrations/0002_governance.sql"),
     },
+    Migration {
+        version: 3,
+        name: "near_index",
+        sql: include_str!("../migrations/0003_near_index.sql"),
+    },
 ];
 
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -286,7 +291,7 @@ mod tests {
         }
         SqlitePersistence::open(&path).unwrap();
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         for table in [
             "usage_daily",
             "request_log",
@@ -314,7 +319,7 @@ mod tests {
         }
         let connection = Connection::open(&path).unwrap();
         let applied = read_applied(&connection).unwrap();
-        assert_eq!(applied.len(), 2);
+        assert_eq!(applied.len(), 3);
         assert_eq!(applied[0].version, 1);
         assert_eq!(applied[0].checksum, MIGRATIONS[0].checksum());
         assert_eq!(applied[1].checksum, MIGRATIONS[1].checksum());
@@ -328,7 +333,7 @@ mod tests {
         // Opening again is a read and changes nothing.
         let before = schema_version(&connection);
         SqlitePersistence::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         assert_eq!(schema_version(&connection), before);
         remove_db(&path);
     }
@@ -360,7 +365,7 @@ mod tests {
         SqlitePersistence::open(&path).unwrap();
 
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         assert_eq!(
             read_applied(&connection).unwrap()[0].checksum,
             MIGRATIONS[0].checksum()
@@ -411,7 +416,7 @@ mod tests {
         assert_eq!(migration_report(&path).unwrap().existing, Existing::Partial);
         SqlitePersistence::open(&path).unwrap();
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2]);
+        assert_eq!(versions(&connection), [1, 2, 3]);
         assert_eq!(existing(&connection).unwrap(), Existing::Complete);
         let kept: (String, i64) = connection
             .query_row(
@@ -433,7 +438,7 @@ mod tests {
             let connection = Connection::open(&path).unwrap();
             connection
                 .execute(
-                    "INSERT INTO schema_migrations (version, checksum) VALUES (3, 'from-the-future')",
+                    "INSERT INTO schema_migrations (version, checksum) VALUES (4, 'from-the-future')",
                     [],
                 )
                 .unwrap();
@@ -442,13 +447,13 @@ mod tests {
             Ok(_) => panic!("a database from a newer version was opened"),
             Err(err) => err.to_string(),
         };
-        assert!(err.contains("schema version 3"), "{err}");
+        assert!(err.contains("schema version 4"), "{err}");
         assert!(err.contains("newer ReFHIR"), "{err}");
         let report = migration_report(&path).unwrap();
         assert!(!report.can_start());
         // Nothing was written to it.
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2, 3]);
+        assert_eq!(versions(&connection), [1, 2, 3, 4]);
         remove_db(&path);
     }
 
@@ -470,7 +475,7 @@ mod tests {
         remove_db(&path);
     }
 
-    static FAILING: [Migration; 3] = [
+    static FAILING: [Migration; 4] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -483,6 +488,11 @@ mod tests {
         },
         Migration {
             version: 3,
+            name: "near_index",
+            sql: include_str!("../migrations/0003_near_index.sql"),
+        },
+        Migration {
+            version: 4,
             name: "half_done",
             // The table is created, then the second statement fails.
             sql: "CREATE TABLE half_done (x INTEGER); INSERT INTO no_such_table VALUES (1);",
@@ -495,7 +505,7 @@ mod tests {
         // transaction, so there is no state in between.
         let mut fresh = Connection::open_in_memory().unwrap();
         let err = run(&mut fresh, &FAILING).unwrap_err().to_string();
-        assert!(err.contains("migration 3 (half_done) failed"), "{err}");
+        assert!(err.contains("migration 4 (half_done) failed"), "{err}");
         assert!(err.contains("no_such_table"), "{err}");
         assert!(!table_exists(&fresh, "half_done"));
         assert!(!table_exists(&fresh, "documents"));
@@ -506,12 +516,12 @@ mod tests {
         let mut at_one = Connection::open_in_memory().unwrap();
         run(&mut at_one, MIGRATIONS).unwrap();
         assert!(run(&mut at_one, &FAILING).is_err());
-        assert_eq!(versions(&at_one), [1, 2]);
+        assert_eq!(versions(&at_one), [1, 2, 3]);
         assert!(!table_exists(&at_one, "half_done"));
         assert!(table_exists(&at_one, "documents"));
     }
 
-    static WITH_SECOND: [Migration; 3] = [
+    static WITH_SECOND: [Migration; 4] = [
         Migration {
             version: 1,
             name: "baseline",
@@ -524,6 +534,11 @@ mod tests {
         },
         Migration {
             version: 3,
+            name: "near_index",
+            sql: include_str!("../migrations/0003_near_index.sql"),
+        },
+        Migration {
+            version: 4,
             name: "probe",
             // Not idempotent: a second run is an error.
             sql: "CREATE TABLE probe (n INTEGER); INSERT INTO probe VALUES (1);",
@@ -553,7 +568,7 @@ mod tests {
             handle.join().unwrap().expect("every opener gets through");
         }
         let connection = Connection::open(&path).unwrap();
-        assert_eq!(versions(&connection), [1, 2, 3]);
+        assert_eq!(versions(&connection), [1, 2, 3, 4]);
         let rows: i64 = connection
             .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
             .unwrap();
@@ -566,8 +581,189 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         run(&mut connection, MIGRATIONS).unwrap();
         run(&mut connection, &WITH_SECOND).unwrap();
-        assert_eq!(versions(&connection), [1, 2, 3]);
+        assert_eq!(versions(&connection), [1, 2, 3, 4]);
         assert!(table_exists(&connection, "probe"));
+    }
+
+    /// A `search_parameters` row, for the near-index tests.
+    fn parameter(
+        connection: &Connection,
+        package: i64,
+        url: &str,
+        base: &str,
+        code: &str,
+        status: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT INTO search_parameters \
+                 (package_id, url, base, code, param_type, expression, status, json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, '{}')",
+                rusqlite::params![
+                    package,
+                    url,
+                    base,
+                    code,
+                    if code == "near" { "special" } else { "string" },
+                    status
+                ],
+            )
+            .unwrap();
+    }
+
+    /// (status, url) of every parameter row, in a fixed order.
+    fn statuses(connection: &Connection) -> Vec<(String, String)> {
+        let mut statement = connection
+            .prepare("SELECT status, package_id || ' ' || url FROM search_parameters ORDER BY 2, 1")
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
+
+    /// (id, package, watermark, tablet, cursor, done, claimed epoch, its parameter urls).
+    #[allow(clippy::type_complexity)]
+    fn backfills(
+        connection: &Connection,
+    ) -> Vec<(
+        i64,
+        i64,
+        i64,
+        String,
+        Option<String>,
+        i64,
+        Option<i64>,
+        Vec<String>,
+    )> {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, package_id, watermark_ts, tablet, cursor_id, done, claimed_epoch \
+                 FROM index_backfills ORDER BY id",
+            )
+            .unwrap();
+        let rows: Vec<_> = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        rows.into_iter()
+            .map(|(id, package, watermark, tablet, cursor, done, claimed): (i64, i64, i64, String, Option<String>, i64, Option<i64>)| {
+                let mut urls = connection
+                    .prepare("SELECT url FROM backfill_parameter WHERE backfill_id = ?1 ORDER BY url")
+                    .unwrap();
+                let urls = urls
+                    .query_map([id], |row| row.get(0))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                (id, package, watermark, tablet, cursor, done, claimed, urls)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_ready_near_parameter_goes_back_to_pending_with_a_backfill_for_its_type() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run(&mut connection, &MIGRATIONS[..2]).unwrap();
+        // Two packages that each carry `near` for Location, a `near` that was already pending
+        // (an install that had not finished: it has a job of its own), a parameter of another name,
+        // and a job that is half way through.
+        parameter(&connection, 1, "u/near", "Location", "near", "ready");
+        parameter(&connection, 1, "u/name", "Location", "name", "ready");
+        parameter(&connection, 2, "u/near", "Location", "near", "ready");
+        parameter(&connection, 3, "u/near", "Location", "near", "pending");
+        parameter(&connection, 3, "u/other", "Patient", "name", "pending");
+        connection
+            .execute_batch(
+                "INSERT INTO index_backfills (package_id, watermark_ts, tablet, cursor_id, done, claimed_epoch) \
+                 VALUES (3, 4, 'Location', 'l2', 0, 7); \
+                 INSERT INTO backfill_parameter (backfill_id, url) VALUES (1, 'u/near'); \
+                 INSERT INTO documents (id, ts, table_id, json_value, deleted, prev_ts) \
+                 VALUES (x'6c31', 9, x'4c', '{}', 0, NULL), (x'6c32', 12, x'4c', '{}', 0, NULL);",
+            )
+            .unwrap();
+
+        run(&mut connection, MIGRATIONS).unwrap();
+
+        // What was ready and is `near` waits for its index; nothing else changed, and nothing the
+        // migration borrowed is left.
+        let status = |status: &str, url: &str| (status.to_string(), url.to_string());
+        assert_eq!(
+            statuses(&connection),
+            [
+                status("ready", "1 u/name"),
+                status("pending", "1 u/near"),
+                status("pending", "2 u/near"),
+                status("pending", "3 u/near"),
+                status("pending", "3 u/other"),
+            ]
+        );
+        let jobs = backfills(&connection);
+        // The job that was there is as it was. One new job for each package whose `near` was
+        // ready, with the newest document as its watermark, nothing done yet, and only `near`.
+        assert_eq!(
+            jobs,
+            [
+                (
+                    1,
+                    3,
+                    4,
+                    "Location".into(),
+                    Some("l2".into()),
+                    0,
+                    Some(7),
+                    vec!["u/near".into()]
+                ),
+                (
+                    2,
+                    1,
+                    12,
+                    "Location".into(),
+                    None,
+                    0,
+                    None,
+                    vec!["u/near".into()]
+                ),
+                (
+                    3,
+                    2,
+                    12,
+                    "Location".into(),
+                    None,
+                    0,
+                    None,
+                    vec!["u/near".into()]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_database_with_no_near_parameter_is_not_touched_by_the_near_index_migration() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        run(&mut connection, &MIGRATIONS[..2]).unwrap();
+        parameter(&connection, 1, "u/name", "Location", "name", "ready");
+        run(&mut connection, MIGRATIONS).unwrap();
+        assert_eq!(
+            statuses(&connection),
+            [("ready".to_string(), "1 u/name".to_string())]
+        );
+        assert!(backfills(&connection).is_empty());
+        // And a new database, which has no parameters yet, gets nothing either.
+        let mut fresh = Connection::open_in_memory().unwrap();
+        run(&mut fresh, MIGRATIONS).unwrap();
+        assert!(statuses(&fresh).is_empty() && backfills(&fresh).is_empty());
     }
 
     #[test]

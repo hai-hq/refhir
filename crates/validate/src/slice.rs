@@ -3,13 +3,14 @@ use serde_json::Value as Json;
 use crate::primitive::type_suffix;
 use crate::schema::{DiscriminatorKind, ElementDef, SliceRules, Structure};
 
+/// The slice of `element` that `item` belongs to, with its index in the structure.
 pub fn assign<'a>(
     item: &Json,
     structure: &'a Structure,
-    path: &str,
+    element: &ElementDef,
 ) -> Option<(usize, &'a ElementDef)> {
-    let slicing = structure.base_element(path)?.slicing.as_ref()?;
-    for (index, slice) in structure.slices(path) {
+    let slicing = element.slicing.as_ref()?;
+    for (index, slice) in structure.slices_of(element) {
         if matches_slice(item, structure, index, slicing) {
             return Some((index, slice));
         }
@@ -17,12 +18,9 @@ pub fn assign<'a>(
     None
 }
 
-pub fn rules_reject_unmatched(path: &str, structure: &Structure) -> bool {
+pub fn rules_reject_unmatched(element: &ElementDef) -> bool {
     matches!(
-        structure
-            .base_element(path)
-            .and_then(|element| element.slicing.as_ref())
-            .map(|slicing| slicing.rules),
+        element.slicing.as_ref().map(|slicing| slicing.rules),
         Some(SliceRules::Closed)
     )
 }
