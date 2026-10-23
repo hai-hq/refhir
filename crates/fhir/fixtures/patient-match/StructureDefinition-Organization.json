@@ -1,0 +1,17 @@
+{
+  "resourceType": "StructureDefinition",
+  "url": "http://hl7.org/fhir/StructureDefinition/Organization",
+  "name": "Organization",
+  "status": "active",
+  "kind": "resource",
+  "abstract": false,
+  "type": "Organization",
+  "fhirVersion": "4.0.1",
+  "derivation": "specialization",
+  "snapshot": {
+    "element": [
+      {"path": "Organization", "min": 0, "max": "*"},
+      {"path": "Organization.name", "min": 0, "max": "1", "type": [{"code": "string"}]}
+    ]
+  }
+}

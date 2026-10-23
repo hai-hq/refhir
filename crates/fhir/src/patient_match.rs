@@ -61,13 +61,25 @@
 //! nothing otherwise. `count` is applied afterwards, so it cannot turn many potential matches
 //! into one.
 //!
+//! **One organization.** A store holds the Patients of every organization that uses it, and each
+//! has its `managingOrganization`. With the parameter `organization` (`Organization/id`) only the
+//! Patients of that organization are candidates, as `Patient?organization=Organization/id` finds
+//! them in a search. Everything above is then about that set: the grades, the Patients that are not
+//! in use, `onlyCertainMatches` (one organization's one certain match is returned although another
+//! organization has a certain match of the same person) and `count`. A `replaced-by` link is
+//! followed only to a Patient of the same organization, and a Patient of another is neither
+//! returned nor a way to reach one. Without the parameter every organization's Patients are
+//! compared, as before.
+//!
 //! **Where it looks.** Only this store's Patients are read. They are found through the indexes:
 //! an `identifier` search for each identifier of the request, and a `birthdate` search for its
-//! birth date. Everything else is compared in memory, on what those two found.
+//! birth date, each with the `organization` of the scope when there is one. Everything else is
+//! compared in memory, on what those two found.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use refhir_database::Transaction;
+use refhir_types::valid_id;
 use serde_json::{json, Value};
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::UnicodeNormalization;
@@ -680,17 +692,83 @@ struct Request {
     subject: Subject,
     only_certain: bool,
     count: Option<usize>,
+    /// `Organization/id`: only the Patients it is the `managingOrganization` of are looked at.
+    scope: Option<String>,
 }
 
-const PARAMETERS: &str = "resource, onlyCertainMatches and count";
+const PARAMETERS: &str = "resource, onlyCertainMatches, count and organization";
+
+/// The name of the parameter that limits the operation to one organization's Patients: the name of
+/// the search parameter that does it for a search of Patient.
+const ORGANIZATION: &str = "organization";
+
+/// The reference `text` names, as `Patient.managingOrganization.reference` is written when it points
+/// at an organization of this server: `Organization/id`. Anything else (a bare id, an absolute URL,
+/// a `#contained` reference, two references joined by a comma) is refused rather than guessed at,
+/// because a scope that matched nothing would look like an organization with no one in it.
+fn scope_of(text: &str) -> Result<String, FhirError> {
+    match text.strip_prefix("Organization/") {
+        Some(id) if valid_id(id) => Ok(text.to_string()),
+        _ => Err(invalid(format!(
+            "{ORGANIZATION} must be a reference to an organization of this server, \
+             Organization/id, and not {text:?}"
+        ))),
+    }
+}
+
+/// The text of an `organization` that was given as a `Reference` (its `reference`) or as a string.
+fn scope_text(value: &Value) -> Result<&str, FhirError> {
+    value
+        .as_str()
+        .or_else(|| value.get("reference").and_then(Value::as_str))
+        .ok_or_else(|| {
+            invalid(format!(
+                "{ORGANIZATION} must be a reference to an organization, Organization/id"
+            ))
+        })
+}
+
+/// Whether `patient` is one of the organization's: the same test a search of Patient makes for
+/// `organization=Organization/id`, which compares the reference as it is written.
+fn in_scope(patient: &Value, scope: &str) -> bool {
+    patient
+        .pointer("/managingOrganization/reference")
+        .and_then(Value::as_str)
+        == Some(scope)
+}
+
+/// Put `organizations`, the values of the `organization` query parameter of a `$match` request,
+/// into `args`, the body of the request, as if the body had given them. A second one, or one that
+/// the body gave as well, is refused: the request says which organization once.
+pub fn add_query_scope(args: &mut Value, organizations: &[String]) -> Result<(), FhirError> {
+    for organization in organizations {
+        if args.get("resourceType").and_then(Value::as_str) == Some("Parameters") {
+            // A repeated parameter is refused when the request is read.
+            let item = json!({"name": ORGANIZATION, "valueString": organization});
+            match args.get_mut("parameter").and_then(Value::as_array_mut) {
+                Some(items) => items.push(item),
+                None => args["parameter"] = json!([item]),
+            }
+        } else if let Some(object) = args.as_object_mut() {
+            if object
+                .insert(ORGANIZATION.into(), Value::String(organization.clone()))
+                .is_some()
+            {
+                return Err(invalid(format!("{ORGANIZATION} was given more than once")));
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Request {
-    /// `args` is the `Parameters` body of the HTTP request, or the same three parameters as the
-    /// members of a plain object.
+    /// `args` is the `Parameters` body of the HTTP request, or the same parameters as the members
+    /// of a plain object.
     fn from_args(args: &Value, rules: &Rules) -> Result<Request, FhirError> {
         let mut resource = None;
         let mut only_certain = None;
         let mut count = None;
+        let mut organization = None;
         let put = |name: &str, found: &mut Option<Value>, value: Value| {
             if found.replace(value).is_some() {
                 return Err(invalid(format!("{name} was given more than once")));
@@ -732,6 +810,16 @@ impl Request {
                             .find_map(|key| item.get(*key).cloned())
                             .ok_or_else(|| invalid("count needs a valueInteger"))?,
                     )?,
+                    ORGANIZATION => put(
+                        name,
+                        &mut organization,
+                        item.get("valueReference")
+                            .or_else(|| item.get("valueString"))
+                            .cloned()
+                            .ok_or_else(|| {
+                                invalid("organization needs a valueReference or a valueString")
+                            })?,
+                    )?,
                     other => {
                         return Err(invalid(format!(
                             "unknown parameter {other}: $match takes {PARAMETERS}"
@@ -745,6 +833,7 @@ impl Request {
                     "resource" => resource = Some(value.clone()),
                     "onlyCertainMatches" => only_certain = Some(value.clone()),
                     "count" => count = Some(value.clone()),
+                    ORGANIZATION => organization = Some(value.clone()),
                     // The server's own controls, which a client cannot set.
                     other if other.starts_with('_') => {}
                     other => {
@@ -775,12 +864,17 @@ impl Request {
                     .ok_or_else(|| invalid("count must be a whole number, 0 or more"))?,
             ),
         };
+        let scope = match organization {
+            None => None,
+            Some(value) => Some(scope_of(scope_text(&value)?)?),
+        };
         limit_elements(&resource, rules)?;
         let subject = Subject::read(&resource, rules)?;
         Ok(Request {
             subject,
             only_certain,
             count,
+            scope,
         })
     }
 }
@@ -821,7 +915,7 @@ fn find(
     // By id, so that a Patient reached in two ways is one match, the better of the two.
     let mut found: BTreeMap<String, Match> = BTreeMap::new();
     if request.subject.can_match() {
-        let mut candidates = Candidates::of(&request.subject);
+        let mut candidates = Candidates::of(&request.subject, request.scope.as_deref());
         while let Some(page) = candidates.next_page(tx, catalog, rules)? {
             for (id, resource) in page {
                 let standing = standing(&resource);
@@ -854,7 +948,9 @@ fn find(
                 // What the request matched is a Patient that another took the place of: the match is
                 // the one that took its place, no stronger than the rules let a link make it.
                 let (grade, score) = rules.capped(grade, score, follow.cap);
-                for (survivor, resource) in survivors(tx, catalog, &id, &resource, follow.max_hops)?
+                let hops = follow.max_hops;
+                for (survivor, resource) in
+                    survivors(tx, catalog, &id, &resource, hops, request.scope.as_deref())?
                 {
                     // What the Patient that is returned shares with the request, which is not what the
                     // replaced one did: the entry says only what it can vouch for.
@@ -993,13 +1089,16 @@ fn replaced_by_ids(patient: &Value) -> Vec<String> {
 /// The Patients in use that `replaced` (the Patient with id `own_id`) leads to by `replaced-by`
 /// links, none further than `max_hops` links away. A link that leads nowhere ends there: to a
 /// Patient that is not stored here or was deleted, that is switched off, or that is not a
-/// relative `Patient/id`. A Patient is visited once, so a cycle ends where it began.
+/// relative `Patient/id`. A Patient is visited once, so a cycle ends where it began. With a `scope`,
+/// a Patient that is not one of that organization's ends the way too, in use or not: it is not
+/// returned, and nothing is reached through it.
 fn survivors(
     tx: &mut Transaction,
     catalog: &Catalog,
     own_id: &str,
     replaced: &Value,
     max_hops: usize,
+    scope: Option<&str>,
 ) -> Result<Vec<(String, Value)>, FhirError> {
     let model = catalog.get("Patient")?;
     let mut seen = BTreeSet::from([own_id.to_string()]);
@@ -1020,6 +1119,9 @@ fn survivors(
                     }
                     Err(err) => return Err(err),
                 };
+                if scope.is_some_and(|scope| !in_scope(&patient, scope)) {
+                    continue;
+                }
                 match standing(&patient) {
                     Standing::InUse => survivors.push((id, patient)),
                     Standing::Replaced => next.push(patient),
@@ -1037,10 +1139,14 @@ fn survivors(
 
 /// The stored Patients worth comparing with the subject: those that have one of its identifiers,
 /// and those born on its birth date when it has a name to compare. They are read a page at a time
-/// and each is given once, so no more than a page of them is held, whatever the search finds.
+/// and each is given once, so no more than a page of them is held, whatever the search finds. With
+/// a scope, every search is for that organization's Patients only, so the other organizations' do
+/// not count towards the most candidates a request may compare.
 struct Candidates {
     /// `(search parameter, value)`, one search each.
     queries: Vec<(&'static str, String)>,
+    /// `Organization/id`, searched for with `organization` alongside each query.
+    scope: Option<String>,
     /// The search being read, and how far into it.
     at: usize,
     offset: usize,
@@ -1049,7 +1155,7 @@ struct Candidates {
 }
 
 impl Candidates {
-    fn of(subject: &Subject) -> Candidates {
+    fn of(subject: &Subject, scope: Option<&str>) -> Candidates {
         let mut queries: Vec<(&'static str, String)> = subject
             .identifiers
             .iter()
@@ -1060,6 +1166,7 @@ impl Candidates {
         }
         Candidates {
             queries,
+            scope: scope.map(str::to_string),
             at: 0,
             offset: 0,
             seen: BTreeSet::new(),
@@ -1077,11 +1184,14 @@ impl Candidates {
         // A page of nothing would never reach the end of a search.
         let size = rules.page.max(1);
         while let Some((parameter, value)) = self.queries.get(self.at).cloned() {
-            let params = BTreeMap::from([
+            let mut params = BTreeMap::from([
                 (parameter.to_string(), value),
                 ("_count".to_string(), size.to_string()),
                 ("_offset".to_string(), self.offset.to_string()),
             ]);
+            if let Some(scope) = &self.scope {
+                params.insert(ORGANIZATION.to_string(), scope.clone());
+            }
             let page = search::search(tx, catalog, model, &params)?;
             let mut read = 0;
             let mut fresh = Vec::new();
@@ -1179,7 +1289,14 @@ pub(crate) fn annotate_capability(statement: &mut Value) {
                 returned, and a match on one that another replaced (link type replaced-by) is the \
                 Patient that replaced it, probable at the most, with `replaced-record` evidence. With \
                 `onlyCertainMatches` true nothing is returned unless exactly one Patient is a \
-                potential match and it is certain. `count` limits the entries."
+                potential match and it is certain. `count` limits the entries. The optional \
+                `organization` parameter (a `valueReference`, or a `valueString`, \
+                `Organization/id`, or the query parameter `?organization=Organization/id`) limits \
+                the operation to the Patients whose managingOrganization is that reference, as \
+                `Patient?organization=` does in a search: the grades, `onlyCertainMatches` and \
+                `count` then apply to that organization's Patients only, and a replaced-by link is \
+                not followed to a Patient of another organization. Without it every organization's \
+                Patients are compared."
         });
         match resource.get_mut("operation").and_then(Value::as_array_mut) {
             Some(operations) => operations.push(operation),
@@ -2517,5 +2634,194 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    #[test]
+    fn the_organization_parameter_of_the_fixture_is_the_one_of_the_release() {
+        // The release's has more in it, the publisher and the dates: what a search by it does is
+        // the same.
+        let read = |dir: &std::path::Path| -> Value {
+            let file = dir.join("SearchParameter-Patient-organization.json");
+            serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap()
+        };
+        let ours = read(crate::package::patient_match_dir());
+        let release = read(crate::package::r4_dir());
+        for field in ["url", "code", "base", "type", "expression", "target"] {
+            assert_eq!(ours[field], release[field], "{field}");
+        }
+    }
+
+    fn scoped(organization: Value) -> Result<Option<String>, FhirError> {
+        let args = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": named("Okafor", &["Ada"])}, organization]});
+        Request::from_args(&args, &RULES).map(|request| request.scope)
+    }
+
+    #[test]
+    fn the_organization_is_a_reference_given_as_a_reference_or_a_string() {
+        let reference =
+            |text: &str| json!({"name": "organization", "valueReference": {"reference": text}});
+        let string = |text: &str| json!({"name": "organization", "valueString": text});
+        let expected = Some("Organization/clinic-a".to_string());
+        for given in [
+            reference("Organization/clinic-a"),
+            string("Organization/clinic-a"),
+            // A reference that says more than the reference is still the reference.
+            json!({"name": "organization", "valueReference":
+                {"reference": "Organization/clinic-a", "display": "Clinic A"}}),
+        ] {
+            assert_eq!(scoped(given.clone()).unwrap(), expected, "{given}");
+        }
+        // Nothing given is no scope.
+        let args = json!({"resource": named("Okafor", &["Ada"])});
+        assert_eq!(Request::from_args(&args, &RULES).unwrap().scope, None);
+        // An id is what FHIR says an id is, and the type is `Organization` as it is written.
+        for good in [
+            "Organization/a",
+            "Organization/A.b-1",
+            &format!("Organization/{}", "a".repeat(64)),
+        ] {
+            assert!(scoped(string(good)).is_ok(), "{good}");
+        }
+        for bad in [
+            "",
+            "clinic-a",
+            "Organization",
+            "Organization/",
+            "Organization//",
+            "Organization/a/b",
+            "Organization/a b",
+            "Organization/a,Organization/b",
+            "Organization/a|b",
+            "Organization/ä",
+            "organization/a",
+            "Patient/a",
+            "#a",
+            "urn:uuid:3f3c1d3e-5c3a-4b1d-8a52-0c9c8d7e1b11",
+            "https://example.org/Organization/a",
+            &format!("Organization/{}", "a".repeat(65)),
+        ] {
+            match scoped(string(bad)) {
+                Err(FhirError::Invalid(message)) => {
+                    assert!(message.contains("organization"), "{message}")
+                }
+                other => panic!("{bad:?}: {other:?}"),
+            }
+        }
+        // It is said once.
+        let twice = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": named("Okafor", &["Ada"])},
+            string("Organization/a"), string("Organization/a")]});
+        assert!(matches!(
+            Request::from_args(&twice, &RULES),
+            Err(FhirError::Invalid(message)) if message.contains("more than once")
+        ));
+    }
+
+    #[test]
+    fn the_organization_of_a_plain_object_is_a_string_or_a_reference() {
+        let args = |organization: Value| json!({"resource": named("Okafor", &["Ada"]), "organization": organization});
+        for given in [
+            json!("Organization/clinic-a"),
+            json!({"reference": "Organization/clinic-a"}),
+        ] {
+            let request = Request::from_args(&args(given.clone()), &RULES).unwrap();
+            assert_eq!(
+                request.scope.as_deref(),
+                Some("Organization/clinic-a"),
+                "{given}"
+            );
+        }
+        for bad in [
+            json!(1),
+            json!(null),
+            json!(["Organization/a"]),
+            json!({"id": "a"}),
+            json!("a"),
+        ] {
+            assert!(
+                Request::from_args(&args(bad.clone()), &RULES).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_query_parameter_is_put_in_the_body_as_the_parameter() {
+        let organizations =
+            |text: &[&str]| text.iter().map(|text| text.to_string()).collect::<Vec<_>>();
+        let scope = |args: &Value| Request::from_args(args, &RULES).map(|request| request.scope);
+
+        let mut args = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": named("Okafor", &["Ada"])}]});
+        add_query_scope(&mut args, &organizations(&["Organization/a"])).unwrap();
+        assert_eq!(scope(&args).unwrap().as_deref(), Some("Organization/a"));
+
+        // None is nothing added, and a body without `parameter` gets the member.
+        let mut same = args.clone();
+        add_query_scope(&mut same, &[]).unwrap();
+        assert_eq!(same, args);
+        let mut empty = json!({"resourceType": "Parameters"});
+        add_query_scope(&mut empty, &organizations(&["Organization/a"])).unwrap();
+        assert_eq!(empty["parameter"][0]["valueString"], "Organization/a");
+
+        // Said again, in the query string or in the body, is refused when the request is read, and
+        // a value that is not an organization is refused whatever way it came.
+        let mut twice = args.clone();
+        add_query_scope(&mut twice, &organizations(&["Organization/b"])).unwrap();
+        assert!(scope(&twice).is_err());
+        let mut twice = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": named("Okafor", &["Ada"])}]});
+        add_query_scope(
+            &mut twice,
+            &organizations(&["Organization/a", "Organization/b"]),
+        )
+        .unwrap();
+        assert!(scope(&twice).is_err());
+        let mut bad = json!({"resourceType": "Parameters", "parameter": [
+            {"name": "resource", "resource": named("Okafor", &["Ada"])}]});
+        add_query_scope(&mut bad, &organizations(&["a"])).unwrap();
+        assert!(scope(&bad).is_err());
+
+        // A plain object holds the name once.
+        let mut plain = json!({"resource": named("Okafor", &["Ada"])});
+        add_query_scope(&mut plain, &organizations(&["Organization/a"])).unwrap();
+        assert_eq!(scope(&plain).unwrap().as_deref(), Some("Organization/a"));
+        assert!(add_query_scope(&mut plain, &organizations(&["Organization/b"])).is_err());
+        assert!(add_query_scope(
+            &mut json!({"resource": 1, "organization": "x"}),
+            &organizations(&["Organization/b"])
+        )
+        .is_err());
+        // A body that is neither is left for the request to be refused for.
+        let mut other = json!("text");
+        add_query_scope(&mut other, &organizations(&["Organization/a"])).unwrap();
+        assert_eq!(other, json!("text"));
+    }
+
+    #[test]
+    fn a_patient_is_in_the_scope_when_its_managing_organization_is_the_reference() {
+        let patient = |reference: Value| json!({"resourceType": "Patient", "managingOrganization": reference});
+        assert!(in_scope(
+            &patient(json!({"reference": "Organization/a"})),
+            "Organization/a"
+        ));
+        for other in [
+            json!({"reference": "Organization/b"}),
+            json!({"reference": "Organization/ab"}),
+            json!({"reference": "https://example.org/Organization/a"}),
+            json!({"display": "A"}),
+            json!({"identifier": {"system": "urn:example", "value": "a"}}),
+            json!("Organization/a"),
+        ] {
+            assert!(
+                !in_scope(&patient(other.clone()), "Organization/a"),
+                "{other}"
+            );
+        }
+        assert!(!in_scope(
+            &json!({"resourceType": "Patient"}),
+            "Organization/a"
+        ));
     }
 }

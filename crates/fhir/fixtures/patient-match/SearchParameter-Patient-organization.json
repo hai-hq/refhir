@@ -1,0 +1,11 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/Patient-organization",
+  "name": "organization",
+  "status": "active",
+  "code": "organization",
+  "base": ["Patient"],
+  "type": "reference",
+  "expression": "Patient.managingOrganization",
+  "target": ["Organization"]
+}

@@ -1304,9 +1304,12 @@ async fn apply_op(
 /// of them (and refuses in them) is its answer. It reads, so a replica answers it itself. The body
 /// is JSON: the XML that `parse_body` can read does not make the Parameters this needs, and a
 /// request it answered with "resource is required" would send its sender looking in the wrong place.
+/// The one parameter that is also a query parameter is `organization`, as it is in a search of
+/// Patient: `?organization=Organization/id` is the same as the parameter of that name in the body.
 async fn match_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
+    Query(params): Query<Vec<(String, String)>>,
     body: Bytes,
 ) -> Response {
     if body.first() == Some(&b'<') {
@@ -1316,7 +1319,19 @@ async fn match_op(
             "$match takes its Parameters as JSON; XML is not supported",
         );
     }
-    terminology_op(app, resource_type, "$match", body).await
+    let mut args = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let organizations: Vec<String> = params
+        .into_iter()
+        .filter(|(name, _)| name == "organization")
+        .map(|(_, value)| value)
+        .collect();
+    if let Err(err) = refhir_fhir::add_query_scope(&mut args, &organizations) {
+        return error_response(RunError::Fhir(err));
+    }
+    terminology_call(app, resource_type, "$match", args).await
 }
 
 async fn terminology_op(app: AppState, resource_type: String, op: &str, body: Bytes) -> Response {
