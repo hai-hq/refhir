@@ -1304,9 +1304,12 @@ async fn apply_op(
 /// of them (and refuses in them) is its answer. It reads, so a replica answers it itself. The body
 /// is JSON: the XML that `parse_body` can read does not make the Parameters this needs, and a
 /// request it answered with "resource is required" would send its sender looking in the wrong place.
+/// The one parameter that is also a query parameter is `organization`, as it is in a search of
+/// Patient: `?organization=Organization/id` is the same as the parameter of that name in the body.
 async fn match_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
+    RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
     if body.first() == Some(&b'<') {
@@ -1316,7 +1319,75 @@ async fn match_op(
             "$match takes its Parameters as JSON; XML is not supported",
         );
     }
-    terminology_op(app, resource_type, "$match", body).await
+    let mut args = match parse_body(&body) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let organizations = match match_scopes(query.as_deref()) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    if let Err(response) = add_match_scope(&mut args, organizations) {
+        return response;
+    }
+    terminology_call(app, resource_type, "$match", args).await
+}
+
+/// The values of the `organization` query parameter of a `$match` request. The rest of the query
+/// string is not this operation's and is not read, so one that cannot be decoded is as harmless as
+/// it was. A name that is a form of `organization` but not `organization` (`organization:exact`, a
+/// chain, another case) is refused: it says which organization, and ignoring it would answer for all.
+fn match_scopes(query: Option<&str>) -> Result<Vec<String>, Response> {
+    let mut found = Vec::new();
+    for pair in query.unwrap_or("").split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let name = crate::auth::percent_decode(name);
+        let base = name.split([':', '.']).next().unwrap_or("");
+        if !base.eq_ignore_ascii_case("organization") {
+            continue;
+        }
+        if name != "organization" {
+            return Err(outcome(
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "$match takes organization=Organization/id, without a modifier or a chain",
+            ));
+        }
+        found.push(crate::auth::percent_decode(value));
+    }
+    Ok(found)
+}
+
+/// Put `organizations`, the values of the `organization` query parameter, into `args`, the body of
+/// the request, as if the body had given them. A repeated one is refused when the request is read,
+/// or here for a plain JSON object, which can hold the name once.
+fn add_match_scope(args: &mut Value, organizations: Vec<String>) -> Result<(), Response> {
+    for organization in organizations {
+        if args.get("resourceType").and_then(Value::as_str) == Some("Parameters") {
+            let item = json!({"name": "organization", "valueString": organization});
+            match args.get_mut("parameter") {
+                None => args["parameter"] = json!([item]),
+                // A `parameter` that is not an array is refused for that when the request is read.
+                Some(items) => {
+                    if let Some(items) = items.as_array_mut() {
+                        items.push(item);
+                    }
+                }
+            }
+        } else if let Some(object) = args.as_object_mut() {
+            if object
+                .insert("organization".into(), Value::String(organization))
+                .is_some()
+            {
+                return Err(outcome(
+                    StatusCode::BAD_REQUEST,
+                    "invalid",
+                    "organization was given more than once",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn terminology_op(app: AppState, resource_type: String, op: &str, body: Bytes) -> Response {

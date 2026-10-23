@@ -389,7 +389,8 @@ elements, no script, and some text.
 ### Finding a patient: `Patient/$match`
 
 `POST [base]/Patient/$match` takes the FHIR R4 `Parameters`: `resource` (a Patient, required),
-`onlyCertainMatches` (boolean) and `count` (integer). It answers a `searchset` Bundle, best match
+`onlyCertainMatches` (boolean) and `count` (integer), and the optional `organization` that
+[limits it to one organization's Patients](#one-organizations-patients). It answers a `searchset` Bundle, best match
 first. Each entry has `search.mode` `match`, a `search.score` from 0 to 1 and the `match-grade`
 extension (`http://hl7.org/fhir/StructureDefinition/match-grade`) on `search`:
 
@@ -504,6 +505,60 @@ a match only if exactly one Patient is a potential match (one with any grade) an
 records that carry the same identifier, or one that does and another with the same name and birth
 date, are for a person to settle. `count` limits the entries and is applied after that, so it never
 turns many potential matches into one.
+
+#### One organization's Patients
+
+One server can hold the Patients of many organizations, each with its `managingOrganization`. Left
+alone, `$match` compares the request with all of them, so a clinic that asks about a person also
+gets the same person's records at the other organizations, `count` can be used up by records that are
+not the clinic's, and `onlyCertainMatches` returns nothing for a person who is at two organizations
+that share an identifier (it is two certain matches). The optional `organization` parameter limits
+the operation to one organization, the way `organization` limits a search of Patient:
+
+```bash
+curl -s -X POST http://localhost:8080/Patient/\$match -H 'content-type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [
+    {"name": "resource", "resource": {
+      "resourceType": "Patient",
+      "identifier": [{"system": "https://boolbyte.health/fhir/NamingSystem/boolbyte-id", "value": "BB-1"}]
+    }},
+    {"name": "organization", "valueReference": {"reference": "Organization/clinic-a"}},
+    {"name": "onlyCertainMatches", "valueBoolean": true}
+  ]
+}'
+```
+
+The same limit can be given in the query string, `POST [base]/Patient/$match?organization=Organization/clinic-a`,
+with the Parameters in the body as before. The value is the reference `Organization/id`, as a
+`valueReference` (its `reference`) or as a `valueString`: a bare id, a URL, a `#contained`
+reference, several references in one value, or a reference to another type is a `400`. So is
+giving it twice, or in the query string and the body, giving both a `valueReference` and a
+`valueString`, and a form of the query parameter that is not exactly `organization`
+(`organization:exact`, `organization.name`, another case), which would otherwise be ignored.
+
+The server does not look for the Organization. It compares the reference with the one the Patients
+carry, so use that one: a reference no Patient has, a mistyped one included, is answered as a
+person who is not there is.
+
+- Only the Patients whose `managingOrganization.reference` is that reference are candidates. The
+  reference is compared as it is written, as a search does, so `Organization/clinic-a` is not
+  `Organization/clinic` or a URL that ends in it. A Patient with no `managingOrganization` is in no
+  organization's set.
+- Everything above then applies to that set alone: the grades, the Patients that are not in use,
+  `onlyCertainMatches` (a person with one certain match at the organization is returned although
+  the other organization has a certain match too) and `count`, which is applied after the limit, so
+  that another organization's records cannot take the places.
+- A `replaced-by` link is followed only to a Patient of the same organization. A Patient of another
+  is never returned and is not a way to reach one: a link that leaves the organization, even one
+  that comes back to it, leads nowhere.
+- No Patient in the set is an empty `searchset` (`total` 0), not an error, as is an organization no
+  Patient has.
+- Only the organization's Patients count towards the 20,000 below.
+- Without the parameter nothing is different: every organization's Patients are compared.
+
+The limit is a filter on what is compared and not an access check: a token that may search Patients
+may leave it out, or name any organization.
 
 A Patient with nothing to look up (no identifier with a system and a value, and no name with a full
 birth date) matches nothing, and the Bundle is empty. More than 20,000 Patients sharing an

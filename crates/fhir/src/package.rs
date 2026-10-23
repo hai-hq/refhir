@@ -42,9 +42,11 @@ pub fn extra_dir() -> &'static Path {
 }
 
 /// A small `Patient` for `$match`: the elements it compares (identifier, name, birth date, gender,
-/// telecom, contact, link) and the search parameters that find a candidate (`identifier`, `name`,
-/// `active`, `birthdate`). It stands alone, so it is not installed with `minir4_dir`, which has its
-/// own `Patient`. A test that does not need the whole release loads this instead.
+/// telecom, contact, link), the `managingOrganization` that scopes it (with a bare `Organization`
+/// for it to point at), and the search parameters that find a candidate (`identifier`, `name`,
+/// `active`, `birthdate`). It stands alone, so it is not installed with
+/// `minir4_dir`, which has its own `Patient`. A test that does not need the whole release loads
+/// this instead.
 pub fn patient_match_dir() -> &'static Path {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
