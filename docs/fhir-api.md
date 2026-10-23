@@ -531,10 +531,15 @@ curl -s -X POST http://localhost:8080/Patient/\$match -H 'content-type: applicat
 
 The same limit can be given in the query string, `POST [base]/Patient/$match?organization=Organization/clinic-a`,
 with the Parameters in the body as before. The value is the reference `Organization/id`, as a
-`valueReference` (its `reference`) or as a `valueString`, and must be the id of an organization of
-this server: a bare id, a URL, a `#contained` reference, several references in one value, or a
-reference to another type is a `400`. Giving it twice, or in the query string and the body, is a
-`400` too.
+`valueReference` (its `reference`) or as a `valueString`: a bare id, a URL, a `#contained`
+reference, several references in one value, or a reference to another type is a `400`. So is
+giving it twice, or in the query string and the body, giving both a `valueReference` and a
+`valueString`, and a form of the query parameter that is not exactly `organization`
+(`organization:exact`, `organization.name`, another case), which would otherwise be ignored.
+
+The server does not look for the Organization. It compares the reference with the one the Patients
+carry, so use that one: a reference no Patient has, a mistyped one included, is answered as a
+person who is not there is.
 
 - Only the Patients whose `managingOrganization.reference` is that reference are candidates. The
   reference is compared as it is written, as a search does, so `Organization/clinic-a` is not
@@ -549,6 +554,7 @@ reference to another type is a `400`. Giving it twice, or in the query string an
   that comes back to it, leads nowhere.
 - No Patient in the set is an empty `searchset` (`total` 0), not an error, as is an organization no
   Patient has.
+- Only the organization's Patients count towards the 20,000 below.
 - Without the parameter nothing is different: every organization's Patients are compared.
 
 The limit is a filter on what is compared and not an access check: a token that may search Patients

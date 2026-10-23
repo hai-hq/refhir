@@ -63,6 +63,14 @@ fn seeded() -> axum::Router {
     SEEDED.get_or_init(seed).clone()
 }
 
+/// Store `resources`, in order, with the ids they have.
+fn import_all(db: &Database, catalog: &RwLock<Catalog>, resources: &[Value]) {
+    for resource in resources {
+        import_resource(db, &catalog.read().unwrap(), resource)
+            .unwrap_or_else(|err| panic!("{resource}: {err}"));
+    }
+}
+
 fn seed() -> axum::Router {
     let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
     let db = Arc::new(Database::open(store.clone()).unwrap());
@@ -210,16 +218,17 @@ fn seed() -> axum::Router {
             json!([{"telecom": [phone("0802 222 3333")]}]),
         ),
     ];
-    for patient in &patients {
-        import_resource(&db, &catalog.read().unwrap(), patient)
-            .unwrap_or_else(|err| panic!("{patient}: {err}"));
-    }
+    import_all(&db, &catalog, &patients);
     // The Patients of two organizations. They are stored after the others, so that the others keep
     // their versions, and each organization before the Patients that name it.
-    for organization in ["clinic-a", "sender-b"] {
-        let organization = json!({"resourceType": "Organization", "id": organization});
-        import_resource(&db, &catalog.read().unwrap(), &organization).unwrap();
-    }
+    import_all(
+        &db,
+        &catalog,
+        &[
+            json!({"resourceType": "Organization", "id": "clinic-a"}),
+            json!({"resourceType": "Organization", "id": "sender-b"}),
+        ],
+    );
     let organized = [
         // Two organizations that hold the same person, with the one identifier of the platform they
         // share: `bola` is at both. `dayo` is at both too, and only `sender-b` has her number.
@@ -331,10 +340,7 @@ fn seed() -> axum::Router {
             "clinic-a",
         ),
     ];
-    for patient in &organized {
-        import_resource(&db, &catalog.read().unwrap(), patient)
-            .unwrap_or_else(|err| panic!("{patient}: {err}"));
-    }
+    import_all(&db, &catalog, &organized);
     let smart = Arc::new(crate::auth::SmartStore::with_defaults());
     smart.install_token("reader", &["user/Patient.read"], None);
     smart.install_token("searcher", &["user/Patient.rs"], None);
@@ -1360,10 +1366,9 @@ async fn a_replacement_in_another_organization_is_not_followed_out_of_the_scope(
     // are `clinic-a`'s, and what is between them is `sender-b`'s.
     let ring = json!({"resourceType": "Patient", "identifier": [boolbyte_id("BB-3")]});
     assert_eq!(
-        matched(ring, None, None).await,
+        matched(ring.clone(), None, None).await,
         ids_and_grades(&[("ring-c", "probable")])
     );
-    let ring = json!({"resourceType": "Patient", "identifier": [boolbyte_id("BB-3")]});
     assert!(matched_in("Organization/clinic-a", ring, None, None)
         .await
         .is_empty());
@@ -1444,6 +1449,13 @@ async fn an_organization_that_is_not_a_reference_to_one_is_a_400() {
             "a number",
             bad(json!({"name": "organization", "valueInteger": 1})),
         ),
+        (
+            "a reference and a string",
+            bad(
+                json!({"name": "organization", "valueString": "Organization/clinic-a",
+                "valueReference": {"reference": "Organization/clinic-a"}}),
+            ),
+        ),
         ("no value", bad(json!({"name": "organization"}))),
         (
             "given twice",
@@ -1496,10 +1508,21 @@ async fn the_organization_may_be_a_query_parameter_as_in_a_search() {
         ids_and_grades(&[("bola-b", "certain")])
     );
 
-    // The others of the query string are not the operation's: they set nothing, as before.
-    let reply = call("_format=json&_count=1&other=x", unscoped.clone()).await;
+    // The others of the query string are not the operation's: they set nothing, as before, and
+    // one that cannot be decoded is no more than that.
+    for query in ["_format=json&_count=1&other=x", "x=%FF&y", "%FF=1", "&&"] {
+        let reply = call(query, unscoped.clone()).await;
+        assert_eq!(reply.status, StatusCode::OK, "{query}: {}", reply.body);
+        assert_eq!(entries(&reply.body).len(), 2, "{query}");
+    }
+    // A body that is a plain JSON object holds the name once, and the query is the same as it.
+    let plain = json!({"resource": bola_by_id()});
+    let reply = call("organization=Organization/clinic-a", plain.clone()).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
-    assert_eq!(entries(&reply.body).len(), 2);
+    assert_eq!(
+        entries(&reply.body),
+        ids_and_grades(&[("bola-a", "certain")])
+    );
 
     // Said twice, in the query string or in the query string and the body, it is not served with
     // one of them: it is a malformed request.
@@ -1520,8 +1543,35 @@ async fn the_organization_may_be_a_query_parameter_as_in_a_search() {
             "organization=Organization/clinic-a",
             in_body,
         ),
+        (
+            "in the query and in a plain object",
+            "organization=Organization/clinic-a",
+            with(plain, "organization", json!("Organization/sender-b")),
+        ),
         ("an id", "organization=clinic-a", unscoped.clone()),
         ("nothing", "organization=", unscoped.clone()),
+        // A form of the name that is not the name says which organization too, and is not ignored.
+        (
+            "a modifier",
+            "organization:Organization=clinic-a",
+            unscoped.clone(),
+        ),
+        (
+            "exact",
+            "organization:exact=Organization/clinic-a",
+            unscoped.clone(),
+        ),
+        ("a chain", "organization.name=Clinic", unscoped.clone()),
+        (
+            "another case",
+            "Organization=Organization/clinic-a",
+            unscoped.clone(),
+        ),
+        (
+            "an encoded name",
+            "organization%3Aexact=Organization/clinic-a",
+            unscoped.clone(),
+        ),
         (
             "two in one",
             "organization=Organization/clinic-a,Organization/sender-b",
@@ -1536,6 +1586,22 @@ async fn the_organization_may_be_a_query_parameter_as_in_a_search() {
             reply.body
         );
         assert_eq!(reply.body["resourceType"], "OperationOutcome", "{what}");
+    }
+}
+
+#[tokio::test]
+async fn a_parameter_list_that_is_not_a_list_is_refused_for_that_with_or_without_the_query() {
+    // The query does not replace what is wrong with the body: it is the body that is refused.
+    let body = json!({"resourceType": "Parameters", "parameter": {"name": "resource"}});
+    for query in ["", "&organization=Organization/clinic-a"] {
+        let url = format!("/Patient/$match?access_token=reader{query}");
+        let reply = send(&seeded(), "POST", &url, Some(body.clone()), None).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");
+        let diagnostics = reply.body["issue"][0]["diagnostics"].as_str().unwrap();
+        assert!(
+            diagnostics.contains("must be an array"),
+            "{query}: {diagnostics}"
+        );
     }
 }
 

@@ -55,7 +55,6 @@ pub use package::{
     run_backfills, sdc_dir, stage_package_dir, version_clash_dir, watch_catalog, CatalogWatcher,
     R4_CORE_PACKAGE, SDC_PACKAGE,
 };
-pub use patient_match::add_query_scope;
 pub use prepared::{install_prepared, write_prepared, PreparedBundle, BUNDLE_FILE};
 pub use refhir_persistence::ConformanceStore;
 pub use run::{
