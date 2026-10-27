@@ -185,13 +185,15 @@ fn a_burst_is_announced_a_few_times_and_ends_with_an_announcement_after_its_last
         300,
         "the watermark is exact whatever is announced"
     );
-    // Announcements are about an interval apart: a listener that looks every 20 ms sees each one
-    // up to that much late, so this allows half an interval of slack and still fails on a storm.
-    for pair in heard.windows(2) {
+    // Announcements are sent an interval apart, but one can be delivered late: its commit waits
+    // behind the burst's own commits. A late one makes its gap short and the next one's long, so
+    // a pair of them proves nothing; four in a row span three intervals less one delivery's
+    // delay. Allowing a whole interval for that still fails on a storm.
+    for run in heard.windows(4) {
         assert!(
-            pair[1].duration_since(pair[0]) >= interval / 2,
-            "two announcements {:?} apart",
-            pair[1].duration_since(pair[0])
+            run[3].duration_since(run[0]) >= interval * 2,
+            "four announcements within {:?}",
+            run[3].duration_since(run[0])
         );
     }
     // And then it is quiet.
@@ -313,12 +315,14 @@ fn an_announcement_that_could_not_be_sent_is_sent_when_the_connection_is_back() 
         "a leading and a trailing announcement"
     );
 
-    // The connection goes away without the thread being told, as a link a NAT forgot would.
+    // The connection goes away without the thread being told, as a link a NAT forgot would. On a
+    // slow machine both publishes can be the first of a burst, announced with their commits, and
+    // the thread has not sent anything: its connection's last query is then the one that set it up.
     let ended: i64 = client(&url)
         .query_one(
             "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
              WHERE datname = current_database() AND pid <> pg_backend_pid() \
-               AND query = 'NOTIFY refhir_published'",
+               AND query IN ('NOTIFY refhir_published', 'SET statement_timeout = ''5s''')",
             &[],
         )
         .unwrap()
