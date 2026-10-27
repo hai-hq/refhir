@@ -12,19 +12,29 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
-- **`Patient/$match` can be limited to one organization.** One server holds many organizations'
-  Patients, and `$match` compared the request with all of them: a clinic that asked about a person
-  also got the same person's records at the other organizations, `count` could be filled by records
-  that were not the clinic's, and `onlyCertainMatches` returned nothing for a person at two
-  organizations that share an identifier, which is two certain matches. The new optional
-  `organization` parameter, `Organization/id` as a `valueReference` or `valueString` in the
-  `Parameters` or as the query parameter `?organization=Organization/id`, makes only the Patients
-  whose `managingOrganization` is that reference candidates, as `Patient?organization=` does in a
-  search. The grades, `onlyCertainMatches` and `count` then apply to that set alone, and a
-  `replaced-by` link is not followed to a Patient of another organization, nor through one. A value
-  that is not `Organization/id`, or one given twice, is a `400`; an organization with no match is an
-  empty `searchset`. Without it nothing changes, and the CapabilityStatement says so with the other
-  `$match` notes. See [FHIR API](docs/fhir-api.md#one-organizations-patients).
+- **`Patient/$match` can be limited to one organization, by the Patient sent.** One server holds
+  many organizations' Patients, and `$match` compared the request with all of them: a clinic that
+  asked about a person also got the same person's records at the other organizations, `count` could
+  be filled by records that were not the clinic's, and `onlyCertainMatches` returned nothing for a
+  person at two organizations that share an identifier, which is two certain matches. R4 gives
+  `$match` no parameter for it, so the Patient in `resource` says it: when it has a
+  `managingOrganization` (`Organization/id`), only the Patients whose `managingOrganization` is that
+  reference are candidates, as `Patient?organization=` finds them in a search. The grades,
+  `onlyCertainMatches` and `count` then apply to that set alone, and a `replaced-by` link is not
+  followed to a Patient of another organization, nor through one. The `managingOrganization` is not
+  compared: it is no evidence and changes no grade or score. One that is not `Organization/id` (a
+  URL, a `#contained` reference, only an `identifier`) is a `400`; an organization with no match is
+  an empty `searchset`; without one nothing changes, and the CapabilityStatement says so with the
+  other `$match` notes. `$match` still takes only `resource`, `onlyCertainMatches` and `count`.
+  See [FHIR API](docs/fhir-api.md#one-organizations-patients).
+
+### Changed
+
+- **`Patient/$match` reads the `managingOrganization` of the Patient sent.** In 0.0.3 it was ignored
+  and every organization's Patients were compared. Now a `managingOrganization` of `Organization/id`
+  limits the answer to that organization's Patients, and one that is not (an absolute URL, a
+  `#contained` reference, only an `identifier` or a `display`) is a `400`. A caller that sends a
+  stored Patient as `resource` should leave the element out to compare with every organization.
 
 ## [0.0.3] - 2026-10-21
 
