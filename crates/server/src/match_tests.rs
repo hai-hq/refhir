@@ -1083,10 +1083,14 @@ async fn the_capability_statement_lists_the_operation() {
     );
     let documentation = found["documentation"].as_str().unwrap();
     assert!(documentation.contains("onlyCertainMatches"));
-    // The parameter that limits it to one organization, in the body and in the query string.
-    assert!(documentation.contains("`organization`"), "{documentation}");
+    // The managingOrganization of the Patient sent limits it to one organization's Patients, and
+    // there is no parameter of its own for that.
     assert!(
-        documentation.contains("?organization=Organization/id"),
+        documentation.contains("`managingOrganization` of the Patient in `resource`"),
+        "{documentation}"
+    );
+    assert!(
+        !documentation.contains("?organization=Organization/id"),
         "{documentation}"
     );
     // And only Patient has it.
@@ -1147,16 +1151,14 @@ async fn it_needs_a_token_that_may_search_patients() {
     assert!(!own.body.to_string().contains("PRF-1001"));
 }
 
-/// `body` with the parameter `organization`, given as a reference.
+/// `body`, the Parameters of `parameters`, with the Patient in it as the Patient of `organization`
+/// (`Organization/id`): the way the operation is told whose Patients to compare with.
 fn in_organization(mut body: Value, organization: &str) -> Value {
-    body["parameter"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!({"name": "organization", "valueReference": {"reference": organization}}));
+    body["parameter"][0]["resource"]["managingOrganization"] = json!({"reference": organization});
     body
 }
 
-/// `$match` limited to one organization, answered: the id and the grade of each entry, in order.
+/// `$match` for the Patient of one organization, answered: the id and the grade of each entry, in order.
 async fn matched_in(
     organization: &str,
     patient: Value,
@@ -1186,7 +1188,7 @@ fn bola_by_id() -> Value {
 }
 
 #[tokio::test]
-async fn without_an_organization_the_patients_of_every_organization_are_compared() {
+async fn without_a_managing_organization_the_patients_of_every_organization_are_compared() {
     // The same person at two organizations is two matches: by the identifier they share, and by
     // what they have in common otherwise.
     assert_eq!(
@@ -1202,7 +1204,7 @@ async fn without_an_organization_the_patients_of_every_organization_are_compared
 }
 
 #[tokio::test]
-async fn an_organization_limits_the_candidates_to_its_own_patients() {
+async fn the_managing_organization_limits_the_candidates_to_its_own_patients() {
     for (organization, own) in [("clinic-a", "bola-a"), ("sender-b", "bola-b")] {
         let reference = format!("Organization/{organization}");
         // By the identifier, which is an `identifier` search, and by the birth date, which is a
@@ -1222,7 +1224,7 @@ async fn an_organization_limits_the_candidates_to_its_own_patients() {
         let found = matched_in(&reference, both, None, None).await;
         assert_eq!(found, ids_and_grades(&[(own, "certain")]), "{organization}");
     }
-    // The record that is returned is the whole of the Patient, as it is without the parameter.
+    // The record that is returned is the whole of the Patient, as it is without a scope.
     let reply = post_match(
         "reader",
         in_organization(
@@ -1236,6 +1238,31 @@ async fn an_organization_limits_the_candidates_to_its_own_patients() {
         "Organization/clinic-a"
     );
     assert_eq!(reply.body["entry"][0]["search"]["score"], 1.0);
+}
+
+#[tokio::test]
+async fn the_managing_organization_is_no_evidence_and_changes_no_grade_or_score() {
+    // What is sent is the same Patient with and without it; the entry for the organization's own
+    // record has the same score and the same evidence, and none of it names the organization.
+    for request in [bola_by_id(), bola()] {
+        let unscoped = post_match("reader", parameters(request.clone(), None, None)).await;
+        let scoped = post_match(
+            "reader",
+            in_organization(parameters(request, None, None), "Organization/clinic-a"),
+        )
+        .await;
+        assert_eq!(scoped.status, StatusCode::OK, "{}", scoped.body);
+        let own = unscoped.body["entry"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["resource"]["id"] == "bola-a")
+            .unwrap();
+        assert_eq!(scoped.body["entry"][0]["search"], own["search"]);
+        for evidence in evidence(&scoped.body["entry"][0]) {
+            assert!(!evidence.contains("rganization"), "{evidence}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -1275,7 +1302,7 @@ async fn an_organization_with_no_match_is_an_empty_searchset() {
 
 #[tokio::test]
 async fn only_certain_matches_is_decided_among_the_organizations_patients() {
-    // Two certain matches without the parameter, and so nothing for the flag; with it, the
+    // Two certain matches without a scope, and so nothing for the flag; with one, the
     // organization's one record.
     assert!(matched(bola_by_id(), Some(true), None).await.is_empty());
     for (organization, own) in [("clinic-a", "bola-a"), ("sender-b", "bola-b")] {
@@ -1335,7 +1362,7 @@ async fn count_is_applied_to_the_organizations_patients() {
 
 #[tokio::test]
 async fn a_replacement_in_another_organization_is_not_followed_out_of_the_scope() {
-    // `merge-a` of `clinic-a` was replaced by `merge-b` of `sender-b`. Without the parameter the
+    // `merge-a` of `clinic-a` was replaced by `merge-b` of `sender-b`. Without a scope the
     // person is found at `sender-b`. Limited to `clinic-a` the link leaves the organization, and
     // limited to `sender-b` the record that has the identifier is not a candidate.
     let by_identifier = json!({"resourceType": "Patient", "identifier": [boolbyte_id("BB-2")]});
@@ -1386,7 +1413,7 @@ async fn a_replacement_in_another_organization_is_not_followed_out_of_the_scope(
     );
     assert_eq!(evidence(&reply.body["entry"][0]), ["name", "birth-date"]);
 
-    // A link inside the organization is followed as it is without the parameter.
+    // A link inside the organization is followed as it is without a scope.
     let own = json!({"resourceType": "Patient", "identifier": [boolbyte_id("BB-4")]});
     for found in [
         matched(own.clone(), None, None).await,
@@ -1405,187 +1432,156 @@ async fn a_replacement_in_another_organization_is_not_followed_out_of_the_scope(
     );
 }
 
+/// `$match` with the text `body`, answered with the status and the OperationOutcome.
+async fn refused(body: String) -> (StatusCode, Value) {
+    let (status, reply) = send_text(
+        &seeded(),
+        "POST",
+        "/Patient/$match?access_token=reader",
+        &body,
+        &[("content-type", "application/fhir+json")],
+    )
+    .await;
+    let outcome: Value = serde_json::from_str(&reply).unwrap_or_else(|_| panic!("{reply}"));
+    (status, outcome)
+}
+
 #[tokio::test]
-async fn an_organization_that_is_not_a_reference_to_one_is_a_400() {
-    let resource = json!({"name": "resource", "resource": bola_by_id()});
-    let bad = |organization: Value| {
-        json!({"resourceType": "Parameters", "parameter": [resource, organization]}).to_string()
+async fn a_managing_organization_that_is_not_a_reference_to_one_is_a_400() {
+    let sent = |managing: Value| {
+        parameters(
+            with(bola_by_id(), "managingOrganization", managing),
+            None,
+            None,
+        )
+        .to_string()
     };
-    let given = |reference: &str| json!({"name": "organization", "valueReference": {"reference": reference}});
-    let text = |text: &str| json!({"name": "organization", "valueString": text});
+    let given = |reference: &str| sent(json!({"reference": reference}));
     let bad_bodies = [
-        ("an id and not a reference", bad(text("clinic-a"))),
-        ("a reference to nobody", bad(text("Organization/"))),
-        ("an empty string", bad(text(""))),
-        ("an id with a space", bad(given("Organization/clinic a"))),
+        ("an id and not a reference", given("clinic-a")),
+        ("a reference to nobody", given("Organization/")),
+        ("an empty string", given("")),
+        ("an id with a space", given("Organization/clinic a")),
         (
             "an id of 65 characters",
-            bad(given(&format!("Organization/{}", "a".repeat(65)))),
+            given(&format!("Organization/{}", "a".repeat(65))),
         ),
         (
             "an id with a slash",
-            bad(given("Organization/clinic-a/_history/1")),
+            given("Organization/clinic-a/_history/1"),
         ),
         (
             "two organizations",
-            bad(given("Organization/clinic-a,Organization/sender-b")),
+            given("Organization/clinic-a,Organization/sender-b"),
         ),
-        ("a reference to a Patient", bad(given("Patient/bola-a"))),
+        ("a reference to a Patient", given("Patient/bola-a")),
         (
             "another type's name in lower case",
-            bad(given("organization/clinic-a")),
+            given("organization/clinic-a"),
         ),
         (
             "a URL",
-            bad(given("https://example.org/fhir/Organization/clinic-a")),
+            given("https://example.org/fhir/Organization/clinic-a"),
         ),
-        ("a contained reference", bad(given("#clinic-a"))),
+        ("a contained reference", given("#clinic-a")),
         (
             "a reference that is an identifier",
-            bad(json!({"name": "organization", "valueReference":
-                {"identifier": {"system": "urn:example", "value": "clinic-a"}}})),
+            sent(json!({"identifier": {"system": "urn:example", "value": "clinic-a"}})),
         ),
         (
-            "a number",
-            bad(json!({"name": "organization", "valueInteger": 1})),
+            "a display and nothing else",
+            sent(json!({"display": "Clinic A"})),
         ),
-        (
-            "a reference and a string",
-            bad(
-                json!({"name": "organization", "valueString": "Organization/clinic-a",
-                "valueReference": {"reference": "Organization/clinic-a"}}),
-            ),
-        ),
-        ("no value", bad(json!({"name": "organization"}))),
-        (
-            "given twice",
-            json!({"resourceType": "Parameters", "parameter": [
-                resource, given("Organization/clinic-a"), given("Organization/clinic-a")]})
-            .to_string(),
-        ),
+        ("an empty reference", sent(json!({}))),
     ];
     for (what, body) in bad_bodies {
-        let (status, reply) = send_text(
-            &seeded(),
-            "POST",
-            "/Patient/$match?access_token=reader",
-            &body,
-            &[("content-type", "application/fhir+json")],
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {reply}");
-        let outcome: Value =
-            serde_json::from_str(&reply).unwrap_or_else(|_| panic!("{what}: {reply}"));
+        let (status, outcome) = refused(body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {outcome}");
         assert_eq!(outcome["resourceType"], "OperationOutcome", "{what}");
+        assert_eq!(outcome["issue"][0]["code"], "invalid", "{what}");
         let diagnostics = outcome["issue"][0]["diagnostics"].as_str().unwrap_or("");
-        assert!(diagnostics.contains("organization"), "{what}: {reply}");
+        assert!(
+            diagnostics.contains("managingOrganization"),
+            "{what}: {outcome}"
+        );
     }
 }
 
 #[tokio::test]
-async fn the_organization_may_be_a_query_parameter_as_in_a_search() {
-    let call = |query: &str, body: Value| {
-        let url = format!("/Patient/$match?access_token=reader&{query}");
-        async move { send(&seeded(), "POST", &url, Some(body), None).await }
-    };
-    let unscoped = parameters(bola_by_id(), None, None);
-    for (query, own) in [
-        ("organization=Organization/clinic-a", "bola-a"),
-        ("organization=Organization%2Fsender-b", "bola-b"),
+async fn an_organization_is_not_a_parameter() {
+    // The scope is the Patient sent, so a parameter of that name is one that $match does not take,
+    // and is refused as any other is, whatever its value, and whether or not it agrees with the
+    // Patient.
+    let resource = json!({"name": "resource", "resource": bola_by_id()});
+    for (what, organization) in [
+        (
+            "a reference",
+            json!({"name": "organization", "valueReference": {"reference": "Organization/clinic-a"}}),
+        ),
+        (
+            "a string",
+            json!({"name": "organization", "valueString": "Organization/clinic-a"}),
+        ),
+        ("no value", json!({"name": "organization"})),
     ] {
-        let reply = call(query, unscoped.clone()).await;
-        assert_eq!(reply.status, StatusCode::OK, "{query}: {}", reply.body);
-        assert_eq!(entries(&reply.body), ids_and_grades(&[(own, "certain")]));
-    }
-    // It is the parameter of the same name: the flag and the count are applied after it.
-    let counted = parameters(bola(), Some(true), Some(1));
-    let reply = call("organization=Organization/clinic-a", counted).await;
-    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
-    assert!(entries(&reply.body).is_empty());
-    let reply = call("organization=Organization/sender-b", unscoped.clone()).await;
-    assert_eq!(
-        entries(&reply.body),
-        ids_and_grades(&[("bola-b", "certain")])
-    );
-
-    // The others of the query string are not the operation's: they set nothing, as before, and
-    // one that cannot be decoded is no more than that.
-    for query in ["_format=json&_count=1&other=x", "x=%FF&y", "%FF=1", "&&"] {
-        let reply = call(query, unscoped.clone()).await;
-        assert_eq!(reply.status, StatusCode::OK, "{query}: {}", reply.body);
-        assert_eq!(entries(&reply.body).len(), 2, "{query}");
-    }
-    // A body that is a plain JSON object holds the name once, and the query is the same as it.
-    let plain = json!({"resource": bola_by_id()});
-    let reply = call("organization=Organization/clinic-a", plain.clone()).await;
-    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
-    assert_eq!(
-        entries(&reply.body),
-        ids_and_grades(&[("bola-a", "certain")])
-    );
-
-    // Said twice, in the query string or in the query string and the body, it is not served with
-    // one of them: it is a malformed request.
-    let in_body = in_organization(unscoped.clone(), "Organization/clinic-a");
-    for (what, query, body) in [
-        (
-            "twice in the query",
-            "organization=Organization/clinic-a&organization=Organization/sender-b",
-            unscoped.clone(),
-        ),
-        (
-            "the same twice",
-            "organization=Organization/clinic-a&organization=Organization/clinic-a",
-            unscoped.clone(),
-        ),
-        (
-            "in the query and in the body",
-            "organization=Organization/clinic-a",
-            in_body,
-        ),
-        (
-            "in the query and in a plain object",
-            "organization=Organization/clinic-a",
-            with(plain, "organization", json!("Organization/sender-b")),
-        ),
-        ("an id", "organization=clinic-a", unscoped.clone()),
-        ("nothing", "organization=", unscoped.clone()),
-        // A form of the name that is not the name says which organization too, and is not ignored.
-        (
-            "a modifier",
-            "organization:Organization=clinic-a",
-            unscoped.clone(),
-        ),
-        (
-            "exact",
-            "organization:exact=Organization/clinic-a",
-            unscoped.clone(),
-        ),
-        ("a chain", "organization.name=Clinic", unscoped.clone()),
-        (
-            "another case",
-            "Organization=Organization/clinic-a",
-            unscoped.clone(),
-        ),
-        (
-            "an encoded name",
-            "organization%3Aexact=Organization/clinic-a",
-            unscoped.clone(),
-        ),
-        (
-            "two in one",
-            "organization=Organization/clinic-a,Organization/sender-b",
-            unscoped.clone(),
-        ),
-    ] {
-        let reply = call(query, body).await;
+        let body = json!({"resourceType": "Parameters", "parameter": [resource, organization]});
+        let (status, outcome) = refused(body.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {outcome}");
         assert_eq!(
-            reply.status,
-            StatusCode::BAD_REQUEST,
-            "{what}: {}",
-            reply.body
+            outcome["issue"][0]["diagnostics"],
+            "unknown parameter organization: $match takes resource, onlyCertainMatches and count",
+            "{what}"
         );
-        assert_eq!(reply.body["resourceType"], "OperationOutcome", "{what}");
+    }
+    // The same in a plain object, which holds the three parameters as members.
+    let (status, outcome) = refused(
+        json!({"resource": bola_by_id(), "organization": "Organization/clinic-a"}).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{outcome}");
+    assert!(
+        outcome["issue"][0]["diagnostics"]
+            .as_str()
+            .unwrap()
+            .starts_with("unknown parameter organization"),
+        "{outcome}"
+    );
+    // And a query parameter is not a way to say it either: it is refused too, not ignored, which
+    // would answer for every organization. Any other query parameter is ignored, as before.
+    for (query, status, entries_found) in [
+        (
+            "organization=Organization/clinic-a",
+            StatusCode::BAD_REQUEST,
+            0,
+        ),
+        (
+            "organization=Organization%2Fsender-b",
+            StatusCode::BAD_REQUEST,
+            0,
+        ),
+        ("organization", StatusCode::BAD_REQUEST, 0),
+        ("_format=json&organization%3D=x&other=1", StatusCode::OK, 2),
+        ("_format=json&other=organization", StatusCode::OK, 2),
+    ] {
+        let url = format!("/Patient/$match?access_token=reader&{query}");
+        let reply = send(
+            &seeded(),
+            "POST",
+            &url,
+            Some(parameters(bola_by_id(), None, None)),
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, status, "{query}: {}", reply.body);
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(
+                reply.body["issue"][0]["diagnostics"],
+                "unknown parameter organization: $match takes resource, onlyCertainMatches and count",
+                "{query}"
+            );
+        } else {
+            assert_eq!(entries(&reply.body).len(), entries_found, "{query}");
+        }
     }
 }
 
@@ -1593,7 +1589,7 @@ async fn the_organization_may_be_a_query_parameter_as_in_a_search() {
 async fn a_parameter_list_that_is_not_a_list_is_refused_for_that_with_or_without_the_query() {
     // The query does not replace what is wrong with the body: it is the body that is refused.
     let body = json!({"resourceType": "Parameters", "parameter": {"name": "resource"}});
-    for query in ["", "&organization=Organization/clinic-a"] {
+    for query in ["", "&_format=json"] {
         let url = format!("/Patient/$match?access_token=reader{query}");
         let reply = send(&seeded(), "POST", &url, Some(body.clone()), None).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{query}");

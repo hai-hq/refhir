@@ -62,14 +62,16 @@
 //! into one.
 //!
 //! **One organization.** A store holds the Patients of every organization that uses it, and each
-//! has its `managingOrganization`. With the parameter `organization` (`Organization/id`) only the
-//! Patients of that organization are candidates, as `Patient?organization=Organization/id` finds
-//! them in a search. Everything above is then about that set: the grades, the Patients that are not
-//! in use, `onlyCertainMatches` (one organization's one certain match is returned although another
-//! organization has a certain match of the same person) and `count`. A `replaced-by` link is
-//! followed only to a Patient of the same organization, and a Patient of another is neither
-//! returned nor a way to reach one. Without the parameter every organization's Patients are
-//! compared, as before.
+//! has its `managingOrganization`. When the Patient sent in `resource` has one
+//! (`Organization/id`), only the Patients of that organization are candidates, as
+//! `Patient?organization=Organization/id` finds them in a search. Everything above is then about
+//! that set: the grades, the Patients that are not in use, `onlyCertainMatches` (one organization's
+//! one certain match is returned although another organization has a certain match of the same
+//! person) and `count`. A `replaced-by` link is followed only to a Patient of the same
+//! organization, and a Patient of another is neither returned nor a way to reach one. The
+//! `managingOrganization` limits the candidates and is not compared: it is no evidence and changes
+//! no grade or score. Without one every organization's Patients are compared, as before; one that
+//! is not `Organization/id` is refused.
 //!
 //! **Where it looks.** Only this store's Patients are read. They are found through the indexes:
 //! an `identifier` search for each identifier of the request, and a `birthdate` search for its
@@ -693,41 +695,37 @@ struct Request {
     subject: Subject,
     only_certain: bool,
     count: Option<usize>,
-    /// `Organization/id`: only the Patients it is the `managingOrganization` of are looked at.
+    /// `Organization/id`, the `managingOrganization` of the Patient in `resource`: only the Patients
+    /// it is the `managingOrganization` of are looked at.
     scope: Option<String>,
 }
 
-const PARAMETERS: &str = "resource, onlyCertainMatches, count and organization";
+const PARAMETERS: &str = "resource, onlyCertainMatches and count";
 
-/// The name of the parameter that limits the operation to one organization's Patients: the name of
-/// the search parameter that does it for a search of Patient.
-const ORGANIZATION: &str = "organization";
-
-/// The reference `text` names, as `Patient.managingOrganization.reference` is written when it points
-/// at an organization of this server: `Organization/id`. Anything else (a bare id, an absolute URL,
-/// a `#contained` reference, two references joined by a comma) is refused rather than guessed at,
-/// because a scope that matched nothing would look like an organization with no one in it. The
+/// The organization the Patient sent in `resource` belongs to, as `Organization/id`, which is how
+/// the operation is limited to one organization's Patients without a parameter of its own: no
+/// `managingOrganization` is no scope. A `managingOrganization` that is not a reference to an
+/// organization of this server (an absolute URL, a `#contained` reference, a bare id, one with only
+/// an identifier or a display) is refused rather than guessed at: the request would be answered for
+/// every organization, which is what the sender of a `managingOrganization` did not ask for. The
 /// text is not in the message: it is whatever the caller sent, and error text is logged.
-fn scope_of(text: &str) -> Result<String, FhirError> {
-    match text.strip_prefix("Organization/") {
-        Some(id) if valid_id(id) => Ok(text.to_string()),
-        _ => Err(invalid(format!(
-            "{ORGANIZATION} must be a reference to an organization of this server, Organization/id"
-        ))),
+fn scope_of(patient: &Value) -> Result<Option<String>, FhirError> {
+    let Some(managing) = patient.get("managingOrganization") else {
+        return Ok(None);
+    };
+    let id = managing
+        .get("reference")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("Organization/"))
+        .filter(|id| valid_id(id));
+    match id {
+        Some(id) => Ok(Some(format!("Organization/{id}"))),
+        None => Err(invalid(
+            "Patient.managingOrganization must be a reference to an organization of this server, \
+             Organization/id, for $match to compare with that organization's Patients; leave it \
+             out to compare with every organization's",
+        )),
     }
-}
-
-/// The text of an `organization` that was given as a `Reference` (its `reference`) or as a string.
-fn scope_text(value: &Value) -> Result<&str, FhirError> {
-    value
-        .as_str()
-        .or_else(|| value.get("reference").and_then(Value::as_str))
-        .ok_or_else(|| {
-            invalid(format!(
-                "{ORGANIZATION} needs the reference of an organization, Organization/id, \
-                 as a valueReference's reference or as a valueString"
-            ))
-        })
 }
 
 /// Whether `patient` is one of the organization's: its `managingOrganization` is the reference,
@@ -741,13 +739,12 @@ fn in_scope(patient: &Value, scope: &str) -> bool {
 }
 
 impl Request {
-    /// `args` is the `Parameters` body of the HTTP request, or the same parameters as the members
-    /// of a plain object.
+    /// `args` is the `Parameters` body of the HTTP request, or the same three parameters as the
+    /// members of a plain object.
     fn from_args(args: &Value, rules: &Rules) -> Result<Request, FhirError> {
         let mut resource = None;
         let mut only_certain = None;
         let mut count = None;
-        let mut organization = None;
         let put = |name: &str, found: &mut Option<Value>, value: Value| {
             if found.replace(value).is_some() {
                 return Err(invalid(format!("{name} was given more than once")));
@@ -789,23 +786,6 @@ impl Request {
                             .find_map(|key| item.get(*key).cloned())
                             .ok_or_else(|| invalid("count needs a valueInteger"))?,
                     )?,
-                    ORGANIZATION => {
-                        put(
-                            name,
-                            &mut organization,
-                            match (item.get("valueReference"), item.get("valueString")) {
-                                (Some(_), Some(_)) => return Err(invalid(
-                                    "organization is a valueReference or a valueString, not both",
-                                )),
-                                (Some(value), None) | (None, Some(value)) => value.clone(),
-                                (None, None) => {
-                                    return Err(invalid(
-                                        "organization needs a valueReference or a valueString",
-                                    ))
-                                }
-                            },
-                        )?
-                    }
                     other => {
                         return Err(invalid(format!(
                             "unknown parameter {other}: $match takes {PARAMETERS}"
@@ -819,7 +799,6 @@ impl Request {
                     "resource" => resource = Some(value.clone()),
                     "onlyCertainMatches" => only_certain = Some(value.clone()),
                     "count" => count = Some(value.clone()),
-                    ORGANIZATION => organization = Some(value.clone()),
                     // The server's own controls, which a client cannot set.
                     other if other.starts_with('_') => {}
                     other => {
@@ -850,10 +829,7 @@ impl Request {
                     .ok_or_else(|| invalid("count must be a whole number, 0 or more"))?,
             ),
         };
-        let scope = match organization {
-            None => None,
-            Some(value) => Some(scope_of(scope_text(&value)?)?),
-        };
+        let scope = scope_of(&resource)?;
         limit_elements(&resource, rules)?;
         let subject = Subject::read(&resource, rules)?;
         Ok(Request {
@@ -1281,13 +1257,13 @@ pub(crate) fn annotate_capability(statement: &mut Value) {
                 returned, and a match on one that another replaced (link type replaced-by) is the \
                 Patient that replaced it, probable at the most, with `replaced-record` evidence. With \
                 `onlyCertainMatches` true nothing is returned unless exactly one Patient is a \
-                potential match and it is certain. `count` limits the entries. The optional \
-                `organization` parameter (a `valueReference`, or a `valueString`, \
-                `Organization/id`, or the query parameter `?organization=Organization/id`) limits \
-                the operation to the Patients whose managingOrganization is that reference, as \
+                potential match and it is certain. `count` limits the entries. The \
+                `managingOrganization` of the Patient in `resource` (`Organization/id`) limits the \
+                operation to the Patients whose managingOrganization is that reference, as \
                 `Patient?organization=` does in a search: the grades, `onlyCertainMatches` and \
                 `count` then apply to that organization's Patients only, and a replaced-by link is \
-                not followed to a Patient of another organization. Without it every organization's \
+                not followed to a Patient of another organization. It is not compared, so it adds \
+                no evidence and changes no grade. Without it every organization's \
                 Patients are compared."
         });
         match resource.get_mut("operation").and_then(Value::as_array_mut) {
@@ -2628,37 +2604,47 @@ mod tests {
         }
     }
 
-    fn scoped(organization: Value) -> Result<Option<String>, FhirError> {
+    /// The scope of a request whose Patient has `managingOrganization` `managing` (none when it
+    /// is `None`), as a Parameters body.
+    fn scoped(managing: Option<Value>) -> Result<Option<String>, FhirError> {
+        let mut patient = named("Okafor", &["Ada"]);
+        if let Some(managing) = managing {
+            patient["managingOrganization"] = managing;
+        }
         let args = json!({"resourceType": "Parameters", "parameter": [
-            {"name": "resource", "resource": named("Okafor", &["Ada"])}, organization]});
+            {"name": "resource", "resource": patient}]});
         Request::from_args(&args, &RULES).map(|request| request.scope)
     }
 
+    fn reference(text: &str) -> Option<Value> {
+        Some(json!({"reference": text}))
+    }
+
     #[test]
-    fn the_organization_is_a_reference_given_as_a_reference_or_a_string() {
-        let reference =
-            |text: &str| json!({"name": "organization", "valueReference": {"reference": text}});
-        let string = |text: &str| json!({"name": "organization", "valueString": text});
+    fn the_scope_is_the_managing_organization_of_the_patient_sent() {
         let expected = Some("Organization/clinic-a".to_string());
         for given in [
-            reference("Organization/clinic-a"),
-            string("Organization/clinic-a"),
+            json!({"reference": "Organization/clinic-a"}),
             // A reference that says more than the reference is still the reference.
-            json!({"name": "organization", "valueReference":
-                {"reference": "Organization/clinic-a", "display": "Clinic A"}}),
+            json!({"reference": "Organization/clinic-a", "display": "Clinic A"}),
+            json!({"reference": "Organization/clinic-a",
+                "identifier": {"system": "urn:example", "value": "a"}}),
         ] {
-            assert_eq!(scoped(given.clone()).unwrap(), expected, "{given}");
+            assert_eq!(scoped(Some(given.clone())).unwrap(), expected, "{given}");
         }
-        // Nothing given is no scope.
-        let args = json!({"resource": named("Okafor", &["Ada"])});
-        assert_eq!(Request::from_args(&args, &RULES).unwrap().scope, None);
+        // Nothing given is no scope: every organization's Patients are compared.
+        assert_eq!(scoped(None).unwrap(), None);
+        // The plain object form reads it the same way.
+        let mut args = request();
+        args["resource"]["managingOrganization"] = json!({"reference": "Organization/clinic-a"});
+        assert_eq!(Request::from_args(&args, &RULES).unwrap().scope, expected);
         // An id is what FHIR says an id is, and the type is `Organization` as it is written.
         for good in [
             "Organization/a",
             "Organization/A.b-1",
             &format!("Organization/{}", "a".repeat(64)),
         ] {
-            assert!(scoped(string(good)).is_ok(), "{good}");
+            assert!(scoped(reference(good)).is_ok(), "{good}");
         }
         for bad in [
             "",
@@ -2667,6 +2653,7 @@ mod tests {
             "Organization/",
             "Organization//",
             "Organization/a/b",
+            "Organization/a/_history/1",
             "Organization/a b",
             "Organization/a,Organization/b",
             "Organization/a|b",
@@ -2678,42 +2665,52 @@ mod tests {
             "https://example.org/Organization/a",
             &format!("Organization/{}", "a".repeat(65)),
         ] {
-            match scoped(string(bad)) {
+            match scoped(reference(bad)) {
                 Err(FhirError::Invalid(message)) => {
-                    assert!(message.contains("organization"), "{message}")
+                    assert!(message.contains("managingOrganization"), "{message}")
                 }
                 other => panic!("{bad:?}: {other:?}"),
             }
         }
-        // It is said once.
-        let twice = json!({"resourceType": "Parameters", "parameter": [
-            {"name": "resource", "resource": named("Okafor", &["Ada"])},
-            string("Organization/a"), string("Organization/a")]});
-        assert!(matches!(
-            Request::from_args(&twice, &RULES),
-            Err(FhirError::Invalid(message)) if message.contains("more than once")
-        ));
-        // And in one way: a value of each kind is two answers, and one of them would be dropped.
-        let both = json!({"name": "organization", "valueString": "Organization/b",
-            "valueReference": {"reference": "Organization/a"}});
-        assert!(matches!(
-            scoped(both),
-            Err(FhirError::Invalid(message)) if message.contains("not both")
-        ));
+    }
+
+    #[test]
+    fn a_managing_organization_with_no_reference_is_refused_not_ignored() {
+        // The sender named an organization that this cannot scope to. Answering for every
+        // organization would show it the Patients of the others.
+        for given in [
+            json!({"identifier": {"system": "urn:example", "value": "clinic-a"}}),
+            json!({"display": "Clinic A"}),
+            json!({}),
+            json!({"reference": 1}),
+            json!(null),
+            json!("Organization/clinic-a"),
+        ] {
+            match scoped(Some(given.clone())) {
+                Err(FhirError::Invalid(message)) => {
+                    assert!(
+                        message.contains("managingOrganization"),
+                        "{given}: {message}"
+                    )
+                }
+                other => panic!("{given}: {other:?}"),
+            }
+        }
     }
 
     #[test]
     fn what_was_refused_is_not_in_the_message() {
         // Whatever was sent in its place (a phone number, a name) is not copied into text that is
-        // logged. A reference with no `reference` in it says what it needs instead.
+        // logged.
         let wrong = "0803 123 4567 Ada Okafor";
         for given in [
-            json!({"name": "organization", "valueString": wrong}),
-            json!({"name": "organization", "valueReference": {"reference": wrong}}),
+            json!({"reference": wrong}),
+            json!({"display": wrong}),
+            json!(wrong),
         ] {
-            match scoped(given) {
+            match scoped(Some(given)) {
                 Err(FhirError::Invalid(message)) => {
-                    assert!(message.contains("organization"), "{message}");
+                    assert!(message.contains("managingOrganization"), "{message}");
                     assert!(
                         !message.contains("0803") && !message.contains("Okafor"),
                         "{message}"
@@ -2722,11 +2719,31 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
-        let identifier = json!({"name": "organization", "valueReference":
-            {"identifier": {"system": "urn:example", "value": "clinic-a"}}});
-        match scoped(identifier) {
-            Err(FhirError::Invalid(message)) => assert!(message.contains("reference"), "{message}"),
-            other => panic!("{other:?}"),
+    }
+
+    #[test]
+    fn an_organization_is_not_a_parameter() {
+        // The way to say it is the Patient sent in, so the parameter of that name is unknown, in
+        // each form the arguments take.
+        let patient = named("Okafor", &["Ada"]);
+        for args in [
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "resource", "resource": patient},
+                {"name": "organization", "valueReference": {"reference": "Organization/a"}}]}),
+            json!({"resourceType": "Parameters", "parameter": [
+                {"name": "resource", "resource": patient},
+                {"name": "organization", "valueString": "Organization/a"}]}),
+            json!({"resource": patient, "organization": "Organization/a"}),
+        ] {
+            match Request::from_args(&args, &RULES) {
+                Err(FhirError::Invalid(message)) => assert!(
+                    message.contains("unknown parameter organization")
+                        && message.contains("resource, onlyCertainMatches and count"),
+                    "{message}"
+                ),
+                Err(other) => panic!("{other:?}"),
+                Ok(_) => panic!("{args}"),
+            }
         }
     }
 
@@ -2758,7 +2775,7 @@ mod tests {
         let ask_in = |organization: Option<&str>| {
             let mut args = request();
             if let Some(organization) = organization {
-                args["organization"] = json!(organization);
+                args["resource"]["managingOrganization"] = json!({"reference": organization});
             }
             let request = Request::from_args(&args, &tight)?;
             find(&mut db.begin(), &catalog, &request, &tight)
@@ -2778,34 +2795,6 @@ mod tests {
             ask_in(Some("Organization/b")),
             Err(FhirError::Unprocessable(_))
         ));
-    }
-
-    #[test]
-    fn the_organization_of_a_plain_object_is_a_string_or_a_reference() {
-        let args = |organization: Value| json!({"resource": named("Okafor", &["Ada"]), "organization": organization});
-        for given in [
-            json!("Organization/clinic-a"),
-            json!({"reference": "Organization/clinic-a"}),
-        ] {
-            let request = Request::from_args(&args(given.clone()), &RULES).unwrap();
-            assert_eq!(
-                request.scope.as_deref(),
-                Some("Organization/clinic-a"),
-                "{given}"
-            );
-        }
-        for bad in [
-            json!(1),
-            json!(null),
-            json!(["Organization/a"]),
-            json!({"id": "a"}),
-            json!("a"),
-        ] {
-            assert!(
-                Request::from_args(&args(bad.clone()), &RULES).is_err(),
-                "{bad}"
-            );
-        }
     }
 
     #[test]
