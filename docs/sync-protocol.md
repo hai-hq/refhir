@@ -18,7 +18,7 @@ All frames are WebSocket text frames holding one JSON object with a `type` field
 | server to client | `MutationResponse` | The answer to one `Mutation` |
 | server to client | `FatalError` | The server is about to drop the connection |
 
-These are all the message types. There is no hello or connect message, no authenticate message (authentication happens on the HTTP upgrade), no application-level ping, no acknowledgement other than the `Transition` that answers a `ModifyQuerySet`, and no resume message. The server ignores binary frames, answers a Ping with a Pong, and treats a Close frame as the end of the session. It never sends pings of its own.
+These are all the message types. There is no hello or connect message, no authenticate message (authentication happens on the HTTP upgrade, and a token is renewed by dialling again: see [Renewing a token](#renewing-a-token)), no application-level ping, no acknowledgement other than the `Transition` that answers a `ModifyQuerySet`, and no resume message. The server ignores binary frames, answers a Ping with a Pong, and treats a Close frame as the end of the session. It never sends pings of its own.
 
 The server reads fields with default JSON rules: unknown extra fields are ignored, and every field listed below as required must be present.
 
@@ -57,7 +57,19 @@ With SMART on, scopes are checked per message, not at the upgrade. A token that 
 
 A token is looked at again while its socket is open: before the server acts on each message, when the token reaches its expiry time, and every 30 seconds in between. A socket whose token has expired or been revoked is sent `{"type": "FatalError", "message": "the token expired or was revoked"}` and dropped. A client that only listens is cut off too, and a revoked token cannot go on writing over a socket it opened earlier. A revocation is noticed within the 30 seconds by a socket that is neither sending nor receiving, and at once by the next message it sends.
 
-Opening a new socket with the same token is refused with HTTP 401. The shipped clients take a 401 or 403 on a redial as final: the session ends, and every watch and mutation fails with the refusal (see [Reconnect and recovery](#reconnect-and-recovery)).
+Opening a new socket with the same token is refused with HTTP 401. A token cannot be replaced on an open socket, so a client that outlives its token has to dial again with a new one.
+
+#### Renewing a token
+
+There is no message that replaces the token of an open socket. Renewal is by redial, and it is cheap, because the server keeps nothing between sockets and a result is never a diff: the client dials with the new token and sends one `ModifyQuerySet` that adds every live query again under the same ids, and the first `QueryUpdated` of each is its current result (see [Reconnect and recovery](#reconnect-and-recovery)).
+
+Both shipped clients do this when they are given a token source, a function that is asked for a token each time one is needed (`WithTokenSource` in Go, a function as the `token` option in TypeScript; a plain token is a source that always gives the same one). The source is asked for the first upgrade and for every redial, and the client's session outlives any one token:
+
+- A refused upgrade with **401** is not final yet. The client asks the source once more, since it may hold a token it has renewed in the meantime, and dials again. A second 401 ends the session, as does a source that gives back the very token that was just refused. **403** is final at once.
+- An **error from the source** is not final: the client waits as it does for any failed dial and asks again.
+- A mutation that was in flight when the token ran out fails as one does for any dropped socket, and may have been applied (see [Reconnect and recovery](#reconnect-and-recovery)).
+
+A client that wants no gap at all can open a second socket with the new token before the old one's token expires, add its queries there, and then close the old one. That is an option for a custom client; the shipped ones redial after the drop. A caller holds at most `max_sync_connections` sockets when that [limit](#limits-and-rate-limiting) is on.
 
 ## Client-to-server messages
 
@@ -131,6 +143,19 @@ Names you may subscribe to (read-only):
 | `{Type}/$expand`, `$expandability`, `$validate-code`, `$lookup`, `$translate`, `$subsumes` | Terminology operations. They read no documents, so their read set is empty and no write invalidates them. |
 | `{Type}/$populate`, `$assemble`, `$next-question`, `$behavior`, `$extract` | SDC operations. SMART treats them as reads. |
 
+The terminology operations take **flat names** as `args`, where REST takes a `Parameters` resource (or the same names in a query string).
+
+| Operation | `args` |
+|-----------|--------|
+| `ValueSet/$expand` | `url` (required), and optionally `filter`, `count`, `offset` and `activeOnly` |
+| `ValueSet/$validate-code` | `url` (required), `system`, `code`, `display`, `systemVersion` and `abstract` |
+
+```json
+{"type": "ModifyQuerySet", "baseVersion": 0, "newVersion": 1, "modifications": [
+  {"type": "Add", "queryId": 1, "udfPath": "ValueSet/$expand", "args": {"url": "http://hl7.org/fhir/ValueSet/organization-type", "filter": "hospital", "count": 10}}
+]}
+```
+
 Names you may send as a `Mutation`:
 
 | Operation | Arguments |
@@ -143,6 +168,19 @@ Names you may send as a `Mutation`:
 | `{Type}/$meta-add`, `$meta-delete` | `id`, `resource` |
 | `Bundle/transaction`, `Bundle/batch` | `resource` (the Bundle), or the Bundle itself as `args` |
 | `ImplementationGuide/$install` | Needs authentication, and runs on the primary. |
+| `Patient/$match` | The `Parameters` resource of the [REST operation](fhir-api.md#finding-a-patient-patientmatch) as `args`. The answer is the `searchset` Bundle of matches, as `result`. |
+| `ChargeItemDefinition/$apply` | `{"id": "...", "resource": <Parameters>}`: the definition's id, and the `Parameters` the [REST operation](fhir-api.md#pricing-a-charge-item-chargeitemdefinitionapply) takes. The answer is the draft `Invoice`. |
+
+An operation that REST sends to one instance (`POST ChargeItemDefinition/[id]/$apply`) takes the id as `id` and the body as `resource`, as `update` does. One that REST sends to a type (`POST Patient/$match`) takes the body as `args`.
+
+```json
+{"type": "Mutation", "requestId": 7, "udfPath": "Patient/$match", "args": {"resourceType": "Parameters", "parameter": [
+  {"name": "resource", "resource": {"resourceType": "Patient", "name": [{"family": "Bee"}], "birthDate": "1990-01-01"}},
+  {"name": "count", "valueInteger": 5}
+]}}
+```
+
+**With SMART on**, `$match` and `$apply` are not available here. The scope table that `/sync` checks every operation against has no entry for them, so a `Mutation` answers `forbidden` with the text `unsupported operation $match` (or `$apply`), whatever the token's scopes. Use REST for them. They need on REST what the pages above say: a scope that may search Patients for `$match`, and a scope that may read the definition, the ChargeItem and any Account for `$apply`. With SMART off they run as they do on REST, with no scopes to check.
 
 A `Mutation` is not limited to writes: any name above is accepted and returns its result with a `ts`. An unknown operation fails with a message such as `unsupported operation Patient/frobnicate`. With SMART on, a name the scope table does not know is refused as `unsupported operation {op}`, and a name with no `/` as `bad operation {path}`.
 
@@ -168,7 +206,7 @@ That is the answer to a `ModifyQuerySet` that added one `Patient/read` query as 
 | `type` | Fields | Meaning |
 |--------|--------|---------|
 | `QueryUpdated` | `queryId`, `value`, `logLines` | The query's current result. `value` is whatever the operation returned: a Bundle for a search, the resource for a read. It is always the full result, never a diff. `logLines` is always `[]`. |
-| `QueryFailed` | `queryId`, `error`, `logLines` | The query failed. `error` is plain text, not an `OperationOutcome`, and its wording is not a contract. `logLines` is always `[]`. |
+| `QueryFailed` | `queryId`, `error`, `code`, `logLines` | The query failed. `error` is plain text, not an `OperationOutcome`, and its wording is not a contract. `code` is the one to switch on: see [Query failure codes](#query-failure-codes). `logLines` is always `[]`. |
 | `QueryRemoved` | `queryId` | Acknowledges a `Remove`. |
 
 A pushed `Transition` can hold several items: every query invalidated since the last push is re-run and reported together, and several commits can be folded into one push. Do not assume one `Transition` per commit.
@@ -241,8 +279,8 @@ A commit timestamp is a logical counter that rises with each commit, starting at
 |-----------|-------------|------------|
 | Not JSON, unknown `type`, unknown modification `type`, or a missing or mistyped field | `FatalError`, with the parser's message | Dropped |
 | `baseVersion` does not match | `FatalError` | Dropped |
-| An `Add` fails: unknown or write operation, scope, bad arguments, not found, rate limit, query cap | `QueryFailed` in the `Transition` that answers the `ModifyQuerySet` | Stays open. The query is not registered. |
-| A re-run fails after the query was registered | `QueryFailed` in a pushed `Transition` | Stays open. See below. |
+| An `Add` fails: unknown or write operation, scope, bad arguments, not found, rate limit, query cap | `QueryFailed`, with a `code`, in the `Transition` that answers the `ModifyQuerySet` | Stays open. The query is not registered. |
+| A re-run fails after the query was registered | `QueryFailed`, with a `code`, in a pushed `Transition` | Stays open. See below. |
 | A mutation fails: scope, validation, conflict, rate limit, no primary | `MutationResponse` with `success: false` and an `OperationOutcome` in `result` | Stays open |
 | The upgrade is refused | HTTP 401 or 429 before any WebSocket exists | None |
 
@@ -252,7 +290,24 @@ When the server ends a connection itself, as after a `FatalError`, it does not s
 
 `QueryFailed.error` strings written by the server itself include `{path} writes and cannot be subscribed`, `scope does not allow {path}`, `invalid value "{value}" for search parameter {name} on {type}: {what was expected}` (a search value that cannot be read as its type, such as a date that is not one: a live query is never lenient, so it fails now rather than staying empty, and `Prefer: handling=lenient` has no say in it), `token is limited to a different patient`, `too many live queries: a connection may hold {cap}`, `query stayed stale` (the server gave up after 8 attempts to take a consistent snapshot), and the rate and quota messages in the next section.
 
-After a pushed `QueryFailed` the server drops the query, as it does when the result left a patient-scoped token's compartment. A failed re-run is typically a watched resource that was deleted. A `QueryFailed` is final for that `queryId`: nothing revives it if a later write would make the query succeed again, and it no longer counts under `max_live_queries`. Both shipped clients forget the query too. To watch again, send an `Add`.
+### Query failure codes
+
+`error` is for a person: its wording can change between releases. A program switches on `code`, the FHIR [IssueType](https://hl7.org/fhir/R4/valueset-issue-type.html) that applies, and the same one on every `QueryFailed` whether the query failed when it was added or when a write made the server run it again. It is the code a mutation that failed the same way carries in its `OperationOutcome`.
+
+| `code` | When |
+|--------|------|
+| `deleted` | The resource a live `read` watches was deleted. The usual cause of a pushed `QueryFailed`. The text still says "not found", as a REST `read` of a deleted resource does; the code is the difference |
+| `not-found` | The resource a query names, or its type, does not exist when the query is added |
+| `forbidden` | The token's scopes, or its patient compartment, do not allow the query |
+| `throttled` | A rate limit or quota refused the `Add`. Trying again later can work |
+| `too-costly` | A cap refused it: `max_live_queries`, or an operation the server will not run because the answer would be too large to be complete (`Patient/$match` over more candidates than it compares) |
+| `invalid` | The operation or its arguments cannot be run as a live query: a write name or a Bundle, a search value that cannot be read, a missing argument |
+| `transient` | The server could not answer now (`query stayed stale`, or a replica with no primary) and may later |
+| `exception` | The server failed |
+
+A server may send a code not in this table, and an older server sends none; a client treats a code it does not know, or none, as a failure it can only report. The shipped clients give it as the `Code` of a `*QueryError` (Go, from `Watch.Next`) and the `code` of a `QueryError` (TypeScript, from `watch.next()`).
+
+After a pushed `QueryFailed` the server drops the query, as it does when the result left a patient-scoped token's compartment. A failed re-run is typically a watched resource that was deleted, which is `code` `deleted`. A `QueryFailed` is final for that `queryId`: nothing revives it if a later write would make the query succeed again, and it no longer counts under `max_live_queries`. Both shipped clients forget the query too. To watch again, send an `Add`.
 
 ## Limits and rate limiting
 
@@ -282,11 +337,17 @@ This works without replay because results are never diffs. After resubscribing, 
 Both shipped clients do the following, and a custom client has to do the same:
 
 1. Treat a socket close, an unparseable frame, an unknown message `type`, a `FatalError` or an out-of-sequence `Transition` as a dropped connection.
-2. Fail every mutation in flight. Neither client retries them. The outcome of such a mutation is unknown: it may have committed before the drop. `create` assigns a new id each time, so retrying one blindly can create a duplicate.
+2. Fail every mutation in flight. Neither client retries them. The outcome of such a mutation is unknown: it may have committed before the drop. `create` assigns a new id each time, so retrying one blindly can create a duplicate. The clients fail these with a disconnected error (`ErrDisconnected` in Go, `DisconnectedError` in TypeScript), which means "in doubt".
 3. Throw away any unsent or in-flight `ModifyQuerySet`.
-4. Dial again with backoff until it works or the client is closed. TypeScript starts at 50 ms, doubles to 1 s, and adds jitter. Go waits 50, 100, 200, 400, 800, then 1600 ms between attempts and repeats the last, with no jitter, and each dial attempt times out after 10 s. A network error is retried for as long as it lasts. A refused upgrade is read by its status: HTTP 401 or 403 is final, because the token will not work if asked again, so the session ends and every watch and mutation fails with the refusal (`UpgradeError` in TypeScript, `*UpgradeError` in Go); any other refusal is retried after the longer of the backoff and its `Retry-After` header, at most a minute. A browser cannot see why a handshake failed, so the TypeScript client there retries every failure.
+4. Dial again with backoff until it works or the client is closed. TypeScript starts at 50 ms, doubles to 1 s, and adds jitter. Go waits 50, 100, 200, 400, 800, then 1600 ms between attempts and repeats the last, with no jitter, and each dial attempt times out after 10 s. A network error is retried for as long as it lasts. Each dial asks for the bearer token first: a client given a [token source](#renewing-a-token) calls it every time, and one given a plain token sends the same one. A refused upgrade is read by its status. HTTP 401 with a token source is asked once more: the client calls the source again and dials with what it returns, unless that is the very token just refused. HTTP 401 that stands after that, or with a plain token, and HTTP 403, are final, because the token will not work if asked again: the session ends and every watch and mutation fails with the refusal (`UpgradeError` in TypeScript, `*UpgradeError` in Go). An error from the source itself is retried with the backoff. Any other refusal is retried after the longer of the backoff and its `Retry-After` header, at most a minute. A browser cannot see why a handshake failed, so the TypeScript client there retries every failure.
 5. Reset the version to 0, then send one `ModifyQuerySet` with `baseVersion: 0`, `newVersion: 1` and an `Add` for every live query, in ascending `queryId`, reusing the same ids, paths and arguments.
 6. Keep each query's last value until the new `QueryUpdated` arrives. The shipped clients do not tell a watcher that a gap happened.
+
+**Calls made while the client dials again.** A mutation is never held until the socket is back and sent then: it was not written, and the caller has to be able to tell that from a write that may have been applied.
+
+- A mutation made while the client has no socket fails at once with a not-sent error (`ErrNotSent` in Go, `NotSentError` in TypeScript). Nothing was written, so it can be tried again once the client reports it is connected (`Connected()` in Go, `connected` in TypeScript). Only a mutation that was sent and lost its answer fails with the in-doubt error above.
+- A call whose context has ended (Go) or whose `signal` has aborted (TypeScript) is not sent when the connection comes back, whether a mutation or a new live query: its caller gave up, and could not know it was run afterwards.
+- A new live query made while the client dials again waits, and is added after the redial with the others.
 
 The server sends no pings and sets no idle timeout, and neither shipped client sends pings, so a half-open connection is only noticed when TCP notices. A client that needs faster detection can send WebSocket pings, which the server answers.
 
@@ -367,7 +428,7 @@ For a live query refused by the connection's query cap, the first `Add` (query 1
 
 ```text
 server -> client
-{"type":"Transition","startVersion":1,"endVersion":2,"modifications":[{"type":"QueryFailed","queryId":2,"error":"too many live queries: a connection may hold 1","logLines":[]}]}
+{"type":"Transition","startVersion":1,"endVersion":2,"modifications":[{"type":"QueryFailed","queryId":2,"error":"too many live queries: a connection may hold 1","code":"too-costly","logLines":[]}]}
 ```
 
 ## Related

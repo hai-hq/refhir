@@ -17,8 +17,17 @@ import (
 )
 
 var (
-	errClosed       = errors.New("refhir: client closed")
-	errDisconnected = errors.New("refhir: disconnected")
+	errClosed = errors.New("refhir: client closed")
+
+	// ErrDisconnected is what a mutation fails with when the socket went down while it was in
+	// flight. It may have been applied: the answer was lost, not the write. Check before sending it
+	// again, since a create assigns a new id each time.
+	ErrDisconnected = errors.New("refhir: disconnected")
+
+	// ErrNotSent is what a mutation fails with when the client had no socket to send it on, as
+	// while it dials again after the connection dropped. Nothing was written, so it is safe to try
+	// again once Connected reports true.
+	ErrNotSent = errors.New("refhir: disconnected: the mutation was not sent")
 )
 
 // UpgradeError is a /sync upgrade the server refused: it answered the WebSocket handshake with
@@ -59,6 +68,52 @@ func retryAfter(value string) time.Duration {
 	return wait
 }
 
+// QueryError is a live query the server stopped answering: its first run failed, or a later run
+// did and the server dropped it. Watch returns it from Next (and from the call that added the
+// query, when that failed). Once a query has failed it is over; add it again to watch again.
+//
+// Message is plain text whose wording is not a contract. Code is: it holds the FHIR IssueType the
+// server gave, or is empty for a server that sends none.
+//
+//	var failed *refhir.QueryError
+//	if errors.As(err, &failed) && failed.Code == refhir.CodeDeleted {
+//		// the resource being watched was deleted
+//	}
+type QueryError struct {
+	// Path is the operation that was being watched, such as Patient/read.
+	Path string
+	// Code is the FHIR IssueType: CodeDeleted, CodeNotFound, CodeForbidden, CodeThrottled,
+	// CodeTooCostly, CodeInvalid, CodeTransient or CodeException, or another code a newer server
+	// uses.
+	Code string
+	// Message is the server's explanation, for a person to read.
+	Message string
+}
+
+// The codes of a QueryError that the server uses.
+const (
+	// CodeDeleted: the watched resource was deleted, which is the usual reason a query ends.
+	CodeDeleted = "deleted"
+	// CodeNotFound: a resource the query names, or a resource type, does not exist.
+	CodeNotFound = "not-found"
+	// CodeForbidden: the token's scopes (or its patient) do not allow the query.
+	CodeForbidden = "forbidden"
+	// CodeThrottled: a rate limit or quota refused it; trying again later may work.
+	CodeThrottled = "throttled"
+	// CodeTooCostly: a cap refused it, such as the number of live queries a connection may hold.
+	CodeTooCostly = "too-costly"
+	// CodeInvalid: the operation or its arguments cannot be run as a live query.
+	CodeInvalid = "invalid"
+	// CodeTransient: the server could not answer now and may be able to later.
+	CodeTransient = "transient"
+	// CodeException: the server failed.
+	CodeException = "exception"
+)
+
+func (e *QueryError) Error() string {
+	return fmt.Sprintf("refhir: %s: %s", e.Path, e.Message)
+}
+
 // OutcomeError is a failed mutation. Outcome is the OperationOutcome JSON.
 type OutcomeError struct {
 	Outcome json.RawMessage
@@ -72,14 +127,36 @@ func (e *OutcomeError) Error() string {
 type Option func(*dialOptions)
 
 type dialOptions struct {
-	token          string
+	tokens         TokenSource
 	readYourWrites bool
 }
 
-// Bearer sets the Authorization header on the /sync upgrade and on HTTP calls.
+// TokenSource gives the bearer token for the next /sync upgrade or REST call. The client asks it
+// each time it needs one, so it may return a token it has renewed. It is called from the session's
+// own goroutine and from the callers of Do, and must be safe for that. A source that returns an
+// empty token sends no Authorization header.
+type TokenSource func(ctx context.Context) (string, error)
+
+// Bearer sets the Authorization header on the /sync upgrade and on HTTP calls, always to the same
+// token. A session that outlives it ends when the server stops accepting it: use WithTokenSource
+// for a token that is renewed.
 func Bearer(token string) Option {
+	return WithTokenSource(func(context.Context) (string, error) { return token, nil })
+}
+
+// WithTokenSource sets where the bearer token comes from, for the /sync upgrade on the first dial
+// and on every redial, and for HTTP calls (Do and Metadata). Use it with tokens that expire, such
+// as a gateway's five-minute OAuth client-credentials tokens: the server drops the socket when a
+// token expires, the client dials again, and the source supplies a fresh one.
+//
+// When the server refuses an upgrade with HTTP 401, the client asks the source once more and dials
+// again before it treats the refusal as final, so a source that was handing out a token on its way
+// out gets a second chance. A second 401, or a source that returns the very token just refused,
+// ends the session; so does 403. An error from the source is not final: a redial tries again after
+// the usual backoff, and Dial returns it.
+func WithTokenSource(source TokenSource) Option {
 	return func(o *dialOptions) {
-		o.token = token
+		o.tokens = source
 	}
 }
 
@@ -100,7 +177,7 @@ func WithReadYourWrites(enabled bool) Option {
 type Client struct {
 	httpBase string
 	wsURL    string
-	token    string
+	tokens   TokenSource
 	http     *http.Client
 
 	// lastTs is the highest commit timestamp seen. Do reads and writes it from
@@ -126,6 +203,12 @@ type Client struct {
 	flight    *flight
 	pending   map[uint64]chan mutationResult
 	closing   bool
+	// held is what was queued on cmds while the session dialled again, to be run once it is back.
+	held []command
+
+	// down is true from the moment the socket drops until the session has dialled again. It is read
+	// by Mutate and Connected from any goroutine.
+	down atomic.Bool
 
 	// fatal is why the session ended when the server ended it (an upgrade it refused for good),
 	// rather than Close. It is written before the session is cancelled, so any goroutine that
@@ -153,6 +236,9 @@ type mutationResult struct {
 }
 
 type command struct {
+	// ctx is the caller's. A command whose context ended before the session reached it is dropped
+	// unsent: its caller has given up and cannot know it was run.
+	ctx   context.Context
 	kind  string
 	path  string
 	args  map[string]any
@@ -185,22 +271,14 @@ func Dial(ctx context.Context, baseURL string, opts ...Option) (*Client, error) 
 	if err != nil {
 		return nil, err
 	}
-	conn, err := dialSocket(ctx, wsURL, options.token)
-	if err != nil {
-		return nil, err
-	}
-	root, cancel := context.WithCancel(context.Background())
 	client := &Client{
 		httpBase:  httpBase,
 		wsURL:     wsURL,
-		token:     options.token,
+		tokens:    options.tokens,
 		http:      &http.Client{},
-		root:      root,
-		cancel:    cancel,
 		cmds:      make(chan command, 64),
 		events:    make(chan sessionEvent, 64),
 		stopped:   make(chan struct{}),
-		conn:      conn,
 		gen:       1,
 		nextQuery: 1,
 		nextReq:   1,
@@ -209,6 +287,13 @@ func Dial(ctx context.Context, baseURL string, opts ...Option) (*Client, error) 
 
 		readYourWrites: options.readYourWrites,
 	}
+	conn, err := client.dialSocket(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client.conn = conn
+	root, cancel := context.WithCancel(context.Background())
+	client.root, client.cancel = root, cancel
 	go client.read(conn, 1)
 	go client.loop()
 	return client, nil
@@ -230,12 +315,33 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// Connected reports whether the session has a socket. It is false while the client dials again
+// after the connection dropped, and Mutate fails with ErrNotSent until it is true.
+func (c *Client) Connected() bool {
+	return !c.down.Load() && c.root.Err() == nil
+}
+
 // Mutate runs a write operation and waits for MutationResponse.
 // A failed mutation returns *OutcomeError. Mutations are not retried after a disconnect.
+//
+// Two errors say how far a mutation got when the connection was not there. ErrNotSent: nothing was
+// written, because the client was dialling again; try again once Connected is true.
+// ErrDisconnected: it was sent and the socket dropped before the answer, so it may have been
+// applied. A call whose ctx has ended is not sent either, and returns the ctx's error; that holds
+// for a call that was already queued when the client began to dial again.
 func (c *Client) Mutate(ctx context.Context, path string, args map[string]any) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.root.Err() != nil {
+		return nil, c.closedErr()
+	}
+	if c.down.Load() {
+		return nil, ErrNotSent
+	}
 	resp := make(chan mutationResult, 1)
 	select {
-	case c.cmds <- command{kind: kindMutate, path: path, args: args, resp: resp}:
+	case c.cmds <- command{ctx: ctx, kind: kindMutate, path: path, args: args, resp: resp}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.root.Done():
@@ -255,7 +361,7 @@ func (c *Client) Mutate(ctx context.Context, path string, args map[string]any) (
 func (c *Client) Watch(ctx context.Context, path string, args map[string]any) (*Watch, error) {
 	watch := newWatch(c)
 	select {
-	case c.cmds <- command{kind: kindAdd, path: path, args: args, watch: watch}:
+	case c.cmds <- command{ctx: ctx, kind: kindAdd, path: path, args: args, watch: watch}:
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-c.root.Done():
@@ -315,6 +421,14 @@ func (c *Client) finish() {
 }
 
 func (c *Client) onCommand(cmd command) {
+	if cmd.ctx != nil && cmd.ctx.Err() != nil && (cmd.kind == kindAdd || cmd.kind == kindMutate) {
+		// Its caller gave up while the command waited, and cannot know it was run. A write that
+		// went out now could be applied unseen.
+		if cmd.kind == kindMutate {
+			cmd.resp <- mutationResult{err: cmd.ctx.Err()}
+		}
+		return
+	}
 	switch cmd.kind {
 	case kindAdd:
 		c.addWatch(cmd)
@@ -335,7 +449,12 @@ func (c *Client) addWatch(cmd command) {
 	}
 	id := c.nextQuery
 	c.nextQuery++
-	cmd.watch.id = id
+	// Close runs on the caller's goroutine while this one is here, so the id is handed over under
+	// the watch's lock. If Close has already run there is nobody to tell about the query, and
+	// registering it would leave it live on the server with no one to remove it.
+	if !cmd.watch.assign(id) {
+		return
+	}
 	sub := &subscription{
 		id:    id,
 		path:  cmd.path,
@@ -386,7 +505,7 @@ func (c *Client) mutate(cmd command) {
 		return
 	}
 	if c.conn == nil {
-		cmd.resp <- mutationResult{err: errDisconnected}
+		cmd.resp <- mutationResult{err: ErrNotSent}
 		return
 	}
 	id := c.nextReq
@@ -496,7 +615,7 @@ func (c *Client) apply(mod stateModification) {
 			return
 		}
 		delete(c.subs, mod.QueryID)
-		sub.watch.fail(fmt.Errorf("refhir: %s: %s", sub.path, mod.Error))
+		sub.watch.fail(&QueryError{Path: sub.path, Code: mod.Code, Message: mod.Error})
 	case "QueryRemoved":
 	}
 }
@@ -542,13 +661,17 @@ func (c *Client) onDown() {
 		return
 	}
 	c.gen++
-	c.failMutations(errDisconnected)
+	c.down.Store(true)
+	c.failMutations(ErrDisconnected)
 	c.flight = nil
 	c.queue = nil
 	if c.conn != nil {
 		c.conn.CloseNow()
 		c.conn = nil
 	}
+	// A call that was queued before the socket dropped has not been sent either: say so now,
+	// instead of sending it whenever the connection returns.
+	c.refuseQueuedMutations()
 	conn, err := c.dialUntilCancelled()
 	if err != nil {
 		if !errors.Is(err, errClosed) {
@@ -562,6 +685,32 @@ func (c *Client) onDown() {
 	c.version = 0
 	go c.read(conn, c.gen)
 	c.resubscribe()
+	c.refuseQueuedMutations()
+	c.down.Store(false)
+	held := c.held
+	c.held = nil
+	for _, cmd := range held {
+		c.onCommand(cmd)
+	}
+}
+
+// refuseQueuedMutations answers the Mutate calls waiting on cmds with ErrNotSent, and keeps the
+// other commands, in order, to run when the session is back. The session goroutine does not read
+// cmds while it dials, so these are calls that got past Mutate's own check just as the socket
+// dropped.
+func (c *Client) refuseQueuedMutations() {
+	for {
+		select {
+		case cmd := <-c.cmds:
+			if cmd.kind == kindMutate {
+				cmd.resp <- mutationResult{err: ErrNotSent}
+				continue
+			}
+			c.held = append(c.held, cmd)
+		default:
+			return
+		}
+	}
 }
 
 func (c *Client) resubscribe() {
@@ -588,6 +737,44 @@ func (c *Client) resubscribe() {
 	c.flush()
 }
 
+// tokenError is a failure of the token source rather than of the dial. It is never final: the
+// source may work next time.
+type tokenError struct{ err error }
+
+func (e *tokenError) Error() string { return "refhir: the token source failed: " + e.err.Error() }
+func (e *tokenError) Unwrap() error { return e.err }
+
+// bearer is the token to send now, or empty for none.
+func (c *Client) bearer(ctx context.Context) (string, error) {
+	if c.tokens == nil {
+		return "", nil
+	}
+	return c.tokens(ctx)
+}
+
+// dialSocket opens the /sync socket with the token the source gives. On a 401 it asks the source
+// once more and dials again, unless the source gives back the very token that was refused, which
+// would only be refused again.
+func (c *Client) dialSocket(ctx context.Context) (*websocket.Conn, error) {
+	token, err := c.bearer(ctx)
+	if err != nil {
+		return nil, &tokenError{err}
+	}
+	conn, err := dialSocket(ctx, c.wsURL, token)
+	var refused *UpgradeError
+	if err == nil || !errors.As(err, &refused) || refused.Status != http.StatusUnauthorized {
+		return conn, err
+	}
+	fresh, serr := c.bearer(ctx)
+	if serr != nil {
+		return nil, &tokenError{serr}
+	}
+	if fresh == token {
+		return nil, err
+	}
+	return dialSocket(ctx, c.wsURL, fresh)
+}
+
 func (c *Client) dialUntilCancelled() (*websocket.Conn, error) {
 	backoff := 50 * time.Millisecond
 	for {
@@ -595,7 +782,7 @@ func (c *Client) dialUntilCancelled() (*websocket.Conn, error) {
 			return nil, errClosed
 		}
 		ctx, cancel := context.WithTimeout(c.root, 10*time.Second)
-		conn, err := dialSocket(ctx, c.wsURL, c.token)
+		conn, err := c.dialSocket(ctx)
 		cancel()
 		if err == nil {
 			return conn, nil
@@ -603,7 +790,8 @@ func (c *Client) dialUntilCancelled() (*websocket.Conn, error) {
 		wait := backoff
 		var refused *UpgradeError
 		if errors.As(err, &refused) {
-			// A token the server does not accept will not be accepted by asking again.
+			// A token the server does not accept, even one the source has just renewed, will not be
+			// accepted by asking again.
 			if refused.Status == http.StatusUnauthorized || refused.Status == http.StatusForbidden {
 				return nil, err
 			}

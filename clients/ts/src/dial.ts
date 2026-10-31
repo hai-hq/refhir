@@ -1,4 +1,4 @@
-import { Client, type DialOptions } from "./client.js";
+import { Client, tokenSource, type DialOptions } from "./client.js";
 import { isBrowser } from "./runtime.js";
 import { openBrowserSocket } from "./transport-browser.js";
 import { openNodeSocket } from "./transport-node.js";
@@ -7,18 +7,17 @@ import type { SocketConnection } from "./socket.js";
 
 export { isBrowser };
 
-function openSocket(options: DialOptions): (wsURL: string) => Promise<SocketConnection> {
+function openSocket(
+  options: DialOptions,
+): (wsURL: string, token: string | undefined) => Promise<SocketConnection> {
   const runtime = options.runtime ?? (isBrowser() ? "browser" : "node");
-  const token = options.token;
-  if (runtime === "browser") {
-    return (wsURL) => openBrowserSocket(wsURL, token);
-  }
-  return (wsURL) => openNodeSocket(wsURL, token);
+  if (runtime === "browser") return openBrowserSocket;
+  return openNodeSocket;
 }
 
 export async function dial(baseURL: string, options: DialOptions = {}): Promise<Client> {
   const { httpBase, wsURL } = splitBase(baseURL);
-  return Client.connect(httpBase, wsURL, options.token, openSocket(options), {
+  return Client.connect(httpBase, wsURL, tokenSource(options.token), openSocket(options), {
     readYourWrites: options.readYourWrites,
   });
 }

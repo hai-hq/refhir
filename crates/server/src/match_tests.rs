@@ -10,12 +10,14 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::http::StatusCode;
+use futures_util::SinkExt;
 use refhir_database::Database;
 use refhir_fhir::{import_resource, install_package_dir, patient_match_dir, Catalog};
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message;
 
-use crate::tests::{send, send_text, Reply};
+use crate::tests::{connect, next_json, send, send_text, Reply};
 use crate::{app_with, ServerConfig};
 
 const PROFILE: &str = "https://id.example.org/profile";
@@ -1620,4 +1622,67 @@ fn a_patient_token_is_refused_whatever_the_route_to_it() {
         .prepare("Patient/$match", &args, false)
         .unwrap_err();
     assert!(refused.contains("unsupported operation"), "{refused}");
+}
+
+/// One `Patient/$match` as a `/sync` Mutation, with the Parameters a REST call takes as its `args`.
+async fn match_over_sync(app: axum::Router, query: &str) -> Value {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut socket, _) = connect(&format!("ws://{addr}/sync{query}")).await;
+    let request = parameters(
+        json!({"resourceType": "Patient", "identifier": [identifier("PRF-1001")]}),
+        None,
+        None,
+    );
+    socket
+        .send(Message::Text(
+            json!({"type": "Mutation", "requestId": 1, "udfPath": "Patient/$match", "args": request})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    next_json(&mut socket).await
+}
+
+#[tokio::test]
+async fn over_sync_a_server_without_smart_answers_and_one_with_smart_refuses() {
+    // No SMART: the operation runs as it does on REST, and answers the Bundle as `result`.
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, patient_match_dir()).unwrap();
+    import_all(
+        &db,
+        &catalog,
+        &[with(
+            person("ada", "Okafor", &["Ada"], "1985-03-02"),
+            "identifier",
+            json!([identifier("PRF-1001")]),
+        )],
+    );
+    let open = app_with(db, catalog, store, ServerConfig::default());
+    let answer = match_over_sync(open, "").await;
+    assert_eq!(answer["type"], "MutationResponse", "{answer}");
+    assert_eq!(answer["success"], true, "{answer}");
+    assert_eq!(answer["result"]["resourceType"], "Bundle", "{answer}");
+    assert_eq!(answer["result"]["type"], "searchset", "{answer}");
+    assert_eq!(
+        entries(&answer["result"]),
+        ids_and_grades(&[("ada", "certain")]),
+        "{answer}"
+    );
+
+    // SMART: the scope table has no entry for `$match`, so no token gets it over `/sync`, however
+    // much it may search Patients on REST.
+    let refused = match_over_sync(seeded(), "?access_token=reader").await;
+    assert_eq!(refused["success"], false, "{refused}");
+    let issue = &refused["result"]["issue"][0];
+    assert_eq!(issue["code"], "forbidden", "{refused}");
+    assert_eq!(
+        issue["diagnostics"], "unsupported operation $match",
+        "{refused}"
+    );
 }

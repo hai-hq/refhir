@@ -323,8 +323,11 @@ curl -s -X POST http://localhost:8080/ChargeItemDefinition/consultation/\$apply 
   is a `415`.
 - **Access.** With SMART the token needs to be able to read the definition, the ChargeItem and, if one is
   named, the Account: the operation writes nothing, so reading is enough. A token that is limited to one
-  patient cannot use it, since it prices a ChargeItem the path does not name. It is not available over
-  `/sync`.
+  patient cannot use it, since it prices a ChargeItem the path does not name.
+- **Over `/sync`.** A server without SMART runs it as a `Mutation` named `ChargeItemDefinition/$apply`,
+  with `{"id": "[id]", "resource": <the Parameters>}` as its `args`, and answers the Invoice as
+  `result`. With SMART the scope table `/sync` checks has no entry for it, so it is refused whatever the
+  token holds: use REST. See [the protocol](sync-protocol.md#mutation).
 
 ### Submitting a claim or an eligibility request
 
@@ -369,7 +372,11 @@ and, in a Bundle, the position of the entry).
 With SMART, the token needs to be able to create everything the submission writes: the Claim, the response
 type, and every other type in the Bundle (or to update it, for a `PUT` entry; a `PUT` with a query, which
 creates when nothing matches, needs to create as well). A token that is limited to
-one patient cannot submit. `$submit` is not available over `/sync`.
+one patient cannot submit.
+
+Over `/sync` a server without SMART runs it as a `Mutation` named `Claim/$submit` (or
+`CoverageEligibilityRequest/$submit`), with `{"resource": <the Claim, or the Bundle, or the Parameters>}`
+as its `args`. With SMART it is refused, as `$apply` is: use REST.
 
 ### Documents
 
@@ -572,8 +579,24 @@ body is a `415`.
 
 Only the store the request is made to is searched. The caller needs a scope that may search
 Patients (`user/Patient.read` or `user/Patient.rs`). A token limited to one patient is refused,
-because the operation reads every Patient there is, and `$match` is not available over `/sync`.
-The audit trail records it as an operation on `Patient`, without the Patient in the request.
+because the operation reads every Patient there is. The audit trail records it as an operation on
+`Patient`, without the Patient in the request.
+
+Over `/sync` it is a `Mutation` named `Patient/$match`, with the same `Parameters` as its `args` (the
+same three parameters as the members of a plain object work too), and the `searchset` Bundle comes back
+as `result`:
+
+```json
+{"type": "Mutation", "requestId": 7, "udfPath": "Patient/$match", "args": {"resourceType": "Parameters", "parameter": [
+  {"name": "resource", "resource": {"resourceType": "Patient", "identifier": [{"system": "https://id.example.org/profile", "value": "PRF-1001"}]}}
+]}}
+```
+
+A server without SMART answers it as REST does, with no scopes to check. **With SMART on, `/sync` does
+not offer it:** the scope table every `/sync` operation is checked against has no entry for `$match`, so
+the `Mutation` answers `forbidden` (`unsupported operation $match`) whatever the token holds, a token that
+may search Patients included. Send it over REST, where the scope above is what it needs. See
+[the protocol](sync-protocol.md#mutation).
 
 Beyond REST:
 

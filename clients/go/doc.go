@@ -13,6 +13,10 @@
 // never serves a read older than this client's own writes. See LastCommitTs and
 // WithReadYourWrites.
 //
+// A session outlives the token it started with when it is dialled with WithTokenSource: the
+// server ends a socket whose token expired, and the client asks the source for a new one at the
+// redial and adds every live query again.
+//
 // See README.md in this directory for examples, operation arguments, and
 // reconnect behavior.
 package refhir

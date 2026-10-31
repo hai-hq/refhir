@@ -85,8 +85,12 @@ func (c *Client) Do(ctx context.Context, method, path string, body []byte) ([]by
 	if body != nil {
 		req.Header.Set("Content-Type", "application/fhir+json")
 	}
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	token, err := c.bearer(ctx)
+	if err != nil {
+		return nil, &tokenError{err}
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	if c.readYourWrites {
 		if ts := c.lastTs.Load(); ts > 0 {

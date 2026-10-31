@@ -397,14 +397,21 @@ async fn handle_text(
                                 message.limit_reached();
                                 transition.push(query_failed(
                                     query_id,
-                                    format!("too many live queries: a connection may hold {cap}"),
+                                    QueryError::new(
+                                        "too-costly",
+                                        format!(
+                                            "too many live queries: a connection may hold {cap}"
+                                        ),
+                                    ),
                                 ));
                                 continue;
                             }
                         }
                         if let Err(rejection) = message.admit().await {
-                            transition
-                                .push(query_failed(query_id, rejection.message().to_string()));
+                            transition.push(query_failed(
+                                query_id,
+                                QueryError::new("throttled", rejection.message()),
+                            ));
                             continue;
                         }
                         // Only now, with the new query let in, is the one it replaces let go: a
@@ -416,7 +423,7 @@ async fn handle_text(
                             Ok(args) => args,
                             Err(err) => {
                                 message.deny(&args, &err);
-                                transition.push(query_failed(query_id, err));
+                                transition.push(query_failed(query_id, QueryError::refused(err)));
                                 continue;
                             }
                         };
@@ -594,11 +601,47 @@ fn batch_writes(args: &Value) -> bool {
         })
 }
 
-fn query_failed(query_id: u64, error: String) -> Value {
+/// Why a query could not be run, or run again: the plain text a person reads, and the FHIR
+/// IssueType a program can switch on. The text is not a contract; the code is.
+struct QueryError {
+    code: String,
+    message: String,
+}
+
+impl QueryError {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// The code the same failure carries when a mutation hits it, so a client sees one vocabulary.
+    fn from_run(err: &RunError) -> Self {
+        let outcome = http::outcome_value(err);
+        let code = outcome
+            .pointer("/issue/0/code")
+            .and_then(Value::as_str)
+            .unwrap_or("exception");
+        Self::new(code, err.to_string())
+    }
+
+    /// A refusal from the scope check, which says why in a sentence. Scope and patient refusals
+    /// are `forbidden`; the rest say the operation is not one that can be subscribed to.
+    fn refused(reason: String) -> Self {
+        let forbidden = reason.starts_with("scope does not allow")
+            || reason.starts_with("token is limited")
+            || reason.ends_with("requires authentication");
+        Self::new(if forbidden { "forbidden" } else { "invalid" }, reason)
+    }
+}
+
+fn query_failed(query_id: u64, error: QueryError) -> Value {
     json!({
         "type": "QueryFailed",
         "queryId": query_id,
-        "error": error,
+        "error": error.message,
+        "code": error.code,
         "logLines": []
     })
 }
@@ -642,7 +685,7 @@ async fn add_query(
     query_id: u64,
     path: &str,
     args: Value,
-) -> Result<(Value, SubToken, Value), String> {
+) -> Result<(Value, SubToken, Value), QueryError> {
     let Engine {
         db,
         catalog,
@@ -652,9 +695,12 @@ async fn add_query(
     for _ in 0..8 {
         let result = execute(db, catalog, store, path, args.clone())
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| QueryError::from_run(&err))?;
         if result.wrote {
-            return Err(format!("{path} writes and cannot be subscribed"));
+            return Err(QueryError::new(
+                "invalid",
+                format!("{path} writes and cannot be subscribed"),
+            ));
         }
         match db.subscribe(result.reads, result.ts, query_id, inv_tx.clone()) {
             Ok(token) => {
@@ -679,7 +725,7 @@ async fn add_query(
             }
         }
     }
-    Err("query stayed stale".into())
+    Err(QueryError::new("transient", "query stayed stale"))
 }
 
 async fn push_updates(
@@ -712,12 +758,11 @@ async fn push_updates(
                         if let Some(old) = live.queries.remove(&query_id) {
                             engine.db.unsubscribe(old.token);
                         }
-                        transition.push(json!({
-                            "type": "QueryFailed",
-                            "queryId": query_id,
-                            "error": allowed.err().unwrap_or_else(|| "token is limited to a different patient".into()),
-                            "logLines": []
-                        }));
+                        let reason = allowed
+                            .err()
+                            .unwrap_or_else(|| "token is limited to a different patient".into());
+                        transition
+                            .push(query_failed(query_id, QueryError::new("forbidden", reason)));
                         continue;
                     }
                 }
@@ -738,6 +783,14 @@ async fn push_updates(
                 if let Some(old) = live.queries.remove(&query_id) {
                     engine.db.unsubscribe(old.token);
                 }
+                // A read answers "not found" for a resource that was deleted, as REST does. This
+                // one was accepted when it was added, so the resource was there then: if it is
+                // gone now, it was deleted, and a client should be told so.
+                let err = if err.code == "not-found" && path.ends_with("/read") {
+                    QueryError::new("deleted", err.message)
+                } else {
+                    err
+                };
                 transition.push(query_failed(query_id, err));
             }
         }
@@ -765,7 +818,7 @@ async fn rerun(
     query_id: u64,
     path: &str,
     args: &Value,
-) -> Result<(Value, SubToken), String> {
+) -> Result<(Value, SubToken), QueryError> {
     let Engine {
         db,
         catalog,
@@ -777,7 +830,7 @@ async fn rerun(
             value, ts, reads, ..
         } = execute(db, catalog, store, path, args.clone())
             .await
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| QueryError::from_run(&err))?;
         match db.refresh_subscription(token, reads.clone(), ts) {
             Ok(()) => {
                 tracing::debug!(
@@ -813,7 +866,7 @@ async fn rerun(
             }
         }
     }
-    Err("query stayed stale".into())
+    Err(QueryError::new("transient", "query stayed stale"))
 }
 
 async fn send_transition(
@@ -895,7 +948,50 @@ mod tests {
     use refhir_sqlite::SqlitePersistence;
     use serde_json::json;
 
-    use super::authorize;
+    use super::{authorize, QueryError};
+
+    #[test]
+    fn a_scope_refusal_is_forbidden_and_a_write_to_subscribe_is_invalid() {
+        for reason in [
+            "scope does not allow Observation/search",
+            "token is limited to a different patient",
+            "ImplementationGuide/$install requires authentication",
+        ] {
+            assert_eq!(
+                QueryError::refused(reason.into()).code,
+                "forbidden",
+                "{reason}"
+            );
+        }
+        for reason in [
+            "bundle cannot be subscribed",
+            "Patient/update writes and cannot be subscribed",
+            "bad operation frobnicate",
+            "unsupported operation Patient/frobnicate",
+        ] {
+            assert_eq!(
+                QueryError::refused(reason.into()).code,
+                "invalid",
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_run_carries_the_code_a_mutation_would() {
+        use refhir_fhir::{FhirError, RunError};
+        let gone = QueryError::from_run(&RunError::Fhir(FhirError::Gone("Patient/p1".into())));
+        assert_eq!(gone.code, "deleted");
+        let missing = QueryError::from_run(&RunError::Fhir(FhirError::NotFound("x".into())));
+        assert_eq!(missing.code, "not-found");
+        // An error that is itself an OperationOutcome gives the code it carries.
+        let costly = QueryError::from_run(&RunError::Fhir(FhirError::Unprocessable(json!({
+            "resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "too-costly", "diagnostics": "too many"}]
+        }))));
+        assert_eq!(costly.code, "too-costly");
+        assert_eq!(costly.message, "too many");
+    }
 
     #[test]
     fn unauthenticated_sync_drops_client_controls() {
