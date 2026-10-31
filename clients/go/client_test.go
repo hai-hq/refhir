@@ -203,6 +203,67 @@ func TestSmartBearer(t *testing.T) {
 	}
 }
 
+func TestWatchedResourceThatIsDeletedFailsWithCodeDeleted(t *testing.T) {
+	base := startServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	watcher, err := Dial(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { watcher.Close() })
+	writer, err := Dial(ctx, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { writer.Close() })
+	created, err := writer.Create(ctx, "Patient", patientJSON("p1", "Ann"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := idOf(t, created)
+	watch, err := watcher.Read(ctx, "Patient", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { watch.Close() })
+
+	if _, err := writer.Delete(ctx, "Patient", id); err != nil {
+		t.Fatal(err)
+	}
+	_, err = watch.Next(ctx)
+	var failed *QueryError
+	if !errors.As(err, &failed) {
+		t.Fatalf("Next returned %v, want a *QueryError", err)
+	}
+	if failed.Code != CodeDeleted || failed.Path != "Patient/read" {
+		t.Fatalf("QueryError = %+v, want code %q on Patient/read", failed, CodeDeleted)
+	}
+}
+
+func TestQueryRefusedByScopeFailsWithCodeForbidden(t *testing.T) {
+	base := startServer(t, "--smart", "--smart-demo-login")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	client, err := Dial(ctx, base, Bearer(issueTokenScoped(t, base, "user/Patient.read")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	// The token reads Patients, so this one works.
+	allowed, err := client.Search(ctx, "Patient", map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed.Close()
+	_, err = client.Search(ctx, "Observation", map[string]string{})
+	var failed *QueryError
+	if !errors.As(err, &failed) || failed.Code != CodeForbidden {
+		t.Fatalf("Search returned %v, want a *QueryError with code %q", err, CodeForbidden)
+	}
+}
+
 func TestTransactionAndDelete(t *testing.T) {
 	base := startServer(t)
 	ctx := context.Background()
@@ -290,6 +351,12 @@ func family(t *testing.T, body json.RawMessage) string {
 // with --smart-demo-login.
 func issueToken(t *testing.T, base string) string {
 	t.Helper()
+	return issueTokenScoped(t, base, "user/*.read user/*.write")
+}
+
+// issueTokenScoped is issueToken for a token that holds only the scope asked for.
+func issueTokenScoped(t *testing.T, base, scope string) string {
+	t.Helper()
 	// Redirects carry the session and the code, so read them instead of following them.
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -303,7 +370,7 @@ func issueToken(t *testing.T, base string) string {
 		"response_type":         {"code"},
 		"client_id":             {"public"},
 		"redirect_uri":          {redirectURI},
-		"scope":                 {"user/*.read user/*.write"},
+		"scope":                 {scope},
 		"state":                 {"s1"},
 		"aud":                   {base},
 		"code_challenge":        {challenge},

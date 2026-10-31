@@ -6,7 +6,7 @@ export type QueryModification =
 
 export type StateModification =
   | { type: "QueryUpdated"; queryId: number; value: JsonValue; logLines?: unknown[] }
-  | { type: "QueryFailed"; queryId: number; error: string; logLines?: unknown[] }
+  | { type: "QueryFailed"; queryId: number; error: string; code?: string; logLines?: unknown[] }
   | { type: "QueryRemoved"; queryId: number };
 
 export function modifyQuerySet(

@@ -2391,6 +2391,34 @@ async fn smart_scopes_gate_http_and_sync() {
         "the live search failed: {first}"
     );
     assert_eq!(first["modifications"][0]["value"]["resourceType"], "Bundle");
+    // The token reads Patients only. A query it may not run says so with a code a client can
+    // switch on, whatever the wording of the text.
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "ModifyQuerySet",
+                "baseVersion": 1,
+                "newVersion": 2,
+                "modifications": [{
+                    "type": "Add",
+                    "queryId": 2,
+                    "udfPath": "Observation/search",
+                    "args": {}
+                }]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let refused = next_json(&mut socket).await;
+    assert_eq!(
+        refused["modifications"][0]["type"], "QueryFailed",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["modifications"][0]["code"], "forbidden",
+        "{refused}"
+    );
     socket
         .send(Message::Text(
             json!({
@@ -7917,6 +7945,7 @@ pub(crate) mod sync_gaps {
                     .contains("cannot be subscribed"),
                 "{path}: {reply}"
             );
+            assert_eq!(item["code"], "invalid", "{path}: {reply}");
         }
         let found = send(&app, "GET", "/Patient", None, None).await;
         assert_eq!(
@@ -7943,6 +7972,7 @@ pub(crate) mod sync_gaps {
             let reply = next_json(&mut socket).await;
             let item = &reply["modifications"][0];
             assert_eq!(item["type"], "QueryFailed", "{reply}");
+            assert_eq!(item["code"], "invalid", "{reply}");
             assert_eq!(item["queryId"], 10 + base);
             let error = item["error"].as_str().unwrap_or("");
             assert!(
@@ -7991,6 +8021,8 @@ pub(crate) mod sync_gaps {
             failed["modifications"][0]["type"], "QueryFailed",
             "{failed}"
         );
+        // A watched resource that was deleted says so by its code, not only in its text.
+        assert_eq!(failed["modifications"][0]["code"], "deleted", "{failed}");
 
         // The same id is written again. Both clients dropped the query when it failed, so the
         // server must have too: nothing may revive it, or it would hold a place under

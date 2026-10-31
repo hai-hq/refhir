@@ -37,6 +37,7 @@ type stateModification struct {
 	QueryID uint64          `json:"queryId"`
 	Value   json.RawMessage `json:"value"`
 	Error   string          `json:"error"`
+	Code    string          `json:"code"`
 }
 
 type mutationResponse struct {

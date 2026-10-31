@@ -10,6 +10,52 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **A client can outlive its token.** The Go and TypeScript clients take a token source
+  (`WithTokenSource`, or a function as the TypeScript `token` option) that they ask for the first
+  `/sync` upgrade, for every redial and for every REST call. The server ends a socket whose token
+  expired, and the client dials again with a renewed one, so a service that holds live queries open
+  for hours behind a gateway that issues short-lived tokens keeps its watches and its session. On a
+  401 at a redial the client asks the source once more before it gives up; a second 401, a source
+  that returns the token just refused, and a 403 still end the session, and an error from the source
+  is retried with the dial backoff. `Bearer(token)` and a plain `token` string are a source that
+  always gives the same token, so they behave as before. A token is renewed by redial: there is no
+  message that replaces the token of an open socket.
+- **`QueryFailed` carries a `code`.** It is the FHIR IssueType that applies (`deleted`, `not-found`,
+  `forbidden`, `throttled`, `too-costly`, `invalid`, `transient`, `exception`), so a client can tell a
+  watched resource that was deleted from a scope refusal, a rate limit or a cap without reading the
+  text of `error`, which is still sent and still not a contract. The Go client returns it as a
+  `*QueryError` from `Watch.Next`, and the TypeScript client as a `QueryError`.
+- **A client can tell a mutation that was never sent from one in doubt.** `Mutate` on a Go client that
+  is dialling again fails at once with `ErrNotSent` (`NotSentError` in TypeScript), and
+  `Connected()` (`connected`) says whether it has a socket. A mutation lost with the socket fails
+  with `ErrDisconnected` (`DisconnectedError`), which may have been applied. TypeScript `mutate` and
+  `watch` take an `AbortSignal`.
+
+### Changed
+
+- **A call whose caller gave up is not sent after a redial.** The Go client's session goroutine
+  redials without reading its commands, so a `Mutate` or `Watch` made meanwhile used to wait and go
+  out when the socket was back, whatever its context said; a caller that had timed out could not
+  know the write was applied later. A command whose context has ended is now dropped unsent, and a
+  `Mutate` made while the client dials again fails at once instead of waiting.
+
+### Fixed
+
+- **A data race in the Go client's `Watch.Close`.** A watch cancelled while its `Add` was still being
+  sent read its id while the session goroutine wrote it. The id is now handed over under the watch's
+  lock, and a query whose watch was closed first is never registered, so none is left running on
+  the server.
+
+### Documentation
+
+- `Patient/$match` is available over `/sync`, as a `Mutation` with the REST `Parameters` as its
+  `args`, on a server without SMART; the docs said it was not. With SMART on `/sync` still refuses it
+  (and `$apply` and `$submit`), as it has no scope entry for them. The page also gives the argument
+  shape of the terminology operations over `/sync` (flat names) and of instance-level operations such
+  as `ChargeItemDefinition/$apply` (`{id, resource}`).
+
 ## [0.0.4] - 2026-10-27
 
 ### Added

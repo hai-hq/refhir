@@ -50,7 +50,7 @@ export async function requestWithHeaders(
     Accept: "application/fhir+json",
   };
   if (body) headers["Content-Type"] = "application/fhir+json";
-  const token = client.authToken();
+  const token = await client.authToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   const minTs = client.minTs();
   if (minTs !== undefined) headers[MIN_TS_HEADER] = minTs.toString();
