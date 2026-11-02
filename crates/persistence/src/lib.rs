@@ -511,6 +511,17 @@ impl ParamStatus {
     }
 }
 
+/// What [`ConformanceStore::shared_catalog`] says about a catalog that tenants can share.
+#[derive(Clone)]
+pub struct SharedCatalog {
+    /// Names the content: equal keys, equal catalogs.
+    pub key: String,
+    /// Reads the definitions and terminology a catalog of this key is made of, one row at a time,
+    /// as the catalog needs them. It belongs to no tenant, so it outlives whichever tenant's store
+    /// the catalog was first made from.
+    pub source: std::sync::Arc<dyn ConformanceStore>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredPackage {
     pub id: i64,
@@ -1136,6 +1147,16 @@ pub trait ConformanceStore: Send + Sync {
     /// that cannot give one, and a catalog then loads everything it needs when it is built.
     fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
         None
+    }
+
+    /// Whether the catalog this store gives is made of nothing but what other stores of the same
+    /// database hold too: the definitions every tenant shares, and nothing of its own. If so, the
+    /// key names exactly that content (two stores with the same key give the same catalog), and
+    /// the source reads it without depending on any one tenant. A process that serves many tenants
+    /// then compiles it once and its tenants share it. `None`, the default, is a store whose
+    /// catalog is its own.
+    fn shared_catalog(&self) -> Result<Option<SharedCatalog>, PersistError> {
+        Ok(None)
     }
 
     /// The terminology rows of one package. The full load returns every installed package's

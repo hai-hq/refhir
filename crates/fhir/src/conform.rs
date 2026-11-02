@@ -757,6 +757,9 @@ pub(crate) fn apply_terminology(
     written: &[String],
     removed: &[(String, String)],
 ) -> Result<(), FhirError> {
+    // What was written is the tenant's own, which a catalog read from the rows tenants share
+    // cannot find when it reads terminology that it does not hold.
+    crate::catalog::Catalog::detach_from_shared(catalog, store)?;
     let mut upserted = Vec::new();
     for row in store.load_terminology_for(written)? {
         // The lookup also matches other versions of the same system; only what was written

@@ -1534,6 +1534,7 @@ dependencies = [
 name = "refhir"
 version = "0.0.4"
 dependencies = [
+ "axum",
  "postgres",
  "refhir-database",
  "refhir-fhir",
@@ -1676,6 +1677,7 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "futures-util",
+ "hmac 0.12.1",
  "http-body-util",
  "jsonwebtoken",
  "rand 0.8.8",

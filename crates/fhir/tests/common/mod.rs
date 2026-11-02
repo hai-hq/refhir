@@ -62,6 +62,7 @@ pub fn measure<T>(work: impl FnOnce() -> T) -> Measured<T> {
     }
 }
 
+#[allow(dead_code)]
 pub fn mib(bytes: usize) -> usize {
     bytes >> 20
 }

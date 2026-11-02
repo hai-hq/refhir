@@ -2568,6 +2568,11 @@ impl MemoryTerminology {
         updates
     }
 
+    /// Whether any value set waits to be expanded, which [`Self::expand_waiting`] tries.
+    pub fn has_unexpanded(&self) -> bool {
+        !self.unexpanded.is_empty()
+    }
+
     fn remove_map(&mut self, map_url: &str) {
         self.maps.retain(|map| map.url != map_url);
     }

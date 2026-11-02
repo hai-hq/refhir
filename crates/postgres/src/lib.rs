@@ -19,18 +19,24 @@ use refhir_types::{DocumentId, IndexId, Interval, Order, TabletId, Timestamp};
 
 mod announce;
 mod lease;
+mod listen;
 mod migrate;
 mod scope;
+mod shared;
 mod tenant;
 #[doc(hidden)]
 pub mod test_support;
 mod tls;
 
+pub use listen::Subscription;
 pub use migrate::migration_report;
 use scope::Scope;
 use serde_json::Value as JsonValue;
+use shared::Connections;
+pub use shared::{SharedConnections, SharedOptions};
 pub use tenant::{
-    create_tenant, delete_tenant, holds_tenants, list_tenants, validate_tenant_name, Tenant,
+    create_tenant, create_tenant_with, delete_tenant, get_tenant, holds_tenants, list_tenants,
+    purge_due_tenants, restore_tenant, soft_delete_tenant, validate_tenant_name, Created, Tenant,
 };
 
 pub(crate) struct Inner {
@@ -40,6 +46,10 @@ pub(crate) struct Inner {
     /// each time is planned each time; a prepared one is planned for a few of its first runs and
     /// then not at all.
     ranges: std::collections::HashMap<String, postgres::Statement>,
+    /// The tenant this connection has told the database it serves (`refhir.tenant`), if any. A
+    /// connection of a pool that several tenants share serves whichever tenant checked it out
+    /// last, and says so again only when that changes.
+    pub(crate) tenant: Option<i32>,
 }
 
 impl Inner {
@@ -47,7 +57,17 @@ impl Inner {
         Self {
             client,
             ranges: std::collections::HashMap::new(),
+            tenant: None,
         }
+    }
+
+    /// A connection that already serves `scope`.
+    pub(crate) fn serving(client: Conn, scope: Scope) -> Self {
+        let mut inner = Self::new(client);
+        if let Scope::Tenant(id) = scope {
+            inner.tenant = Some(id);
+        }
+        inner
     }
 }
 
@@ -146,10 +166,11 @@ pub(crate) fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 
 #[derive(Clone)]
 pub struct PostgresPersistence {
-    inner: Arc<Pool<Inner>>,
-    /// A connection that only listens for the writer's "published" notice. Dedicated, so a
-    /// reader waiting on it never holds one of the pool's connections.
-    listener: Arc<std::sync::Mutex<Option<Conn>>>,
+    inner: Arc<Connections>,
+    /// How a reader hears the writer's "published" notice: on a connection of its own, so a
+    /// reader waiting on it never holds one of the pool's connections, or through the one that
+    /// listens for every tenant of the process.
+    listener: Arc<Listener>,
     /// Held across the multi-statement conformance writes. A single connection used to make
     /// them run one at a time; with a pool they would interleave, and two installs could
     /// both pass a check before either inserts.
@@ -164,6 +185,9 @@ pub struct PostgresPersistence {
     /// another tenant's rows whatever it asks. False for the classic layout, and for a role that
     /// bypasses row-level security (a superuser, or one with BYPASSRLS).
     row_security: bool,
+    /// For a reader of what every tenant shares: the expansions a catalog made for one tenant holds
+    /// beyond the shared copy's, which the catalog reads from here. Empty for any other.
+    overlay: Arc<std::collections::HashMap<(i64, String), String>>,
 }
 
 impl PostgresPersistence {
@@ -186,25 +210,85 @@ impl PostgresPersistence {
             let announcer = announce::Announcer::new(interval, scope.channel(), owned.clone());
             let pool = Pool::new(
                 options.pool_size,
-                vec![Inner::new(client)],
+                vec![Inner::serving(client, scope)],
                 move || {
                     connect_client_for(&factory_url, scope)
-                        .map(|client| Inner::new(Conn::new(client)))
+                        .map(|client| Inner::serving(Conn::new(client), scope))
                 },
                 |inner: &Inner| !inner.client.is_closed(),
             );
             Ok(Self {
-                inner: Arc::new(pool),
-                listener: Arc::new(std::sync::Mutex::new(None)),
+                inner: Arc::new(Connections::own(pool, scope)),
+                listener: Arc::new(Listener::Own(Box::new(std::sync::Mutex::new(None)))),
                 gate: Arc::new(std::sync::Mutex::new(())),
                 lease: Arc::new(lease::LeaseState::new(scope)),
                 url: owned,
                 scope,
                 announcer,
                 row_security,
+                overlay: Arc::default(),
             })
         })
     }
+
+    /// Tenant `name` of a database that many tenants share, served through `shared`: up to
+    /// `share` of its pool's connections at once, its lease on the shared session, and its
+    /// announcements on the shared line. The tenant must exist and must not be deleted.
+    pub fn open_tenant(
+        shared: &Arc<SharedConnections>,
+        name: &str,
+        share: usize,
+    ) -> Result<Self, PersistError> {
+        tenant::validate_tenant_name(name)?;
+        let id = shared.with_registry(|client| {
+            tenant::tenant_id(client, name)?
+                .ok_or_else(|| definite(format!("tenant `{name}` does not exist in this database")))
+        })?;
+        let scope = Scope::Tenant(id);
+        let announcer = announce::Announcer::with_line(
+            TENANT_ANNOUNCE_INTERVAL,
+            scope.channel(),
+            shared.url.clone(),
+            Some(shared.announce.clone()),
+        );
+        Ok(Self {
+            inner: Arc::new(Connections::shared(shared.pool.clone(), scope, share)),
+            listener: Arc::new(Listener::Shared(shared.listen.subscribe(scope.channel()))),
+            gate: Arc::new(std::sync::Mutex::new(())),
+            lease: Arc::new(lease::LeaseState::on_hub(scope, shared.lease.clone())),
+            url: shared.url.clone(),
+            scope,
+            announcer,
+            row_security: shared.row_security,
+            overlay: Arc::default(),
+        })
+    }
+}
+
+/// Rows up to which [`PostgresPersistence::storage_usage`] adds up every row's size.
+pub const EXACT_SIZE_ROWS: u64 = 20_000;
+
+/// What [`PostgresPersistence::storage_usage`] measured.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageUsage {
+    /// Rows of the document log: every version of every resource.
+    pub documents: u64,
+    pub document_bytes: u64,
+    /// Rows of the search index.
+    pub index_rows: u64,
+    pub index_bytes: u64,
+}
+
+impl StorageUsage {
+    pub fn bytes(&self) -> u64 {
+        self.document_bytes.saturating_add(self.index_bytes)
+    }
+}
+
+/// See the `listener` field of [`PostgresPersistence`].
+enum Listener {
+    Own(Box<std::sync::Mutex<Option<Conn>>>),
+    Shared(listen::Subscription),
 }
 
 /// Checks that the database has the layout this process expects, brings it up to date, and says
@@ -257,6 +341,32 @@ fn open_layout(client: &mut Conn, options: &ConnectOptions) -> Result<Scope, Per
 }
 
 impl PostgresPersistence {
+    /// A reader of what every tenant shares (the catalog's instance), through the same pool as this
+    /// tenant, for a catalog that tenants share to read its definitions through: it is nobody's
+    /// tenant, so it goes on working when the tenant it was made from has gone. `None` unless this
+    /// persistence is one of several tenants' of one pool.
+    pub(crate) fn base_view(
+        &self,
+        overlay: std::collections::HashMap<(i64, String), String>,
+    ) -> Option<Self> {
+        let inner = self.inner.with_scope(Scope::CATALOG, 1)?;
+        Some(Self {
+            inner: Arc::new(inner),
+            listener: Arc::new(Listener::Own(Box::new(std::sync::Mutex::new(None)))),
+            gate: Arc::new(std::sync::Mutex::new(())),
+            lease: Arc::new(lease::LeaseState::new(Scope::CATALOG)),
+            url: self.url.clone(),
+            scope: Scope::CATALOG,
+            announcer: announce::Announcer::new(
+                std::time::Duration::ZERO,
+                Scope::CATALOG.channel(),
+                self.url.clone(),
+            ),
+            row_security: self.row_security,
+            overlay: Arc::new(overlay),
+        })
+    }
+
     /// Whether the database itself keeps this process to its own tenant's rows (see the
     /// `row_security` field).
     pub fn row_security_applies(&self) -> bool {
@@ -269,6 +379,85 @@ impl PostgresPersistence {
     /// against the epoch this process held.
     pub fn release_writer_lease(&self) {
         self.lease.release();
+    }
+
+    /// For a tenant opened with [`PostgresPersistence::open_tenant`]: `hook` is called once if
+    /// its writer lease is lost while the process goes on (another process took the tenant over).
+    /// Its writes are refused from then on; the hook is for the process to stop serving it.
+    pub fn on_writer_lease_lost(&self, hook: impl Fn(&str) + Send + Sync + 'static) {
+        self.lease.set_on_lost(Box::new(hook));
+    }
+
+    /// Whether this tenant's writer lease was lost while the process went on.
+    pub fn writer_lease_lost(&self) -> bool {
+        self.lease.is_lost()
+    }
+
+    /// How much this database (or, for a tenant, this tenant) stores: the rows of its document log
+    /// (every version of every resource) and of its search index, and their size in bytes as
+    /// Postgres stores them, before indexes and free space. The rows are counted exactly (from the
+    /// index that leads with the tenant, so without reading the table); the size is exact up to
+    /// [`EXACT_SIZE_ROWS`] rows and otherwise the average of a 1% sample of the table's pages times
+    /// the rows, so the cost does not grow with the tenant. It gives up after 30 seconds.
+    pub fn storage_usage(&self) -> Result<StorageUsage, PersistError> {
+        crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            let mut tx = guard.client.transaction().map_err(definite)?;
+            tx.batch_execute("SET LOCAL statement_timeout = '30s'")
+                .map_err(definite)?;
+            let mut measure = |table: &str, alias: &str| -> Result<(u64, u64), PersistError> {
+                let and = self.scope.and();
+                let rows: i64 = tx
+                    .query_one(
+                        &format!("SELECT count(*) FROM {table} WHERE {and}true"),
+                        &[],
+                    )
+                    .map_err(definite)?
+                    .get(0);
+                let rows = rows.max(0) as u64;
+                let bytes: i64 = if rows <= EXACT_SIZE_ROWS {
+                    tx.query_one(
+                        &format!(
+                            "SELECT COALESCE(sum(pg_column_size({alias}.*)), 0)::bigint \
+                             FROM {table} {alias} WHERE {and}true"
+                        ),
+                        &[],
+                    )
+                    .map_err(definite)?
+                    .get(0)
+                } else {
+                    let average: f64 = tx
+                        .query_one(
+                            &format!(
+                                "SELECT COALESCE(avg(pg_column_size({alias}.*)), 0)::float8 \
+                                 FROM {table} {alias} TABLESAMPLE SYSTEM (1) WHERE {and}true"
+                            ),
+                            &[],
+                        )
+                        .map_err(definite)?
+                        .get(0);
+                    (average * rows as f64) as i64
+                };
+                Ok((rows, bytes.max(0) as u64))
+            };
+            let (documents, document_bytes) = measure("documents", "d")?;
+            let (index_rows, index_bytes) = measure("indexes", "i")?;
+            tx.rollback().map_err(definite)?;
+            Ok(StorageUsage {
+                documents,
+                document_bytes,
+                index_rows,
+                index_bytes,
+            })
+        })
+    }
+
+    /// The tenant this persistence serves, by its registry id (`None` for a classic database).
+    pub fn tenant_id(&self) -> Option<i32> {
+        match self.scope {
+            Scope::Classic => None,
+            Scope::Tenant(id) => Some(id),
+        }
     }
 
     /// See the `gate` field.
@@ -791,11 +980,12 @@ impl Persistence for PostgresPersistence {
     }
 
     fn wait_for_publish(&self, timeout: std::time::Duration) -> bool {
+        let own = match self.listener.as_ref() {
+            Listener::Shared(subscription) => return subscription.wait(timeout),
+            Listener::Own(own) => own,
+        };
         crate::off_runtime(|| {
-            let mut listener = self
-                .listener
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut listener = own.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if listener.is_none() {
                 let connected = connect_client_for(&self.url, self.scope)
                     .map(Conn::new)
@@ -1220,7 +1410,7 @@ pub(crate) fn connect_client_for(url: &str, scope: Scope) -> Result<Client, Pers
 
 /// Whether row-level security binds the role this connection is, and a warning when it does not,
 /// since then another tenant's rows are kept out of reach by the process's own statements alone.
-fn check_row_security(client: &mut Client, scope: Scope) -> bool {
+pub(crate) fn check_row_security(client: &mut Client, scope: Scope) -> bool {
     if scope == Scope::Classic {
         return false;
     }
@@ -1329,6 +1519,9 @@ mod tenancy_rls_tests;
 
 #[cfg(test)]
 mod tenancy_foreign_tests;
+
+#[cfg(test)]
+mod tenancy_shared_tests;
 
 #[cfg(test)]
 mod tests {

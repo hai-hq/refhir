@@ -376,21 +376,18 @@ pub(crate) fn start(
     runner
 }
 
-fn kick() -> &'static Mutex<Option<UnboundedSender<Timestamp>>> {
-    static KICK: std::sync::OnceLock<Mutex<Option<UnboundedSender<Timestamp>>>> =
-        std::sync::OnceLock::new();
-    KICK.get_or_init(|| Mutex::new(None))
-}
-
+/// Runs what follows a commit (hooks, Subscription deliveries, terminology fetches) for one
+/// server's database until `stop` says that server is no longer served.
 pub fn attach(
     db: Arc<Database>,
     catalog: Arc<std::sync::RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
     config: &ServerConfig,
+    sockets: Arc<Sockets>,
+    stop: crate::http::Stop,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    db.on_commit(tx.clone());
-    *kick().lock().expect("kick") = Some(tx);
+    db.on_commit(tx);
     let urls = config.terminology_urls.clone();
     if tokio::runtime::Handle::try_current().is_err() {
         return;
@@ -399,12 +396,15 @@ pub fn attach(
         db,
         catalog,
         store,
+        sockets,
         pending: Mutex::new(Vec::new()),
     });
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(2));
         loop {
             tokio::select! {
+                // The relay holds the database, so this task, not the database, has to end it.
+                _ = stop.stopped() => break,
                 Some(ts) = rx.recv() => {
                     let relay = relay.clone();
                     let urls = urls.clone();
@@ -457,7 +457,13 @@ pub async fn accept_export(
             "issue": [{"severity": "information", "code": "informational", "diagnostics": "export accepted"}]
         }),
     );
-    if let Ok(location) = format!("/export/{job_id}").parse() {
+    let base = app
+        .config
+        .public_url
+        .as_deref()
+        .map(|url| url.trim_end_matches('/'))
+        .unwrap_or("");
+    if let Ok(location) = format!("{base}/export/{job_id}").parse() {
         response
             .headers_mut()
             .insert(header::CONTENT_LOCATION, location);
@@ -575,6 +581,16 @@ impl JobHandler for ExportHandler {
         written?;
         Ok(json!({"file": file}))
     }
+}
+
+/// Writes every resource `db` holds now, its current version, one per line, to `path`: what a
+/// system-level `$export` writes. For a tenant that is about to be deleted.
+pub fn export_everything(
+    db: &Database,
+    catalog: &std::sync::RwLock<Catalog>,
+    path: &Path,
+) -> Result<(), String> {
+    write_export(db, catalog, None, None, &path.to_path_buf())
 }
 
 fn write_export(
@@ -848,7 +864,7 @@ fn deliver_subscriptions(relay: &Relay, ts: Timestamp) {
                     .get("id")
                     .and_then(|value| value.as_str())
                     .unwrap_or("");
-                notify_socket(id, &body);
+                relay.sockets.notify(id, &body);
             }
         }
     }
@@ -921,21 +937,23 @@ fn criteria_matches(
         })
 }
 
-fn socket_senders() -> &'static Mutex<BTreeMap<String, UnboundedSender<String>>> {
-    static SOCKETS: std::sync::OnceLock<Mutex<BTreeMap<String, UnboundedSender<String>>>> =
-        std::sync::OnceLock::new();
-    SOCKETS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
+/// The open `$websocket` sockets of one server's Subscriptions, by Subscription id. Each server
+/// (each tenant of a process that serves many) has its own, so a Subscription is only ever told
+/// about the commits of the server it belongs to, whatever id another tenant gives its own.
+#[derive(Default)]
+pub struct Sockets(Mutex<BTreeMap<String, UnboundedSender<String>>>);
 
-pub fn register_socket(id: String) -> tokio::sync::mpsc::UnboundedReceiver<String> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    socket_senders().lock().expect("sockets").insert(id, tx);
-    rx
-}
+impl Sockets {
+    pub fn register(&self, id: String) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.0.lock().expect("sockets").insert(id, tx);
+        rx
+    }
 
-fn notify_socket(id: &str, payload: &str) {
-    if let Some(sender) = socket_senders().lock().expect("sockets").get(id) {
-        let _ = sender.send(payload.to_string());
+    fn notify(&self, id: &str, payload: &str) {
+        if let Some(sender) = self.0.lock().expect("sockets").get(id) {
+            let _ = sender.send(payload.to_string());
+        }
     }
 }
 
@@ -1031,6 +1049,7 @@ struct Relay {
     db: Arc<Database>,
     catalog: Arc<std::sync::RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
+    sockets: Arc<Sockets>,
     /// Notifications that failed and wait for another attempt. They are held in memory only: a
     /// restart loses them.
     pending: Mutex<Vec<PendingHook>>,
