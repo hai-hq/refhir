@@ -1,4 +1,11 @@
-import { errClosed, errDisconnected, OutcomeError, UpgradeError } from "./errors.js";
+import {
+  errClosed,
+  errDisconnected,
+  errNotSent,
+  OutcomeError,
+  QueryError,
+  UpgradeError,
+} from "./errors.js";
 import { modifyQuerySet, mutationMessage, type QueryModification, type StateModification } from "./protocol.js";
 import type { SocketConnection } from "./socket.js";
 import { SOCKET_OPEN } from "./socket.js";
@@ -7,8 +14,29 @@ import * as helpers from "./helpers.js";
 import * as rest from "./rest.js";
 import { Watch } from "./watch.js";
 
+/**
+ * Gives the bearer token for the next `/sync` upgrade or REST call. The client asks it each time it
+ * needs one, so it may return a token it has renewed. Return `undefined` or an empty string to
+ * send no `Authorization`.
+ */
+export type TokenSource = () => Promise<string | undefined> | string | undefined;
+
 export type DialOptions = {
-  token?: string;
+  /**
+   * The bearer token, or a function that gives one. A string is always the same token, and a
+   * session that outlives it ends when the server stops accepting it. A function is called for the
+   * `/sync` upgrade on the first dial and on every redial, and for REST calls: use it for tokens
+   * that expire, such as a gateway's five-minute OAuth client-credentials tokens.
+   *
+   * When the server refuses an upgrade with HTTP 401, the client asks the function once more and
+   * dials again before it treats the refusal as final. A second 401, or a function that returns the
+   * very token just refused, ends the session; so does 403. An error from the function is not
+   * final: a redial tries again after the usual backoff, and `dial` rejects with it.
+   *
+   * In a browser a refused upgrade cannot be told from any other failure, so every failure is
+   * retried, asking the function each time.
+   */
+  token?: string | TokenSource;
   /** Default: browser when `window` exists, else Node (`ws` + Authorization header). */
   runtime?: "browser" | "node";
   /**
@@ -23,6 +51,33 @@ export type DialOptions = {
    */
   readYourWrites?: boolean;
 };
+
+/** Options for one `mutate` or `watch` call. */
+export type CallOptions = {
+  /**
+   * Gives up on the call. A call whose signal has aborted is not sent, and one waiting for its
+   * answer rejects with the signal's reason. A mutation that was already sent may still be applied.
+   */
+  signal?: AbortSignal;
+};
+
+/** @internal The source `dial` hands to the client for a `token` option. */
+export function tokenSource(token: string | TokenSource | undefined): TokenSource | undefined {
+  if (typeof token === "function") return token;
+  if (token === undefined) return undefined;
+  return () => token;
+}
+
+/** Settle with `promise`, or reject with the signal's reason when it aborts first. */
+function abortable<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
 
 type Subscription = {
   id: number;
@@ -48,12 +103,15 @@ type PendingMutation = {
 export class Client {
   private readonly httpBase: string;
   private readonly wsURL: string;
-  private readonly token: string | undefined;
+  private readonly tokens: TokenSource | undefined;
   private readonly readYourWrites: boolean;
   private lastTs = 0n;
 
   private socket: SocketConnection | null = null;
-  private readonly openSocket: (wsURL: string) => Promise<SocketConnection>;
+  private readonly openSocket: (
+    wsURL: string,
+    token: string | undefined,
+  ) => Promise<SocketConnection>;
   private gen = 0;
   private version = 0;
   private nextQuery = 1;
@@ -73,13 +131,13 @@ export class Client {
   private constructor(
     httpBase: string,
     wsURL: string,
-    token: string | undefined,
-    openSocket: (wsURL: string) => Promise<SocketConnection>,
+    tokens: TokenSource | undefined,
+    openSocket: (wsURL: string, token: string | undefined) => Promise<SocketConnection>,
     readYourWrites: boolean,
   ) {
     this.httpBase = httpBase;
     this.wsURL = wsURL;
-    this.token = token;
+    this.tokens = tokens;
     this.openSocket = openSocket;
     this.readYourWrites = readYourWrites;
   }
@@ -88,14 +146,14 @@ export class Client {
   static async connect(
     httpBase: string,
     wsURL: string,
-    token: string | undefined,
-    openSocket: (wsURL: string) => Promise<SocketConnection>,
+    tokens: TokenSource | undefined,
+    openSocket: (wsURL: string, token: string | undefined) => Promise<SocketConnection>,
     options: { readYourWrites?: boolean } = {},
   ): Promise<Client> {
     const client = new Client(
       httpBase,
       wsURL,
-      token,
+      tokens,
       openSocket,
       options.readYourWrites ?? true,
     );
@@ -117,10 +175,31 @@ export class Client {
     this.subs.clear();
   }
 
-  async mutate(path: string, args: Args): Promise<JsonValue> {
-    return this.enqueue(async () => {
+  /**
+   * Whether the session has a socket. It is false while the client dials again after the
+   * connection dropped, and `mutate` rejects with `NotSentError` until it is true.
+   */
+  get connected(): boolean {
+    return this.socket !== null && !this.closing;
+  }
+
+  /**
+   * Run a write operation and wait for its `MutationResponse`. A failed mutation rejects with
+   * `OutcomeError`. Mutations are not retried after a disconnect.
+   *
+   * Two errors say how far a mutation got when the connection was not there. `NotSentError`:
+   * nothing was written, because the client was dialling again (or `signal` had aborted); try again
+   * once `connected` is true. `DisconnectedError`: it was sent and the socket dropped before the
+   * answer, so it may have been applied.
+   */
+  async mutate(path: string, args: Args, options: CallOptions = {}): Promise<JsonValue> {
+    const { signal } = options;
+    if (signal?.aborted) throw errNotSent;
+    const sent = this.enqueue(async () => {
+      // The caller may have given up while this waited its turn.
+      if (signal?.aborted) throw errNotSent;
       if (this.terminal) throw this.terminal;
-      if (!this.socket) throw errDisconnected;
+      if (!this.socket) throw errNotSent;
       const id = this.nextReq++;
       const result = new Promise<JsonValue>((resolve, reject) => {
         this.pending.set(id, { resolve, reject });
@@ -128,28 +207,60 @@ export class Client {
       this.send(mutationMessage(id, path, args));
       return result;
     });
+    return abortable(sent, signal);
   }
 
-  async watch(path: string, args: Args = {}): Promise<Watch> {
+  /**
+   * Subscribe to a read-only operation and wait for its first result. A watch whose `signal`
+   * aborts first is dropped without being sent, or removed if it was.
+   */
+  async watch(path: string, args: Args = {}, options: CallOptions = {}): Promise<Watch> {
+    const { signal } = options;
+    signal?.throwIfAborted();
     const watch = new Watch(() =>
       this.enqueue(async () => {
         await this.removeWatch(watch);
       }),
     );
     await this.enqueue(async () => {
+      signal?.throwIfAborted();
       if (this.terminal) throw this.terminal;
       this.addWatch(path, args, watch);
     });
     try {
-      return await watch.waitForFirst().then(() => watch);
+      return await abortable(
+        watch.waitForFirst().then(() => watch),
+        signal,
+      );
     } catch (err) {
       await watch.close();
       throw err;
     }
   }
 
+  private async bearer(): Promise<string | undefined> {
+    return this.tokens?.();
+  }
+
+  /**
+   * Open the socket with the token the source gives. On a 401 it asks the source once more and
+   * dials again, unless the source gives back the very token that was refused, which would only be
+   * refused again.
+   */
+  private async openWithToken(): Promise<SocketConnection> {
+    const token = await this.bearer();
+    try {
+      return await this.openSocket(this.wsURL, token);
+    } catch (err) {
+      if (!(err instanceof UpgradeError) || err.status !== 401) throw err;
+      const fresh = await this.bearer();
+      if (fresh === token) throw err;
+      return this.openSocket(this.wsURL, fresh);
+    }
+  }
+
   private async connectSocket(): Promise<void> {
-    const socket = await this.openSocket(this.wsURL);
+    const socket = await this.openWithToken();
     if (this.closing) {
       // close() ran while the socket was opening; do not leak it.
       socket.close();
@@ -349,7 +460,7 @@ export class Client {
         const sub = this.subs.get(mod.queryId);
         if (!sub) break;
         this.subs.delete(mod.queryId);
-        sub.watch.fail(new Error(`refhir: ${sub.path}: ${mod.error}`));
+        sub.watch.fail(new QueryError(sub.path, mod.error, mod.code ?? ""));
         break;
       }
       case "QueryRemoved":
@@ -486,9 +597,9 @@ export class Client {
     return this.httpBase;
   }
 
-  /** @internal */
-  authToken(): string | undefined {
-    return this.token;
+  /** @internal The token to send now, from the source. */
+  async authToken(): Promise<string | undefined> {
+    return this.bearer();
   }
 }
 

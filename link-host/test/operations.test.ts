@@ -345,6 +345,13 @@ describe('where a host keeps its links', () => {
       sweep: (args) => inner.sweep(args),
       ping: () => inner.ping(),
       close: () => inner.close(),
+      listLinks: (clientId, page) => inner.listLinks(clientId, page),
+      createClient: (client) => inner.createClient(client),
+      getClient: (id) => inner.getClient(id),
+      clientByToken: (hash) => inner.clientByToken(hash),
+      listClients: () => inner.listClients(),
+      updateClient: (id, change) => inner.updateClient(id, change),
+      deleteClient: (id) => inner.deleteClient(id),
     };
     await using({ store }, async (host) => {
       const link = await linkWithFile(host, { passcode: 'p' });

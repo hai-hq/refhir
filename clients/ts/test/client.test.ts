@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { dial, OutcomeError } from "../src/index.js";
+import { dial, OutcomeError, QueryError } from "../src/index.js";
 import { modifyQuerySet, mutationMessage } from "../src/protocol.js";
 import { attachAccessToken, splitBase } from "../src/url.js";
 import { freePort, startServer } from "./server.js";
@@ -75,6 +75,29 @@ describe("integration", () => {
       ).rejects.toBeInstanceOf(OutcomeError);
     } finally {
       await client.close();
+      stop();
+    }
+  });
+
+  it("fails a watch whose resource was deleted with code deleted", async () => {
+    const port = await freePort();
+    const { base, stop } = await startServer(port);
+    const watcher = await dial(base);
+    const writer = await dial(base);
+    try {
+      const created = (await writer.create("Patient", {
+        resourceType: "Patient",
+        active: true,
+        name: [{ family: "Ann" }],
+      })) as { id: string };
+      const watch = await watcher.read("Patient", created.id);
+      await writer.delete("Patient", created.id);
+      const failure = await watch.next().catch((err: unknown) => err);
+      expect(failure).toBeInstanceOf(QueryError);
+      expect(failure).toMatchObject({ code: "deleted", path: "Patient/read" });
+    } finally {
+      await watcher.close();
+      await writer.close();
       stop();
     }
   });

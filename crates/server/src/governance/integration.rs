@@ -1194,6 +1194,7 @@ async fn a_websocket_does_not_get_around_the_limits_the_audit_or_the_meter() {
         .as_str()
         .unwrap()
         .contains("too many live queries"));
+    assert_eq!(second["modifications"][0]["code"], "too-costly");
 
     // Writes through the socket spend the same bucket. The two connection attempts, the HTTP
     // create and the live query took 1 + 1 + 6 + 1 of the 24, so two more writes fit (12) and a
@@ -1597,6 +1598,10 @@ async fn a_client_refused_for_going_too_fast_keeps_the_live_query_it_tried_to_re
     let refused = next_json(&mut socket).await;
     assert_eq!(
         refused["modifications"][0]["type"], "QueryFailed",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["modifications"][0]["code"], "throttled",
         "{refused}"
     );
     // The subscription it would have replaced is still there: a write reaches it.

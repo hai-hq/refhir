@@ -142,7 +142,7 @@ say({
   address: `${runtime.host}:${runtime.port}`,
   publicUrl: options.publicUrl,
   store: runtime.database.kind,
-  clients: options.clients.map((client) => client.name),
+  clients: [...(options.adminToken ? ['admin'] : []), ...options.clients.map((client) => client.name)],
 });
 
 // A container is stopped with SIGTERM. The host says it is not ready, so that a balancer stops

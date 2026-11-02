@@ -25,7 +25,8 @@ describe('the settings of a host', () => {
   it('need, on localhost, only a token and a database, and say what the host is doing', () => {
     const { options, runtime, notes } = loadConfig({ ADMIN_TOKEN: TOKEN, DATABASE_URL: DB, HOST: '127.0.0.1', PORT: '9000' });
     expect(options.publicUrl).toBe('http://localhost:9000');
-    expect(options.clients).toEqual([{ name: 'admin', token: TOKEN }]);
+    expect(options.adminToken).toBe(TOKEN); // which makes links as the client named admin, and manages the others
+    expect(options.clients).toEqual([]);
     expect(runtime.port).toBe(9000);
     expect(runtime.host).toBe('127.0.0.1');
     expect(runtime.database).toEqual({ kind: 'postgres', url: DB, poolMax: 10, waitSeconds: 30, migrate: true });
@@ -136,7 +137,8 @@ describe('the settings of a host', () => {
     expect(options.clients[0]).toMatchObject({ maxLifetimeSeconds: 7 * 86_400, defaultLifetimeSeconds: 2 * 86_400, requirePasscode: true });
     expect(options.clients[0]).not.toHaveProperty('maxLifetimeDays'); // days became seconds
     const both = loadConfig({ CLIENTS_FILE: '/clients.json', ADMIN_TOKEN: TOKEN, DATABASE_URL: DB, PUBLIC_URL: 'https://x.example' }, reader);
-    expect(both.options.clients.map((client) => client.name)).toEqual(['admin', 'ehr', 'portal']);
+    expect(both.options.adminToken).toBe(TOKEN);
+    expect(both.options.clients.map((client) => client.name)).toEqual(['ehr', 'portal']);
   });
 
   it('refuse a clients file with a mistake in it, and say which client and what', () => {
@@ -156,7 +158,7 @@ describe('the settings of a host', () => {
     expect(loadConfig({ ...BASE, MANAGEMENT_ALLOW: '10.0.0.0/8, 203.0.113.7' }).options.managementAllow).toEqual(['10.0.0.0/8', '203.0.113.7']);
     expect(problemsOf({ ...BASE, MANAGEMENT_ALLOW: '10.0.0.0/8, nope' }).join()).toMatch(/MANAGEMENT_ALLOW: nope is not an address or a range/);
     const reader = files({ '/c.json': JSON.stringify({ clients: [{ name: 'a', token: 'a-token-of-sixteen-chars', allow: ['203.0.113.0/24'] }] }) });
-    expect(loadConfig({ ...BASE, CLIENTS_FILE: '/c.json' }, reader).options.clients[1]?.allow).toEqual(['203.0.113.0/24']);
+    expect(loadConfig({ ...BASE, CLIENTS_FILE: '/c.json' }, reader).options.clients[0]?.allow).toEqual(['203.0.113.0/24']);
     const bad = files({ '/c.json': JSON.stringify({ clients: [{ name: 'a', token: 'a-token-of-sixteen-chars', allow: ['300.1.1.1'] }] }) });
     expect(problemsOf({ ...BASE, CLIENTS_FILE: '/c.json' }, bad).join()).toMatch(/client a of \/c.json: allow: 300.1.1.1 is not an address/);
     const empty = files({ '/c.json': JSON.stringify({ clients: [{ name: 'a', token: 'a-token-of-sixteen-chars', allow: [] }] }) });

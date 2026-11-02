@@ -129,7 +129,17 @@ Options:
 refhir.Dial(ctx, baseURL, refhir.Bearer(accessToken))
 ```
 
-`Bearer` sets `Authorization` on the WebSocket upgrade and on `Metadata` / `Do`.
+`Bearer` sets `Authorization` on the WebSocket upgrade and on `Metadata` / `Do`, always to the same token.
+
+A token that expires (a gateway's five-minute OAuth tokens, say) is given as a source instead:
+
+```go
+refhir.Dial(ctx, baseURL, refhir.WithTokenSource(func(ctx context.Context) (string, error) {
+	return gateway.Token(ctx) // your client-credentials call, cached as you like
+}))
+```
+
+`WithTokenSource` is asked for the first upgrade, for every redial and for every `Do` / `Metadata` call, so a session can outlive any one token. It runs on the session's goroutine and on callers of `Do`, so it must be safe for that. See [Reconnect](#reconnect) for what the client does when the server refuses a token.
 
 ```go
 refhir.Dial(ctx, baseURL, refhir.WithReadYourWrites(false)) // default: on
@@ -230,6 +240,17 @@ Subscribed paths must be read-only. Subscribing to a write operation yields `Que
 
 ### Errors
 
+A live query the server stopped answering fails `Watch.Next` (or the `Watch` call, if its first run failed) with a `*refhir.QueryError`. `Message` is plain text whose wording is not a contract; switch on `Code`, the FHIR IssueType the server gave:
+
+```go
+var failed *refhir.QueryError
+if errors.As(err, &failed) && failed.Code == refhir.CodeDeleted {
+	// the resource being watched was deleted
+}
+```
+
+The codes are `CodeDeleted` (a watched resource was deleted, the usual cause), `CodeNotFound`, `CodeForbidden` (scopes), `CodeThrottled` (a rate limit), `CodeTooCostly` (a cap, such as the number of live queries), `CodeInvalid`, `CodeTransient` and `CodeException`. `Code` is empty for a server that sends none. The query is over once it has failed: call `Watch` again to watch again. The codes are listed in [the protocol](../../docs/sync-protocol.md#query-failure-codes).
+
 Failed mutations return `*refhir.OutcomeError`. `Outcome` is the `OperationOutcome` JSON from the server.
 
 ```go
@@ -271,11 +292,12 @@ This is on by default. `WithReadYourWrites(false)` stops the header from being s
 If the WebSocket drops or the server sends `FatalError`, the client dials again, resets its query-set version to `0`, and re-sends **Add** for every live `Watch`.
 
 - Watches eventually get a fresh `QueryUpdated` via `Next` (or `Latest` after that).
-- **In-flight mutations are not retried.** They fail with `refhir: disconnected` so a create is never applied twice.
+- **In-flight mutations are not retried.** They fail with `refhir.ErrDisconnected`, which means "in doubt": the write may have been applied, so check before sending a create again.
+- **A mutation is never held until the redial and sent then.** While the client has no socket, `Mutate` fails at once with `refhir.ErrNotSent`: nothing was written, so it is safe to try again once `client.Connected()` is true. A call whose `ctx` ends while the client dials again is not sent when the connection returns, whether a `Mutate` or a `Watch`. A `Watch` made during the redial waits and is added after it.
 
 There is no resume token; after reconnect the first watch result is the current committed state.
 
-**A refused upgrade.** If the server answers the redial with HTTP 401 or 403, the token will not work if asked again, so the session ends instead of dialing forever: every `Watch` and `Mutate` returns a `*refhir.UpgradeError` (`Status`, `RetryAfter`), as does `Dial` if the first upgrade is refused. Any other refusal is retried after the longer of the backoff and the server's `Retry-After` (at most a minute). The server ends a socket whose token expired or was revoked, so a long-lived session sees this when its token runs out; dial a new client with a fresh token.
+**A refused upgrade, and renewing the token.** The server ends a socket whose token expired or was revoked, so a long-lived session needs a new token at the redial. With `WithTokenSource` the client asks the source for each dial. If the server answers HTTP 401, it asks the source once more and dials again before giving up, since the source may have renewed the token in the meantime; the watches stay open and see the new result, as after any drop. A second 401, or a source that returns the very token just refused, ends the session, as does HTTP 403 at once, since the token will not work if asked again: every `Watch` and `Mutate` returns a `*refhir.UpgradeError` (`Status`, `RetryAfter`), as does `Dial` if the first upgrade is refused. With `Bearer` the client has only the one token, so a 401 at a redial ends the session. An error from the source is not final: the redial tries again after the backoff, and `Dial` returns it. Any other refusal is retried after the longer of the backoff and the server's `Retry-After` (at most a minute). The protocol side is in [Renewing a token](../../docs/sync-protocol.md#renewing-a-token).
 
 ## Auth (SMART)
 

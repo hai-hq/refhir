@@ -3,8 +3,21 @@ import path from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vitest';
 
-import { StoreBusy, type Store } from '../src/types.js';
+import postgres from 'postgres';
+
+import { MIGRATIONS, migrate } from '../src/store/migrate.js';
+import { migrateSqlite } from '../src/store/sqlite.js';
+import { NameTaken, StoreBusy, type Store, type StoredClient } from '../src/types.js';
 import { ID, aLink, databaseUrl, memory, schemaStore, scratchDatabase, sqliteFile } from './support.js';
+
+const MIGRATION_COUNT = fs.readdirSync(path.join(MIGRATIONS, 'sqlite')).filter((name) => name.endsWith('.sql')).length;
+
+/** A directory of the first migration alone, which is the schema of a host from before clients were kept. */
+function firstMigrationOnly(kind: 'postgres' | 'sqlite') {
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync(process.env.TMPDIR ?? '/tmp'), 'link-migrations-'));
+  fs.copyFileSync(path.join(MIGRATIONS, kind, '001_init.sql'), path.join(dir, '001_init.sql'));
+  return { dir: `${dir}/`, done: () => fs.rmSync(dir, { recursive: true, force: true }) };
+}
 
 // Every store keeps the same promises, so one set of tests holds them all to it.
 const stores: Array<[string, () => Promise<{ store: Store; done: () => Promise<unknown> }>]> = [
@@ -180,6 +193,85 @@ describe.each(stores)('%s store', (_name, make) => {
     }));
 
   it('says it can take a write', () => using((store) => store.ping()));
+
+  it('keeps clients, finds one by the hash of its token, and lets a name be one client\'s', () =>
+    using(async (store) => {
+      const client = (id: string, name: string, extra: Partial<StoredClient> = {}): StoredClient => ({
+        id,
+        name,
+        tokenHash: `${id}-hash`,
+        settings: { allow: ['203.0.113.0/24'], maxFilesPerLink: 2, allowedContentTypes: ['application/fhir+json'] },
+        createdAt: 100,
+        updatedAt: 100,
+        ...extra,
+      });
+      expect(await store.listClients()).toEqual([]);
+      await store.createClient(client('cl_a', 'a'));
+      await store.createClient(client('cl_b', 'b', { createdAt: 101, settings: {} }));
+      await expect(store.createClient(client('cl_c', 'a'))).rejects.toBeInstanceOf(NameTaken);
+
+      expect(await store.getClient('cl_a')).toEqual(client('cl_a', 'a'));
+      expect(await store.getClient('cl_x')).toBeNull();
+      expect((await store.clientByToken('cl_b-hash'))?.id).toBe('cl_b');
+      expect(await store.clientByToken('nobody')).toBeNull();
+      expect((await store.listClients()).map((found) => found.name)).toEqual(['a', 'b']);
+
+      // A change keeps what it does not name.
+      const renamed = await store.updateClient('cl_a', { name: 'a2', updatedAt: 200 });
+      expect(renamed).toEqual({ ...client('cl_a', 'a2'), updatedAt: 200 });
+      // Settings are merged into those kept, and a null takes one away.
+      const rotated = await store.updateClient('cl_a', { tokenHash: 'new-hash', settings: { maxAttempts: 3, allow: null, maxFilesPerLink: 5 }, updatedAt: 201 });
+      expect(rotated).toMatchObject({ name: 'a2', tokenHash: 'new-hash', updatedAt: 201 });
+      expect(rotated?.settings).toEqual({ maxAttempts: 3, maxFilesPerLink: 5, allowedContentTypes: ['application/fhir+json'] });
+      expect(await store.clientByToken('cl_a-hash')).toBeNull(); // the old token is no one's
+      await expect(store.updateClient('cl_b', { name: 'a2', updatedAt: 202 })).rejects.toBeInstanceOf(NameTaken);
+      expect(await store.updateClient('cl_x', { name: 'x', updatedAt: 203 })).toBeNull();
+
+      expect(await store.deleteClient('cl_a')).toBe(true);
+      expect(await store.deleteClient('cl_a')).toBe(false);
+      expect(await store.clientByToken('new-hash')).toBeNull();
+      await store.createClient(client('cl_d', 'a2')); // its name is free again
+    }));
+
+  it('says whose a link is, and lists a client\'s links newest first, a page at a time', () =>
+    using(async (store) => {
+      await store.create(aLink(ID('a'), { createdAt: 100, clientId: 'cl_one', contentTypes: ['application/smart-health-card'] }));
+      await store.create(aLink(ID('b'), { createdAt: 200, clientId: 'cl_one', passcode: { salt: 'aa', hash: 'bb' } }));
+      await store.create(aLink(ID('c'), { createdAt: 200, clientId: 'cl_one' }));
+      await store.create(aLink(ID('d'), { createdAt: 300, clientId: 'cl_two' }));
+      await store.create(aLink(ID('e'), { createdAt: 150, createdBy: 'ehr' })); // a store's own default: the name of who made it
+      await store.update(ID('c'), async (link, tx) => {
+        await tx.putFile({ id: 'f0', contentType: 'x/y', bytes: 2 }, 'hi');
+        link!.active = false;
+        link!.endedAt = 250;
+      });
+
+      expect(await store.get(ID('a'))).toMatchObject({ clientId: 'cl_one', contentTypes: ['application/smart-health-card'] });
+      expect((await store.get(ID('b')))?.contentTypes).toBeUndefined();
+      expect((await store.get(ID('e')))?.clientId).toBe('ehr');
+
+      const all = await store.listLinks('cl_one', { limit: 10 });
+      expect(all.map((link) => link.id)).toEqual([ID('c'), ID('b'), ID('a')]); // newest first, and by id within a second
+      expect(all[0]).toEqual({
+        id: ID('c'),
+        createdBy: 'test',
+        createdAt: 200,
+        expiresAt: all[0]!.expiresAt,
+        endedAt: 250,
+        active: false,
+        passcodeRequired: false,
+        files: 1,
+      });
+      expect(all[1]).toMatchObject({ passcodeRequired: true, files: 0, active: true, endedAt: null });
+
+      const first = await store.listLinks('cl_one', { limit: 2 });
+      expect(first.map((link) => link.id)).toEqual([ID('c'), ID('b')]);
+      const rest = await store.listLinks('cl_one', { limit: 2, before: { createdAt: 200, id: ID('b') } });
+      expect(rest.map((link) => link.id)).toEqual([ID('a')]);
+      expect((await store.listLinks('cl_two', { limit: 10 })).map((link) => link.id)).toEqual([ID('d')]);
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id)).toEqual([ID('e')]);
+      expect(await store.listLinks('nobody', { limit: 10 })).toEqual([]);
+    }));
 });
 
 describe('sqlite store, as several processes would use it', () => {
@@ -298,7 +390,7 @@ describe('sqlite store, as several processes would use it', () => {
       expect((await again.get(ID('a')))!.files).toHaveLength(1);
       const { DatabaseSync } = await import('node:sqlite');
       const raw = new DatabaseSync(sqlite.file);
-      expect(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()).toEqual({ n: 1 });
+      expect(raw.prepare('SELECT count(*) AS n FROM schema_migrations').get()).toEqual({ n: MIGRATION_COUNT });
       raw.close();
     } finally {
       await sqlite.done();
@@ -403,7 +495,7 @@ describe.skipIf(!databaseUrl)('postgres store, as several processes would use it
       const opened = await Promise.all(Array.from({ length: 5 }, () => schema.open()));
       const raw = schema.raw();
       const [row] = await raw<{ n: number }[]>`SELECT count(*)::int AS n FROM schema_migrations`;
-      expect(row?.n).toBe(1);
+      expect(row?.n).toBe(MIGRATION_COUNT);
       await raw.end({ timeout: 1 });
       await opened[0]!.create(aLink(ID('a')));
       await schema.open(); // opening it again leaves what is there
@@ -486,3 +578,59 @@ describe.skipIf(!databaseUrl)('postgres store, as several processes would use it
 });
 
 afterAll(() => undefined);
+
+describe('a database from before clients were kept', () => {
+  const before = aLink(ID('a'), { createdBy: 'ehr' });
+
+  it('gives each link to the client named by who made it, on SQLite', async () => {
+    const sqlite = sqliteFile();
+    const first = firstMigrationOnly('sqlite');
+    try {
+      const { DatabaseSync } = await import('node:sqlite');
+      const raw = new DatabaseSync(sqlite.file);
+      expect(await migrateSqlite(raw, first.dir)).toEqual([1]);
+      raw
+        .prepare('INSERT INTO links (id, token_hash, created_at, created_by, expires_at, attempts_left, max_files, max_file_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(before.id, before.tokenHash, before.createdAt, before.createdBy, before.expiresAt, 5, 10, 1000);
+      raw.close();
+      const store = await sqlite.open();
+      expect((await store.get(before.id))?.clientId).toBe('ehr');
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id)).toEqual([before.id]);
+      // A host that has not been upgraded makes a link with no client_id after the migration.
+      const { DatabaseSync: Again } = await import('node:sqlite');
+      const late = new Again(sqlite.file);
+      late
+        .prepare('INSERT INTO links (id, token_hash, created_at, created_by, expires_at, attempts_left, max_files, max_file_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(ID('b'), before.tokenHash, before.createdAt, 'ehr', before.expiresAt, 5, 10, 1000);
+      late.close();
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id).sort()).toEqual([before.id, ID('b')].sort());
+    } finally {
+      first.done();
+      await sqlite.done();
+    }
+  });
+
+  it.skipIf(!databaseUrl)('gives each link to the client named by who made it, on Postgres', async () => {
+    const schema = await schemaStore();
+    const first = firstMigrationOnly('postgres');
+    const raw = schema.raw();
+    try {
+      expect(await migrate(raw as postgres.Sql, first.dir)).toEqual([1]);
+      await raw`
+        INSERT INTO links (id, token_hash, created_at, created_by, expires_at, attempts_left, max_files, max_file_bytes)
+        VALUES (${before.id}, ${before.tokenHash}, ${before.createdAt}, ${before.createdBy}, ${before.expiresAt}, 5, 10, 1000)`;
+      const store = await schema.open();
+      expect((await store.get(before.id))?.clientId).toBe('ehr');
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id)).toEqual([before.id]);
+      // A host that has not been upgraded makes a link with no client_id after the migration.
+      await raw`
+        INSERT INTO links (id, token_hash, created_at, created_by, expires_at, attempts_left, max_files, max_file_bytes)
+        VALUES (${ID('b')}, ${before.tokenHash}, ${before.createdAt}, 'ehr', ${before.expiresAt}, 5, 10, 1000)`;
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id).sort()).toEqual([before.id, ID('b')].sort());
+    } finally {
+      first.done();
+      await raw.end({ timeout: 1 });
+      await schema.done();
+    }
+  });
+});

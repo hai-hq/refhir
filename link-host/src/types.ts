@@ -22,6 +22,23 @@ export interface Link {
   maxFiles: number;
   maxFileBytes: number;
   files: FileEntry[];
+  /** Whose link it is: the `id` of the client that made it, or its name for a client that has no id.
+   * A client lists, reads about and switches off only the links that are its own. */
+  clientId?: string;
+  /** The media types of file the link may hold, when its client was limited to some. */
+  contentTypes?: string[];
+}
+
+/** A link as it is listed for its client: nothing that opens it. */
+export interface LinkListed {
+  id: string;
+  createdBy: string;
+  createdAt: number;
+  expiresAt: number;
+  endedAt: number | null;
+  active: boolean;
+  passcodeRequired: boolean;
+  files: number;
 }
 
 export interface AccessEntry {
@@ -80,17 +97,37 @@ export interface Store {
   /** Throws if the store cannot take a write. */
   ping(): Promise<void>;
   close(): Promise<void>;
+
+  /** A client's links, newest first, `limit` at most, and only those made before `before` when it is
+   * given (the last of the page before). Links that have ended are listed until they are forgotten. */
+  listLinks(clientId: string, page: { limit: number; before?: { createdAt: number; id: string } }): Promise<LinkListed[]>;
+
+  /** Clients made over the admin API. A name is one client's: a second is `NameTaken`. */
+  createClient(client: StoredClient): Promise<void>;
+  getClient(id: string): Promise<StoredClient | null>;
+  /** The client whose token has this SHA-256, in hex. */
+  clientByToken(tokenHash: string): Promise<StoredClient | null>;
+  /** Every client, oldest first. */
+  listClients(): Promise<StoredClient[]>;
+  /** Changes what is given, and answers the client as it now is, or `null` when there is none. The
+   * `settings` given are merged into those kept, in the store, so two changes at once both stay: a
+   * setting that is `null` is taken away. */
+  updateClient(
+    id: string,
+    change: Partial<Pick<StoredClient, 'name' | 'tokenHash'>> & { settings?: { [K in keyof ClientSettings]: ClientSettings[K] | null }; updatedAt: number },
+  ): Promise<StoredClient | null>;
+  /** Forgets a client. `false` when there was none. */
+  deleteClient(id: string): Promise<boolean>;
 }
 
 /** The store could not take the work in time. The host answers 503, and the caller may try again. */
 export class StoreBusy extends Error {}
 
-/** Someone who may make links, and what each of their links may be. */
-export interface Client {
-  name: string;
-  token?: string;
-  /** `sha256:` and the SHA-256 of the token in hex, in place of the token. */
-  tokenHash?: string;
+/** Another client has that name. */
+export class NameTaken extends Error {}
+
+/** What a client's links may be: its limits, and where its token is accepted from. */
+export interface ClientSettings {
   /** Addresses and ranges the client's token is accepted from. */
   allow?: string[];
   defaultAttempts?: number;
@@ -100,6 +137,30 @@ export interface Client {
   maxFileBytes?: number;
   maxFilesPerLink?: number;
   requirePasscode?: boolean;
+  /** The media types of file its links may hold, besides what the host allows. */
+  allowedContentTypes?: string[];
+}
+
+/** Someone who may make links, and what each of their links may be. */
+export interface Client extends ClientSettings {
+  name: string;
+  /** What its links are kept under. A client made over the admin API has one; one given to the host
+   * in its options is known by its name. */
+  id?: string;
+  token?: string;
+  /** `sha256:` and the SHA-256 of the token in hex, in place of the token. */
+  tokenHash?: string;
+}
+
+/** A client made over the admin API, as a store keeps it. Times are seconds since 1970. */
+export interface StoredClient {
+  id: string;
+  name: string;
+  /** SHA-256, in hex, of its token. The token itself is not kept. */
+  tokenHash: string;
+  settings: ClientSettings;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export interface RateLimits {
@@ -142,7 +203,8 @@ export interface LogEntry {
 
 export interface HostOptions {
   store: Store;
-  /** One token that may make links, as the client named `admin`. */
+  /** One token that may make links, as the client named `admin`, and that manages the clients kept in
+   * the store, at `/admin/clients`. Without it there is no `/admin/clients`. */
   adminToken?: string;
   clients?: Client[];
   /** Says who is making a link, in place of the tokens. */
