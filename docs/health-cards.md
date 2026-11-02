@@ -43,7 +43,7 @@ address.
 
 With a key, the server:
 
-- signs cards for `iss` = `[public_url]/health-cards`;
+- signs cards for `iss` = `[public_url]/health-cards`, or the [issuer you set](#an-issuer-of-your-own);
 - publishes the public key at `[public_url]/health-cards/.well-known/jwks.json`, which needs no
   token and can be read from any origin, as a card verifier running in a browser needs;
 - lists `health-cards` among the `capabilities` of `/.well-known/smart-configuration`, and
@@ -111,11 +111,62 @@ laboratory history may not, and a patient summary does not. The chunked form tha
 specification used for this is deprecated, so for larger data use a
 [health link](health-links.md).
 
+## An issuer of your own
+
+By default a card's `iss` is `[public_url]/health-cards`. `public_url` is also the address of the
+server's SMART and OAuth issuer, so it is the wrong thing to change when a card should name another
+address: a clinic's own site, or one stable address that stands for many servers. Set the issuer
+for cards on its own:
+
+```toml
+[health_cards]
+key_file = "/etc/refhir/health-cards.pem"
+issuer = "https://health.clinic.example"
+```
+
+or set `REFHIR_HEALTH_CARDS_ISSUER`. A card's `iss` is then exactly that, with a trailing slash
+dropped. It must be an `https` address (`http` is allowed for `localhost`, `127.0.0.1` and `[::1]`,
+for testing) with a host and no user name, query or fragment, and a server with a value that is
+not one does not start. Setting it with no `key_file` is refused too, since it would do nothing.
+
+A verifier fetches `[iss]/.well-known/jwks.json`, so that address has to serve the key set. The
+server serves it at `/health-cards/.well-known/jwks.json`, which is where `iss` points only when
+`iss` is `[public_url]/health-cards`. With an issuer of your own, make `[issuer]/.well-known/jwks.json`
+reach it: route that path to the server's `/health-cards/.well-known/jwks.json` on the proxy that
+serves the issuer address, or publish the same key set there. The resource links in the answer to
+`$health-cards-issue` are still addresses of this server.
+
+## Keep a replaced key public
+
+A key set that holds only the signing key ends every card it signed the day the key is replaced.
+To keep those cards valid, list the public keys of the keys you replaced in a JWKS file and point
+the server at it:
+
+```toml
+[health_cards]
+extra_keys_file = "/etc/refhir/health-cards-retired.json"
+```
+
+or set `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE`. The file is a JWKS, `{"keys": [...]}`, of EC P-256
+keys. The key set the server publishes holds the signing key first and then these, each with its
+`kid` (the RFC 7638 thumbprint of the key, which the server works out; one the file gives that
+is not the thumbprint is refused) and `use` and `alg` of `sig` and `ES256`. A file with no keys is
+fine. **A file with a private member (`d`) is refused and the server does not start**, so a private
+key cannot be published by mistake. To make the file from a key you are replacing:
+
+```bash
+openssl ec -in old-health-cards.pem -pubout -out old-public.pem
+```
+
+then write its `x` and `y` as a JWK, or take the entry from the key set the server was publishing
+(`/health-cards/.well-known/jwks.json`) before you replaced the key.
+
 ## Who is the issuer
 
 A card's `iss` says who vouches for it, and a verifier decides whether to trust a card by deciding
 whether to trust that address and the key published under it. ReFHIR signs with one key per
-server, and one `iss` for it: `[public_url]/health-cards`. On a database that many
+server, and one `iss` for it: `[public_url]/health-cards` unless you
+[set an issuer](#an-issuer-of-your-own). On a database that many
 [tenants](clustering.md#tenants-on-one-database) share, each tenant is a process of its own with its
 own `public_url` and its own key, so each tenant has its own issuer. When one tenant holds the
 records of several organizations (clinics, hospitals), there are two ways to answer "who issued
@@ -187,10 +238,11 @@ card; another patient's is a `403`. See [SMART on FHIR](smart.md).
 
 ## Look after the key
 
-The key set the server publishes holds the one key it signs with. If you replace the key, cards
-signed with the old one stop verifying, because their `kid` is no longer in the set. Keep the key
-safe, back it up, and treat a change of key as the end of every card it signed. A card cannot be
-revoked.
+The key set the server publishes holds the key it signs with, and the public keys in
+`extra_keys_file` if you set one. If you replace the key and do not keep the old public key in the
+set, cards signed with the old one stop verifying, because their `kid` is no longer in the set. Keep
+the key safe and back it up, and either keep a replaced key's public half in `extra_keys_file` or
+treat a change of key as the end of every card it signed. A card cannot be revoked.
 
 See [Production deployment](../deploy/production.md#smart-health-cards-signing-key) for keeping the
 key out of the image and out of the configuration file.

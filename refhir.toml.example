@@ -101,6 +101,16 @@ enabled = false
 # on a bind that is not loopback. REFHIR_HEALTH_CARDS_KEY_FILE sets the same file.
 # [health_cards]
 # key_file = "/etc/refhir/health-cards.pem"
+# By default a card's issuer (iss) is [public_url]/health-cards. To name another https address (a
+# clinic's own site, or one shared address), set issuer; it needs a host and no query or fragment,
+# and a trailing slash is dropped. That address must serve the key set at
+# [issuer]/.well-known/jwks.json, which the server has at /health-cards/.well-known/jwks.json.
+# REFHIR_HEALTH_CARDS_ISSUER sets the same.
+# issuer = "https://health.clinic.example"
+# A JWKS file of public keys of keys you replaced, published beside the signing key so the cards
+# they signed still verify. A file with a private member (d) is refused.
+# REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE sets the same file.
+# extra_keys_file = "/etc/refhir/health-cards-retired.json"
 
 [export]
 # Local NDJSON output for $export jobs.

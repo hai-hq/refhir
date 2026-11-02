@@ -27,6 +27,10 @@ pub struct IssuerKey {
     kid: String,
     x: String,
     y: String,
+    /// What `iss` says when it is not the server's own address, with no trailing slash.
+    issuer: Option<String>,
+    /// Public keys that signed cards before and are still published: each a complete JWK.
+    retired: Vec<Value>,
 }
 
 impl std::fmt::Debug for IssuerKey {
@@ -70,6 +74,8 @@ impl IssuerKey {
             kid,
             x,
             y,
+            issuer: None,
+            retired: Vec::new(),
         })
     }
 
@@ -77,9 +83,41 @@ impl IssuerKey {
         &self.kid
     }
 
-    /// The key set that checks the cards: this one public key, never the private part.
+    /// Cards name `issuer` as `iss`, not an address of this server's. It is checked by
+    /// [`validate_issuer`] and kept with no trailing slash.
+    pub fn with_issuer(mut self, issuer: &str) -> Result<Self, String> {
+        self.issuer = Some(validate_issuer(issuer)?);
+        Ok(self)
+    }
+
+    /// The `iss` the cards name when one was set.
+    pub fn issuer(&self) -> Option<&str> {
+        self.issuer.as_deref()
+    }
+
+    /// Also publish the public keys in the JWKS file at `path`, so a key that was replaced stays
+    /// in the key set and the cards it signed still verify.
+    pub fn with_retired_keys_file(self, path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+        self.with_retired_keys(&text)
+    }
+
+    pub fn with_retired_keys(mut self, jwks: &str) -> Result<Self, String> {
+        for key in public_keys(jwks)? {
+            let already = key["kid"] == self.kid.as_str()
+                || self.retired.iter().any(|known| known["kid"] == key["kid"]);
+            if !already {
+                self.retired.push(key);
+            }
+        }
+        Ok(self)
+    }
+
+    /// The key set that checks the cards: this key and any retired ones, never a private part.
     pub fn jwks(&self) -> Value {
-        json!({"keys": [{
+        let mut keys = vec![json!({
             "kty": "EC",
             "kid": self.kid,
             "use": "sig",
@@ -87,7 +125,9 @@ impl IssuerKey {
             "crv": "P-256",
             "x": self.x,
             "y": self.y
-        }]})
+        })];
+        keys.extend(self.retired.iter().cloned());
+        json!({ "keys": keys })
     }
 
     /// A health card: the claims of a credential, compressed and signed. `types` are the
@@ -136,6 +176,115 @@ impl IssuerKey {
             URL_SAFE_NO_PAD.encode(signature.as_ref())
         ))
     }
+}
+
+/// An address a card can name as `iss`: `https` (or `http` on a loopback host, for tests), a host,
+/// and no user, query or fragment. A trailing slash is dropped, because the specification has the
+/// key set at `[iss]/.well-known/jwks.json` and `iss` with none.
+pub fn validate_issuer(issuer: &str) -> Result<String, String> {
+    let trimmed = issuer.trim();
+    let url = trimmed.trim_end_matches('/');
+    if url.is_empty() {
+        return Err("the issuer is empty".into());
+    }
+    if url.contains(char::is_whitespace) {
+        return Err(format!("the issuer {issuer:?} has a space in it"));
+    }
+    if url.contains('?') || url.contains('#') {
+        return Err(format!(
+            "the issuer {url} has a query or fragment: it must be a plain address"
+        ));
+    }
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("the issuer {url} is not an https address"))?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err(format!(
+            "the issuer {url} needs a host, and no user name or password"
+        ));
+    }
+    // The host without its port; an IPv6 address is bracketed.
+    let host = match authority.strip_prefix('[') {
+        Some(inner) => inner.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    match scheme {
+        "https" => {}
+        "http" if matches!(host, "localhost" | "127.0.0.1" | "::1") => {}
+        "http" => {
+            return Err(format!(
+                "the issuer {url} is an http address: a verifier accepts only https \
+                 (http is allowed for localhost only)"
+            ))
+        }
+        _ => return Err(format!("the issuer {url} is not an https address")),
+    }
+    if host.is_empty() {
+        return Err(format!("the issuer {url} needs a host"));
+    }
+    Ok(url.to_string())
+}
+
+/// The keys in a JWKS, each as the public key the key set publishes it as, with the `kid` the
+/// card header uses (its thumbprint). A key with a private member, or one that is not P-256, is an
+/// error, and so is a `kid` that is not the key's thumbprint: it would not be found by a verifier.
+fn public_keys(jwks: &str) -> Result<Vec<Value>, String> {
+    let parsed: Value =
+        serde_json::from_str(jwks).map_err(|err| format!("not a JSON key set: {err}"))?;
+    let keys = parsed
+        .get("keys")
+        .and_then(Value::as_array)
+        .ok_or("not a JWKS: no `keys` array")?;
+    let mut out: Vec<Value> = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        let at = |what: &str| format!("key {index}: {what}");
+        let object = key.as_object().ok_or_else(|| at("not an object"))?;
+        // `d` is the private scalar; the other members are RSA's private parts.
+        for private in ["d", "p", "q", "dp", "dq", "qi", "oth", "k"] {
+            if object.contains_key(private) {
+                return Err(at(&format!(
+                    "has a private member `{private}`: the file may hold public keys only"
+                )));
+            }
+        }
+        if object.get("kty").and_then(Value::as_str) != Some("EC")
+            || object.get("crv").and_then(Value::as_str) != Some("P-256")
+        {
+            return Err(at("not an EC key on P-256"));
+        }
+        if let Some(alg) = object.get("alg").and_then(Value::as_str) {
+            if alg != "ES256" {
+                return Err(at("`alg` is not ES256"));
+            }
+        }
+        let coordinate = |name: &str| -> Result<String, String> {
+            let value = object
+                .get(name)
+                .and_then(Value::as_str)
+                .ok_or_else(|| at(&format!("no `{name}`")))?;
+            match URL_SAFE_NO_PAD.decode(value) {
+                Ok(bytes) if bytes.len() == 32 => Ok(value.to_string()),
+                _ => Err(at(&format!("`{name}` is not 32 bytes of base64url"))),
+            }
+        };
+        let (x, y) = (coordinate("x")?, coordinate("y")?);
+        let kid = thumbprint(&x, &y);
+        if let Some(given) = object.get("kid").and_then(Value::as_str) {
+            if given != kid {
+                return Err(at(&format!(
+                    "`kid` {given} is not the key's thumbprint {kid}"
+                )));
+            }
+        }
+        if out.iter().any(|known| known["kid"] == kid.as_str()) {
+            continue;
+        }
+        out.push(json!({
+            "kty": "EC", "kid": kid, "use": "sig", "alg": "ES256", "crv": "P-256", "x": x, "y": y
+        }));
+    }
+    Ok(out)
 }
 
 /// The RFC 7638 thumbprint of an EC key, base64url: the SHA-256 of its required members in the
@@ -317,6 +466,171 @@ mod tests {
                 .contains("P-256")
         );
         assert!(IssuerKey::from_file("/nonexistent/key.pem")
+            .unwrap_err()
+            .contains("cannot read"));
+    }
+
+    #[test]
+    fn an_issuer_is_an_https_address_without_a_query_a_fragment_or_a_trailing_slash() {
+        let ok = |issuer: &str| validate_issuer(issuer).unwrap();
+        assert_eq!(
+            ok("https://health.clinic.example"),
+            "https://health.clinic.example"
+        );
+        assert_eq!(
+            ok("https://health.clinic.example/"),
+            "https://health.clinic.example"
+        );
+        assert_eq!(ok(" https://x.example/cards// "), "https://x.example/cards");
+        assert_eq!(
+            ok("https://x.example:8443/a/b"),
+            "https://x.example:8443/a/b"
+        );
+        for loopback in [
+            "http://localhost:8080",
+            "http://127.0.0.1:8080/cards",
+            "http://[::1]:8080",
+        ] {
+            assert_eq!(ok(loopback), loopback);
+        }
+
+        let refused = |issuer: &str| validate_issuer(issuer).unwrap_err();
+        assert!(refused("").contains("empty"));
+        assert!(refused("/").contains("empty"));
+        assert!(refused("http://health.clinic.example").contains("https"));
+        assert!(refused("http://localhost.evil.example").contains("https"));
+        assert!(refused("http://127.0.0.1.evil.example").contains("https"));
+        assert!(refused("ftp://health.clinic.example").contains("https"));
+        assert!(refused("health.clinic.example").contains("https"));
+        assert!(refused("https://x.example?a=1").contains("query"));
+        assert!(refused("https://x.example/cards#top").contains("fragment"));
+        assert!(validate_issuer("https://").is_err());
+        assert!(refused("https:///cards").contains("host"));
+        assert!(refused("https://user:pw@x.example").contains("user"));
+        assert!(refused("https://x .example").contains("space"));
+    }
+
+    #[test]
+    fn a_configured_issuer_is_what_a_card_says_and_is_kept_without_the_slash() {
+        let key = IssuerKey::from_pem(&generated_pem()).unwrap();
+        assert_eq!(key.issuer(), None);
+        let key = key.with_issuer("https://health.clinic.example/").unwrap();
+        assert_eq!(key.issuer(), Some("https://health.clinic.example"));
+        let bad = IssuerKey::from_pem(&generated_pem()).unwrap();
+        assert!(bad.with_issuer("http://health.clinic.example").is_err());
+    }
+
+    fn public_jwk(key: &IssuerKey) -> Value {
+        key.jwks()["keys"][0].clone()
+    }
+
+    #[test]
+    fn retired_keys_are_published_beside_the_signing_key_each_under_its_thumbprint() {
+        let old_one = IssuerKey::from_pem(&generated_pem()).unwrap();
+        let old_two = IssuerKey::from_pem(&generated_pem()).unwrap();
+        // A `kid` the file gives is checked against the thumbprint; one it leaves out is made.
+        let mut without_kid = public_jwk(&old_two);
+        without_kid.as_object_mut().unwrap().remove("kid");
+        without_kid.as_object_mut().unwrap().remove("use");
+        let file = json!({"keys": [public_jwk(&old_one), without_kid]}).to_string();
+
+        let key = IssuerKey::from_pem(&generated_pem())
+            .unwrap()
+            .with_retired_keys(&file)
+            .unwrap();
+        let jwks = key.jwks();
+        let keys = jwks["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0]["kid"], key.kid(), "the signing key comes first");
+        for (published, expected) in keys[1..].iter().zip([&old_one, &old_two]) {
+            assert_eq!(published["kid"], expected.kid());
+            assert_eq!(published, &public_jwk(expected));
+            assert!(published.get("d").is_none());
+            assert_eq!(
+                published["kid"],
+                thumbprint(
+                    published["x"].as_str().unwrap(),
+                    published["y"].as_str().unwrap()
+                )
+            );
+        }
+
+        // The signing key, or a key listed twice, is not published twice.
+        let again = json!({"keys": [public_jwk(&old_one), public_jwk(&old_one), public_jwk(&key)]})
+            .to_string();
+        let key = key.with_retired_keys(&again).unwrap();
+        assert_eq!(key.jwks()["keys"].as_array().unwrap().len(), 3);
+
+        // A file with no keys is fine: a server that has retired nothing yet.
+        let none = IssuerKey::from_pem(&generated_pem())
+            .unwrap()
+            .with_retired_keys(r#"{"keys": []}"#)
+            .unwrap();
+        assert_eq!(none.jwks()["keys"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_retired_card_checks_against_the_key_set_the_server_serves() {
+        let retired = IssuerKey::from_pem(&generated_pem()).unwrap();
+        let key = IssuerKey::from_pem(&generated_pem())
+            .unwrap()
+            .with_retired_keys(&retired.jwks().to_string())
+            .unwrap();
+        let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": []});
+        let card = retired
+            .sign("https://health.clinic.example", 1, &[], "4.0.1", &bundle)
+            .unwrap();
+        let parts: Vec<&str> = card.split('.').collect();
+        let header: Value = serde_json::from_slice(&decode(parts[0])).unwrap();
+        let jwks = key.jwks();
+        let jwk = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|jwk| jwk["kid"] == header["kid"])
+            .expect("the served key set holds the retired key's kid");
+        let mut point = vec![4u8];
+        point.extend(decode(jwk["x"].as_str().unwrap()));
+        point.extend(decode(jwk["y"].as_str().unwrap()));
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
+            .verify(
+                format!("{}.{}", parts[0], parts[1]).as_bytes(),
+                &decode(parts[2]),
+            )
+            .expect("the retired key's card verifies against the served set");
+    }
+
+    #[test]
+    fn a_key_file_that_is_not_all_public_keys_on_p256_is_refused() {
+        let good = public_jwk(&IssuerKey::from_pem(&generated_pem()).unwrap());
+        let with = |member: &str, value: Value| {
+            let mut jwk = good.clone();
+            jwk[member] = value;
+            json!({"keys": [jwk]}).to_string()
+        };
+        let refused = |text: &str| {
+            IssuerKey::from_pem(&generated_pem())
+                .unwrap()
+                .with_retired_keys(text)
+                .unwrap_err()
+        };
+        // A private member, even next to good keys, stops the file being read at all.
+        let private = refused(&with("d", json!("c2VjcmV0")));
+        assert!(private.contains("private member `d`"), "{private}");
+        let mixed = json!({"keys": [good.clone(), {"kty": "EC", "d": "x"}]}).to_string();
+        assert!(refused(&mixed).contains("private member"));
+        assert!(refused(&with("crv", json!("P-384"))).contains("P-256"));
+        assert!(refused(&with("kty", json!("RSA"))).contains("P-256"));
+        assert!(refused(&with("alg", json!("RS256"))).contains("ES256"));
+        assert!(refused(&with("x", json!("AAAA"))).contains("32 bytes"));
+        assert!(refused(&with("kid", json!("not-the-thumbprint"))).contains("thumbprint"));
+        assert!(refused("not json").contains("not a JSON key set"));
+        assert!(refused(r#"{"nope": []}"#).contains("keys"));
+        assert!(refused(r#"{"keys": [1]}"#).contains("not an object"));
+
+        let key = IssuerKey::from_pem(&generated_pem()).unwrap();
+        assert!(key
+            .with_retired_keys_file("/nonexistent/keys.json")
             .unwrap_err()
             .contains("cannot read"));
     }

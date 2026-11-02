@@ -12,6 +12,15 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **A health card's issuer can be an address of its own, and a replaced key can stay public.**
+  `[health_cards] issuer` (or `REFHIR_HEALTH_CARDS_ISSUER`) is the `iss` of every card, in place of
+  `[public_url]/health-cards`, for a clinic's own address or one address shared by many servers;
+  it must be `https` (or loopback `http`) with no query or fragment, and the server does not start
+  with one that is not. `[health_cards] extra_keys_file` (or `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE`)
+  is a JWKS file of public keys that the key set at `/health-cards/.well-known/jwks.json` publishes
+  beside the signing key, so cards a replaced key signed still verify; a file with a private member
+  is refused. Neither is set by default, and without them nothing changes. See
+  [SMART Health Cards](docs/health-cards.md#an-issuer-of-your-own).
 - **The SMART Health Links host manages its clients over an API, with no restart.** A host that
   several apps or projects share can now make a client for each and revoke it again while it runs.
   `POST /admin/clients` makes one (a name, the addresses it may call from, its limits, and the media
