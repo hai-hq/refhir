@@ -258,7 +258,8 @@ chmod 600 health-cards.pem
   `/health-cards/.well-known/jwks.json`. See
   [An issuer of your own](../docs/health-cards.md#an-issuer-of-your-own).
 - **Every process serving one deployment needs the same key**, or a card made by one fails to
-  verify against the key set another publishes.
+  verify against the key set another publishes. The same goes for `REFHIR_HEALTH_CARDS_ISSUER` and
+  `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE`: a process without the retired keys does not publish them.
 
 ## FHIR version and Implementation Guides
 

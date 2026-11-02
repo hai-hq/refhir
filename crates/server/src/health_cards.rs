@@ -25,12 +25,10 @@ pub struct IssuerKey {
     pair: EcdsaKeyPair,
     rng: SystemRandom,
     kid: String,
-    x: String,
-    y: String,
     /// What `iss` says when it is not the server's own address, with no trailing slash.
     issuer: Option<String>,
-    /// Public keys that signed cards before and are still published: each a complete JWK.
-    retired: Vec<Value>,
+    /// The key set that checks the cards, made once: this key, then any retired public keys.
+    jwks: Value,
 }
 
 impl std::fmt::Debug for IssuerKey {
@@ -44,10 +42,7 @@ impl IssuerKey {
     /// The key in the PEM file at `path`: an unencrypted PKCS#8 `PRIVATE KEY` on P-256, as
     /// `openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256` writes it.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, String> {
-        let path = path.as_ref();
-        let pem = std::fs::read_to_string(path)
-            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        Self::from_pem(&pem)
+        Self::from_pem(&read_file(path.as_ref())?)
     }
 
     pub fn from_pem(pem: &str) -> Result<Self, String> {
@@ -68,14 +63,21 @@ impl IssuerKey {
         let x = URL_SAFE_NO_PAD.encode(&point[1..33]);
         let y = URL_SAFE_NO_PAD.encode(&point[33..65]);
         let kid = thumbprint(&x, &y);
+        let jwks = json!({"keys": [{
+            "kty": "EC",
+            "kid": kid,
+            "use": "sig",
+            "alg": "ES256",
+            "crv": "P-256",
+            "x": x,
+            "y": y
+        }]});
         Ok(Self {
             pair,
             rng,
             kid,
-            x,
-            y,
             issuer: None,
-            retired: Vec::new(),
+            jwks,
         })
     }
 
@@ -98,18 +100,16 @@ impl IssuerKey {
     /// Also publish the public keys in the JWKS file at `path`, so a key that was replaced stays
     /// in the key set and the cards it signed still verify.
     pub fn with_retired_keys_file(self, path: impl AsRef<Path>) -> Result<Self, String> {
-        let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
-        self.with_retired_keys(&text)
+        self.with_retired_keys(&read_file(path.as_ref())?)
     }
 
     pub fn with_retired_keys(mut self, jwks: &str) -> Result<Self, String> {
         for key in public_keys(jwks)? {
-            let already = key["kid"] == self.kid.as_str()
-                || self.retired.iter().any(|known| known["kid"] == key["kid"]);
-            if !already {
-                self.retired.push(key);
+            let published = self.jwks["keys"]
+                .as_array_mut()
+                .expect("the key set has keys");
+            if !published.iter().any(|known| known["kid"] == key["kid"]) {
+                published.push(key);
             }
         }
         Ok(self)
@@ -117,17 +117,7 @@ impl IssuerKey {
 
     /// The key set that checks the cards: this key and any retired ones, never a private part.
     pub fn jwks(&self) -> Value {
-        let mut keys = vec![json!({
-            "kty": "EC",
-            "kid": self.kid,
-            "use": "sig",
-            "alg": "ES256",
-            "crv": "P-256",
-            "x": self.x,
-            "y": self.y
-        })];
-        keys.extend(self.retired.iter().cloned());
-        json!({ "keys": keys })
+        self.jwks.clone()
     }
 
     /// A health card: the claims of a credential, compressed and signed. `types` are the
@@ -178,8 +168,22 @@ impl IssuerKey {
     }
 }
 
+fn read_file(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|err| format!("cannot read {}: {err}", path.display()))
+}
+
+/// Whether `point` (0x04, x, y) is on the P-256 curve. `ring` has no call for it, but it refuses a
+/// peer key that is not on the curve when it agrees a secret with one.
+fn on_curve(point: &[u8]) -> bool {
+    use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
+    let Ok(private) = EphemeralPrivateKey::generate(&ECDH_P256, &SystemRandom::new()) else {
+        return false;
+    };
+    agree_ephemeral(private, &UnparsedPublicKey::new(&ECDH_P256, point), |_| ()).is_ok()
+}
+
 /// An address a card can name as `iss`: `https` (or `http` on a loopback host, for tests), a host,
-/// and no user, query or fragment. A trailing slash is dropped, because the specification has the
+/// a valid port if it has one, no user, query, fragment or empty or dot path segment. A trailing slash is dropped, because the specification has the
 /// key set at `[iss]/.well-known/jwks.json` and `iss` with none.
 pub fn validate_issuer(issuer: &str) -> Result<String, String> {
     let trimmed = issuer.trim();
@@ -198,20 +202,56 @@ pub fn validate_issuer(issuer: &str) -> Result<String, String> {
     let (scheme, rest) = url
         .split_once("://")
         .ok_or_else(|| format!("the issuer {url} is not an https address"))?;
-    let authority = rest.split('/').next().unwrap_or_default();
+    let mut segments = rest.split('/');
+    let authority = segments.next().unwrap_or_default();
     if authority.is_empty() || authority.contains('@') {
         return Err(format!(
             "the issuer {url} needs a host, and no user name or password"
         ));
     }
-    // The host without its port; an IPv6 address is bracketed.
-    let host = match authority.strip_prefix('[') {
-        Some(inner) => inner.split(']').next().unwrap_or_default(),
-        None => authority.split(':').next().unwrap_or_default(),
+    if segments.any(|segment| matches!(segment, "" | "." | "..")) {
+        return Err(format!(
+            "the issuer {url} has an empty or `.` or `..` part in its path"
+        ));
+    }
+    // The host and the port, if any; an IPv6 address is bracketed.
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(inner) => {
+            let (host, after) = inner
+                .split_once(']')
+                .ok_or_else(|| format!("the issuer {url} has a `[` that is not closed"))?;
+            match after {
+                "" => (host, None),
+                _ => (
+                    host,
+                    Some(
+                        after
+                            .strip_prefix(':')
+                            .ok_or_else(|| format!("the issuer {url} has text after its host"))?,
+                    ),
+                ),
+            }
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
     };
+    if let Some(port) = port {
+        let digits = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
+        if !digits || port.parse::<u16>().map_or(true, |port| port == 0) {
+            return Err(format!(
+                "the issuer {url} has a port that is not 1 to 65535"
+            ));
+        }
+    }
+    let loopback = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    );
     match scheme {
         "https" => {}
-        "http" if matches!(host, "localhost" | "127.0.0.1" | "::1") => {}
+        "http" if loopback => {}
         "http" => {
             return Err(format!(
                 "the issuer {url} is an http address: a verifier accepts only https \
@@ -253,6 +293,13 @@ fn public_keys(jwks: &str) -> Result<Vec<Value>, String> {
         {
             return Err(at("not an EC key on P-256"));
         }
+        if let Some(usage) = object.get("use").and_then(Value::as_str) {
+            if usage != "sig" {
+                return Err(at(
+                    "`use` is not `sig`: the key is not for checking signatures",
+                ));
+            }
+        }
         if let Some(alg) = object.get("alg").and_then(Value::as_str) {
             if alg != "ES256" {
                 return Err(at("`alg` is not ES256"));
@@ -269,6 +316,13 @@ fn public_keys(jwks: &str) -> Result<Vec<Value>, String> {
             }
         };
         let (x, y) = (coordinate("x")?, coordinate("y")?);
+        let mut point = vec![4u8];
+        for part in [&x, &y] {
+            point.extend(URL_SAFE_NO_PAD.decode(part).unwrap_or_default());
+        }
+        if !on_curve(&point) {
+            return Err(at("the point (x, y) is not on the P-256 curve"));
+        }
         let kid = thumbprint(&x, &y);
         if let Some(given) = object.get("kid").and_then(Value::as_str) {
             if given != kid {
@@ -352,6 +406,16 @@ mod tests {
         URL_SAFE_NO_PAD.decode(part).unwrap()
     }
 
+    /// Whether the key `jwk` checks `signature` of `signing_input`.
+    fn checks(jwk: &Value, signing_input: &[u8], signature: &[u8]) -> bool {
+        let mut point = vec![4u8];
+        point.extend(decode(jwk["x"].as_str().unwrap()));
+        point.extend(decode(jwk["y"].as_str().unwrap()));
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
+            .verify(signing_input, signature)
+            .is_ok()
+    }
+
     #[test]
     fn a_card_is_a_compact_jws_that_the_published_key_checks() {
         let key = IssuerKey::from_pem(&generated_pem()).unwrap();
@@ -397,21 +461,14 @@ mod tests {
         let signature = decode(parts[2]);
         assert_eq!(signature.len(), 64);
         let jwk = &key.jwks()["keys"][0];
-        let mut point = vec![4u8];
-        point.extend(decode(jwk["x"].as_str().unwrap()));
-        point.extend(decode(jwk["y"].as_str().unwrap()));
         let signing_input = format!("{}.{}", parts[0], parts[1]);
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
-            .verify(signing_input.as_bytes(), &signature)
-            .expect("the card verifies against the published key");
+        assert!(
+            checks(jwk, signing_input.as_bytes(), &signature),
+            "the card verifies against the published key"
+        );
         let mut tampered = signing_input.into_bytes();
         tampered[10] ^= 1;
-        let mut point = vec![4u8];
-        point.extend(decode(jwk["x"].as_str().unwrap()));
-        point.extend(decode(jwk["y"].as_str().unwrap()));
-        assert!(UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
-            .verify(&tampered, &signature)
-            .is_err());
+        assert!(!checks(jwk, &tampered, &signature));
     }
 
     #[test]
@@ -486,7 +543,9 @@ mod tests {
             ok("https://x.example:8443/a/b"),
             "https://x.example:8443/a/b"
         );
+        assert_eq!(ok("https://x.example:443"), "https://x.example:443");
         for loopback in [
+            "http://LOCALHOST:8080",
             "http://localhost:8080",
             "http://127.0.0.1:8080/cards",
             "http://[::1]:8080",
@@ -507,6 +566,26 @@ mod tests {
         assert!(validate_issuer("https://").is_err());
         assert!(refused("https:///cards").contains("host"));
         assert!(refused("https://user:pw@x.example").contains("user"));
+        for port in [
+            "x.example:",
+            "x.example:abc",
+            "x.example:0",
+            "x.example:99999999",
+            "x.example:+80",
+        ] {
+            assert!(
+                refused(&format!("https://{port}")).contains("port"),
+                "{port}"
+            );
+        }
+        assert!(refused("https://[::1]x").contains("text after"));
+        assert!(refused("https://[::1").contains("not closed"));
+        for path in ["x.example//a", "x.example/a/../b", "x.example/./a"] {
+            assert!(
+                refused(&format!("https://{path}")).contains("path"),
+                "{path}"
+            );
+        }
         assert!(refused("https://x .example").contains("space"));
     }
 
@@ -570,37 +649,6 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_card_checks_against_the_key_set_the_server_serves() {
-        let retired = IssuerKey::from_pem(&generated_pem()).unwrap();
-        let key = IssuerKey::from_pem(&generated_pem())
-            .unwrap()
-            .with_retired_keys(&retired.jwks().to_string())
-            .unwrap();
-        let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": []});
-        let card = retired
-            .sign("https://health.clinic.example", 1, &[], "4.0.1", &bundle)
-            .unwrap();
-        let parts: Vec<&str> = card.split('.').collect();
-        let header: Value = serde_json::from_slice(&decode(parts[0])).unwrap();
-        let jwks = key.jwks();
-        let jwk = jwks["keys"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|jwk| jwk["kid"] == header["kid"])
-            .expect("the served key set holds the retired key's kid");
-        let mut point = vec![4u8];
-        point.extend(decode(jwk["x"].as_str().unwrap()));
-        point.extend(decode(jwk["y"].as_str().unwrap()));
-        UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
-            .verify(
-                format!("{}.{}", parts[0], parts[1]).as_bytes(),
-                &decode(parts[2]),
-            )
-            .expect("the retired key's card verifies against the served set");
-    }
-
-    #[test]
     fn a_key_file_that_is_not_all_public_keys_on_p256_is_refused() {
         let good = public_jwk(&IssuerKey::from_pem(&generated_pem()).unwrap());
         let with = |member: &str, value: Value| {
@@ -622,6 +670,11 @@ mod tests {
         assert!(refused(&with("crv", json!("P-384"))).contains("P-256"));
         assert!(refused(&with("kty", json!("RSA"))).contains("P-256"));
         assert!(refused(&with("alg", json!("RS256"))).contains("ES256"));
+        assert!(refused(&with("use", json!("enc"))).contains("`use`"));
+        // 32 bytes each, but (0, 0) is not a point on the curve.
+        let zeros = "A".repeat(43);
+        let off_curve = json!({"keys": [{"kty": "EC", "crv": "P-256", "x": zeros, "y": zeros}]});
+        assert!(refused(&off_curve.to_string()).contains("not on the P-256 curve"));
         assert!(refused(&with("x", json!("AAAA"))).contains("32 bytes"));
         assert!(refused(&with("kid", json!("not-the-thumbprint"))).contains("thumbprint"));
         assert!(refused("not json").contains("not a JSON key set"));

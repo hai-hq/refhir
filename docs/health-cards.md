@@ -152,14 +152,25 @@ keys. The key set the server publishes holds the signing key first and then thes
 `kid` (the RFC 7638 thumbprint of the key, which the server works out; one the file gives that
 is not the thumbprint is refused) and `use` and `alg` of `sig` and `ES256`. A file with no keys is
 fine. **A file with a private member (`d`) is refused and the server does not start**, so a private
-key cannot be published by mistake. To make the file from a key you are replacing:
+key cannot be published by mistake. To make the file from the PEM of a key you are replacing (the last 64 bytes of its public key in
+DER are `x` and `y`):
 
 ```bash
-openssl ec -in old-health-cards.pem -pubout -out old-public.pem
+openssl pkey -in old-health-cards.pem -pubout -outform DER | tail -c 64 > xy.bin
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+x=$(head -c 32 xy.bin | b64url); y=$(tail -c 32 xy.bin | b64url)
+printf '{"keys":[{"kty":"EC","crv":"P-256","x":"%s","y":"%s"}]}\n' "$x" "$y" \
+  > health-cards-retired.json
+rm xy.bin
 ```
 
-then write its `x` and `y` as a JWK, or take the entry from the key set the server was publishing
-(`/health-cards/.well-known/jwks.json`) before you replaced the key.
+A key from several rotations is one more entry in `keys`. You can instead take the entry from the
+key set the server was publishing (`/health-cards/.well-known/jwks.json`) before you replaced the
+key. The server refuses a key whose point is not on the P-256 curve or whose `use` is not `sig`.
+
+Every process that serves one deployment needs the same `issuer` and the same `extra_keys_file`
+as well as the same signing key, or a card verifies against the key set of some of them and not
+others.
 
 ## Who is the issuer
 

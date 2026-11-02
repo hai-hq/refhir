@@ -679,8 +679,8 @@ fn load_health_cards_key(
     let warning = health_cards_address(cfg.public_url.as_deref(), loopback)?;
     let mut key = refhir_server::IssuerKey::from_file(path)
         .map_err(|err| format!("[health_cards] key_file {path}: {err}"))?;
-    // A card names the issuer set, so the address the server is reached at is not what a verifier
-    // is told, and the warning about it does not apply.
+    // A card names the issuer set, so the warning about the address it would name does not apply.
+    // The links in an answer are still addresses of this server, which needs `public_url` to say.
     match &cfg.health_cards_issuer {
         Some(issuer) => {
             key = key
@@ -690,6 +690,13 @@ fn load_health_cards_key(
                 "SMART Health Cards name {} as their issuer",
                 key.issuer().unwrap_or_default()
             );
+            if cfg.public_url.is_none() {
+                tracing::warn!(
+                    "the resource links in a $health-cards-issue answer name http://127.0.0.1 (the \
+                     address a request arrives at), which no one else can reach: set --public-url \
+                     to the https address the server is reached at"
+                );
+            }
         }
         None => {
             if let Some(warning) = warning {

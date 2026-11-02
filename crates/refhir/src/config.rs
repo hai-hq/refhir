@@ -922,7 +922,9 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     if let Some(path) = env_value("REFHIR_HEALTH_CARDS_KEY_FILE") {
         cfg.health_cards_key_file = Some(path);
     }
-    if let Some(issuer) = env_value("REFHIR_HEALTH_CARDS_ISSUER") {
+    // Set but empty is not "unset": it reaches the check at startup, which refuses it, and cards do
+    // not quietly name the server's own address.
+    if let Ok(issuer) = std::env::var("REFHIR_HEALTH_CARDS_ISSUER") {
         cfg.health_cards_issuer = Some(issuer);
     }
     if let Some(path) = env_value("REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE") {
@@ -1056,6 +1058,15 @@ mod tests {
         assert_eq!(
             cfg.health_cards_extra_keys_file.as_deref(),
             Some("/run/old.json")
+        );
+        std::env::set_var("REFHIR_HEALTH_CARDS_ISSUER", "");
+        let applied = apply_env(&mut cfg);
+        std::env::remove_var("REFHIR_HEALTH_CARDS_ISSUER");
+        applied.unwrap();
+        assert_eq!(
+            cfg.health_cards_issuer.as_deref(),
+            Some(""),
+            "an empty issuer is kept, for startup to refuse"
         );
     }
 
