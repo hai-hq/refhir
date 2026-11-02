@@ -219,8 +219,10 @@ describe.each(stores)('%s store', (_name, make) => {
       // A change keeps what it does not name.
       const renamed = await store.updateClient('cl_a', { name: 'a2', updatedAt: 200 });
       expect(renamed).toEqual({ ...client('cl_a', 'a2'), updatedAt: 200 });
-      const rotated = await store.updateClient('cl_a', { tokenHash: 'new-hash', settings: { maxAttempts: 3 }, updatedAt: 201 });
-      expect(rotated).toMatchObject({ name: 'a2', tokenHash: 'new-hash', settings: { maxAttempts: 3 }, updatedAt: 201 });
+      // Settings are merged into those kept, and a null takes one away.
+      const rotated = await store.updateClient('cl_a', { tokenHash: 'new-hash', settings: { maxAttempts: 3, allow: null, maxFilesPerLink: 5 }, updatedAt: 201 });
+      expect(rotated).toMatchObject({ name: 'a2', tokenHash: 'new-hash', updatedAt: 201 });
+      expect(rotated?.settings).toEqual({ maxAttempts: 3, maxFilesPerLink: 5, allowedContentTypes: ['application/fhir+json'] });
       expect(await store.clientByToken('cl_a-hash')).toBeNull(); // the old token is no one's
       await expect(store.updateClient('cl_b', { name: 'a2', updatedAt: 202 })).rejects.toBeInstanceOf(NameTaken);
       expect(await store.updateClient('cl_x', { name: 'x', updatedAt: 203 })).toBeNull();
@@ -594,6 +596,14 @@ describe('a database from before clients were kept', () => {
       const store = await sqlite.open();
       expect((await store.get(before.id))?.clientId).toBe('ehr');
       expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id)).toEqual([before.id]);
+      // A host that has not been upgraded makes a link with no client_id after the migration.
+      const { DatabaseSync: Again } = await import('node:sqlite');
+      const late = new Again(sqlite.file);
+      late
+        .prepare('INSERT INTO links (id, token_hash, created_at, created_by, expires_at, attempts_left, max_files, max_file_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(ID('b'), before.tokenHash, before.createdAt, 'ehr', before.expiresAt, 5, 10, 1000);
+      late.close();
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id).sort()).toEqual([before.id, ID('b')].sort());
     } finally {
       first.done();
       await sqlite.done();
@@ -612,6 +622,11 @@ describe('a database from before clients were kept', () => {
       const store = await schema.open();
       expect((await store.get(before.id))?.clientId).toBe('ehr');
       expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id)).toEqual([before.id]);
+      // A host that has not been upgraded makes a link with no client_id after the migration.
+      await raw`
+        INSERT INTO links (id, token_hash, created_at, created_by, expires_at, attempts_left, max_files, max_file_bytes)
+        VALUES (${ID('b')}, ${before.tokenHash}, ${before.createdAt}, 'ehr', ${before.expiresAt}, 5, 10, 1000)`;
+      expect((await store.listLinks('ehr', { limit: 10 })).map((link) => link.id).sort()).toEqual([before.id, ID('b')].sort());
     } finally {
       first.done();
       await raw.end({ timeout: 1 });

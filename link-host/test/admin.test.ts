@@ -83,7 +83,7 @@ describe('a client made over the admin API', () => {
       expect((await admin(host, `/${a.id}`, { method: 'DELETE' })).status).toBe(404);
 
       const ended = await admin(host, `/${b.id}?endLinks=true`, { method: 'DELETE' });
-      expect([ended.status, ended.json]).toEqual([200, { endedLinks: 1 }]);
+      expect([ended.status, ended.json]).toEqual([200, { endedLinks: 1, more: false }]);
       expect(await opens(host, bLink.id)).toBe(404);
       expect((await makeLink(host, {}, b.token)).status).toBe(401);
       expect((await admin(host, `/${a.id}?endLinks=maybe`, { method: 'DELETE' })).status).toBe(400);
@@ -93,6 +93,21 @@ describe('a client made over the admin API', () => {
       expect(again.id).not.toBe(a.id);
       expect((await linksOf(host, again.token)).json.links).toEqual([]);
       expect((await accessOf(host, aLink.id, again.token)).status).toBe(401);
+    }));
+
+  it('can have its links ended after it is gone, so that a revoke cut short is made again', () =>
+    using(async (host) => {
+      const a = await newClient(host, { name: 'a' });
+      const link = (await makeLink(host, {}, a.token)).json;
+      expect((await admin(host, `/${a.id}`, { method: 'DELETE' })).status).toBe(204); // the client is gone, and its link is not
+      expect(await opens(host, link.id)).toBe(200);
+      const again = await admin(host, `/${a.id}?endLinks=true`, { method: 'DELETE' });
+      expect([again.status, again.json]).toEqual([200, { endedLinks: 1, more: false }]);
+      expect(await opens(host, link.id)).toBe(404);
+      const third = await admin(host, `/${a.id}?endLinks=true`, { method: 'DELETE' });
+      expect([third.status, third.json]).toEqual([200, { endedLinks: 0, more: false }]); // its links are still there to be seen, ended
+      // Nothing of a client that never was.
+      expect((await admin(host, '/cl_bbbbbbbbbbbbbbbbbbbbbb?endLinks=true', { method: 'DELETE' })).status).toBe(404);
     }));
 
   it('is refused its old token once it is rotated, and keeps its links', () =>
@@ -229,6 +244,26 @@ describe('the admin API', () => {
     });
   });
 
+  it('keeps both of two changes made at once, and does not take a token that is not its own for a client of the host\'s code', async () => {
+    await using(async (host) => {
+      const a = await newClient(host, { name: 'a', maxAttempts: 7 });
+      const patch = (body: unknown) => admin(host, `/${a.id}`, { method: 'PATCH', body });
+      const replies = await Promise.all([patch({ requirePasscode: true }), patch({ maxFilesPerLink: 3 }), patch({ maxAttempts: null })]);
+      expect(replies.map((reply) => reply.status)).toEqual([200, 200, 200]);
+      const kept = (await admin(host, `/${a.id}`)).json;
+      expect(kept).toMatchObject({ requirePasscode: true, maxFilesPerLink: 3 });
+      expect(kept).not.toHaveProperty('maxAttempts');
+    });
+    // A host with its own way to tell who is calling still takes the clients made over the API.
+    await using({ authenticate: (request) => (request.headers.get('x-api-key') === 'let-me-in' ? { name: 'sso-user' } : null) }, async (host) => {
+      const a = await newClient(host, { name: 'a' });
+      expect((await makeLink(host, {}, a.token)).status).toBe(201);
+      expect((await call(`${host.base}/shl`, { token: a.token })).status).toBe(200);
+      expect((await call(`${host.base}/shl`, { method: 'POST', body: {}, headers: { 'x-api-key': 'let-me-in' } })).status).toBe(201);
+      expect((await makeLink(host, {}, 'not-the-token-of-anyone')).status).toBe(401);
+    });
+  });
+
   it('says what is wrong with a client it is asked to make or change, and leaves a client of the settings alone', () =>
     using({ clients: [{ name: 'ehr', token: 'ehr-token-of-sixteen-chars', maxFilesPerLink: 2 }] }, async (host) => {
       const post = (body: unknown) => admin(host, '', { method: 'POST', body });
@@ -239,6 +274,7 @@ describe('the admin API', () => {
       expect(wrong.json.error).toMatch(/maxFileBytes is a whole number above 0/);
       expect(wrong.json.error).toMatch(/300.0.0.1 is not an address/);
       expect((await post({ name: 'x', allowedContentTypes: ['not a type'] })).status).toBe(400);
+      expect((await post({ name: 'x', maxFileBytes: 5_000_000_000 })).json.error).toMatch(/maxFileBytes is a whole number above 0 and up to 2147483647/); // links keep it in 32 bits
       expect((await post({ name: 'has spaces' })).status).toBe(400);
       expect((await post({ name: 'cl_aaaaaaaaaaaaaaaaaaaaaa' })).status).toBe(400); // the shape of an id
       expect((await post({ name: 'x', token: 'my-own-token-of-sixteen' })).status).toBe(400); // a token is made by the host

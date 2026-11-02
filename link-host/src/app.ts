@@ -48,6 +48,7 @@ const ADMIN_JSON_LIMIT = 16_384;
 const DAY = 86_400;
 // What a client made over the admin API may be called: it is what the logs say did a thing.
 const CLIENT_NAME = /^[A-Za-z0-9][\w.@:-]{0,99}$/;
+const END_BATCH = 500;
 const LIST_LIMIT = 100;
 const LIST_MOST = 1000;
 
@@ -297,15 +298,18 @@ export async function createHost(options: HostOptions): Promise<Host> {
   // the store, which is asked each time, so that a client made, changed or revoked over the admin API
   // is so at once, in every process.
   async function identify(c: C, ctx: Ctx): Promise<Known | null> {
-    if (authenticate) {
-      const client = await authenticate(c.req.raw, { ip: ctx.ip });
-      return client ? { client, owner: client.id ?? client.name, allows: allowsOf(client) } : null;
-    }
     const token = bearer(c);
-    // Every client is compared, so the time taken does not say which one matched or how far.
     const presented = sha256(token);
     let known: Known | null = null;
-    for (const candidate of clients) if (timingSafeEqual(presented, candidate.hash)) known ??= candidate;
+    if (authenticate) {
+      // The host's own code says who a token is; a token it does not know may still be a client's
+      // that was made over the admin API.
+      const client = await authenticate(c.req.raw, { ip: ctx.ip });
+      if (client) return { client, owner: client.id ?? client.name, allows: allowsOf(client) };
+    } else {
+      // Every client is compared, so the time taken does not say which one matched or how far.
+      for (const candidate of clients) if (timingSafeEqual(presented, candidate.hash)) known ??= candidate;
+    }
     if (known || !token) return known;
     const stored = await store.clientByToken(presented.toString('hex'));
     return stored ? fromStored(stored) : null;
@@ -792,13 +796,9 @@ export async function createHost(options: HostOptions): Promise<Host> {
   async function changeClient(c: C, ctx: Ctx): Promise<Response> {
     requireAdmin(c, ctx);
     const current = await storedClient(c);
-    const { name, settings: change } = readSettings(await readJson(c, ADMIN_JSON_LIMIT), { clearable: true });
-    // A setting that is `null` is taken away, and the client has the host's own.
-    const settings: Record<string, unknown> = { ...current.settings };
-    for (const [field, value] of Object.entries(change)) {
-      if (value === null) delete settings[field];
-      else settings[field] = value;
-    }
+    // A setting that is `null` is taken away, and the client has the host's own. The store merges
+    // what is given into what is kept, so two changes at once both stay.
+    const { name, settings } = readSettings(await readJson(c, ADMIN_JSON_LIMIT), { clearable: true });
     let changed: StoredClient | null;
     try {
       changed = await store.updateClient(current.id, { ...(name ? { name } : {}), settings, updatedAt: seconds() });
@@ -822,21 +822,35 @@ export async function createHost(options: HostOptions): Promise<Host> {
   }
 
   // Revokes a client: its token is refused at once. Its links go on until they end, unless
-  // `endLinks=true`, which switches off every one that is still live.
+  // `endLinks=true`, which switches off the ones that are still live, END_BATCH at a time: the answer
+  // says `more` while there are others, and the same request is made again, which it can be after the
+  // client is gone, so that a call that was cut short is not the end of it.
   async function revokeClient(c: C, ctx: Ctx): Promise<Response> {
     requireAdmin(c, ctx);
     const endLinks = c.req.query('endLinks');
     if (endLinks !== undefined && !/^(true|false)$/.test(endLinks)) throw new Refused(400, { error: 'endLinks is true or false' });
-    const current = await storedClient(c);
-    if (!(await store.deleteClient(current.id))) throw new Refused(404, { error: 'there is no such client' });
-    emit('client.revoked', { clientId: current.id, client: current.name });
-    if (endLinks !== 'true') return reply(204);
+    const id = c.req.param('client')!;
+    const wanted = endLinks === 'true';
+    const current = wanted && STORED_ID.test(id) && !configured.has(id) ? await store.getClient(id) : await storedClient(c);
+    const revoked = current !== null && (await store.deleteClient(current.id));
+    if (revoked) emit('client.revoked', { clientId: current.id, client: current.name });
+    if (!wanted) {
+      if (!revoked) throw new Refused(404, { error: 'there is no such client' });
+      return reply(204);
+    }
     let ended = 0;
+    let seen = false;
+    let more = false;
     let before: { createdAt: number; id: string } | undefined;
-    for (;;) {
-      const page = await store.listLinks(current.id, { limit: 200, ...(before ? { before } : {}) });
+    scan: for (;;) {
+      const page = await store.listLinks(id, { limit: 200, ...(before ? { before } : {}) });
       for (const listed of page) {
+        seen = true;
         if (!isLive(listed, seconds())) continue;
+        if (ended >= END_BATCH) {
+          more = true;
+          break scan;
+        }
         const reason = await store.update(listed.id, async (link, tx) => (live(link) ? switchOff(link, tx, 'revoked') : undefined));
         if (!reason) continue;
         ended += 1;
@@ -847,7 +861,8 @@ export async function createHost(options: HostOptions): Promise<Host> {
       if (page.length < 200 || !last) break;
       before = { createdAt: last.createdAt, id: last.id };
     }
-    return reply(200, { endedLinks: ended });
+    if (!revoked && !seen) throw new Refused(404, { error: 'there is no such client' });
+    return reply(200, { endedLinks: ended, more });
   }
 
   async function serveFile(c: C, ctx: Ctx): Promise<Response> {

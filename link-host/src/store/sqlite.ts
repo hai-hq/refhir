@@ -210,7 +210,7 @@ export async function sqliteStore(options: SqliteOptions): Promise<SqliteStore> 
     clients: db.prepare('SELECT * FROM link_clients ORDER BY created_at, id'),
     newClient: db.prepare('INSERT INTO link_clients (id, name, token_hash, settings, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'),
     changeClient: db.prepare(`
-      UPDATE link_clients SET name = COALESCE(?, name), token_hash = COALESCE(?, token_hash), settings = COALESCE(?, settings), updated_at = ?
+      UPDATE link_clients SET name = COALESCE(?, name), token_hash = COALESCE(?, token_hash), settings = json_patch(settings, ?), updated_at = ?
       WHERE id = ? RETURNING *`),
     dropClient: db.prepare('DELETE FROM link_clients WHERE id = ?'),
   } satisfies Record<string, StatementSync>;
@@ -414,7 +414,7 @@ export async function sqliteStore(options: SqliteOptions): Promise<SqliteStore> 
           sql.changeClient,
           change.name ?? null,
           change.tokenHash ?? null,
-          change.settings ? JSON.stringify(change.settings) : null,
+          JSON.stringify(change.settings ?? {}), // merged by SQLite: a null takes a setting away
           change.updatedAt,
           id,
         );

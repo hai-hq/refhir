@@ -93,7 +93,7 @@ and its own key. `docs/examples/share-summary.mjs` in the ReFHIR repository does
 |---|---|
 | `POST /shl` | Makes a link. Needs `Authorization: Bearer <token>`. The optional JSON body has `passcode` (up to 64 characters), `attempts` (how many wrong passcodes, 1 to 20, default 5) and `expiresAt` (seconds since 1970). Answers `{id, manifestUrl, manageToken, expiresAt, passcodeRequired}`. Without `expiresAt` a link lasts 30 days. Put `expiresAt` in the link's own `exp`. |
 | `POST /shl/{id}/file?contentType=...` | Puts the encrypted file on the link. Needs the link's `manageToken`. The body is the file, a compact JWE. The `contentType` is what the manifest will say it is, `application/fhir+json` unless you name another. |
-| `GET /shl` | The links the calling client made, newest first. Needs the client's token. Takes `limit` (1 to 1000, default 100) and `before`, and answers `{links, next}`: each link's `id`, `manifestUrl`, `createdAt`, `expiresAt`, `endedAt`, `active`, `passcodeRequired` and `files`, and never what opens it. `next` is the `before` of the next page, and is left out on the last. |
+| `GET /shl` | The links the calling client made, newest first. Needs the client's token. Takes `limit` (1 to 1000, default 100) and `before`, and answers `{links, next}`: each link's `id`, `manifestUrl`, `createdAt`, `expiresAt`, `endedAt`, `active`, `passcodeRequired` and `files`. `manifestUrl` is the link's address, so keep the answer out of logs as you would the address itself; it holds no `manageToken` and no key. `next` is the `before` of the next page, and is left out on the last. |
 | `GET /shl/{id}/access` | Who has asked, and when. Needs the link's `manageToken`, or the token of the client that made the link, and no one else's. Answers `{access, expiresAt, active}`. Kept for 30 days after the link ends. |
 | `DELETE /shl/{id}` | Switches the link off, and deletes its files at once. Needs the `manageToken`, or the token of the client that made the link. |
 
@@ -252,7 +252,7 @@ each time it is presented.
 | `GET /admin/clients/{id}` | One client. |
 | `PATCH /admin/clients/{id}` | Changes what the body names. A setting set to `null` is taken away, so the client has the host's own again. The name can be changed. Answers the client. |
 | `POST /admin/clients/{id}/rotate` | Gives the client a new `token`, shown once, and the old one is refused from that moment. The client keeps its links. |
-| `DELETE /admin/clients/{id}` | Revokes the client: its token is refused from that moment. `204`. Its links keep working until they end, and their owners keep their own tokens. With `?endLinks=true` every link of the client that is still live is switched off too, and the answer is `200` with `{endedLinks}`. |
+| `DELETE /admin/clients/{id}` | Revokes the client: its token is refused from that moment. `204`. Its links keep working until they end, and their owners keep their own tokens. With `?endLinks=true` the client's live links are switched off too, up to 500 a call: the answer is `200` with `{endedLinks, more}`, and while `more` is `true` the same request is made again. It can be made again after the client is gone, and is `404` only when there is nothing left of the client. |
 
 A name is one client's, so a second client with it is a `409`; it is free again once its client is
 revoked. The id of a client, `cl_` and 22 characters, is what its links are kept under, and what
@@ -433,7 +433,7 @@ those:
 
 | Option | |
 |---|---|
-| `authenticate(request, { ip })` | Says who is making a link, by returning a client (`{ name, ...limits }`) or `null`, in place of the tokens. Use it to take a token from your own identity provider. |
+| `authenticate(request, { ip })` | Says who is making a link, by returning a client (`{ name, ...limits }`) or `null`, in place of `adminToken` and `clients` (a token it does not know is still looked up among the clients made over the admin API). It is asked again for what lists, reads about or switches off a client's links, so it has to answer `null` for a token it does not know and not throw. Use it to take a token from your own identity provider. |
 | `authorizeCreate({ client, options, ip, request })` | Returns `false`, or `{ allow: false, status, error }`, to refuse a link before it is made. |
 | `authorizeManifest({ link, recipient, ip, request })` | The same, for a receiver, before a passcode is looked at and so without using an attempt up. `link` says who made it and when it ends, and nothing that opens it. A hook that throws refuses. This is the place to require that a recipient is who the directory says. |
 | `onEvent(event)` | Told of `link.created`, `file.stored`, `manifest.opened`, `manifest.denied`, `file.served`, `link.ended`, `client.refused`, and `client.created`, `client.changed`, `client.rotated` and `client.revoked` for the admin API (which say the client's `clientId` and `client` name, never a token), each with `type`, `at` and the whole link `id`, which a log never has. Use it for an audit trail, or to tell the owner their link was opened. A failure here does not fail the request. |

@@ -125,7 +125,12 @@ export function memoryStore({ now = () => Date.now() }: { now?: () => number } =
       const client = clients.get(id);
       if (!client) return null;
       if (change.name !== undefined && nameTaken(change.name, id)) throw new NameTaken(change.name);
-      Object.assign(client, structuredClone(change));
+      const { settings, ...rest } = structuredClone(change);
+      Object.assign(client, rest);
+      for (const [field, value] of Object.entries(settings ?? {})) {
+        if (value === null) delete (client.settings as Record<string, unknown>)[field];
+        else (client.settings as Record<string, unknown>)[field] = value;
+      }
       return structuredClone(client);
     },
     async deleteClient(id) {

@@ -20,7 +20,7 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   change, revoke and rotate. They need the `ADMIN_TOKEN`. Clients are kept in the host's database
   (Postgres or SQLite, as links are), so a change is in force at once in every copy of the host.
   A revoked client, and a token that was rotated, are refused from that moment; `DELETE` takes
-  `?endLinks=true` to switch off the client's live links too. `CLIENTS_FILE` still works for a small
+  `?endLinks=true` to switch off the client's live links too, 500 a call, repeated until `more` is `false`. `CLIENTS_FILE` still works for a small
   host: its clients are read at start, and a name in it cannot also be made over the API.
 - **A client sees only its own links.** `GET /shl` lists the calling client's links, a page at a
   time, and a client reads the access list (`GET /shl/{id}/access`) of, and switches off, only the

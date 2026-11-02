@@ -109,8 +109,13 @@ export interface Store {
   clientByToken(tokenHash: string): Promise<StoredClient | null>;
   /** Every client, oldest first. */
   listClients(): Promise<StoredClient[]>;
-  /** Changes what is given, and answers the client as it now is, or `null` when there is none. */
-  updateClient(id: string, change: Partial<Pick<StoredClient, 'name' | 'tokenHash' | 'settings'>> & { updatedAt: number }): Promise<StoredClient | null>;
+  /** Changes what is given, and answers the client as it now is, or `null` when there is none. The
+   * `settings` given are merged into those kept, in the store, so two changes at once both stay: a
+   * setting that is `null` is taken away. */
+  updateClient(
+    id: string,
+    change: Partial<Pick<StoredClient, 'name' | 'tokenHash'>> & { settings?: { [K in keyof ClientSettings]: ClientSettings[K] | null }; updatedAt: number },
+  ): Promise<StoredClient | null>;
   /** Forgets a client. `false` when there was none. */
   deleteClient(id: string): Promise<boolean>;
 }

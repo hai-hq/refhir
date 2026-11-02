@@ -311,7 +311,7 @@ export async function postgresStore(options: PostgresOptions): Promise<Store> {
           UPDATE link_clients SET
             name = COALESCE(${change.name ?? null}, name),
             token_hash = COALESCE(${change.tokenHash ?? null}, token_hash),
-            settings = COALESCE(${change.settings ? sql.json(change.settings as postgres.JSONValue) : null}, settings),
+            settings = jsonb_strip_nulls(settings || ${sql.json((change.settings ?? {}) as postgres.JSONValue)}),
             updated_at = ${change.updatedAt}
           WHERE id = ${id}
           RETURNING *`;

@@ -20,6 +20,9 @@ export const SETTING_FIELDS = {
 
 export type FieldType = (typeof SETTING_FIELDS)[keyof typeof SETTING_FIELDS] | 'string';
 
+// A link keeps these in 32-bit columns.
+const COUNT_MAX = 2_147_483_647;
+
 const MEDIA_TYPE = /^[\w.+-]+\/[\w.+-]+$/;
 
 /** The id of a client made over the admin API, and nothing else. A client given to the host by name
@@ -47,14 +50,14 @@ export function checkFields(
     const fine =
       type === 'string' ? typeof value === 'string' && value !== '' :
       type === 'boolean' ? typeof value === 'boolean' :
-      type === 'count' ? Number.isInteger(value) && (value as number) > 0 :
+      type === 'count' ? Number.isInteger(value) && (value as number) > 0 && (value as number) <= COUNT_MAX :
       type === 'days' ? Number.isInteger(value) && (value as number) > 0 && (value as number) <= 36500 :
       type === 'addresses' || type === 'types' ? Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === 'string') :
       false;
     if (!fine) {
       const what = {
         days: 'whole number of days',
-        count: 'whole number above 0',
+        count: `whole number above 0 and up to ${COUNT_MAX}`,
         addresses: 'list of addresses and ranges',
         types: 'list of media types, such as application/fhir+json',
       }[type as string] ?? type;
