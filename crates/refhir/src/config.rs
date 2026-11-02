@@ -41,6 +41,131 @@ pub struct FileConfig {
     pub unknown: BTreeMap<String, toml::Value>,
     #[serde(default)]
     pub cluster: ClusterSection,
+    #[serde(default)]
+    pub tenants: TenantsSection,
+}
+
+/// Serving every tenant of a shared Postgres database from one process. See `TenantsConfig`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TenantsSection {
+    pub serve_all: Option<bool>,
+    pub path_prefix: Option<String>,
+    pub domain: Option<String>,
+    pub public_url: Option<String>,
+    pub admin_token: Option<String>,
+    pub admin_bind: Option<String>,
+    pub connections_per_tenant: Option<usize>,
+    pub delete_grace: Option<String>,
+    pub export_on_delete: Option<bool>,
+    pub delete_hook: Option<String>,
+    pub storage_check_interval: Option<String>,
+    pub limits: Option<refhir_server::tenancy::TenantLimits>,
+}
+
+/// How a process that serves every tenant of a shared database is set up (`--all-tenants`).
+#[derive(Debug, Clone)]
+pub struct TenantsConfig {
+    /// Serve every tenant of the database, rather than one (`--tenant`) or a classic database.
+    pub serve_all: bool,
+    /// `/t/{tenant}/…`; `None` turns path routing off.
+    pub path_prefix: Option<String>,
+    /// `{tenant}.{domain}`; `None` turns host routing off.
+    pub domain: Option<String>,
+    /// Each tenant's address, with `{tenant}` in it, or the base the path prefix is added to.
+    /// Falls back to `--public-url`.
+    pub public_url: Option<String>,
+    /// The bearer token of the admin API (`REFHIR_ADMIN_TOKEN`).
+    pub admin_token: Option<String>,
+    /// A listener of its own for the admin API and the probes.
+    pub admin_bind: Option<String>,
+    /// Connections of the pool one tenant may hold at once; `None` is half the pool.
+    pub connections_per_tenant: Option<usize>,
+    /// How long a deleted tenant's rows are kept, and it can be restored.
+    pub delete_grace: std::time::Duration,
+    /// Whether a tenant's resources are written out when it is deleted.
+    pub export_on_delete: bool,
+    /// A URL told (`POST`) when a tenant is deleted.
+    pub delete_hook: Option<String>,
+    /// How often each tenant's storage is measured.
+    pub storage_check_interval: std::time::Duration,
+    /// The limits of a tenant that sets none of its own.
+    pub limits: refhir_server::tenancy::TenantLimits,
+}
+
+impl Default for TenantsConfig {
+    fn default() -> Self {
+        Self {
+            serve_all: false,
+            path_prefix: Some(refhir_server::tenancy::DEFAULT_PATH_PREFIX.to_string()),
+            domain: None,
+            public_url: None,
+            admin_token: None,
+            admin_bind: None,
+            connections_per_tenant: None,
+            delete_grace: std::time::Duration::from_secs(7 * 86_400),
+            export_on_delete: true,
+            delete_hook: None,
+            storage_check_interval: std::time::Duration::from_secs(300),
+            limits: Default::default(),
+        }
+    }
+}
+
+impl TenantsConfig {
+    fn apply_file(&mut self, file: &TenantsSection) -> Result<(), String> {
+        use refhir_server::tenancy::admin::parse_duration;
+        if let Some(on) = file.serve_all {
+            self.serve_all = on;
+        }
+        if let Some(prefix) = &file.path_prefix {
+            // An empty prefix turns path routing off.
+            self.path_prefix = (!prefix.is_empty()).then(|| prefix.clone());
+        }
+        if let Some(domain) = &file.domain {
+            self.domain = (!domain.is_empty()).then(|| domain.clone());
+        }
+        if file.public_url.is_some() {
+            self.public_url = file.public_url.clone();
+        }
+        if file.admin_token.is_some() {
+            self.admin_token = file.admin_token.clone();
+        }
+        if file.admin_bind.is_some() {
+            self.admin_bind = file.admin_bind.clone();
+        }
+        if let Some(share) = file.connections_per_tenant {
+            if share == 0 {
+                return Err("tenants.connections_per_tenant must be a positive number".into());
+            }
+            self.connections_per_tenant = Some(share);
+        }
+        if let Some(grace) = &file.delete_grace {
+            self.delete_grace =
+                parse_duration(grace).map_err(|err| format!("tenants.delete_grace: {err}"))?;
+        }
+        if let Some(export) = file.export_on_delete {
+            self.export_on_delete = export;
+        }
+        if file.delete_hook.is_some() {
+            self.delete_hook = file.delete_hook.clone();
+        }
+        if let Some(every) = &file.storage_check_interval {
+            let every = parse_duration(every)
+                .map_err(|err| format!("tenants.storage_check_interval: {err}"))?;
+            if every.is_zero() {
+                return Err("tenants.storage_check_interval must be longer than 0".into());
+            }
+            self.storage_check_interval = every;
+        }
+        if let Some(limits) = &file.limits {
+            limits
+                .validate()
+                .map_err(|err| format!("[tenants.limits]: {err}"))?;
+            self.limits = limits.clone();
+        }
+        Ok(())
+    }
 }
 
 /// Running several processes against one database. See `Role`.
@@ -369,6 +494,8 @@ pub struct ResolvedConfig {
     /// The tenant this process serves, in a Postgres database that many tenants share; `None` is a
     /// database that holds one deployment.
     pub tenant: Option<String>,
+    /// Serving every tenant of a shared database from this process.
+    pub tenants: TenantsConfig,
 }
 
 impl ResolvedConfig {
@@ -403,6 +530,7 @@ impl ResolvedConfig {
             primary_url: None,
             db_pool: None,
             tenant: None,
+            tenants: TenantsConfig::default(),
         }
     }
 
@@ -473,6 +601,7 @@ impl ResolvedConfig {
         if let Some(tenant) = &file.database.tenant {
             self.tenant = Some(tenant.clone());
         }
+        self.tenants.apply_file(&file.tenants)?;
 
         self.packages = package_plan_from_file(&file.fhir, &file.conformance)?;
 
@@ -883,6 +1012,12 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     }
     if let Some(tenant) = env_value("REFHIR_TENANT") {
         cfg.tenant = Some(tenant);
+    }
+    if let Some(on) = env_value("REFHIR_ALL_TENANTS") {
+        cfg.tenants.serve_all = on == "1" || on.eq_ignore_ascii_case("true");
+    }
+    if let Some(token) = env_value("REFHIR_ADMIN_TOKEN") {
+        cfg.tenants.admin_token = Some(token);
     }
     if let Some(size) = env_value("REFHIR_DB_POOL") {
         cfg.db_pool = Some(

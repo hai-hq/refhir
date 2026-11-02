@@ -24,7 +24,7 @@ use crate::catalog::Catalog;
 use crate::conform::apply_terminology;
 use crate::error::FhirError;
 use crate::npm::packages_installed;
-use crate::package::{announce_terminology, stage_new_package, terminology_row};
+use crate::package::{announce_terminology, stage_package_in_pieces, terminology_row, PackageHead};
 
 /// The name the built-in terminology is stored under, with the version of what it holds.
 pub const BUILTIN_PACKAGE: &str = "refhir.builtin.terminology@1.0.0";
@@ -32,6 +32,23 @@ pub const BUILTIN_PACKAGE: &str = "refhir.builtin.terminology@1.0.0";
 /// The resources the package holds. ISO 4217 is the active alphabetic currency codes, with their
 /// numeric codes and English names.
 const RESOURCES: [&str; 1] = [include_str!("../builtin/CodeSystem-iso4217.json")];
+
+/// Names what the package holds, so that a store that keeps one copy of what its tenants have in
+/// common knows the copies it has are of the same: a digest of the resources and of this format.
+fn content_digest() -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"refhir builtin terminology, format 1\0");
+    for text in RESOURCES {
+        digest.update(text.as_bytes());
+        digest.update([0]);
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 fn builtin_package() -> Result<NewPackage, FhirError> {
     let (name, version) = BUILTIN_PACKAGE
@@ -74,7 +91,6 @@ pub fn install_builtin_terminology(
     if store.load_packages()?.is_empty() {
         return Ok(());
     }
-    let started = std::time::Instant::now();
     let package = builtin_package()?;
     let urls: Vec<String> = package
         .terminology
@@ -85,13 +101,22 @@ pub fn install_builtin_terminology(
     // Not published: the catalog is brought up to date below, as it is for a code system that is
     // written, which reads only the value sets that include what arrives and does not load the
     // whole catalog again.
-    let pending = stage_new_package(
+    // Every tenant of a database that shares its packages is given the same one, held once: the
+    // content it names is what this release carries.
+    let head = PackageHead {
+        name: name.clone(),
+        version: version.clone(),
+        fhir_version: package.fhir_version.clone(),
+    };
+    let content = content_digest();
+    let rows = package.terminology;
+    let pending = stage_package_in_pieces(
         store,
         db,
         catalog,
-        package,
-        started.elapsed(),
-        "read",
+        &head,
+        Some(&content),
+        &mut |sink| sink.terminology(&rows),
         false,
     )?;
     // The value sets that were waiting for what this carries are in other packages, and are

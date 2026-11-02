@@ -714,6 +714,19 @@ pub(crate) fn finish_install(
 /// The packages are installed whether or not this succeeds, so a failure is logged and not
 /// returned: the value sets stay as they were, and the next install tries them again.
 pub(crate) fn expand_waiting(store: &dyn ConformanceStore, catalog: &RwLock<Catalog>) {
+    // Nothing waiting is the usual case, and asking must not make a catalog that tenants share a
+    // copy of its own.
+    if !catalog.read().expect("catalog").terms().has_unexpanded() {
+        return;
+    }
+    // The expansions made are stored under the tenant's own rows.
+    if let Err(err) = Catalog::detach_from_shared(catalog, store) {
+        tracing::warn!(
+            target: "refhir_engine",
+            "could not expand the value sets that were waiting for a package: {err}"
+        );
+        return;
+    }
     let started = std::time::Instant::now();
     let updates = catalog
         .write()
@@ -751,6 +764,25 @@ pub(crate) fn expand_waiting(store: &dyn ConformanceStore, catalog: &RwLock<Cata
             changes.len()
         ),
     }
+}
+
+/// Put `catalog` with the one that the tenants of this process with the same definitions hold, if
+/// its store says its definitions are of that kind (see [`ConformanceStore::shared_catalog`]), so
+/// that it does not keep a copy of its own. A catalog is made one by an install, which changes it
+/// in place and leaves it a copy; this is done once a server has finished starting. Returns
+/// whether it is shared now. What the catalog reads and what it says are the same either way.
+pub fn share_catalog(
+    store: &dyn ConformanceStore,
+    catalog: &RwLock<Catalog>,
+) -> Result<bool, FhirError> {
+    let Some(shared) = Catalog::open_if_shared(store)? else {
+        return Ok(false);
+    };
+    catalog
+        .write()
+        .expect("catalog")
+        .take_definitions_of(shared);
+    Ok(true)
 }
 
 pub(crate) fn publish(

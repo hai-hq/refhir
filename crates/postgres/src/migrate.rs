@@ -52,6 +52,11 @@ pub(crate) static SHARED_MIGRATIONS: &[Migration] = &[
         name: "near_index",
         sql: include_str!("../migrations-shared/0004_near_index.sql"),
     },
+    Migration {
+        version: 5,
+        name: "tenant_registry",
+        sql: include_str!("../migrations-shared/0005_tenant_registry.sql"),
+    },
 ];
 
 const CREATE_TABLE: &str = "CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -336,6 +341,18 @@ mod tests {
             MIGRATIONS[1].checksum(),
             "97715d421cbf6d3fe408d5ae921b2735b36b30c56ac7d1f70c8ddce2c7a6ca44",
             "migration 2 was edited"
+        );
+    }
+
+    /// Version 5 of the shared stream is pinned from the release that carries it: every shared
+    /// database that applied it records this checksum.
+    #[test]
+    fn the_tenant_registry_migration_is_frozen() {
+        assert_eq!(SHARED_MIGRATIONS[4].name, "tenant_registry");
+        assert_eq!(
+            SHARED_MIGRATIONS[4].checksum(),
+            "37a7ed170019749355cf8eb447b328965f2897dd4209b76e28e988419e4390fb",
+            "shared migration 5 was edited"
         );
     }
 

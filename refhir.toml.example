@@ -42,6 +42,26 @@ sqlite_path = "/data/refhir.sqlite"
 # primary_url = "http://primary:8080"   # replicas send writes here; REFHIR_PRIMARY_URL
 # db_pool = 8        # most Postgres connections (SQLite: read connections, default 4); REFHIR_DB_POOL
 
+[tenants]
+# Serve every tenant of a shared Postgres database from this process, and create them over HTTP
+# (see docs/clustering.md, "Many tenants in one process"). Off by default.
+# serve_all = true        # or --all-tenants, REFHIR_ALL_TENANTS=1
+# path_prefix = "/t"      # tenants are at /t/{tenant}/...; "" turns it off
+# domain = "fhir.example.com"   # tenants are also at {tenant}.fhir.example.com
+# public_url = "https://fhir.example.com"  # each tenant's address; {tenant} may be in it
+# admin_token = "..."     # prefer REFHIR_ADMIN_TOKEN; without one the admin API is off
+# admin_bind = "127.0.0.1:8081"  # serve /admin on a listener of its own
+# connections_per_tenant = 8     # pool connections one tenant may hold (default: half of db_pool)
+# delete_grace = "7d"     # how long a deleted tenant can be restored
+# export_on_delete = true # write a tenant's resources out before deleting it
+# delete_hook = "https://ops.example.com/hooks/tenant-deleted"
+# storage_check_interval = "5m"
+# [tenants.limits]        # for tenants that set none of their own
+# requests_per_second = 200
+# burst = 400
+# storage_bytes = 53687091200
+# connections = 4
+
 [conformance]
 reference_policy = "strict" # strict | fhir
 # strict: a reference must point at a resource this server holds, of a type the element allows,

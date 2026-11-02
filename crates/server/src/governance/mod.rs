@@ -28,7 +28,7 @@ mod classify;
 mod config;
 #[cfg(test)]
 mod integration;
-mod limiter;
+pub(crate) mod limiter;
 mod message;
 mod meter;
 mod middleware;

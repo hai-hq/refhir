@@ -46,9 +46,12 @@ impl IssuerKey {
     }
 
     pub fn from_pem(pem: &str) -> Result<Self, String> {
-        let der = pkcs8_der(pem)?;
+        Self::from_der(&pkcs8_der(pem)?)
+    }
+
+    fn from_der(der: &[u8]) -> Result<Self, String> {
         let rng = SystemRandom::new();
-        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &der, &rng).map_err(
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng).map_err(
             |_| {
                 "not a P-256 private key in PKCS#8 form: generate one with `openssl genpkey \
                  -algorithm EC -pkeyopt ec_paramgen_curve:P-256`"
@@ -113,6 +116,94 @@ impl IssuerKey {
             }
         }
         Ok(self)
+    }
+
+    /// A new P-256 key, and its PEM to keep.
+    pub fn generate() -> Result<(Self, String), String> {
+        let rng = SystemRandom::new();
+        let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+            .map_err(|_| "cannot generate a P-256 key".to_string())?;
+        let body = STANDARD.encode(document.as_ref());
+        let mut pem = String::from("-----BEGIN PRIVATE KEY-----\n");
+        for line in body.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+            pem.push('\n');
+        }
+        pem.push_str("-----END PRIVATE KEY-----\n");
+        Ok((Self::from_pem(&pem)?, pem))
+    }
+
+    /// The key a tenant of a process that serves many signs its cards with: its own, kept in its
+    /// own database (beside its SMART signing key), so every process that serves the tenant signs
+    /// with the same one and no tenant's cards verify against another's. The tenant's primary
+    /// makes it the first time (`create`); another process waits for it to be there.
+    pub fn for_tenant(
+        store: &dyn refhir_persistence::AuthStore,
+        create: bool,
+    ) -> Result<Self, String> {
+        const KIND: &str = "health_cards_key";
+        const ACTIVE: &str = "active";
+        // The same passphrase seals this key as seals the SMART signing key.
+        let passphrase = std::env::var("REFHIR_SIGNING_KEY_PASSPHRASE")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let stored = |store: &dyn refhir_persistence::AuthStore| -> Result<Option<Self>, String> {
+            match store.auth_get(KIND, ACTIVE, 0) {
+                Ok(Some(json)) => {
+                    let pem: String = serde_json::from_str(&json)
+                        .map_err(|err| format!("the stored health card key: {err}"))?;
+                    if pem.contains(ENCRYPTED_BEGIN) {
+                        let passphrase = passphrase.as_deref().ok_or(
+                            "the health card key is encrypted: set REFHIR_SIGNING_KEY_PASSPHRASE",
+                        )?;
+                        return Self::from_der(&unseal(&pem, passphrase)?).map(Some);
+                    }
+                    let key = Self::from_pem(&pem)?;
+                    if let (true, Some(passphrase)) = (create, passphrase.as_deref()) {
+                        // A key stored before a passphrase was set is sealed now.
+                        match seal(&pem, passphrase).and_then(|sealed| {
+                            serde_json::to_string(&sealed).map_err(|err| err.to_string())
+                        }) {
+                            Ok(sealed) => {
+                                if let Err(err) = store.auth_put(KIND, ACTIVE, &sealed, u64::MAX) {
+                                    tracing::warn!("health card key not encrypted: {err}");
+                                }
+                            }
+                            Err(err) => tracing::warn!("health card key not encrypted: {err}"),
+                        }
+                    }
+                    Ok(Some(key))
+                }
+                Ok(None) => Ok(None),
+                Err(err) => Err(format!("cannot read the health card key: {err}")),
+            }
+        };
+        if let Some(key) = stored(store)? {
+            return Ok(key);
+        }
+        if !create {
+            return Err("the tenant's health card key has not been made yet".into());
+        }
+        let (key, pem) = Self::generate()?;
+        let pem = match passphrase.as_deref() {
+            Some(passphrase) => seal(&pem, passphrase)?,
+            None => {
+                tracing::warn!(
+                    "a health card signing key is stored unencrypted in the database; set \
+                     REFHIR_SIGNING_KEY_PASSPHRASE"
+                );
+                pem
+            }
+        };
+        let json = serde_json::to_string(&pem).expect("pem json");
+        let inserted = store
+            .auth_insert(KIND, ACTIVE, &json, u64::MAX, 0)
+            .map_err(|err| format!("cannot store the health card key: {err}"))?;
+        if inserted {
+            return Ok(key);
+        }
+        // Another process made one first: use that one.
+        stored(store)?.ok_or_else(|| "the health card key vanished".to_string())
     }
 
     /// The key set that checks the cards: this key and any retired ones, never a private part.
@@ -348,6 +439,52 @@ fn thumbprint(x: &str, y: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
 }
 
+const ENCRYPTED_BEGIN: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
+const ENCRYPTED_END: &str = "-----END ENCRYPTED PRIVATE KEY-----";
+
+/// A `PRIVATE KEY` PEM as an `ENCRYPTED PRIVATE KEY` PEM under `passphrase`.
+fn seal(pem: &str, passphrase: &str) -> Result<String, String> {
+    use rsa::pkcs8::PrivateKeyInfo;
+    let der = pkcs8_der(pem)?;
+    let info = PrivateKeyInfo::try_from(der.as_slice())
+        .map_err(|err| format!("the health card key: {err}"))?;
+    let sealed = info
+        .encrypt(&mut rand::thread_rng(), passphrase)
+        .map_err(|err| format!("cannot encrypt the health card key: {err}"))?;
+    let body = STANDARD.encode(sealed.as_bytes());
+    let mut out = format!("{ENCRYPTED_BEGIN}\n");
+    for line in body.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(line).expect("base64 is ascii"));
+        out.push('\n');
+    }
+    out.push_str(ENCRYPTED_END);
+    out.push('\n');
+    Ok(out)
+}
+
+/// The PKCS#8 DER inside an `ENCRYPTED PRIVATE KEY` PEM, opened with `passphrase`.
+fn unseal(pem: &str, passphrase: &str) -> Result<Vec<u8>, String> {
+    use rsa::pkcs8::EncryptedPrivateKeyInfo;
+    let start = pem.find(ENCRYPTED_BEGIN).ok_or("not an encrypted key")? + ENCRYPTED_BEGIN.len();
+    let end = pem[start..]
+        .find(ENCRYPTED_END)
+        .ok_or("the encrypted key is not closed")?
+        + start;
+    let body: String = pem[start..end]
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let der = STANDARD
+        .decode(body)
+        .map_err(|_| "the encrypted health card key is not valid PEM".to_string())?;
+    let info = EncryptedPrivateKeyInfo::try_from(der.as_slice())
+        .map_err(|err| format!("the encrypted health card key: {err}"))?;
+    let opened = info.decrypt(passphrase).map_err(|_| {
+        "REFHIR_SIGNING_KEY_PASSPHRASE does not open the health card key".to_string()
+    })?;
+    Ok(opened.as_bytes().to_vec())
+}
+
 /// The DER inside a PKCS#8 `PRIVATE KEY` PEM.
 fn pkcs8_der(pem: &str) -> Result<Vec<u8>, String> {
     const BEGIN: &str = "-----BEGIN PRIVATE KEY-----";
@@ -401,6 +538,19 @@ mod tests {
     use flate2::read::DeflateDecoder;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
     use std::io::Read;
+
+    #[test]
+    fn a_sealed_health_card_key_opens_with_its_passphrase_and_no_other() {
+        let (key, pem) = IssuerKey::generate().unwrap();
+        let sealed = seal(&pem, "correct horse").unwrap();
+        assert!(sealed.contains(ENCRYPTED_BEGIN) && !sealed.contains("-----BEGIN PRIVATE KEY"));
+        let opened = IssuerKey::from_der(&unseal(&sealed, "correct horse").unwrap()).unwrap();
+        assert_eq!(opened.kid(), key.kid());
+        // A wrong passphrase can, rarely, decrypt to padding that looks valid, but never to a key.
+        assert!(unseal(&sealed, "wrong")
+            .and_then(|der| IssuerKey::from_der(&der))
+            .is_err());
+    }
 
     fn decode(part: &str) -> Vec<u8> {
         URL_SAFE_NO_PAD.decode(part).unwrap()

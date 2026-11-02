@@ -1,4 +1,5 @@
 mod config;
+mod host;
 mod migrate;
 mod package_bundle;
 mod tenant;
@@ -106,6 +107,10 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli_primary_url: Option<String> = None;
     let mut cli_db_pool: Option<usize> = None;
     let mut cli_tenant: Option<String> = None;
+    let mut cli_all_tenants = false;
+    let mut cli_tenant_path_prefix: Option<String> = None;
+    let mut cli_tenant_domain: Option<String> = None;
+    let mut cli_admin_bind: Option<String> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -215,6 +220,19 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
             "--tenant" => {
                 index += 1;
                 cli_tenant = Some(required(&args, index, "--tenant")?);
+            }
+            "--all-tenants" => cli_all_tenants = true,
+            "--tenant-path-prefix" => {
+                index += 1;
+                cli_tenant_path_prefix = Some(required(&args, index, "--tenant-path-prefix")?);
+            }
+            "--tenant-domain" => {
+                index += 1;
+                cli_tenant_domain = Some(required(&args, index, "--tenant-domain")?);
+            }
+            "--admin-bind" => {
+                index += 1;
+                cli_admin_bind = Some(required(&args, index, "--admin-bind")?);
             }
             "--db-pool" => {
                 index += 1;
@@ -340,6 +358,18 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     if cli_tenant.is_some() {
         cfg.tenant = cli_tenant;
     }
+    if cli_all_tenants {
+        cfg.tenants.serve_all = true;
+    }
+    if let Some(prefix) = cli_tenant_path_prefix {
+        cfg.tenants.path_prefix = (!prefix.is_empty()).then_some(prefix);
+    }
+    if let Some(domain) = cli_tenant_domain {
+        cfg.tenants.domain = (!domain.is_empty()).then_some(domain);
+    }
+    if cli_admin_bind.is_some() {
+        cfg.tenants.admin_bind = cli_admin_bind;
+    }
 
     // A limit that cannot work is refused now, and not discovered by the first caller to hit it.
     cfg.governance.validate(cfg.auth)?;
@@ -384,7 +414,8 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("reactive engine tracing enabled (target refhir_engine=debug)");
     }
 
-    if cfg.auth {
+    check_tenant(&cfg)?;
+    if cfg.auth && !cfg.tenants.serve_all {
         // Settings that can be checked up front are, before any package install.
         let loopback = cfg.bind.parse::<SocketAddr>()?.ip().is_loopback();
         check_login(&cfg, loopback)?;
@@ -393,8 +424,11 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let health_cards = load_health_cards_key(&cfg)?;
-    check_tenant(&cfg)?;
+    let health_cards = if cfg.tenants.serve_all {
+        None
+    } else {
+        load_health_cards_key(&cfg)?
+    };
     check_role(&cfg)?;
     // A tenant's files are its own: another tenant's process on this host must not write in them.
     if let Some(tenant) = &cfg.tenant {
@@ -435,6 +469,9 @@ fn serve(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap = refhir_server::serve_bootstrap(probe, role.name(), detail)?;
     let listener = TcpListener::from_std(std_listener)?;
     tracing::info!("{} listening on http://{addr}, not ready yet", role.name());
+    if cfg.tenants.serve_all {
+        return host::run(cfg, &runtime, listener, bootstrap);
+    }
 
     let pool_size = cfg.db_pool.unwrap_or(DEFAULT_DB_POOL);
     let (persistence, store, auth_store, job_store, governance_store): Stores =
@@ -733,6 +770,20 @@ fn health_cards_address(
 
 /// A tenant is a part of a Postgres database that many tenants share: nothing else holds one.
 fn check_tenant(cfg: &ResolvedConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if cfg.tenants.serve_all {
+        if cfg.tenant.is_some() {
+            return Err(
+                "pass --tenant to serve one tenant or --all-tenants to serve every one, not both"
+                    .into(),
+            );
+        }
+        if cfg.postgres.is_none() {
+            return Err(
+                "--all-tenants needs --postgres: tenants share one Postgres database".into(),
+            );
+        }
+        return Ok(());
+    }
     let Some(name) = &cfg.tenant else {
         return Ok(());
     };
@@ -1096,7 +1147,8 @@ fn print_help() {
          [--oidc-issuer url --oidc-client-id id] [--smart-demo-login]\n\
          [--export-dir path] [--terminology url] [--trace-engine] [--sdc-archiver]\n\
          [--role primary|standby|replica] [--standby] [--primary-url url] [--db-pool n]\n\
-         [--tenant name]\n\
+         [--tenant name | --all-tenants [--tenant-path-prefix /t] [--tenant-domain domain]\n\
+         [--admin-bind host:port]]\n\
          refhir migrate --status | --dry-run   (schema versions; see refhir migrate --help)\n\
          refhir tenant create|list|delete      (tenants of a shared Postgres database; see --help)\n\
          refhir package-bundle [--out file]    (prepare the packages ahead of time; see --help)\n\
@@ -1141,7 +1193,11 @@ fn print_help() {
          Tenants: one Postgres database can hold many, each a separate FHIR server sharing its\n\
          tables. `refhir tenant create NAME` adds one, and --tenant NAME (or REFHIR_TENANT, or\n\
          [database] tenant) makes this process serve it. Each tenant has its own writer, and\n\
-         its own standbys and replicas. A database made without tenants cannot hold them."
+         its own standbys and replicas. A database made without tenants cannot hold them.\n\
+         --all-tenants (or [tenants] serve_all) serves every tenant of the database from this\n\
+         process instead, at /t/NAME/... (--tenant-path-prefix) or NAME.DOMAIN (--tenant-domain),\n\
+         and creates, lists and deletes them over HTTP at /admin/tenants with the bearer token\n\
+         REFHIR_ADMIN_TOKEN ([tenants] admin_token), on --admin-bind if given."
     );
 }
 

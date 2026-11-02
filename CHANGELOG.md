@@ -12,6 +12,34 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **One process can serve every tenant of a shared Postgres database, and tenants are created over
+  HTTP.** `refhir --all-tenants` (with `[tenants]` settings) replaces a process, and a Kubernetes
+  object, per tenant: each request is routed to its tenant by path (`/t/{tenant}/…`) or host name
+  (`{tenant}.{domain}`), and each tenant keeps its own resources, SMART clients and keys, health
+  card key, audit trail, `/sync` sessions, Subscriptions and export files, at its own public
+  address (`Location` headers, Bundle links, SMART discovery and `/health-cards/.well-known/jwks.json`
+  are per tenant). The tenants share one connection pool (each limited to a share of it), one
+  session for all their writer leases, one connection for announcing commits and one for listening
+  for them, so a process needs the pool plus three connections however many tenants it serves.
+  Primaries, standbys and replicas work as before, tenant by tenant.
+- **An admin API, with a bearer token of its own** (`REFHIR_ADMIN_TOKEN`, optionally on its own
+  listener): `POST /admin/tenants` (idempotent; packages, `update_as_create`, SMART, health cards,
+  limits), `GET /admin/tenants` and `/admin/tenants/{name}` (status, size, package versions),
+  `DELETE /admin/tenants/{name}` (a soft delete with a grace period, an export of the tenant's
+  resources first and a hook URL told afterwards), `POST /admin/tenants/{name}/restore`, and
+  `GET /admin/metrics`. Every process of a deployment follows the tenant registry within moments.
+- **Tenants that hold the same definitions share one compiled catalog in a process.** A process
+  that serves many tenants kept a full copy of the catalog for each (tens of megabytes for the R4
+  core); now every tenant given only the release's own packages holds the one copy, and a change a
+  tenant makes (a package, a SearchParameter or terminology it writes) is made to a copy of its
+  own, so it is never seen by another. The built-in terminology is stored once for the tenants
+  of a database, like the release's packages (tenants made before keep the copy they have).
+  `GET /admin/tenants/{name}` says whether a tenant holds the shared catalog (`served.shared_catalog`).
+- **Per-tenant limits and metrics:** requests a second, storage in bytes and a share of the
+  connection pool, and Prometheus counters labelled by tenant.
+- `refhir tenant` gained `show`, `restore` and `purge`, and `create` takes a tenant's settings as
+  flags; it changes the same registry the admin API does.
+
 - **A health card's issuer can be an address of its own, and a replaced key can stay public.**
   `[health_cards] issuer` (or `REFHIR_HEALTH_CARDS_ISSUER`) is the `iss` of every card, in place of
   `[public_url]/health-cards`, for a clinic's own address or one address shared by many servers;
@@ -67,6 +95,12 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Changed
 
+- `refhir tenant delete NAME --yes` now deletes with a grace period (7 days, `--grace` changes it):
+  the tenant is not served from then on, and `restore` undoes it until the rows are removed. The old
+  behaviour, which removes everything at once and refuses while a primary runs, is `--grace 0`.
+- Shared databases get a fifth migration that adds the registry's `settings`, `deleted_at`,
+  `purge_after` and `updated_at` columns. Existing tenants are served as they were.
+
 - **The link host's `ADMIN_TOKEN` is `adminToken`, apart from `clients`.** A host started from its
   settings is unchanged, and `ADMIN_TOKEN` still makes links as the client `admin`. A host built in
   code from `createHost` that listed the admin token in `clients` should pass it as `adminToken`;
@@ -95,6 +129,7 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   (and `$apply` and `$submit`), as it has no scope entry for them. The page also gives the argument
   shape of the terminology operations over `/sync` (flat names) and of instance-level operations such
   as `ChargeItemDefinition/$apply` (`{id, resource}`).
+
 
 ## [0.0.4] - 2026-10-27
 

@@ -136,6 +136,10 @@ reach it: route that path to the server's `/health-cards/.well-known/jwks.json` 
 serves the issuer address, or publish the same key set there. The resource links in the answer to
 `$health-cards-issue` are still addresses of this server.
 
+`issuer` and `extra_keys_file` are settings of a server that has one key file. A process that serves
+[many tenants](clustering.md#tenants-on-one-database) with `--all-tenants` keeps each tenant's own
+key in its database, and does not read them: its cards name each tenant's own address.
+
 ## Keep a replaced key public
 
 A key set that holds only the signing key ends every card it signed the day the key is replaced.

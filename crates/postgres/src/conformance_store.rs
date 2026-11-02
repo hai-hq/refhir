@@ -4,9 +4,11 @@ use refhir_persistence::{
     ConformanceStore, ExpansionChange, InstallError, InstallOutcome, InstalledParam, NewExpansion,
     NewPackage, NewSearchParameter, NewStructureDefinition, NewTerminology, PackageRows,
     ParamStatus, PendingParam, PersistError, PersistenceGlobalKey, PoolGuard, RetiredParam,
-    StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow, StoredSearchParameter,
-    StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
+    SharedCatalog, StoredBackfill, StoredExpansion, StoredPackage, StoredParameterRow,
+    StoredSearchParameter, StoredStructureDefinition, StoredTerminology, CONFORMANCE_PAGE_ROWS,
 };
+
+use std::sync::Arc;
 
 use crate::scope::Scope;
 use crate::{definite, PostgresPersistence};
@@ -261,6 +263,76 @@ fn sql_load_expansions(scope: Scope, replaced: &[i64]) -> String {
             and_not_in("t.package_id", replaced)
         ),
     }
+}
+
+/// The most expansions, and the most bytes of them, a catalog that tenants share carries beyond
+/// the shared copy's.
+const MAX_OVERLAY_ROWS: i64 = 256;
+const MAX_OVERLAY_BYTES: i64 = 8 << 20;
+
+/// The expansions of tenant `tenant`, of the shared packages it has, that the shared copy does not
+/// hold or holds otherwise: (package id, url, json).
+fn sql_shared_catalog_extras(tenant: i32) -> String {
+    format!(
+        "SELECT e.package_id, e.url, e.json FROM value_set_expansion e \
+         JOIN tenant_packages t ON t.instance_id = {tenant} AND t.package_id = e.package_id \
+              AND t.owner = 0 \
+         WHERE e.instance_id = {tenant} AND NOT EXISTS ( \
+             SELECT 1 FROM base_expansions b \
+             WHERE b.package_id = e.package_id AND b.url = e.url AND b.json = e.json)"
+    )
+}
+
+/// What [`ConformanceStore::shared_catalog`] asks of the database for tenant `tenant`: the ids of
+/// the shared packages it has, in its order; how many of its own packages are not `refhir.local`,
+/// and how many rows its own packages hold; a hash of its copy of the search parameters of the
+/// shared packages; how many expansions the shared copy holds that it does not; and how many it
+/// holds that the shared copy does not (or holds otherwise), how big they are, a hash of them, and
+/// the rows themselves as a JSON array of (package id, url, json) if there are few enough to carry;
+/// and which database this is, since the packages' ids are the database's own.
+fn sql_shared_catalog(tenant: i32) -> String {
+    format!(
+        "WITH links AS ( \
+             SELECT t.package_id, t.owner, t.seq, p.name \
+             FROM tenant_packages t JOIN packages p ON p.id = t.package_id \
+             WHERE t.instance_id = {tenant} \
+         ), shared AS (SELECT package_id FROM links WHERE owner = 0), \
+            own AS (SELECT package_id, name FROM links WHERE owner <> 0), \
+            extras AS ({extras}) \
+         SELECT \
+           (SELECT COALESCE(string_agg(package_id::text, ',' ORDER BY seq), '') \
+              FROM links WHERE owner = 0), \
+           (SELECT count(*) FROM own WHERE name <> 'refhir.local'), \
+           (SELECT (SELECT count(*) FROM structure_definitions \
+                      WHERE instance_id = {tenant} AND package_id IN (SELECT package_id FROM own)) \
+                 + (SELECT count(*) FROM terminology \
+                      WHERE instance_id = {tenant} AND package_id IN (SELECT package_id FROM own)) \
+                 + (SELECT count(*) FROM search_parameters \
+                      WHERE instance_id = {tenant} AND package_id IN (SELECT package_id FROM own)) \
+                 + (SELECT count(*) FROM value_set_expansion \
+                      WHERE instance_id = {tenant} AND package_id IN (SELECT package_id FROM own))), \
+           (SELECT COALESCE(md5(string_agg(concat_ws('|', package_id, url, base, code, param_type, \
+                        COALESCE(expression, ''), status, md5(json)), ',' \
+                        ORDER BY package_id, url, base)), '') \
+              FROM search_parameters \
+              WHERE instance_id = {tenant} AND package_id IN (SELECT package_id FROM shared)), \
+           (SELECT count(*) FROM base_expansions b \
+              WHERE b.package_id IN (SELECT package_id FROM shared) AND NOT EXISTS ( \
+                SELECT 1 FROM value_set_expansion e WHERE e.instance_id = {tenant} \
+                  AND e.package_id = b.package_id AND e.url = b.url)), \
+           (SELECT count(*) FROM extras), \
+           (SELECT COALESCE(sum(length(json)), 0)::bigint FROM extras), \
+           (SELECT COALESCE(md5(string_agg(package_id || '|' || url || '|' || md5(json), ',' \
+                        ORDER BY package_id, url)), '') FROM extras), \
+           (SELECT COALESCE(json_agg(json_build_array(package_id, url, json) \
+                        ORDER BY package_id, url), '[]'::json)::text FROM extras \
+              WHERE (SELECT count(*) FROM extras) <= {rows} \
+                AND (SELECT COALESCE(sum(length(json)), 0) FROM extras) <= {bytes}), \
+           current_database() || ':' || (SELECT system_identifier FROM pg_control_system())::text",
+        extras = sql_shared_catalog_extras(tenant),
+        rows = MAX_OVERLAY_ROWS,
+        bytes = MAX_OVERLAY_BYTES,
+    )
 }
 
 fn structure_definition_from(row: &postgres::Row) -> StoredStructureDefinition {
@@ -830,11 +902,81 @@ impl ConformanceStore for PostgresPersistence {
         package_id: i64,
         url: &str,
     ) -> Result<Option<String>, PersistError> {
+        if self.scope == Scope::CATALOG {
+            // What every tenant shares: the expansions each tenant's own copy was made from, and
+            // the few the catalog this reader was made for holds beyond them.
+            if let Some(json) = self.overlay.get(&(package_id, url.to_string())) {
+                return Ok(Some(json.clone()));
+            }
+            return crate::off_runtime(|| {
+                let mut guard = self.inner.lock()?;
+                let row = guard
+                    .client
+                    .query_opt(
+                        "SELECT json FROM base_expansions WHERE package_id = $1 AND url = $2",
+                        &[&package_id, &url],
+                    )
+                    .map_err(definite)?;
+                Ok(row.map(|row| row.get(0)))
+            });
+        }
         self.row_json("value_set_expansion", false, package_id, url)
     }
 
-    fn shared(&self) -> Option<std::sync::Arc<dyn ConformanceStore>> {
-        Some(std::sync::Arc::new(self.clone()))
+    fn shared(&self) -> Option<Arc<dyn ConformanceStore>> {
+        Some(Arc::new(self.clone()))
+    }
+
+    fn shared_catalog(&self) -> Result<Option<SharedCatalog>, PersistError> {
+        let Scope::Tenant(tenant) = self.scope else {
+            return Ok(None);
+        };
+        if tenant == 0 || !self.inner.is_shared() {
+            return Ok(None);
+        }
+        let row = crate::off_runtime(|| {
+            let mut guard = self.inner.lock()?;
+            guard
+                .client
+                .query_one(&sql_shared_catalog(tenant), &[])
+                .map_err(definite)
+        })?;
+        let ids: String = row.get(0);
+        let own_other: i64 = row.get(1);
+        let own_rows: i64 = row.get(2);
+        let params: String = row.get(3);
+        let missing: i64 = row.get(4);
+        let (extra_count, extra_bytes): (i64, i64) = (row.get(5), row.get(6));
+        let extras_hash: String = row.get(7);
+        let extras_json: String = row.get(8);
+        let database: String = row.get(9);
+        // Only a tenant whose catalog is made of shared packages and nothing of its own can share
+        // one: its own package (the one a primary makes at its first start, `refhir.local`) must be
+        // empty, it must hold every expansion the shared copy does, and what it holds beyond them
+        // (the value sets that a package it has brought something to expand, which it expanded
+        // itself) must be few, since the catalog carries them.
+        let shareable = !ids.is_empty()
+            && own_other == 0
+            && own_rows == 0
+            && missing == 0
+            && extra_count <= MAX_OVERLAY_ROWS
+            && extra_bytes <= MAX_OVERLAY_BYTES;
+        if !shareable {
+            return Ok(None);
+        }
+        let mut overlay = std::collections::HashMap::new();
+        let extras: Vec<(i64, String, String)> = serde_json::from_str(&extras_json)
+            .map_err(|err: serde_json::Error| definite(err.to_string()))?;
+        for (package_id, url, json) in extras {
+            overlay.insert((package_id, url), json);
+        }
+        let Some(base) = self.base_view(overlay) else {
+            return Ok(None);
+        };
+        Ok(Some(SharedCatalog {
+            key: format!("postgres:{database}:{ids}:{params}:{extras_hash}"),
+            source: Arc::new(base),
+        }))
     }
 
     fn load_structure_definitions(&self) -> Result<Vec<StoredStructureDefinition>, PersistError> {

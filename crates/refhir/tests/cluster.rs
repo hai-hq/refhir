@@ -970,13 +970,29 @@ fn tenants_share_a_database_and_each_has_its_own_primary_and_replica() {
         404
     );
 
-    // A tenant cannot be deleted while it has a primary.
-    let (code, said) = tenant_command(&database, &["delete", "beta", "--yes"]);
+    // A tenant cannot be removed at once while it has a primary.
+    let (code, said) = tenant_command(&database, &["delete", "beta", "--yes", "--grace", "0"]);
     assert_eq!(code, 1, "{said}");
     assert!(said.contains("primary running"), "{said}");
     let (code, said) = tenant_command(&database, &["delete", "beta"]);
     assert_eq!(code, 1, "{said}");
     assert!(said.contains("--yes"), "{said}");
+    // A delete with a grace period is allowed: the tenant is marked deleted, nothing is removed,
+    // and it can be restored while its primary goes on running.
+    let (code, said) = tenant_command(&database, &["delete", "beta", "--yes"]);
+    assert_eq!(code, 0, "{said}");
+    let (_, listed) = tenant_command(&database, &["list"]);
+    let line = listed
+        .lines()
+        .find(|line| line.starts_with("beta"))
+        .unwrap();
+    assert!(
+        line.contains("deleted") && line.contains("running"),
+        "{listed}"
+    );
+    let (code, said) = tenant_command(&database, &["restore", "beta"]);
+    assert_eq!(code, 0, "{said}");
+    assert!(put_patient(&beta.base(), "kept").unwrap().status < 300);
 
     // Losing one tenant's primary leaves the other tenant serving and writing.
     acme.kill();
