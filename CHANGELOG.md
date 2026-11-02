@@ -12,6 +12,29 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Added
 
+- **The SMART Health Links host manages its clients over an API, with no restart.** A host that
+  several apps or projects share can now make a client for each and revoke it again while it runs.
+  `POST /admin/clients` makes one (a name, the addresses it may call from, its limits, and the media
+  types its links may hold) and answers a token that is shown once; `GET /admin/clients`,
+  `GET`/`PATCH`/`DELETE /admin/clients/{id}` and `POST /admin/clients/{id}/rotate` list, read,
+  change, revoke and rotate. They need the `ADMIN_TOKEN`. Clients are kept in the host's database
+  (Postgres or SQLite, as links are), so a change is in force at once in every copy of the host.
+  A revoked client, and a token that was rotated, are refused from that moment; `DELETE` takes
+  `?endLinks=true` to switch off the client's live links too, 500 a call, repeated until `more` is `false`. `CLIENTS_FILE` still works for a small
+  host: its clients are read at start, and a name in it cannot also be made over the API.
+- **A client sees only its own links.** `GET /shl` lists the calling client's links, a page at a
+  time, and a client reads the access list (`GET /shl/{id}/access`) of, and switches off, only the
+  links it made, with its own token as well as the link's. Each link is now kept under the client
+  that made it, and a database from before is brought up to date when the host starts, giving each
+  link to the client named by who made it. See the
+  [link host](link-host/README.md#who-may-make-links).
+- **`allowedContentTypes` for a client**: the media types its links may hold, in addition to the
+  host's `ALLOWED_CONTENT_TYPES`.
+- **Who issues a health card.** [SMART Health Cards](docs/health-cards.md#who-is-the-issuer)
+  now sets out the two ways to answer it, the server or tenant as the issuer (what ReFHIR does, and
+  needs no change) and a key for each organization inside a tenant (not built), with what each
+  costs and gives.
+
 - **A client can outlive its token.** The Go and TypeScript clients take a token source
   (`WithTokenSource`, or a function as the TypeScript `token` option) that they ask for the first
   `/sync` upgrade, for every redial and for every REST call. The server ends a socket whose token
@@ -34,6 +57,14 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `watch` take an `AbortSignal`.
 
 ### Changed
+
+- **The link host's `ADMIN_TOKEN` is `adminToken`, apart from `clients`.** A host started from its
+  settings is unchanged, and `ADMIN_TOKEN` still makes links as the client `admin`. A host built in
+  code from `createHost` that listed the admin token in `clients` should pass it as `adminToken`;
+  only `adminToken` turns on `/admin/clients`. A `Store` now has the methods that keep clients
+  and list a client's links, and the link host's database gets a migration (`002_clients`) that
+  runs when it starts. A client name of the shape `cl_` and 22 characters is refused, as it is
+  the id of a client made over the API.
 
 - **A call whose caller gave up is not sent after a redial.** The Go client's session goroutine
   redials without reading its commands, so a `Mutate` or `Watch` made meanwhile used to wait and go
