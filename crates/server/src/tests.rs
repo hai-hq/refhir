@@ -8244,6 +8244,12 @@ pub(crate) mod sync_gaps {
 /// A server over a tiny package (Patient and Immunization) with a signing key (or none), holding
 /// three patients, two of them with an immunization. `p1-reader` is bound to `p1`; `admin` is not.
 fn cards_app(signing: bool) -> axum::Router {
+    cards_app_signing_with(
+        signing.then(|| crate::IssuerKey::from_pem(&crate::health_cards::generated_pem()).unwrap()),
+    )
+}
+
+fn cards_app_signing_with(key: Option<crate::IssuerKey>) -> axum::Router {
     let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
     let db = Arc::new(Database::open(store.clone()).unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::empty()));
@@ -8287,9 +8293,7 @@ fn cards_app(signing: bool) -> axum::Router {
             sdc_archiver: false,
             smart: Some(smart),
             public_url: Some("https://refhir.example.org/fhir".into()),
-            health_cards: signing.then(|| {
-                Arc::new(crate::IssuerKey::from_pem(&crate::health_cards::generated_pem()).unwrap())
-            }),
+            health_cards: key.map(Arc::new),
             ..Default::default()
         },
     )
@@ -8371,6 +8375,91 @@ async fn a_server_with_a_signing_key_issues_cards_that_its_published_key_checks(
     a_health_card_request_that_cannot_be_met_is_refused_and_says_why(&app).await;
     a_health_card_for_what_is_new_holds_only_what_is_new(&app).await;
     a_server_with_a_key_says_it_issues_cards(&app).await;
+}
+
+#[tokio::test]
+async fn cards_name_the_configured_issuer_and_the_key_set_keeps_retired_keys() {
+    use crate::health_cards::generated_pem;
+    let retired = crate::IssuerKey::from_pem(&generated_pem()).unwrap();
+    let retired_set = retired.jwks().to_string();
+    let key = crate::IssuerKey::from_pem(&generated_pem())
+        .unwrap()
+        // The slash is trimmed, and `public_url` (the address the app is served at) is not used.
+        .with_issuer("https://health.clinic.example/")
+        .unwrap()
+        .with_retired_keys(&retired_set)
+        .unwrap();
+    let current = key.kid().to_string();
+    let app = cards_app_signing_with(Some(key));
+
+    let served = send(
+        &app,
+        "GET",
+        "/health-cards/.well-known/jwks.json",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(served.status, StatusCode::OK, "{}", served.body);
+    let jwks = served.body.clone();
+    let kids: Vec<&str> = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap())
+        .collect();
+    assert_eq!(kids, [current.as_str(), retired.kid()]);
+    assert!(
+        jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| key.get("d").is_none()),
+        "no private part: {jwks}"
+    );
+
+    let issued = post_as(
+        &app,
+        "admin",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(issued.0, StatusCode::OK, "{}", issued.1);
+    let card = issued.1["parameter"][0]["valueString"].as_str().unwrap();
+    let claims = checked_claims(card, &jwks);
+    assert_eq!(claims["iss"], "https://health.clinic.example");
+    // Links to the records are still this server's own addresses.
+    let link = issued.1["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|parameter| parameter["name"] == "resourceLink")
+        .unwrap();
+    assert!(link["part"][2]["valueUri"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://refhir.example.org/fhir/"));
+
+    // A card the retired key signed, before it was replaced, still checks against the set.
+    let old_card = retired
+        .sign(
+            "https://health.clinic.example",
+            1_700_000_000,
+            &[],
+            "4.0.1",
+            &json!({"resourceType": "Bundle", "type": "collection", "entry": []}),
+        )
+        .unwrap();
+    let old_claims = checked_claims(&old_card, &jwks);
+    assert_eq!(old_claims["iss"], "https://health.clinic.example");
+    // And one signed by a key the set does not hold does not.
+    let stranger = crate::IssuerKey::from_pem(&generated_pem()).unwrap();
+    let forged = stranger
+        .sign("https://health.clinic.example", 1, &[], "4.0.1", &json!({}))
+        .unwrap();
+    let outcome = std::panic::catch_unwind(|| checked_claims(&forged, &jwks));
+    assert!(outcome.is_err(), "a key outside the set is not accepted");
 }
 
 async fn a_health_card_for_what_is_new_holds_only_what_is_new(app: &axum::Router) {

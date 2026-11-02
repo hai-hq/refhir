@@ -268,6 +268,13 @@ pub struct HealthCardsSection {
     /// A PEM file holding the signing key: an unencrypted PKCS#8 private key on P-256.
     /// `REFHIR_HEALTH_CARDS_KEY_FILE` sets it too.
     pub key_file: Option<String>,
+    /// The address cards name as their issuer (`iss`), where the key set is published at
+    /// `[issuer]/.well-known/jwks.json`. Without it, it is `[public_url]/health-cards`.
+    /// `REFHIR_HEALTH_CARDS_ISSUER` sets it too.
+    pub issuer: Option<String>,
+    /// A JWKS file of public keys the key set also holds: keys that signed cards and were
+    /// replaced. `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE` sets it too.
+    pub extra_keys_file: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -466,6 +473,10 @@ pub struct ResolvedConfig {
     pub smart_demo_login: bool,
     /// The PEM file with the key that signs SMART Health Cards; `None` issues none.
     pub health_cards_key_file: Option<String>,
+    /// What cards name as `iss` instead of `[public_url]/health-cards`.
+    pub health_cards_issuer: Option<String>,
+    /// A JWKS file of retired public keys that the card key set keeps publishing.
+    pub health_cards_extra_keys_file: Option<String>,
     pub oidc: Option<refhir_server::OidcConfig>,
     pub export_dir: String,
     pub terminology_urls: Vec<String>,
@@ -506,6 +517,8 @@ impl ResolvedConfig {
             smart_confidential_secret: None,
             smart_demo_login: false,
             health_cards_key_file: None,
+            health_cards_issuer: None,
+            health_cards_extra_keys_file: None,
             oidc: None,
             export_dir: "export".to_string(),
             terminology_urls: Vec::new(),
@@ -643,6 +656,12 @@ impl ResolvedConfig {
         }
         if file.health_cards.key_file.is_some() {
             self.health_cards_key_file = file.health_cards.key_file.clone();
+        }
+        if file.health_cards.issuer.is_some() {
+            self.health_cards_issuer = file.health_cards.issuer.clone();
+        }
+        if file.health_cards.extra_keys_file.is_some() {
+            self.health_cards_extra_keys_file = file.health_cards.extra_keys_file.clone();
         }
         if let Some(section) = &file.smart.oidc {
             let oidc = self
@@ -1038,6 +1057,14 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     if let Some(path) = env_value("REFHIR_HEALTH_CARDS_KEY_FILE") {
         cfg.health_cards_key_file = Some(path);
     }
+    // Set but empty is not "unset": it reaches the check at startup, which refuses it, and cards do
+    // not quietly name the server's own address.
+    if let Ok(issuer) = std::env::var("REFHIR_HEALTH_CARDS_ISSUER") {
+        cfg.health_cards_issuer = Some(issuer);
+    }
+    if let Some(path) = env_value("REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE") {
+        cfg.health_cards_extra_keys_file = Some(path);
+    }
     let issuer = env_value("REFHIR_OIDC_ISSUER");
     let client_id = env_value("REFHIR_OIDC_CLIENT_ID");
     let client_secret = env_value("REFHIR_OIDC_CLIENT_SECRET");
@@ -1125,6 +1152,56 @@ mod tests {
         assert_eq!(
             cfg.health_cards_key_file.as_deref(),
             Some("/run/secrets/cards.pem")
+        );
+    }
+
+    #[test]
+    fn the_health_cards_issuer_and_extra_keys_come_from_the_file_and_the_environment_overrides_them(
+    ) {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let file: FileConfig = toml::from_str(
+            "[health_cards]\nissuer = \"https://health.clinic.example\"\n\
+             extra_keys_file = \"/etc/refhir/old-keys.json\"\n",
+        )
+        .unwrap();
+        assert!(file.unknown.is_empty());
+        let mut cfg = ResolvedConfig::defaults();
+        assert_eq!(cfg.health_cards_issuer, None);
+        assert_eq!(cfg.health_cards_extra_keys_file, None);
+        cfg.apply_file(&file).unwrap();
+        assert_eq!(
+            cfg.health_cards_issuer.as_deref(),
+            Some("https://health.clinic.example")
+        );
+        assert_eq!(
+            cfg.health_cards_extra_keys_file.as_deref(),
+            Some("/etc/refhir/old-keys.json")
+        );
+        std::env::set_var(
+            "REFHIR_HEALTH_CARDS_ISSUER",
+            "https://cards.boolbyte.example",
+        );
+        std::env::set_var("REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE", "/run/old.json");
+        let applied = apply_env(&mut cfg);
+        std::env::remove_var("REFHIR_HEALTH_CARDS_ISSUER");
+        std::env::remove_var("REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE");
+        applied.unwrap();
+        assert_eq!(
+            cfg.health_cards_issuer.as_deref(),
+            Some("https://cards.boolbyte.example")
+        );
+        assert_eq!(
+            cfg.health_cards_extra_keys_file.as_deref(),
+            Some("/run/old.json")
+        );
+        std::env::set_var("REFHIR_HEALTH_CARDS_ISSUER", "");
+        let applied = apply_env(&mut cfg);
+        std::env::remove_var("REFHIR_HEALTH_CARDS_ISSUER");
+        applied.unwrap();
+        assert_eq!(
+            cfg.health_cards_issuer.as_deref(),
+            Some(""),
+            "an empty issuer is kept, for startup to refuse"
         );
     }
 

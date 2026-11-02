@@ -698,14 +698,54 @@ fn load_health_cards_key(
     cfg: &ResolvedConfig,
 ) -> Result<Option<std::sync::Arc<refhir_server::IssuerKey>>, Box<dyn std::error::Error>> {
     let Some(path) = &cfg.health_cards_key_file else {
+        for (set, name) in [
+            (&cfg.health_cards_issuer, "issuer"),
+            (&cfg.health_cards_extra_keys_file, "extra_keys_file"),
+        ] {
+            if set.is_some() {
+                return Err(format!(
+                    "[health_cards] {name} is set but there is no key_file: nothing is signed, \
+                     so it would do nothing"
+                )
+                .into());
+            }
+        }
         return Ok(None);
     };
     let loopback = cfg.bind.parse::<SocketAddr>()?.ip().is_loopback();
-    if let Some(warning) = health_cards_address(cfg.public_url.as_deref(), loopback)? {
-        tracing::warn!("{warning}");
-    }
-    let key = refhir_server::IssuerKey::from_file(path)
+    let warning = health_cards_address(cfg.public_url.as_deref(), loopback)?;
+    let mut key = refhir_server::IssuerKey::from_file(path)
         .map_err(|err| format!("[health_cards] key_file {path}: {err}"))?;
+    // A card names the issuer set, so the warning about the address it would name does not apply.
+    // The links in an answer are still addresses of this server, which needs `public_url` to say.
+    match &cfg.health_cards_issuer {
+        Some(issuer) => {
+            key = key
+                .with_issuer(issuer)
+                .map_err(|err| format!("[health_cards] issuer: {err}"))?;
+            tracing::info!(
+                "SMART Health Cards name {} as their issuer",
+                key.issuer().unwrap_or_default()
+            );
+            if cfg.public_url.is_none() {
+                tracing::warn!(
+                    "the resource links in a $health-cards-issue answer name http://127.0.0.1 (the \
+                     address a request arrives at), which no one else can reach: set --public-url \
+                     to the https address the server is reached at"
+                );
+            }
+        }
+        None => {
+            if let Some(warning) = warning {
+                tracing::warn!("{warning}");
+            }
+        }
+    }
+    if let Some(extra) = &cfg.health_cards_extra_keys_file {
+        key = key
+            .with_retired_keys_file(extra)
+            .map_err(|err| format!("[health_cards] extra_keys_file {extra}: {err}"))?;
+    }
     tracing::info!("SMART Health Cards are signed with key {}", key.kid());
     Ok(Some(std::sync::Arc::new(key)))
 }
@@ -1216,6 +1256,77 @@ mod tests {
         cfg.role = role;
         cfg.postgres = Some("postgres://example/db".into());
         cfg
+    }
+
+    /// A P-256 key made for these tests; it protects nothing.
+    const TEST_CARD_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+        MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgGQ71895c1lVoehTa\n\
+        B1VwaWIKjbXLqwG/6mjKOnviptGhRANCAATOMOX15ky//N49Jep/p5N+1OTcOSdZ\n\
+        OdtaYZL5LyQC3qalZKiV4khBioMtj0BBLf9o5CpB3hErTElWUbiUWeJn\n\
+        -----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn a_card_issuer_or_retired_key_that_cannot_be_used_stops_the_server_with_the_reason() {
+        let dir = std::env::temp_dir().join(format!("refhir-cards-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        let key_file = write("signing.pem", TEST_CARD_KEY);
+        let cards = |issuer: Option<&str>, extra: Option<&str>| {
+            let mut cfg = ResolvedConfig::defaults();
+            cfg.health_cards_key_file = Some(key_file.clone());
+            cfg.health_cards_issuer = issuer.map(str::to_string);
+            cfg.health_cards_extra_keys_file = extra.map(str::to_string);
+            load_health_cards_key(&cfg).map_err(|err| err.to_string())
+        };
+
+        // Without either setting, cards name the server's own address.
+        let plain = cards(None, None).unwrap().expect("a key");
+        assert_eq!(plain.issuer(), None);
+        // An issuer is kept as given, less the slash.
+        let own = cards(Some("https://health.clinic.example/"), None)
+            .unwrap()
+            .expect("a key");
+        assert_eq!(own.issuer(), Some("https://health.clinic.example"));
+
+        for bad in [
+            "http://health.clinic.example",
+            "https://health.clinic.example/?a=1",
+            "https://health.clinic.example/#top",
+            "",
+            "   ",
+        ] {
+            let err = cards(Some(bad), None).unwrap_err();
+            assert!(err.contains("[health_cards] issuer"), "{bad:?}: {err}");
+        }
+
+        // A retired-key file that holds a private member is refused, and so is one that is not there.
+        let private = write(
+            "private.json",
+            r#"{"keys": [{"kty": "EC", "crv": "P-256", "x": "AAAA", "y": "AAAA", "d": "AAAA"}]}"#,
+        );
+        let err = cards(None, Some(&private)).unwrap_err();
+        assert!(
+            err.contains("extra_keys_file") && err.contains("private member"),
+            "{err}"
+        );
+        let err = cards(None, Some(&format!("{}/missing.json", dir.display()))).unwrap_err();
+        assert!(err.contains("cannot read"), "{err}");
+        let good = write("retired.json", r#"{"keys": []}"#);
+        assert!(cards(None, Some(&good)).is_ok());
+
+        // Either setting with no key to sign with does nothing, so the server says so.
+        let mut keyless = ResolvedConfig::defaults();
+        keyless.health_cards_issuer = Some("https://health.clinic.example".into());
+        let err = load_health_cards_key(&keyless).expect_err("refused");
+        assert!(err.to_string().contains("no key_file"), "{err}");
+        let mut keyless = ResolvedConfig::defaults();
+        keyless.health_cards_extra_keys_file = Some(good);
+        assert!(load_health_cards_key(&keyless).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

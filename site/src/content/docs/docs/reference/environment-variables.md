@@ -63,6 +63,8 @@ generated value changes on every restart, and those roles refuse to start withou
 | Variable | What it does |
 |---|---|
 | `REFHIR_HEALTH_CARDS_KEY_FILE` | The PEM file with the key that signs SMART Health Cards: an unencrypted PKCS#8 private key on P-256. Overrides `[health_cards].key_file`. Without a key the server issues no cards. See [Health cards](/docs/guides/health-cards/). |
+| `REFHIR_HEALTH_CARDS_ISSUER` | The address cards name as their issuer (`iss`), in place of `[public_url]/health-cards`: `https` (or loopback `http`), no query or fragment, a trailing slash dropped. Set but empty is refused, and so is a value with no key file. Overrides `[health_cards].issuer`. See [An issuer of your own](/docs/guides/health-cards/#an-issuer-of-your-own). |
+| `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE` | A JWKS file of public keys that the card key set publishes beside the signing key, so cards a replaced key signed still verify. A file with a private member is refused. Overrides `[health_cards].extra_keys_file`. See [Keep a replaced key public](/docs/guides/health-cards/#keep-a-replaced-key-public). |
 
 ## Audit
 

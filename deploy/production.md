@@ -249,10 +249,17 @@ chmod 600 health-cards.pem
   `public_url`.
 - **Let `/health-cards/.well-known/jwks.json` through the reverse proxy** without authentication.
   It holds the public key only. The server answers it for any origin.
-- **Back the key up, and do not replace it casually.** The server publishes the one key it signs
-  with. Cards signed with a key you have replaced stop verifying.
+- **Back the key up, and do not replace it casually.** The server publishes the key it signs with.
+  Cards signed with a key you have replaced stop verifying, unless you list its public key in a JWKS
+  file and set `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE` to it (the file may hold public keys only: the
+  server refuses a private member).
+- **To name an issuer other than `[public_url]/health-cards`**, set `REFHIR_HEALTH_CARDS_ISSUER` to
+  an `https` address, and make `[issuer]/.well-known/jwks.json` reach the server's
+  `/health-cards/.well-known/jwks.json`. See
+  [An issuer of your own](../docs/health-cards.md#an-issuer-of-your-own).
 - **Every process serving one deployment needs the same key**, or a card made by one fails to
-  verify against the key set another publishes.
+  verify against the key set another publishes. The same goes for `REFHIR_HEALTH_CARDS_ISSUER` and
+  `REFHIR_HEALTH_CARDS_EXTRA_KEYS_FILE`: a process without the retired keys does not publish them.
 
 ## FHIR version and Implementation Guides
 

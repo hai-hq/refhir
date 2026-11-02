@@ -1965,7 +1965,10 @@ fn issued_cards(
     base: &str,
     material: &Value,
 ) -> Result<Value, String> {
-    let iss = format!("{base}/health-cards");
+    let iss = match key.issuer() {
+        Some(issuer) => issuer.to_string(),
+        None => format!("{base}/health-cards"),
+    };
     let nbf = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
