@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,10 +22,13 @@ type scriptedSync struct {
 
 	mu       sync.Mutex
 	attempts []time.Time // when each upgrade was asked for
+	tokens   []string    // the bearer token each upgrade carried
 	bases    []uint64    // the baseVersion of each ModifyQuerySet
 	// refuse says how to turn away upgrade n (counted from 1): a status, and a Retry-After value.
 	// A status of zero accepts it.
 	refuse func(n int) (int, string)
+	// authorize, when set, refuses an upgrade with 401 unless it returns true for its bearer token.
+	authorize func(token string) bool
 	// serve runs an accepted connection until it returns.
 	serve func(conn *websocket.Conn, n int)
 }
@@ -34,10 +38,17 @@ func newScriptedSync(t *testing.T) *scriptedSync {
 	s := &scriptedSync{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/sync", func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		s.mu.Lock()
 		s.attempts = append(s.attempts, time.Now())
+		s.tokens = append(s.tokens, token)
 		n := len(s.attempts)
+		authorize := s.authorize
 		s.mu.Unlock()
+		if authorize != nil && !authorize(token) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 		if s.refuse != nil {
 			if status, wait := s.refuse(n); status != 0 {
 				if wait != "" {
@@ -63,6 +74,13 @@ func (s *scriptedSync) attemptCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.attempts)
+}
+
+// tokenList is the bearer token each upgrade carried, in order.
+func (s *scriptedSync) tokenList() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.tokens...)
 }
 
 // readQuerySet reads the next ModifyQuerySet, recording its base. It returns the ids it adds.

@@ -1,4 +1,4 @@
-import { Client, type DialOptions } from "./client.js";
+import { Client, tokenSource, type DialOptions } from "./client.js";
 import { isBrowser } from "./runtime.js";
 import { openBrowserSocket } from "./transport-browser.js";
 import { splitBase } from "./url.js";
@@ -13,8 +13,8 @@ export async function dial(baseURL: string, options: DialOptions = {}): Promise<
   return Client.connect(
     httpBase,
     wsURL,
-    options.token,
-    (url) => openBrowserSocket(url, options.token),
+    tokenSource(options.token),
+    openBrowserSocket,
     { readYourWrites: options.readYourWrites },
   );
 }

@@ -76,6 +76,18 @@ func (w *Watch) Close() error {
 	}
 }
 
+// assign gives the watch the id of its query, for the session goroutine. It reports false when
+// Close has already run, so the caller must not register the query.
+func (w *Watch) assign(id uint64) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return false
+	}
+	w.id = id
+	return true
+}
+
 func (w *Watch) deliver(value json.RawMessage) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
