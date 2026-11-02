@@ -20,6 +20,9 @@ import {
 
 const BASE_ENV = { ADMIN_TOKEN: ADMIN, HOST: '127.0.0.1', STORE: 'memory' };
 
+// One row of `schema_migrations` for each file of migrations, however many times the host started.
+const MIGRATION_COUNT = fs.readdirSync(new URL('../migrations/postgres/', import.meta.url)).filter((name) => name.endsWith('.sql')).length;
+
 describe('the command', () => {
   it('says how to use it, and makes a token together with the hash that stands for it', async () => {
     const help = await runCli(['--help'], {});
@@ -205,6 +208,32 @@ describe('the command, with a SQLite file', () => {
         await b.stop();
       }
     }), 60_000);
+
+  it('keeps the clients made over the admin API beside those of the clients file, and both survive a restart', () =>
+    inTemp(async (dir, env) => {
+      const file = path.join(dir, 'clients.json');
+      fs.writeFileSync(file, JSON.stringify({ clients: [{ name: 'ehr', token: 'ehr-token-of-sixteen-chars' }] }));
+      const settings = { ...env, CLIENTS_FILE: file };
+      const first = await startCli(settings);
+      const admin = (host: { base: string }, body?: unknown) =>
+        call(`${host.base}/admin/clients`, { method: body ? 'POST' : 'GET', token: ADMIN, ...(body ? { body } : {}) });
+      const made = (await admin(first, { name: 'project-a' })).json;
+      expect((await admin(first, { name: 'ehr' })).status).toBe(409); // a name of the file's is the file's
+      const link = (await makeLink({ base: first.base }, {}, made.token)).json;
+      expect(first.lines().find((line) => line.msg === 'listening')?.clients).toEqual(['admin', 'ehr']);
+      await first.stop();
+
+      const again = await startCli(settings);
+      try {
+        expect((await admin(again)).json.clients.map((client: { name: string }) => client.name)).toEqual(['ehr', 'admin', 'project-a']);
+        expect((await makeLink({ base: again.base }, {}, made.token)).status).toBe(201);
+        expect((await makeLink({ base: again.base }, {}, 'ehr-token-of-sixteen-chars')).status).toBe(201);
+        expect((await call(`${again.base}/shl`, { token: made.token })).json.links.map((listed: { id: string }) => listed.id)).toContain(link.id);
+        expect(JSON.stringify(again.lines())).not.toContain(made.token);
+      } finally {
+        await again.stop();
+      }
+    }), 60_000);
 });
 
 describe.skipIf(!databaseUrl)('the command, with a database', () => {
@@ -222,7 +251,7 @@ describe.skipIf(!databaseUrl)('the command, with a database', () => {
       const sql = database.connect();
       try {
         const [row] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM schema_migrations`;
-        expect(row?.n).toBe(1);
+        expect(row?.n).toBe(MIGRATION_COUNT);
       } finally {
         await sql.end({ timeout: 1 });
       }

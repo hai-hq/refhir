@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 
-import type { AccessEntry, Link, LinkTx, Store, SweepCounts } from '../types.js';
-import { endOf, inTurns } from './shared.js';
+import { NameTaken, type AccessEntry, type Link, type LinkTx, type Store, type StoredClient, type SweepCounts } from '../types.js';
+import { endOf, inTurns, listed, newerFirst } from './shared.js';
 
 /** Links and files in memory, which a restart loses: for trying a host out, and for tests. */
 export function memoryStore({ now = () => Date.now() }: { now?: () => number } = {}): Store {
@@ -9,6 +9,8 @@ export function memoryStore({ now = () => Date.now() }: { now?: () => number } =
   const files = new Map<string, string>();
   const access = new Map<string, AccessEntry[]>();
   const secrets = new Map<string, string>();
+  const clients = new Map<string, StoredClient>();
+  const nameTaken = (name: string, id: string) => [...clients.values()].some((client) => client.name === name && client.id !== id);
   // Changes to one link take turns, which is what a lock on its row is in a database.
   const inTurn = inTurns();
   const dropFiles = (id: string) => {
@@ -18,7 +20,8 @@ export function memoryStore({ now = () => Date.now() }: { now?: () => number } =
   const store: Store = {
     async create(link) {
       if (links.has(link.id)) throw new Error('that link exists');
-      links.set(link.id, structuredClone(link));
+      // A link that does not say whose it is, is the client's that made it, as in a database.
+      links.set(link.id, { ...structuredClone(link), clientId: link.clientId ?? link.createdBy });
     },
     async get(id) {
       const link = links.get(id);
@@ -94,6 +97,40 @@ export function memoryStore({ now = () => Date.now() }: { now?: () => number } =
     },
     async ping() {},
     async close() {},
+
+    async listLinks(clientId, { limit, before }) {
+      return [...links.values()]
+        .filter((link) => link.clientId === clientId)
+        .sort(newerFirst)
+        .filter((link) => !before || newerFirst(before, link) < 0)
+        .slice(0, limit)
+        .map(listed);
+    },
+    async createClient(client) {
+      if (nameTaken(client.name, client.id)) throw new NameTaken(client.name);
+      clients.set(client.id, structuredClone(client));
+    },
+    async getClient(id) {
+      const client = clients.get(id);
+      return client ? structuredClone(client) : null;
+    },
+    async clientByToken(tokenHash) {
+      const client = [...clients.values()].find((candidate) => candidate.tokenHash === tokenHash);
+      return client ? structuredClone(client) : null;
+    },
+    async listClients() {
+      return [...clients.values()].map((client) => structuredClone(client));
+    },
+    async updateClient(id, change) {
+      const client = clients.get(id);
+      if (!client) return null;
+      if (change.name !== undefined && nameTaken(change.name, id)) throw new NameTaken(change.name);
+      Object.assign(client, structuredClone(change));
+      return structuredClone(client);
+    },
+    async deleteClient(id) {
+      return clients.delete(id);
+    },
   };
   return store;
 }

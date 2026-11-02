@@ -93,8 +93,9 @@ and its own key. `docs/examples/share-summary.mjs` in the ReFHIR repository does
 |---|---|
 | `POST /shl` | Makes a link. Needs `Authorization: Bearer <token>`. The optional JSON body has `passcode` (up to 64 characters), `attempts` (how many wrong passcodes, 1 to 20, default 5) and `expiresAt` (seconds since 1970). Answers `{id, manifestUrl, manageToken, expiresAt, passcodeRequired}`. Without `expiresAt` a link lasts 30 days. Put `expiresAt` in the link's own `exp`. |
 | `POST /shl/{id}/file?contentType=...` | Puts the encrypted file on the link. Needs the link's `manageToken`. The body is the file, a compact JWE. The `contentType` is what the manifest will say it is, `application/fhir+json` unless you name another. |
-| `GET /shl/{id}/access` | Who has asked, and when. Needs the `manageToken`. Answers `{access, expiresAt, active}`. Kept for 30 days after the link ends. |
-| `DELETE /shl/{id}` | Switches the link off, and deletes its files at once. Needs the `manageToken`. |
+| `GET /shl` | The links the calling client made, newest first. Needs the client's token. Takes `limit` (1 to 1000, default 100) and `before`, and answers `{links, next}`: each link's `id`, `manifestUrl`, `createdAt`, `expiresAt`, `endedAt`, `active`, `passcodeRequired` and `files`, and never what opens it. `next` is the `before` of the next page, and is left out on the last. |
+| `GET /shl/{id}/access` | Who has asked, and when. Needs the link's `manageToken`, or the token of the client that made the link, and no one else's. Answers `{access, expiresAt, active}`. Kept for 30 days after the link ends. |
+| `DELETE /shl/{id}` | Switches the link off, and deletes its files at once. Needs the `manageToken`, or the token of the client that made the link. |
 
 The request a receiver makes needs nothing but the link:
 
@@ -132,8 +133,8 @@ does not start.
 | Setting | |
 |---|---|
 | `DATABASE_URL` | Where links are kept. A Postgres, `postgres://user:password@host:5432/database` (add `?sslmode=require` for one that insists on TLS), or a SQLite file, `sqlite:///data/links.db` for an absolute path and `sqlite:links.db` for one from where the host is run. The kind of address says which. Required, unless `STORE=memory`. |
-| `ADMIN_TOKEN` | A secret of 16 characters or more. It lets a caller make links. Either this or `CLIENTS_FILE` is required. |
-| `CLIENTS_FILE` | A JSON file of [clients](#who-may-make-links), for a host that has more than one sender. |
+| `ADMIN_TOKEN` | A secret of 16 characters or more. It lets a caller make links, as the client named `admin`, and it manages the [clients](#who-may-make-links) kept in the database, at `/admin/clients`. Either this or `CLIENTS_FILE` is required, and without this there is no `/admin/clients`. |
+| `CLIENTS_FILE` | A JSON file of [clients](#who-may-make-links), for a small host that does not manage its clients over the API. Read when the host starts. |
 | `PUBLIC_URL` | The address the host is reached at, which the links it makes point to. It has to be `https`, except for `localhost`. Required, unless `HOST` is `127.0.0.1`, `::1` or `localhost`, when it is that address. |
 
 ### Network
@@ -233,8 +234,62 @@ the new host beside the old, make new links there, and switch the old off when i
 
 ## Who may make links
 
-One `ADMIN_TOKEN` is enough for one sender. A host with several, or that wants each held to what it
-needs, has a clients file, a JSON file named by `CLIENTS_FILE`:
+A host that several apps or projects share gives each its own **client**: a name, a token, the limits
+its links keep to, and the addresses it calls from. A client's links are its own: it lists them,
+reads the access list of them and switches them off, and it can do none of that to another client's.
+Clients come from two places, and the host uses both.
+
+### Over the API
+
+The admin token (`ADMIN_TOKEN`) manages the clients kept in the database. A change is in force
+at once, in every copy of the host, and needs no restart, because a token is looked up in the database
+each time it is presented.
+
+| Request | What it does |
+|---|---|
+| `POST /admin/clients` | Makes a client. The JSON body has `name` (required: letters, digits and `. _ : @ -`, up to 100, the first a letter or digit; it is what the logs and each link say made it) and optionally the [settings](#what-a-client-may-be-given) below. Answers `201` with the client and its `token`, **which is shown this once**: the host keeps only a hash of it. |
+| `GET /admin/clients` | Every client, oldest first, the ones the host was given in its settings first. A client has a `source`, `api` or `config`. A token, or the hash of one, is never in the answer. |
+| `GET /admin/clients/{id}` | One client. |
+| `PATCH /admin/clients/{id}` | Changes what the body names. A setting set to `null` is taken away, so the client has the host's own again. The name can be changed. Answers the client. |
+| `POST /admin/clients/{id}/rotate` | Gives the client a new `token`, shown once, and the old one is refused from that moment. The client keeps its links. |
+| `DELETE /admin/clients/{id}` | Revokes the client: its token is refused from that moment. `204`. Its links keep working until they end, and their owners keep their own tokens. With `?endLinks=true` every link of the client that is still live is switched off too, and the answer is `200` with `{endedLinks}`. |
+
+A name is one client's, so a second client with it is a `409`; it is free again once its client is
+revoked. The id of a client, `cl_` and 22 characters, is what its links are kept under, and what
+the other requests name it by.
+
+```bash
+curl -s -X POST https://links.example.org/admin/clients \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"name": "clinic-app", "allow": ["203.0.113.0/24"], "maxLifetimeDays": 30,
+       "maxFilesPerLink": 2, "allowedContentTypes": ["application/fhir+json"]}'
+```
+
+The admin API is a request for whoever runs the host, so `MANAGEMENT_ALLOW` limits where it may be
+called from, and `MANAGEMENT_CORS_ORIGINS` which pages. A client's token does not open it, and
+the admin token does not open a client's links: it is for managing clients.
+
+### What a client may be given
+
+The same settings, in the body of `POST` and `PATCH` and in the clients file. A setting that is
+misspelt is an error and not ignored.
+
+- `allow`: a list of addresses and ranges. The client's token is accepted only from them, and a
+  right token from anywhere else is a `403`.
+- `defaultLifetimeDays`, `maxLifetimeDays`, `defaultAttempts`, `maxAttempts`, `maxFileBytes`,
+  `maxFilesPerLink`, `requirePasscode`: the limits of `DEFAULT_LIFETIME_DAYS`, `MAX_LIFETIME_DAYS`,
+  `DEFAULT_ATTEMPTS`, `MAX_ATTEMPTS`, `MAX_FILE_BYTES`, `MAX_FILES_PER_LINK` and `REQUIRE_PASSCODE`,
+  for this client alone.
+- `allowedContentTypes`: the media types of file its links may hold. A file of another type is a
+  `400`. This is in addition to `ALLOWED_CONTENT_TYPES`, which limits every client, so a file has to
+  pass both. A link keeps the list it was made with.
+
+Rate limits are the host's: `RATE_LIMIT_CREATE` counts the links each client makes in a minute.
+
+### In a file
+
+For one machine with a few senders that do not change, a clients file, a JSON file named by
+`CLIENTS_FILE`, needs no admin API:
 
 ```json
 {
@@ -257,13 +312,31 @@ needs, has a clients file, a JSON file named by `CLIENTS_FILE`:
 - Give `token`, or `tokenHash`, which is `sha256:` and the SHA-256 of the token in hex.
   `refhir-link-host new-token` prints a token and its hash: give the client the token, keep the hash.
   The host checks a token against its hash and does not keep it.
-- `allow` ties the client to its own addresses. A right token from anywhere else is a `403`.
-- The rest are the limits of `DEFAULT_LIFETIME_DAYS`, `MAX_LIFETIME_DAYS`, `DEFAULT_ATTEMPTS`,
-  `MAX_ATTEMPTS`, `MAX_FILE_BYTES`, `MAX_FILES_PER_LINK` and `REQUIRE_PASSCODE`, for this client alone.
-  A setting that is misspelt is an error and not ignored.
+- The rest are the settings above.
 
-Revoking a client is taking it out of the file and restarting the host. Links it made keep working
-until they end, and their owners keep their own tokens.
+The file is read when the host starts, so a change to it needs a restart. Taking a client out of it
+and restarting revokes the client.
+
+### How the two combine
+
+- **Both are in force together.** The host first compares a token with `ADMIN_TOKEN` and the clients
+  of the file, which are in memory, and then asks the database. A client is one or the other, and
+  `GET /admin/clients` says which.
+- **The file's win.** A name that is in the file, or is `admin`, cannot be made over the API (a
+  `409`), so a name is never two clients' and a link never says it was made by two.
+- **The file is not changed over the API.** A client of the file is listed and read, and a
+  request to change, rotate or revoke it is a `409` that says to change it where it was set.
+- **Links belong to a client by its id**, or by its name for a client of the file, so an
+  API client and a file client cannot see each other's links, and neither can see the links of the
+  admin token.
+- **Clients of the database are shared by every copy of the host** on that database, and a host
+  that is started with no clients in the database has only the file's.
+- **A database from before clients were kept** is brought up to date when the host starts: each
+  link already there is given to the client named by who made it (`created_by`), so a client of the
+  file keeps its links.
+
+Links a client made stay when it is revoked, so a link a recipient was given keeps working until it
+ends; revoke with `?endLinks=true` to end them with it.
 
 ## What it protects, and what it does not
 
@@ -354,7 +427,7 @@ app can be mounted inside a larger Hono app with `parent.route('/', host.app)`.
 Most settings above are an option of the same name in camel case (`maxFileBytes`, `trustProxy`,
 `corsOrigins`, `requirePasscode`). The ones that are not: lifetimes and times are in seconds
 (`defaultLifetimeSeconds`, `maxLifetimeSeconds`, `retainSeconds`, `sweepIntervalSeconds`), `clients`
-is the list itself and not a file, `rateLimits` is an object of `public`, `perLink`, `management`,
+is the list itself and not a file, `adminToken` is `ADMIN_TOKEN` (and turns on `/admin/clients`), `rateLimits` is an object of `public`, `perLink`, `management`,
 `create` and `authFailures`, and the database, logging and stopping belong to the command. Besides
 those:
 
@@ -363,7 +436,7 @@ those:
 | `authenticate(request, { ip })` | Says who is making a link, by returning a client (`{ name, ...limits }`) or `null`, in place of the tokens. Use it to take a token from your own identity provider. |
 | `authorizeCreate({ client, options, ip, request })` | Returns `false`, or `{ allow: false, status, error }`, to refuse a link before it is made. |
 | `authorizeManifest({ link, recipient, ip, request })` | The same, for a receiver, before a passcode is looked at and so without using an attempt up. `link` says who made it and when it ends, and nothing that opens it. A hook that throws refuses. This is the place to require that a recipient is who the directory says. |
-| `onEvent(event)` | Told of `link.created`, `file.stored`, `manifest.opened`, `manifest.denied`, `file.served`, `link.ended` and `client.refused`, each with `type`, `at` and the whole link `id`, which a log never has. Use it for an audit trail, or to tell the owner their link was opened. A failure here does not fail the request. |
+| `onEvent(event)` | Told of `link.created`, `file.stored`, `manifest.opened`, `manifest.denied`, `file.served`, `link.ended`, `client.refused`, and `client.created`, `client.changed`, `client.rotated` and `client.revoked` for the admin API (which say the client's `clientId` and `client` name, never a token), each with `type`, `at` and the whole link `id`, which a log never has. Use it for an audit trail, or to tell the owner their link was opened. A failure here does not fail the request. |
 | `logger(entry)` | Gets each log line as an object. Without one the library logs only errors. |
 | `store` | Where links are kept: `postgresStore({ url })`, `sqliteStore({ path })`, or `memoryStore()` for trying out. Required. |
 | `remoteAddress(c)` | The address a request came from, where it is not a Node request. |

@@ -111,6 +111,74 @@ laboratory history may not, and a patient summary does not. The chunked form tha
 specification used for this is deprecated, so for larger data use a
 [health link](health-links.md).
 
+## Who is the issuer
+
+A card's `iss` says who vouches for it, and a verifier decides whether to trust a card by deciding
+whether to trust that address and the key published under it. ReFHIR signs with one key per
+server, and one `iss` for it: `[public_url]/health-cards`. On a database that many
+[tenants](clustering.md#tenants-on-one-database) share, each tenant is a process of its own with its
+own `public_url` and its own key, so each tenant has its own issuer. When one tenant holds the
+records of several organizations (clinics, hospitals), there are two ways to answer "who issued
+this card", and they differ in what a verifier sees and in what you look after.
+
+### A. The server or tenant is the issuer (what ReFHIR does)
+
+Every card the server or tenant signs has `iss` = `[public_url]/health-cards`, whichever organization
+the patient's record belongs to.
+
+- **Needs no change.** It is what the server does now, and what the specification's examples show.
+- **One key to keep.** One key file, one key set to publish, one thing to back up or replace.
+  Replacing it ends every card it signed, as described below, but it is one event.
+- **A verifier trusts the operator, not the organization.** A card says "this tenant issued it". It
+  does not say which organization's records it came from. A verifier that wants to accept cards
+  from one clinic and not another cannot tell them apart by `iss`, and little inside a card can say (a card
+  drops `meta` and every `id`, so it carries no source of its own): it has to trust the operator for
+  all of them. For a platform where the operator is the party the verifier already
+  trusts, that is the natural reading.
+- **A leak is one key, and everyone's cards.** If the key is stolen, every organization's cards
+  are at risk and the key has to be replaced, which ends every card.
+- **Every organization shares one trust decision.** A verifier cannot drop one organization from its
+  trusted list, and an organization cannot leave without the operator's help.
+
+### B. A key for each Organization, inside a tenant (not built)
+
+Each organization that issues cards would have a key of its own, and cards would say
+`iss` = `[public_url]/health-cards/[org]`, with the key set at
+`[public_url]/health-cards/[org]/.well-known/jwks.json`.
+
+- **A verifier can trust one organization and not another.** `iss` says whose records a card
+  holds, so a verifier's list of trusted issuers can name a clinic, and a clinic that is removed
+  from it stops being trusted without affecting the others.
+- **An organization can take its key with it.** Replacing or retiring one organization's key ends
+  only its cards, and the key can be kept by the organization when it does not want the operator to
+  hold it.
+- **A leak is bounded** to that organization's cards.
+- **More to look after.** A key for each organization to make, store (the operator keeps a file or a
+  secret for each, and the secrets must not be readable across organizations), back up, rotate and
+  publish, and a key set for each at its own address. The number of keys grows with the number of
+  organizations, and onboarding an organization means making a key.
+- **A new decision for the server.** It has to know which organization a card is for, which means a
+  rule for finding it from the patient (`Patient.managingOrganization`, which may be absent or point
+  outside the tenant), what to do when there is none, and who may ask for a card on an
+  organization's behalf. It also changes what a published `iss` means to verifiers already
+  holding the old address, and each organization's address has to be reachable and `https`.
+- **Verifiers see more trust surface.** A verifier that trusts the operator today would now have an
+  issuer for each organization to trust, and a new organization is a new entry to add.
+
+### Choosing
+
+| | A. Server or tenant is the issuer | B. A key for each Organization |
+|---|---|---|
+| Change to ReFHIR | None | New key store, new routes, a rule for which organization a card is for |
+| Keys to look after | One for the server or tenant | One for each organization |
+| What a verifier can trust or drop | The server or tenant, as a whole | Each organization separately |
+| If a key leaks | Every card of the server or tenant | One organization's cards |
+| Fits when | The operator is the party the verifier trusts, or the tenant is one organization | Verifiers must tell organizations apart, or organizations must hold their own keys |
+
+If each organization is a tenant of its own, A already gives each its own issuer and key, and B is
+not needed: tenants are the unit that has a key. B is for several organizations inside one tenant
+that must be told apart by their `iss`. The server does A today. B is not built.
+
 ## Who can ask
 
 The caller needs to be able to read `Patient`, and the card holds only the kinds of resource their

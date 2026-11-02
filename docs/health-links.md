@@ -160,6 +160,25 @@ The script is not a SMART app: it takes a token you have. A sender that is one r
 described in [SMART on FHIR](smart.md), signs the patient in, and asks for the scopes it needs,
 `patient/Patient.rs` and a read scope for each kind of resource the summary should hold.
 
+## One host for many senders
+
+A host that several apps or projects share gives each its own **client**: a name, a token of its own,
+and the limits and addresses that fit it. Clients are made, changed, rotated and revoked over the
+host's API with the admin token, in a running host and with no restart:
+
+```bash
+curl -s -X POST https://links.example.org/admin/clients \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"name": "clinic-app", "allow": ["203.0.113.0/24"], "maxLifetimeDays": 30,
+       "allowedContentTypes": ["application/fhir+json"]}'
+#    {"id": "cl_...", "name": "clinic-app", ..., "token": "..."}   the token is said once
+```
+
+A client's token makes links, and lists them (`GET /shl`). A client reads the access list of, and
+switches off, only the links it made, and sees nothing of another client's. Revoking a client
+(`DELETE /admin/clients/{id}`) refuses its token at once; add `?endLinks=true` to switch off its live
+links too. The [link host's README](../link-host/README.md#who-may-make-links) has the whole API.
+
 ## Put it together
 
 ```bash

@@ -2,8 +2,8 @@ import { randomBytes } from 'node:crypto';
 
 import postgres from 'postgres';
 
-import type { AccessEntry, FileEntry, Link, LinkTx, Store } from '../types.js';
-import { StoreBusy } from '../types.js';
+import type { AccessEntry, ClientSettings, FileEntry, Link, LinkListed, LinkTx, Store, StoredClient } from '../types.js';
+import { NameTaken, StoreBusy } from '../types.js';
 import { migrate } from './migrate.js';
 
 export interface PostgresOptions {
@@ -34,6 +34,26 @@ interface LinkRow {
   passcode_hash: string | null;
   max_files: number;
   max_file_bytes: number;
+  client_id: string | null;
+  content_types: string | null;
+}
+interface ListedRow {
+  id: string;
+  created_by: string;
+  created_at: string;
+  expires_at: string;
+  ended_at: string | null;
+  active: boolean;
+  passcode: boolean;
+  files: number;
+}
+interface ClientRow {
+  id: string;
+  name: string;
+  token_hash: string;
+  settings: ClientSettings;
+  created_at: string;
+  updated_at: string;
 }
 interface FileRow {
   name: string;
@@ -55,7 +75,30 @@ const toLink = (row: LinkRow, files: FileEntry[]): Link => ({
   maxFiles: row.max_files,
   maxFileBytes: row.max_file_bytes,
   files,
+  ...(row.client_id === null ? {} : { clientId: row.client_id }),
+  ...(row.content_types === null ? {} : { contentTypes: JSON.parse(row.content_types) as string[] }),
 });
+const toListed = (row: ListedRow): LinkListed => ({
+  id: row.id,
+  createdBy: row.created_by,
+  createdAt: Number(row.created_at),
+  expiresAt: Number(row.expires_at),
+  endedAt: row.ended_at === null ? null : Number(row.ended_at),
+  active: row.active,
+  passcodeRequired: row.passcode,
+  files: row.files,
+});
+const toClient = (row: ClientRow): StoredClient => ({
+  id: row.id,
+  name: row.name,
+  tokenHash: row.token_hash,
+  settings: row.settings,
+  createdAt: Number(row.created_at),
+  updatedAt: Number(row.updated_at),
+});
+// 23505: a unique value that is there already, which for a client is its name (a token is random).
+const named = (error: unknown, name: string | undefined) =>
+  (error as { code?: string }).code === '23505' && /name/.test((error as { constraint_name?: string }).constraint_name ?? '') ? new NameTaken(name) : error;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -105,10 +148,11 @@ export async function postgresStore(options: PostgresOptions): Promise<Store> {
     async create(link) {
       await sql`
         INSERT INTO links (id, token_hash, active, created_at, created_by, expires_at, ended_at, attempts_left,
-                           passcode_salt, passcode_hash, max_files, max_file_bytes)
+                           passcode_salt, passcode_hash, max_files, max_file_bytes, client_id, content_types)
         VALUES (${link.id}, ${link.tokenHash}, ${link.active}, ${link.createdAt}, ${link.createdBy}, ${link.expiresAt},
                 ${link.endedAt}, ${link.attemptsLeft}, ${link.passcode?.salt ?? null}, ${link.passcode?.hash ?? null},
-                ${link.maxFiles}, ${link.maxFileBytes})`;
+                ${link.maxFiles}, ${link.maxFileBytes}, ${link.clientId ?? link.createdBy},
+                ${link.contentTypes ? JSON.stringify(link.contentTypes) : null})`;
     },
 
     async get(id) {
@@ -222,6 +266,63 @@ export async function postgresStore(options: PostgresOptions): Promise<Store> {
 
     async close() {
       await sql.end({ timeout: 5 });
+    },
+
+    async listLinks(clientId, { limit, before }) {
+      // Ids are compared byte by byte, as every store compares them, whatever the database's collation.
+      const rows = await sql<ListedRow[]>`
+        SELECT id, created_by, created_at, expires_at, ended_at, active, passcode_hash IS NOT NULL AS passcode,
+               (SELECT count(*)::int FROM link_files f WHERE f.link_id = links.id) AS files
+        FROM links
+        WHERE client_id = ${clientId}
+          ${before ? sql`AND (created_at < ${before.createdAt} OR (created_at = ${before.createdAt} AND id COLLATE "C" < ${before.id}))` : sql``}
+        ORDER BY created_at DESC, id COLLATE "C" DESC
+        LIMIT ${limit}`;
+      return rows.map(toListed);
+    },
+
+    async createClient(client) {
+      try {
+        await sql`
+          INSERT INTO link_clients (id, name, token_hash, settings, created_at, updated_at)
+          VALUES (${client.id}, ${client.name}, ${client.tokenHash}, ${sql.json(client.settings as postgres.JSONValue)}, ${client.createdAt}, ${client.updatedAt})`;
+      } catch (error) {
+        throw named(error, client.name);
+      }
+    },
+
+    async getClient(id) {
+      const [row] = await sql<ClientRow[]>`SELECT * FROM link_clients WHERE id = ${id}`;
+      return row ? toClient(row) : null;
+    },
+
+    async clientByToken(tokenHash) {
+      const [row] = await sql<ClientRow[]>`SELECT * FROM link_clients WHERE token_hash = ${tokenHash}`;
+      return row ? toClient(row) : null;
+    },
+
+    async listClients() {
+      return (await sql<ClientRow[]>`SELECT * FROM link_clients ORDER BY created_at, id`).map(toClient);
+    },
+
+    async updateClient(id, change) {
+      try {
+        const [row] = await sql<ClientRow[]>`
+          UPDATE link_clients SET
+            name = COALESCE(${change.name ?? null}, name),
+            token_hash = COALESCE(${change.tokenHash ?? null}, token_hash),
+            settings = COALESCE(${change.settings ? sql.json(change.settings as postgres.JSONValue) : null}, settings),
+            updated_at = ${change.updatedAt}
+          WHERE id = ${id}
+          RETURNING *`;
+        return row ? toClient(row) : null;
+      } catch (error) {
+        throw named(error, change.name);
+      }
+    },
+
+    async deleteClient(id) {
+      return (await sql`DELETE FROM link_clients WHERE id = ${id}`).count > 0;
     },
   };
   return store;

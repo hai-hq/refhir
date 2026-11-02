@@ -4,8 +4,8 @@ import path from 'node:path';
 
 import type { DatabaseSync, StatementSync } from 'node:sqlite';
 
-import type { AccessEntry, FileEntry, Link, LinkTx, Store, SweepCounts } from '../types.js';
-import { StoreBusy } from '../types.js';
+import type { AccessEntry, ClientSettings, FileEntry, Link, LinkListed, LinkTx, Store, StoredClient, SweepCounts } from '../types.js';
+import { NameTaken, StoreBusy } from '../types.js';
 import { MIGRATIONS, migrationFiles } from './migrate.js';
 import { inTurns } from './shared.js';
 
@@ -32,6 +32,26 @@ interface LinkRow {
   max_files: number;
   max_file_bytes: number;
   version: number;
+  client_id: string | null;
+  content_types: string | null;
+}
+interface ListedRow {
+  id: string;
+  created_by: string;
+  created_at: number;
+  expires_at: number;
+  ended_at: number | null;
+  active: number;
+  passcode: number;
+  files: number;
+}
+interface ClientRow {
+  id: string;
+  name: string;
+  token_hash: string;
+  settings: string;
+  created_at: number;
+  updated_at: number;
 }
 interface FileRow {
   name: string;
@@ -60,7 +80,29 @@ const toLink = (row: LinkRow, files: FileEntry[]): Link => ({
   maxFiles: row.max_files,
   maxFileBytes: row.max_file_bytes,
   files,
+  ...(row.client_id === null ? {} : { clientId: row.client_id }),
+  ...(row.content_types === null ? {} : { contentTypes: JSON.parse(row.content_types) as string[] }),
 });
+const toListed = (row: ListedRow): LinkListed => ({
+  id: row.id,
+  createdBy: row.created_by,
+  createdAt: row.created_at,
+  expiresAt: row.expires_at,
+  endedAt: row.ended_at,
+  active: row.active === 1,
+  passcodeRequired: row.passcode === 1,
+  files: row.files,
+});
+const toClient = (row: ClientRow): StoredClient => ({
+  id: row.id,
+  name: row.name,
+  tokenHash: row.token_hash,
+  settings: JSON.parse(row.settings) as ClientSettings,
+  createdAt: row.created_at,
+  updatedAt: row.updated_at,
+});
+const named = (error: unknown, name: string | undefined) =>
+  /UNIQUE constraint failed: link_clients\.name/.test(String((error as Error)?.message)) ? new NameTaken(name) : error;
 
 /** How many times a change is run again because another process changed the link first. */
 const ATTEMPTS = 50;
@@ -147,8 +189,8 @@ export async function sqliteStore(options: SqliteOptions): Promise<SqliteStore> 
     access: db.prepare('SELECT at, recipient, outcome, ip, user_agent FROM link_access WHERE link_id = ? ORDER BY id'),
     create: db.prepare(`
       INSERT INTO links (id, token_hash, active, created_at, created_by, expires_at, ended_at, attempts_left,
-                         passcode_salt, passcode_hash, max_files, max_file_bytes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
+                         passcode_salt, passcode_hash, max_files, max_file_bytes, client_id, content_types)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
     keep: db.prepare('UPDATE links SET active = ?, ended_at = ?, attempts_left = ?, version = version + 1 WHERE id = ? AND version = ?'),
     putFile: db.prepare('INSERT INTO link_files (link_id, seq, name, content_type, bytes, body) VALUES (?, ?, ?, ?, ?, ?)'),
     dropFiles: db.prepare('DELETE FROM link_files WHERE link_id = ?'),
@@ -156,6 +198,21 @@ export async function sqliteStore(options: SqliteOptions): Promise<SqliteStore> 
     prune: db.prepare('DELETE FROM link_access WHERE link_id = ? AND id NOT IN (SELECT id FROM link_access WHERE link_id = ? ORDER BY id DESC LIMIT ?)'),
     secret: db.prepare('SELECT value FROM host_secrets WHERE name = ?'),
     newSecret: db.prepare('INSERT OR IGNORE INTO host_secrets (name, value) VALUES (?, ?)'),
+    links: db.prepare(`
+      SELECT id, created_by, created_at, expires_at, ended_at, active, passcode_hash IS NOT NULL AS passcode,
+             (SELECT count(*) FROM link_files f WHERE f.link_id = links.id) AS files
+      FROM links
+      WHERE client_id = ? AND (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?))
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?`),
+    client: db.prepare('SELECT * FROM link_clients WHERE id = ?'),
+    clientByToken: db.prepare('SELECT * FROM link_clients WHERE token_hash = ?'),
+    clients: db.prepare('SELECT * FROM link_clients ORDER BY created_at, id'),
+    newClient: db.prepare('INSERT INTO link_clients (id, name, token_hash, settings, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'),
+    changeClient: db.prepare(`
+      UPDATE link_clients SET name = COALESCE(?, name), token_hash = COALESCE(?, token_hash), settings = COALESCE(?, settings), updated_at = ?
+      WHERE id = ? RETURNING *`),
+    dropClient: db.prepare('DELETE FROM link_clients WHERE id = ?'),
   } satisfies Record<string, StatementSync>;
 
   const row = <T>(statement: StatementSync, ...values: Array<string | number | null>) => statement.get(...values) as unknown as T | undefined;
@@ -190,6 +247,7 @@ export async function sqliteStore(options: SqliteOptions): Promise<SqliteStore> 
       sql.create.run(
         link.id, link.tokenHash, link.active ? 1 : 0, link.createdAt, link.createdBy, link.expiresAt, link.endedAt,
         link.attemptsLeft, link.passcode?.salt ?? null, link.passcode?.hash ?? null, link.maxFiles, link.maxFileBytes,
+        link.clientId ?? link.createdBy, link.contentTypes ? JSON.stringify(link.contentTypes) : null,
       );
     },
 
@@ -321,6 +379,53 @@ export async function sqliteStore(options: SqliteOptions): Promise<SqliteStore> 
 
     async close() {
       db.close();
+    },
+
+    async listLinks(clientId, { limit, before }) {
+      const at = before?.createdAt ?? null;
+      return rows<ListedRow>(sql.links, clientId, at, at, at, before?.id ?? null, limit).map(toListed);
+    },
+
+    async createClient(client) {
+      try {
+        sql.newClient.run(client.id, client.name, client.tokenHash, JSON.stringify(client.settings), client.createdAt, client.updatedAt);
+      } catch (error) {
+        throw named(error, client.name);
+      }
+    },
+
+    async getClient(id) {
+      const found = row<ClientRow>(sql.client, id);
+      return found ? toClient(found) : null;
+    },
+
+    async clientByToken(tokenHash) {
+      const found = row<ClientRow>(sql.clientByToken, tokenHash);
+      return found ? toClient(found) : null;
+    },
+
+    async listClients() {
+      return rows<ClientRow>(sql.clients).map(toClient);
+    },
+
+    async updateClient(id, change) {
+      try {
+        const found = row<ClientRow>(
+          sql.changeClient,
+          change.name ?? null,
+          change.tokenHash ?? null,
+          change.settings ? JSON.stringify(change.settings) : null,
+          change.updatedAt,
+          id,
+        );
+        return found ? toClient(found) : null;
+      } catch (error) {
+        throw named(error, change.name);
+      }
+    },
+
+    async deleteClient(id) {
+      return Number(sql.dropClient.run(id).changes) > 0;
     },
   };
   return store;

@@ -3,26 +3,15 @@
 import { readFileSync } from 'node:fs';
 
 import { DEFAULTS } from './app.js';
-import type { Client, HostOptions, RateLimits } from './types.js';
+import { SETTING_FIELDS, STORED_ID, checkFields, toSettings } from './clients.js';
+import type { Client, ClientSettings, HostOptions, RateLimits } from './types.js';
 import { addressList } from './util.js';
 
 const DAY = 86_400;
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 
 // What a client of the clients file may set, and what each is.
-const CLIENT_FIELDS = {
-  name: 'string',
-  token: 'string',
-  tokenHash: 'string',
-  defaultAttempts: 'count',
-  maxAttempts: 'count',
-  maxFileBytes: 'count',
-  maxFilesPerLink: 'count',
-  defaultLifetimeDays: 'days',
-  maxLifetimeDays: 'days',
-  requirePasscode: 'boolean',
-  allow: 'addresses',
-} as const;
+const CLIENT_FIELDS = { name: 'string', token: 'string', tokenHash: 'string', ...SETTING_FIELDS } as const;
 
 export class ConfigError extends Error {
   constructor(readonly problems: string[]) {
@@ -97,9 +86,10 @@ export function loadConfig(env: Env = process.env, { read = (file: string) => re
 
   // Who may make links.
   const clients: Client[] = [];
+  let adminToken: string | undefined;
   if (env.ADMIN_TOKEN) {
     if (env.ADMIN_TOKEN.length < 16) bad('ADMIN_TOKEN is a secret of 16 characters or more');
-    else clients.push({ name: 'admin', token: env.ADMIN_TOKEN });
+    else adminToken = env.ADMIN_TOKEN;
   }
   if (env.CLIENTS_FILE) {
     try {
@@ -108,7 +98,7 @@ export function loadConfig(env: Env = process.env, { read = (file: string) => re
       bad(`CLIENTS_FILE ${env.CLIENTS_FILE} cannot be read: ${(error as Error).message}`);
     }
   }
-  if (!clients.length && !problems.some((problem) => problem.startsWith('ADMIN_TOKEN') || problem.startsWith('CLIENTS_FILE'))) {
+  if (!clients.length && !adminToken && !problems.some((problem) => problem.startsWith('ADMIN_TOKEN') || problem.startsWith('CLIENTS_FILE'))) {
     bad('Set ADMIN_TOKEN to a secret of 16 characters or more (or CLIENTS_FILE to a file of clients): it is what lets a caller make links.');
   }
 
@@ -176,6 +166,7 @@ export function loadConfig(env: Env = process.env, { read = (file: string) => re
   const metricsToken = secret('METRICS_TOKEN');
 
   const options: Config['options'] = {
+    ...(adminToken ? { adminToken } : {}),
     clients,
     ...(publicUrl ? { publicUrl } : {}),
     trustProxy,
@@ -243,31 +234,12 @@ function readClients(file: string, read: (file: string) => string, bad: (message
       bad(`${label} is not an object`);
       return [];
     }
-    let ok = true;
-    for (const [field, value] of Object.entries(record)) {
-      const type = (CLIENT_FIELDS as Record<string, string>)[field];
-      const fine =
-        type === 'string' ? typeof value === 'string' && value !== '' :
-        type === 'boolean' ? typeof value === 'boolean' :
-        type === 'count' ? Number.isInteger(value) && (value as number) > 0 :
-        type === 'days' ? Number.isInteger(value) && (value as number) > 0 && (value as number) <= 36500 :
-        type === 'addresses' ? Array.isArray(value) && value.length > 0 && value.every((item) => typeof item === 'string') :
-        undefined;
-      if (fine === undefined) {
-        bad(`${label}: ${field} is not a setting of a client (${Object.keys(CLIENT_FIELDS).join(', ')})`);
-        ok = false;
-      } else if (!fine) {
-        const what = { days: 'whole number of days', count: 'whole number above 0', addresses: 'list of addresses and ranges' }[type as string] ?? type;
-        bad(`${label}: ${field} is a ${what}`);
-        ok = false;
-      } else if (type === 'addresses') {
-        try {
-          addressList(value as string[], `${label}: allow`);
-        } catch (error) {
-          bad((error as Error).message);
-          ok = false;
-        }
-      }
+    const found = checkFields(record, label, CLIENT_FIELDS);
+    for (const problem of found) bad(problem);
+    let ok = !found.length;
+    if (typeof record.name === 'string' && STORED_ID.test(record.name)) {
+      bad(`${label}: a name of the shape cl_ and 22 characters is the id of a client made over the admin API`);
+      ok = false;
     }
     if (!record.name) {
       bad(`${label} needs a name, which is what the logs say it did`);
@@ -282,13 +254,7 @@ function readClients(file: string, read: (file: string) => string, bad: (message
       ok = false;
     }
     if (!ok) return [];
-    const { defaultLifetimeDays, maxLifetimeDays, ...rest } = record as Record<string, unknown> & { defaultLifetimeDays?: number; maxLifetimeDays?: number };
-    return [
-      {
-        ...(rest as unknown as Client),
-        ...(defaultLifetimeDays ? { defaultLifetimeSeconds: defaultLifetimeDays * DAY } : {}),
-        ...(maxLifetimeDays ? { maxLifetimeSeconds: maxLifetimeDays * DAY } : {}),
-      },
-    ];
+    const { name, token, tokenHash } = record as { name: string; token?: string; tokenHash?: string };
+    return [{ name, ...(token ? { token } : {}), ...(tokenHash ? { tokenHash } : {}), ...(toSettings(record) as ClientSettings) }];
   });
 }

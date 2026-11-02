@@ -15,13 +15,16 @@ import { promisify } from 'node:util';
 import { getConnInfo } from '@hono/node-server/conninfo';
 import { Hono, type Context, type MiddlewareHandler } from 'hono';
 
+import { SETTING_FIELDS, STORED_ID, checkFields, fromSettings, toSettings } from './clients.js';
 import { rateLimiter, type Verdict as Limit } from './limits.js';
 import { createMetrics } from './metrics.js';
 import { isLive } from './store/shared.js';
 import {
+  NameTaken,
   StoreBusy,
   type AccessEntry,
   type Client,
+  type ClientSettings,
   type HostEvent,
   type HostOptions,
   type Link,
@@ -29,6 +32,7 @@ import {
   type LinkTx,
   type RateLimits,
   type Store,
+  type StoredClient,
   type SweepCounts,
   type Verdict,
 } from './types.js';
@@ -40,7 +44,12 @@ const FILE_ID = /^f\d{1,6}$/;
 const CONTENT_TYPE = /^[\w.+-]+\/[\w.+-]+(;[\w.+=\- ]+)*$/;
 const TICKET_SECONDS = 60;
 const JSON_LIMIT = 4096;
+const ADMIN_JSON_LIMIT = 16_384;
 const DAY = 86_400;
+// What a client made over the admin API may be called: it is what the logs say did a thing.
+const CLIENT_NAME = /^[A-Za-z0-9][\w.@:-]{0,99}$/;
+const LIST_LIMIT = 100;
+const LIST_MOST = 1000;
 
 /** What a host does when it is not told otherwise. */
 export const DEFAULTS = Object.freeze({
@@ -104,11 +113,22 @@ function looksEncrypted(text: string): boolean {
   }
 }
 
-interface KnownClient {
+/** A client the host knows, and what its links are kept under. */
+interface Known {
   client: Client;
-  hash: Buffer;
+  owner: string;
   allows: ((ip: string) => boolean) | null;
 }
+interface KnownClient extends Known {
+  hash: Buffer;
+}
+
+const ownerOf = (link: Link) => link.clientId ?? link.createdBy;
+const allowsOf = (client: Client) => (client.allow ? addressList(client.allow, `client ${client.name}: allow`) : null);
+const fromStored = (stored: StoredClient): Known => {
+  const client: Client = { ...stored.settings, name: stored.name, id: stored.id };
+  return { client, owner: stored.id, allows: allowsOf(client) };
+};
 
 function knownClients({ clients = [], adminToken }: Pick<HostOptions, 'clients' | 'adminToken'>): KnownClient[] {
   const list = adminToken ? [...clients, { name: 'admin', token: adminToken }] : [...clients];
@@ -117,6 +137,9 @@ function knownClients({ clients = [], adminToken }: Pick<HostOptions, 'clients' 
     const name = client.name ?? `client-${index + 1}`;
     if (names.has(name)) throw new Error(`two clients are named ${name}`);
     names.add(name);
+    // A link is kept under its client's name, so a name that looks like the id of a client made over
+    // the admin API could be taken for that client.
+    if (STORED_ID.test(client.id ?? name)) throw new Error(`client ${name}: cl_ and 22 characters is the shape of the id of a client made over the admin API`);
     let hash: Buffer;
     if (client.tokenHash) {
       hash = Buffer.from(String(client.tokenHash).replace(/^sha256:/, ''), 'hex');
@@ -127,7 +150,7 @@ function knownClients({ clients = [], adminToken }: Pick<HostOptions, 'clients' 
       }
       hash = sha256(client.token);
     }
-    return { client: { ...client, name }, hash, allows: client.allow ? addressList(client.allow, `client ${name}: allow`) : null };
+    return { client: { ...client, name }, owner: client.id ?? name, hash, allows: allowsOf({ ...client, name }) };
   });
 }
 
@@ -139,12 +162,19 @@ const ROUTES = [
   { method: 'GET', path: '/readyz', route: 'readyz', kind: 'ops' },
   { method: 'GET', path: '/metrics', route: 'metrics', kind: 'ops' },
   { method: 'POST', path: '/shl', route: 'create', kind: 'management' },
+  { method: 'GET', path: '/shl', route: 'list', kind: 'management' },
   { method: 'POST', path: `/shl/${ID}`, route: 'manifest', kind: 'public' },
   { method: 'GET', path: `/shl/${ID}`, route: 'direct', kind: 'public' },
   { method: 'DELETE', path: `/shl/${ID}`, route: 'switch-off', kind: 'management' },
   { method: 'POST', path: `/shl/${ID}/file`, route: 'upload', kind: 'management' },
   { method: 'GET', path: `/shl/${ID}/access`, route: 'access', kind: 'management' },
   { method: 'GET', path: `/shl/${ID}/file/:file`, route: 'file', kind: 'public' },
+  { method: 'POST', path: '/admin/clients', route: 'client-create', kind: 'management' },
+  { method: 'GET', path: '/admin/clients', route: 'clients', kind: 'management' },
+  { method: 'GET', path: '/admin/clients/:client', route: 'client', kind: 'management' },
+  { method: 'PATCH', path: '/admin/clients/:client', route: 'client-change', kind: 'management' },
+  { method: 'DELETE', path: '/admin/clients/:client', route: 'client-revoke', kind: 'management' },
+  { method: 'POST', path: '/admin/clients/:client/rotate', route: 'client-rotate', kind: 'management' },
 ] as const satisfies ReadonlyArray<{ method: string; path: string; route: string; kind: Kind }>;
 
 const SHAPES: Array<[string, RegExp]> = [
@@ -156,6 +186,9 @@ const SHAPES: Array<[string, RegExp]> = [
   [`/shl/${ID}/file`, /^\/shl\/[A-Za-z0-9_-]{43}\/file$/],
   [`/shl/${ID}/access`, /^\/shl\/[A-Za-z0-9_-]{43}\/access$/],
   [`/shl/${ID}/file/:file`, /^\/shl\/[A-Za-z0-9_-]{43}\/file\/[^/]+$/],
+  ['/admin/clients', /^\/admin\/clients$/],
+  ['/admin/clients/:client', /^\/admin\/clients\/[^/]+$/],
+  ['/admin/clients/:client/rotate', /^\/admin\/clients\/[^/]+\/rotate$/],
 ];
 
 /** The kind of request a browser is asking whether it may make: from the path and the method. */
@@ -207,7 +240,9 @@ export async function createHost(options: HostOptions): Promise<Host> {
     logger,
   } = options;
   const rateLimits = { ...DEFAULTS.rateLimits, ...options.rateLimits };
+  const adminToken = options.adminToken;
   const clients = knownClients(options);
+  const configured = new Map(clients.map((known) => [known.owner, known]));
   if (!clients.length && !authenticate) {
     throw new Error('createHost needs a way to tell who may make links: adminToken, clients or authenticate');
   }
@@ -258,21 +293,25 @@ export async function createHost(options: HostOptions): Promise<Host> {
   const manages = (link: Link | null, c: C): link is Link =>
     link !== null && timingSafeEqual(sha256(bearer(c)), Buffer.from(link.tokenHash, 'hex'));
 
-  async function who(c: C, ctx: Ctx): Promise<Client> {
-    limited('auth-failures', limiters.authFailures.blocked(ctx.ip));
-    let known: { client: Client; allows: ((ip: string) => boolean) | null } | null = null;
+  // The client a request's token is: one the host was given, compared in memory, or else one kept in
+  // the store, which is asked each time, so that a client made, changed or revoked over the admin API
+  // is so at once, in every process.
+  async function identify(c: C, ctx: Ctx): Promise<Known | null> {
     if (authenticate) {
       const client = await authenticate(c.req.raw, { ip: ctx.ip });
-      if (client) known = { client, allows: client.allow ? addressList(client.allow, `client ${client.name}: allow`) : null };
-    } else {
-      // Every client is compared, so the time taken does not say which one matched or how far.
-      const presented = sha256(bearer(c));
-      for (const candidate of clients) if (timingSafeEqual(presented, candidate.hash)) known ??= candidate;
+      return client ? { client, owner: client.id ?? client.name, allows: allowsOf(client) } : null;
     }
-    if (!known) {
-      limiters.authFailures.hit(ctx.ip);
-      throw new Refused(401, { error: 'a token that may make links is required' });
-    }
+    const token = bearer(c);
+    // Every client is compared, so the time taken does not say which one matched or how far.
+    const presented = sha256(token);
+    let known: Known | null = null;
+    for (const candidate of clients) if (timingSafeEqual(presented, candidate.hash)) known ??= candidate;
+    if (known || !token) return known;
+    const stored = await store.clientByToken(presented.toString('hex'));
+    return stored ? fromStored(stored) : null;
+  }
+
+  function admit(known: Known, ctx: Ctx) {
     ctx.client = known.client.name ?? 'client';
     // A token that is right, from an address its client does not use, is told so and not counted as
     // a guess: it is the client's own mistake, or a stolen token that has been found out.
@@ -280,7 +319,17 @@ export async function createHost(options: HostOptions): Promise<Host> {
       emit('client.refused', { client: ctx.client, ip: ctx.ip, reason: 'address' });
       throw new Refused(403, { error: 'this token is not accepted from this address' });
     }
-    return known.client;
+  }
+
+  async function who(c: C, ctx: Ctx): Promise<Known> {
+    limited('auth-failures', limiters.authFailures.blocked(ctx.ip));
+    const known = await identify(c, ctx);
+    if (!known) {
+      limiters.authFailures.hit(ctx.ip);
+      throw new Refused(401, { error: 'a token that may make links is required' });
+    }
+    admit(known, ctx);
+    return known;
   }
 
   function requireManager(c: C, ctx: Ctx, link: Link | null): asserts link is Link {
@@ -289,6 +338,33 @@ export async function createHost(options: HostOptions): Promise<Host> {
       if (link) limiters.authFailures.hit(ctx.ip);
       throw notYours(link);
     }
+  }
+
+  // Whoever holds a link's own token, or the client that made it. Answers the same question, to ask
+  // again of the link as a transaction holds it.
+  async function requireOwner(c: C, ctx: Ctx, link: Link | null): Promise<(held: Link | null) => held is Link> {
+    limited('auth-failures', limiters.authFailures.blocked(ctx.ip));
+    if (manages(link, c)) return (held): held is Link => manages(held, c);
+    if (link) {
+      const known = await identify(c, ctx);
+      if (known && known.owner === ownerOf(link)) {
+        admit(known, ctx);
+        return (held): held is Link => held !== null && ownerOf(held) === known.owner;
+      }
+      // A client's own token on another's link is not a guess at a token.
+      if (!known) limiters.authFailures.hit(ctx.ip);
+    }
+    throw notYours(link);
+  }
+
+  function requireAdmin(c: C, ctx: Ctx) {
+    if (!adminToken) throw notFound();
+    limited('auth-failures', limiters.authFailures.blocked(ctx.ip));
+    if (!same(bearer(c), adminToken)) {
+      limiters.authFailures.hit(ctx.ip);
+      throw new Refused(401, { error: 'the admin token is required' });
+    }
+    ctx.client = 'admin';
   }
 
   async function permitted<D>(hook: ((details: D) => Verdict | Promise<Verdict>) | undefined, details: D, status = 403) {
@@ -320,8 +396,8 @@ export async function createHost(options: HostOptions): Promise<Host> {
     }
     return Buffer.concat(chunks).toString('utf8');
   }
-  async function readJson(c: C): Promise<Record<string, unknown>> {
-    const text = await readBody(c.req.raw, JSON_LIMIT);
+  async function readJson(c: C, limit = JSON_LIMIT): Promise<Record<string, unknown>> {
+    const text = await readBody(c.req.raw, limit);
     try {
       const value: unknown = text ? JSON.parse(text) : {};
       if (value && typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -369,8 +445,8 @@ export async function createHost(options: HostOptions): Promise<Host> {
   });
 
   async function makeLink(c: C, ctx: Ctx): Promise<Response> {
-    const client = await who(c, ctx);
-    limited('create', limiters.create.hit(ctx.client ?? 'client'));
+    const { client, owner } = await who(c, ctx);
+    limited('create', limiters.create.hit(owner));
     const asked = await readJson(c);
     const policy = policyOf(client);
     const attempts = asked.attempts ?? policy.defaultAttempts;
@@ -409,6 +485,8 @@ export async function createHost(options: HostOptions): Promise<Host> {
       maxFiles: policy.maxFilesPerLink,
       maxFileBytes: policy.maxFileBytes,
       files: [],
+      clientId: owner,
+      ...(client.allowedContentTypes ? { contentTypes: client.allowedContentTypes.map((type) => type.toLowerCase()) } : {}),
     };
     if (typeof passcode === 'string' && passcode) {
       const salt = randomBytes(16);
@@ -435,8 +513,12 @@ export async function createHost(options: HostOptions): Promise<Host> {
     requireManager(c, ctx, first);
     const contentType = c.req.query('contentType') ?? 'application/fhir+json';
     if (!CONTENT_TYPE.test(contentType)) throw new Refused(400, { error: 'contentType is not a media type' });
-    if (allowedTypes && !allowedTypes.includes(contentType.split(';')[0]!.trim().toLowerCase())) {
+    const type = contentType.split(';')[0]!.trim().toLowerCase();
+    if (allowedTypes && !allowedTypes.includes(type)) {
       throw new Refused(400, { error: `this host keeps files of these types only: ${allowedTypes.join(', ')}` });
+    }
+    if (first.contentTypes && !first.contentTypes.includes(type)) {
+      throw new Refused(400, { error: `this link keeps files of these types only: ${first.contentTypes.join(', ')}` });
     }
     const full = () => new Refused(409, { error: `a link holds up to ${first.maxFiles} files` });
     if (first.files.length >= first.maxFiles) throw full();
@@ -575,10 +657,10 @@ export async function createHost(options: HostOptions): Promise<Host> {
   async function switchOffByOwner(c: C, ctx: Ctx): Promise<Response> {
     const id = c.req.param('id')!;
     ctx.link = id;
-    requireManager(c, ctx, await store.get(id));
+    const owns = await requireOwner(c, ctx, await store.get(id));
     type Ended = { refused: Refused } | { ended?: string };
     const outcome = await store.update<Ended>(id, async (link, tx) => {
-      if (!manages(link, c)) return { refused: notYours(link) };
+      if (!owns(link)) return { refused: notYours(link) };
       if (!link.active) return {};
       return { ended: await switchOff(link, tx, 'revoked') };
     });
@@ -594,8 +676,178 @@ export async function createHost(options: HostOptions): Promise<Host> {
     const id = c.req.param('id')!;
     ctx.link = id;
     const link = await store.get(id);
-    requireManager(c, ctx, link);
+    if (!(await requireOwner(c, ctx, link))(link)) throw notYours(link);
     return reply(200, { access: await store.listAccess(id), expiresAt: link.expiresAt, active: live(link) });
+  }
+
+  // A client's own links, newest first, a page at a time: `next` is the `before` of the next page.
+  async function listLinks(c: C, ctx: Ctx): Promise<Response> {
+    const { owner } = await who(c, ctx);
+    const asked = c.req.query('limit') ?? String(LIST_LIMIT);
+    const limit = Number(asked);
+    if (!/^\d+$/.test(asked) || limit < 1 || limit > LIST_MOST) throw new Refused(400, { error: `limit is a whole number from 1 to ${LIST_MOST}` });
+    const cursor = c.req.query('before');
+    const at = cursor === undefined ? null : /^(\d{1,15})\.([A-Za-z0-9_-]{43})$/.exec(cursor);
+    if (at === null && cursor !== undefined) throw new Refused(400, { error: 'before is the next of the page before' });
+    const page = await store.listLinks(owner, { limit: limit + 1, ...(at ? { before: { createdAt: Number(at[1]), id: at[2]! } } : {}) });
+    const links = page.slice(0, limit).map((link) => ({
+      id: link.id,
+      manifestUrl: `${base(c)}/shl/${link.id}`,
+      createdAt: link.createdAt,
+      expiresAt: link.expiresAt,
+      endedAt: link.endedAt,
+      active: isLive(link, seconds()),
+      passcodeRequired: link.passcodeRequired,
+      files: link.files,
+    }));
+    const last = links[links.length - 1];
+    return reply(200, { links, ...(page.length > limit && last ? { next: `${last.createdAt}.${last.id}` } : {}) });
+  }
+
+  // ---- the clients kept in the store, which the admin token manages ----
+
+  // A client as the admin API says it: never its token, nor the hash of it.
+  const settingsOf = (client: Client): ClientSettings => {
+    const { name: _name, id: _id, token: _token, tokenHash: _hash, ...settings } = client;
+    return settings;
+  };
+  const described = (client: StoredClient) => ({
+    id: client.id,
+    name: client.name,
+    source: 'api',
+    ...fromSettings(client.settings),
+    createdAt: client.createdAt,
+    updatedAt: client.updatedAt,
+  });
+  const describedConfigured = (known: Known) => ({ id: known.owner, name: known.client.name, source: 'config', ...fromSettings(settingsOf(known.client)) });
+
+  // A client the host was given is changed where it was given, and not here.
+  async function storedClient(c: C): Promise<StoredClient> {
+    const id = c.req.param('client')!;
+    if (configured.has(id)) {
+      throw new Refused(409, { error: `client ${id} is set in the host's settings (ADMIN_TOKEN or CLIENTS_FILE): change it there` });
+    }
+    const client = STORED_ID.test(id) ? await store.getClient(id) : null;
+    if (!client) throw new Refused(404, { error: 'there is no such client' });
+    return client;
+  }
+
+  // What a client is given, checked: problems are all said at once.
+  function readSettings(asked: Record<string, unknown>, { clearable }: { clearable: boolean }) {
+    const problems = checkFields(asked, 'the client', { name: 'string', ...SETTING_FIELDS }, { clearable });
+    const name = asked.name;
+    if (typeof name === 'string') {
+      if (!CLIENT_NAME.test(name)) problems.push('name is up to 100 letters, digits and . _ : @ -, and starts with a letter or digit');
+      else if (STORED_ID.test(name)) problems.push('name may not have the shape of a client id, cl_ and 22 characters');
+      else if (clients.some((known) => known.client.name === name)) {
+        throw new Refused(409, { error: `a client named ${name} is set in the host's settings` });
+      }
+    }
+    if (problems.length) throw new Refused(400, { error: problems.join('; ') });
+    return { name: typeof name === 'string' ? name : undefined, settings: toSettings(asked) };
+  }
+  const nameTaken = (name: string | undefined) => new Refused(409, { error: `a client named ${name} exists` });
+  const newToken = () => {
+    const token = base64url(randomBytes(32));
+    return { token, tokenHash: sha256(token).toString('hex') };
+  };
+
+  async function createClient(c: C, ctx: Ctx): Promise<Response> {
+    requireAdmin(c, ctx);
+    const asked = await readJson(c, ADMIN_JSON_LIMIT);
+    if (asked.name === undefined) throw new Refused(400, { error: 'name is required: it is what the logs say did a thing' });
+    const { name, settings } = readSettings(asked, { clearable: false });
+    const { token, tokenHash } = newToken();
+    const client: StoredClient = {
+      id: `cl_${base64url(randomBytes(16))}`,
+      name: name!,
+      tokenHash,
+      settings: settings as ClientSettings,
+      createdAt: seconds(),
+      updatedAt: seconds(),
+    };
+    try {
+      await store.createClient(client);
+    } catch (error) {
+      if (error instanceof NameTaken) throw nameTaken(name);
+      throw error;
+    }
+    emit('client.created', { clientId: client.id, client: client.name });
+    // The token is said this once. The host keeps only its hash.
+    return reply(201, { ...described(client), token });
+  }
+
+  async function listClients(c: C, ctx: Ctx): Promise<Response> {
+    requireAdmin(c, ctx);
+    const kept = await store.listClients();
+    return reply(200, { clients: [...clients.map(describedConfigured), ...kept.map(described)] });
+  }
+
+  async function getClient(c: C, ctx: Ctx): Promise<Response> {
+    requireAdmin(c, ctx);
+    const known = configured.get(c.req.param('client')!);
+    return reply(200, known ? describedConfigured(known) : described(await storedClient(c)));
+  }
+
+  async function changeClient(c: C, ctx: Ctx): Promise<Response> {
+    requireAdmin(c, ctx);
+    const current = await storedClient(c);
+    const { name, settings: change } = readSettings(await readJson(c, ADMIN_JSON_LIMIT), { clearable: true });
+    // A setting that is `null` is taken away, and the client has the host's own.
+    const settings: Record<string, unknown> = { ...current.settings };
+    for (const [field, value] of Object.entries(change)) {
+      if (value === null) delete settings[field];
+      else settings[field] = value;
+    }
+    let changed: StoredClient | null;
+    try {
+      changed = await store.updateClient(current.id, { ...(name ? { name } : {}), settings, updatedAt: seconds() });
+    } catch (error) {
+      if (error instanceof NameTaken) throw nameTaken(name);
+      throw error;
+    }
+    if (!changed) throw new Refused(404, { error: 'there is no such client' });
+    emit('client.changed', { clientId: changed.id, client: changed.name });
+    return reply(200, described(changed));
+  }
+
+  async function rotateClient(c: C, ctx: Ctx): Promise<Response> {
+    requireAdmin(c, ctx);
+    const current = await storedClient(c);
+    const { token, tokenHash } = newToken();
+    const changed = await store.updateClient(current.id, { tokenHash, updatedAt: seconds() });
+    if (!changed) throw new Refused(404, { error: 'there is no such client' });
+    emit('client.rotated', { clientId: changed.id, client: changed.name });
+    return reply(200, { ...described(changed), token });
+  }
+
+  // Revokes a client: its token is refused at once. Its links go on until they end, unless
+  // `endLinks=true`, which switches off every one that is still live.
+  async function revokeClient(c: C, ctx: Ctx): Promise<Response> {
+    requireAdmin(c, ctx);
+    const endLinks = c.req.query('endLinks');
+    if (endLinks !== undefined && !/^(true|false)$/.test(endLinks)) throw new Refused(400, { error: 'endLinks is true or false' });
+    const current = await storedClient(c);
+    if (!(await store.deleteClient(current.id))) throw new Refused(404, { error: 'there is no such client' });
+    emit('client.revoked', { clientId: current.id, client: current.name });
+    if (endLinks !== 'true') return reply(204);
+    let ended = 0;
+    let before: { createdAt: number; id: string } | undefined;
+    for (;;) {
+      const page = await store.listLinks(current.id, { limit: 200, ...(before ? { before } : {}) });
+      for (const listed of page) {
+        if (!isLive(listed, seconds())) continue;
+        const reason = await store.update(listed.id, async (link, tx) => (live(link) ? switchOff(link, tx, 'revoked') : undefined));
+        if (!reason) continue;
+        ended += 1;
+        metrics.count('shl_links_ended_total', { reason });
+        emit('link.ended', { id: listed.id, reason });
+      }
+      const last = page[page.length - 1];
+      if (page.length < 200 || !last) break;
+      before = { createdAt: last.createdAt, id: last.id };
+    }
+    return reply(200, { endedLinks: ended });
   }
 
   async function serveFile(c: C, ctx: Ctx): Promise<Response> {
@@ -640,7 +892,7 @@ export async function createHost(options: HostOptions): Promise<Host> {
     return {
       'access-control-allow-origin': matched,
       'access-control-allow-headers': 'authorization, content-type',
-      'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS',
+      'access-control-allow-methods': 'GET, POST, PATCH, DELETE, OPTIONS',
       'access-control-max-age': '600',
       ...(matched === '*' ? {} : { vary: 'Origin' }),
     };
@@ -741,12 +993,19 @@ export async function createHost(options: HostOptions): Promise<Host> {
       return reply(200, metrics.render(), 'text/plain; version=0.0.4');
     },
     create: makeLink,
+    list: listLinks,
     manifest,
     direct,
     'switch-off': switchOffByOwner,
     upload: putFile,
     access: accessList,
     file: serveFile,
+    'client-create': createClient,
+    clients: listClients,
+    client: getClient,
+    'client-change': changeClient,
+    'client-revoke': revokeClient,
+    'client-rotate': rotateClient,
   };
   for (const { method, path, route, kind } of ROUTES) {
     app.on(method, path, gate(route, kind), async (c) => handlers[route](c, c.get('ctx')));
