@@ -5,11 +5,12 @@
 //! parameters writers and search may use.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use refhir_fhirpath::{Host, Model, ModelBuilder};
 use refhir_persistence::{
-    ConformanceStore, ParamStatus, PersistError, StoredSearchParameter, StoredStructureDefinition,
+    ConformanceStore, ParamStatus, PersistError, SharedCatalog, StoredSearchParameter,
+    StoredStructureDefinition,
 };
 use refhir_types::{exact_key, valid_id, IndexId, TabletId};
 use refhir_validate::{
@@ -191,15 +192,81 @@ pub(crate) struct Warmth {
     terminology: refhir_validate::Resident,
 }
 
+/// What a catalog is compiled from the conformance tables: the part that is the same for every
+/// tenant that holds the same definitions, and so can be held once by all of them (see
+/// [`Catalog::open`]). A change to it makes a copy first, for the catalog that makes it.
 #[derive(Clone, Debug)]
-pub struct Catalog {
+struct Core {
     fhir_version: Option<String>,
     types: BTreeMap<String, ResourceModel>,
     path_model: Model,
     schema: Schema,
     terms: MemoryTerminology,
-    reference_policy: ReferencePolicy,
     compartments: BTreeMap<String, Compartment>,
+    /// Whether any stored expansion was made under other rules than the current ones, so that it
+    /// may be wrong and the stored expansions need rebuilding.
+    stale_expansions: bool,
+    /// Whether what the terminology and definitions read when used (see [`Catalog::open`]) is read
+    /// from the rows every tenant shares, and not from one tenant's own. A write of a tenant's
+    /// own terminology makes that wrong (see [`Catalog::detach_from_shared`]).
+    reads_shared_rows: bool,
+}
+
+/// The compiled catalogs that tenants of this process hold in common, by what they are made of.
+/// They are not kept alive by being here: one is let go when the last catalog that holds it is.
+struct SharedCores;
+
+impl SharedCores {
+    fn cores() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Core>>>
+    {
+        static CORES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Core>>>,
+        > = std::sync::OnceLock::new();
+        CORES.get_or_init(Default::default)
+    }
+
+    fn find(key: &str) -> Option<Arc<Core>> {
+        Self::cores()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// The core for `key`, built by `build` if no catalog holds one. One is built at a time, so
+    /// tenants that start together and share one build it once, and the process never holds a
+    /// load's peak for each of them. `build` gives `None` for a core that is not what `key` says
+    /// (the rows changed while it was read), which is not kept for others.
+    fn get_or_build(
+        key: &str,
+        build: impl FnOnce() -> Result<Option<Arc<Core>>, PersistError>,
+    ) -> Result<Option<Arc<Core>>, PersistError> {
+        if let Some(core) = Self::find(key) {
+            return Ok(Some(core));
+        }
+        static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one_at_a_time = BUILDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(core) = Self::find(key) {
+            return Ok(Some(core));
+        }
+        let Some(core) = build()? else {
+            return Ok(None);
+        };
+        let mut cores = Self::cores()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cores.retain(|_, held| held.strong_count() > 0);
+        cores.insert(key.to_string(), Arc::downgrade(&core));
+        Ok(Some(core))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Catalog {
+    core: Arc<Core>,
+    reference_policy: ReferencePolicy,
     /// Form Archiver: store QuestionnaireResponse, never return one.
     sdc_archiver: bool,
     /// Whether a PUT to an id that does not exist creates it under that id. Off by default: the
@@ -208,15 +275,13 @@ pub struct Catalog {
     /// Whether a rebuild of this catalog lets go of it before it builds the new one, instead of
     /// holding both. See [`Catalog::set_rebuild_in_place`].
     rebuild_in_place: bool,
-    /// Whether any stored expansion was made under other rules than the current ones, so that it
-    /// may be wrong and the stored expansions need rebuilding.
-    stale_expansions: bool,
 }
 
 impl Catalog {
     /// Whether any search parameter is still waiting for its backfill.
     pub fn has_pending_parameters(&self) -> bool {
-        self.types
+        self.core
+            .types
             .values()
             .any(|model| model.pending_params().next().is_some())
     }
@@ -231,6 +296,7 @@ impl Catalog {
         parameters: &[StoredSearchParameter],
     ) -> BTreeMap<String, Vec<SearchParam>> {
         let mut types: BTreeMap<String, ResourceModel> = self
+            .core
             .types
             .iter()
             .map(|(name, model)| {
@@ -253,7 +319,7 @@ impl Catalog {
     /// [`Catalog::compiled_parameters`] made. A type the catalog gained since is left as it is.
     pub fn set_parameters(&mut self, compiled: BTreeMap<String, Vec<SearchParam>>) {
         for (name, params) in compiled {
-            if let Some(model) = self.types.get_mut(&name) {
+            if let Some(model) = Arc::make_mut(&mut self.core).types.get_mut(&name) {
                 model.params = params;
             }
         }
@@ -264,25 +330,29 @@ impl Catalog {
     /// so the two sets are not held at once. That is a server that is starting; see
     /// [`Self::rebuild_in_place`].
     pub fn recompile_parameters(&mut self, parameters: &[StoredSearchParameter]) {
-        for model in self.types.values_mut() {
+        let core = Arc::make_mut(&mut self.core);
+        for model in core.types.values_mut() {
             model.params = Vec::new();
         }
-        add_parameters(&mut self.types, parameters);
+        add_parameters(&mut core.types, parameters);
     }
 
     pub fn empty() -> Self {
         Self {
-            fhir_version: None,
-            types: BTreeMap::new(),
-            path_model: Model::new(),
-            schema: Schema::default(),
-            terms: MemoryTerminology::default(),
+            core: Arc::new(Core {
+                fhir_version: None,
+                types: BTreeMap::new(),
+                path_model: Model::new(),
+                schema: Schema::default(),
+                terms: MemoryTerminology::default(),
+                compartments: compartment::load(&[]),
+                stale_expansions: false,
+                reads_shared_rows: false,
+            }),
             reference_policy: ReferencePolicy::Strict,
-            compartments: compartment::load(&[]),
             sdc_archiver: false,
             update_create: false,
             rebuild_in_place: false,
-            stale_expansions: false,
         }
     }
 
@@ -334,16 +404,17 @@ impl Catalog {
     /// catalog being replaced is still answering; [`Self::replace_terminology`] then only swaps.
     /// What is held depends on the definitions, which a terminology-only reload does not change.
     pub(crate) fn prepare_terminology(&self, part: &mut CompiledTerminology) {
-        part.terms.hold(&self.schema.checked_value_sets());
-        part.terms.warm(&self.terms.resident());
+        part.terms.hold(&self.core.schema.checked_value_sets());
+        part.terms.warm(&self.core.terms.resident());
         crate::memory::release_unused_memory();
     }
 
     /// Put terminology read by [`Self::open_terminology`] in place of this catalog's own.
     pub(crate) fn replace_terminology(&mut self, part: CompiledTerminology) {
-        self.terms = part.terms;
-        self.compartments = part.compartments;
-        self.stale_expansions = part.stale_expansions;
+        let core = Arc::make_mut(&mut self.core);
+        core.terms = part.terms;
+        core.compartments = part.compartments;
+        core.stale_expansions = part.stale_expansions;
     }
 
     /// Read the conformance tables and compile them.
@@ -358,11 +429,83 @@ impl Catalog {
     /// A store that can give a handle to itself (see [`ConformanceStore::shared`]) gets a catalog
     /// that keeps an index of its definitions and reads each from the store when it is first
     /// used; any other is read whole, as [`Self::open_whole`] does.
+    ///
+    /// A store whose catalog is made of what its tenants share (see
+    /// [`ConformanceStore::shared_catalog`]) gets the compiled catalog the other tenants of the
+    /// process hold, if there is one, without reading the tables, and makes it for them to share if
+    /// there is not. A change to a catalog that shares makes it a copy of its own first, so one
+    /// tenant's definitions never reach another.
     pub fn open(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
+        match store.shared_catalog() {
+            Ok(Some(shared)) => {
+                if let Some(catalog) = Self::open_shared(store, shared)? {
+                    return Ok(catalog);
+                }
+            }
+            Ok(None) => {}
+            // Whether a catalog can be shared is only a saving, and the tables are read in any
+            // case: a catalog that cannot be asked about is read as the tenant's own.
+            Err(err) => tracing::warn!(
+                target: "refhir_engine",
+                "could not tell whether the catalog can be shared, loading one of its own: {err}"
+            ),
+        }
+        Self::open_own(store)
+    }
+
+    /// [`Self::open`] for a catalog that is not shared with other tenants: it reads what it holds
+    /// no more than an index of from this store's own rows.
+    pub(crate) fn open_own(store: &dyn ConformanceStore) -> Result<Self, PersistError> {
         let source = store
             .shared()
             .map(|shared| Arc::new(StoreSource::new(shared)));
         Self::open_from(store, source)
+    }
+
+    /// The catalog of what `shared` is the key of, or `None` if the rows changed while it was
+    /// being made, so that it is not what the key says.
+    fn open_shared(
+        store: &dyn ConformanceStore,
+        shared: SharedCatalog,
+    ) -> Result<Option<Self>, PersistError> {
+        let core = SharedCores::get_or_build(&shared.key, || {
+            let source = Arc::new(StoreSource::new(shared.source.clone()));
+            let mut catalog = Self::open_from(store, Some(source))?;
+            // The key was made before the tables were read. A core built from rows another writer
+            // changed since would be kept for every tenant with the old key.
+            match store.shared_catalog() {
+                Ok(Some(again)) if again.key == shared.key => {}
+                _ => return Ok(None),
+            }
+            let core = Arc::get_mut(&mut catalog.core).expect("a catalog just built is not shared");
+            core.reads_shared_rows = true;
+            Ok(Some(catalog.core))
+        })?;
+        Ok(core.map(Self::from_core))
+    }
+
+    /// Whether this catalog reads what it does not hold from rows that tenants share, which a
+    /// tenant's own terminology is not among.
+    pub fn reads_shared_rows(&self) -> bool {
+        self.core.reads_shared_rows
+    }
+
+    /// Make this catalog one that reads from `store`'s own rows, keeping its settings, before a
+    /// change of the tenant's own terminology is applied to it: the shared rows it read from do
+    /// not have what the tenant wrote, so what it read afterwards would answer as if it were absent.
+    pub(crate) fn detach_from_shared(
+        catalog: &RwLock<Self>,
+        store: &dyn ConformanceStore,
+    ) -> Result<(), PersistError> {
+        if !catalog.read().expect("catalog").reads_shared_rows() {
+            return Ok(());
+        }
+        let own = Self::open_own(store)?;
+        let mut guard = catalog.write().expect("catalog");
+        if guard.reads_shared_rows() {
+            guard.take_definitions_of(own);
+        }
+        Ok(())
     }
 
     /// [`Self::open`] with every definition read and compiled now, whatever the store can do. It
@@ -395,8 +538,9 @@ impl Catalog {
             // against and the code systems behind them. A request of any common kind finds all of
             // it in memory. What it uses beyond that (a profile, an extension, a table nothing
             // binds) is read when it is first used.
-            let checked = catalog.schema.checked_value_sets();
-            catalog.terms.hold(&checked);
+            let core = Arc::get_mut(&mut catalog.core).expect("a catalog just built is not shared");
+            let checked = core.schema.checked_value_sets();
+            core.terms.hold(&checked);
         }
         // The load parsed several times what the catalog keeps; do not let the process stay at
         // that peak.
@@ -409,18 +553,26 @@ impl Catalog {
         definitions: CompiledDefinitions,
         terminology: CompiledTerminology,
     ) -> Self {
-        Self {
+        Self::from_core(Arc::new(Core {
             fhir_version,
             types: definitions.types,
             path_model: definitions.path_model,
             schema: definitions.schema,
             terms: terminology.terms,
-            reference_policy: ReferencePolicy::Strict,
             compartments: terminology.compartments,
+            stale_expansions: terminology.stale_expansions,
+            reads_shared_rows: false,
+        }))
+    }
+
+    /// A catalog of `core`, with every setting at its default.
+    fn from_core(core: Arc<Core>) -> Self {
+        Self {
+            core,
+            reference_policy: ReferencePolicy::Strict,
             sdc_archiver: false,
             update_create: false,
             rebuild_in_place: false,
-            stale_expansions: terminology.stale_expansions,
         }
     }
 
@@ -428,8 +580,8 @@ impl Catalog {
     /// replaces it can be told to read at once (see [`Self::warm`]).
     pub(crate) fn warmth(&self) -> Warmth {
         Warmth {
-            structures: self.schema.resident(),
-            terminology: self.terms.resident(),
+            structures: self.core.schema.resident(),
+            terminology: self.core.terms.resident(),
         }
     }
 
@@ -437,15 +589,38 @@ impl Catalog {
     /// answered back to waiting for reads. It is done before the catalog is put in place, while
     /// the one it replaces is still answering.
     pub(crate) fn warm(&self, warmth: &Warmth) {
-        self.schema.warm(&warmth.structures);
-        self.terms.warm(&warmth.terminology);
+        self.core.schema.warm(&warmth.structures);
+        self.core.terms.warm(&warmth.terminology);
     }
 
     /// Whether any stored expansion was made under other rules than the current ones. A database
     /// the previous version rebuilt has expansions read from one pool for every package, and
     /// nothing else would ever correct them.
     pub fn expansions_stale(&self) -> bool {
-        self.stale_expansions
+        self.core.stale_expansions
+    }
+
+    /// The catalog that tenants with the same definitions hold, if this store's are such, as
+    /// [`Catalog::open`] gives it, and `None` if they are not.
+    pub(crate) fn open_if_shared(
+        store: &dyn ConformanceStore,
+    ) -> Result<Option<Self>, PersistError> {
+        match store.shared_catalog()? {
+            Some(shared) => Self::open_shared(store, shared),
+            None => Ok(None),
+        }
+    }
+
+    /// Take the compiled definitions of `other`, a catalog opened from the same store, and keep
+    /// every setting this one has.
+    pub(crate) fn take_definitions_of(&mut self, other: Catalog) {
+        self.core = other.core;
+    }
+
+    /// Whether both catalogs hold the one compiled copy of the definitions that tenants with the
+    /// same definitions share (see [`Catalog::open`]), and so the memory of one.
+    pub fn shares_definitions_with(&self, other: &Catalog) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
     }
 
     pub fn reference_policy(&self) -> ReferencePolicy {
@@ -499,47 +674,49 @@ impl Catalog {
     }
 
     pub fn compartment(&self, code: &str) -> Option<&Compartment> {
-        self.compartments.get(code)
+        self.core.compartments.get(code)
     }
 
     pub fn resource_models(&self) -> impl Iterator<Item = &ResourceModel> {
-        self.types.values()
+        self.core.types.values()
     }
 
     pub fn path_model(&self) -> &Model {
-        &self.path_model
+        &self.core.path_model
     }
 
     pub fn schema(&self) -> &Schema {
-        &self.schema
+        &self.core.schema
     }
 
     pub fn terms(&self) -> &MemoryTerminology {
-        &self.terms
+        &self.core.terms
     }
 
     /// For a change to terminology alone, applied in place rather than by rebuilding the whole
     /// catalog from the store.
     pub(crate) fn terms_mut(&mut self) -> &mut MemoryTerminology {
-        &mut self.terms
+        &mut Arc::make_mut(&mut self.core).terms
     }
 
     pub fn get(&self, name: &str) -> Result<&ResourceModel, FhirError> {
-        self.types
+        self.core
+            .types
             .get(name)
             .ok_or_else(|| FhirError::UnknownResource(format!("unknown resource type {name}")))
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.types.contains_key(name)
+        self.core.types.contains_key(name)
     }
 
     pub fn fhir_version(&self) -> &str {
-        self.fhir_version.as_deref().unwrap_or("4.0.1")
+        self.core.fhir_version.as_deref().unwrap_or("4.0.1")
     }
 
     pub fn capability_statement(&self) -> Value {
         let resources: Vec<Value> = self
+            .core
             .types
             .values()
             .map(|model| {
@@ -1093,6 +1270,7 @@ mod tests {
     /// What a type's parameters come to, for comparing two catalogs.
     fn parameters_of(catalog: &Catalog) -> BTreeMap<String, String> {
         catalog
+            .core
             .types
             .iter()
             .map(|(name, model)| (name.clone(), format!("{:?}", model.params)))
@@ -1135,5 +1313,40 @@ mod tests {
                 .is_some(),
             "the parameter the package added is searchable"
         );
+    }
+}
+
+#[cfg(test)]
+mod shared_core_tests {
+    use super::*;
+
+    #[test]
+    fn a_change_to_a_catalog_that_shares_its_definitions_makes_a_copy_for_that_catalog_only() {
+        let first = Catalog::empty();
+        let second = first.clone();
+        assert!(first.shares_definitions_with(&second));
+        // Settings are the catalog's own, and are not part of what is shared.
+        let mut configured = first.clone();
+        configured.set_update_create(true);
+        configured.set_reference_policy(ReferencePolicy::Fhir);
+        configured.set_sdc_archiver(true);
+        assert!(configured.shares_definitions_with(&first));
+        assert!(!first.update_create() && first.reference_policy() == ReferencePolicy::Strict);
+        // A change to the definitions copies them first, for the one that makes it.
+        let mut terminology = first.clone();
+        terminology.terms_mut();
+        assert!(!terminology.shares_definitions_with(&first));
+        assert!(first.shares_definitions_with(&second));
+        let mut parameters = first.clone();
+        parameters.recompile_parameters(&[]);
+        assert!(!parameters.shares_definitions_with(&first));
+        let mut replaced = first.clone();
+        replaced.replace_terminology(CompiledTerminology {
+            terms: MemoryTerminology::default(),
+            compartments: compartment::load(&[]),
+            stale_expansions: true,
+        });
+        assert!(!replaced.shares_definitions_with(&first));
+        assert!(replaced.expansions_stale() && !first.expansions_stale());
     }
 }

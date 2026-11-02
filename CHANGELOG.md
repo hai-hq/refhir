@@ -28,6 +28,13 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   `DELETE /admin/tenants/{name}` (a soft delete with a grace period, an export of the tenant's
   resources first and a hook URL told afterwards), `POST /admin/tenants/{name}/restore`, and
   `GET /admin/metrics`. Every process of a deployment follows the tenant registry within moments.
+- **Tenants that hold the same definitions share one compiled catalog in a process.** A process
+  that serves many tenants kept a full copy of the catalog for each (tens of megabytes for the R4
+  core); now every tenant given only the release's own packages holds the one copy, and a change a
+  tenant makes (a package, a SearchParameter or terminology it writes) is made to a copy of its
+  own, so it is never seen by another. The built-in terminology is stored once for the tenants
+  of a database, like the release's packages (tenants made before keep the copy they have).
+  `GET /admin/tenants/{name}` says whether a tenant holds the shared catalog (`served.shared_catalog`).
 - **Per-tenant limits and metrics:** requests a second, storage in bytes and a share of the
   connection pool, and Prometheus counters labelled by tenant.
 - `refhir tenant` gained `show`, `restore` and `purge`, and `create` takes a tenant's settings as

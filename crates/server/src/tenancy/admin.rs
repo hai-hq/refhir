@@ -536,6 +536,11 @@ fn with_served(host: &TenantHost, mut tenant: Value) -> Value {
     if let Some(TenantState::Unavailable(reason)) = host.state(&name) {
         served["detail"] = json!(reason);
     }
+    if let Some(TenantState::Ready(app)) = host.state(&name) {
+        // Whether it holds the compiled definitions that tenants with the same ones hold in
+        // common, which is most of what a tenant costs in memory.
+        served["shared_catalog"] = json!(app.catalog.read().expect("catalog").reads_shared_rows());
+    }
     if let Some(counters) = host.counters(&name) {
         served["metrics"] = counters.json();
     }

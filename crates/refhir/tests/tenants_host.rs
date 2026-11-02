@@ -37,6 +37,54 @@ fn types_package(tag: &str) -> PathBuf {
     dir
 }
 
+struct NoNetwork;
+
+impl refhir_fhir::PackageFetcher for NoNetwork {
+    fn fetch(&self, name: &str, version: &str, _dest: &Path) -> Result<(), refhir_fhir::FhirError> {
+        panic!("{name}@{version} was fetched, and nothing here may fetch");
+    }
+}
+
+/// A file of prepared packages for the release (R4 core and SDC, tiny ones), as a release archive
+/// has, so that every tenant is given them from the one shared copy.
+fn prepared_packages(tag: &str) -> PathBuf {
+    let scratch =
+        std::env::temp_dir().join(format!("refhir-host-bundle-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let minir4 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/fixtures/minir4");
+    let core = scratch.join("core");
+    std::fs::create_dir_all(&core).unwrap();
+    for entry in std::fs::read_dir(&minir4).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), core.join(entry.file_name())).unwrap();
+    }
+    std::fs::write(
+        core.join("package.json"),
+        r#"{"name":"hl7.fhir.r4.core","version":"4.0.1","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(core.join(".complete"), "ab".repeat(32)).unwrap();
+    let sdc = types_package("sdc");
+    std::fs::write(
+        sdc.join("package.json"),
+        r#"{"name":"hl7.fhir.uv.sdc","version":"4.0.0","fhirVersion":"4.0.1"}"#,
+    )
+    .unwrap();
+    std::fs::write(sdc.join(".complete"), "cd".repeat(32)).unwrap();
+    let bundle = scratch.join("packages.bundle");
+    refhir_fhir::write_prepared(
+        &bundle,
+        &[
+            core.to_str().unwrap().to_string(),
+            sdc.to_str().unwrap().to_string(),
+        ],
+        &NoNetwork,
+        &scratch.join("cache"),
+    )
+    .unwrap();
+    bundle
+}
+
 struct Host {
     child: Child,
     port: u16,
@@ -46,21 +94,37 @@ struct Host {
 
 impl Host {
     fn start(name: &str, database: &str, args: &[&str]) -> Host {
+        Self::spawn(name, database, args, None)
+    }
+
+    /// A host whose tenants are given the release's packages from `bundle` (a file of prepared
+    /// packages, as a release archive has), which tenants share, instead of a package directory.
+    fn start_with_bundle(name: &str, database: &str, args: &[&str], bundle: &Path) -> Host {
+        Self::spawn(name, database, args, Some(bundle))
+    }
+
+    fn spawn(name: &str, database: &str, args: &[&str], bundle: Option<&Path>) -> Host {
         let port = free_port();
         let dir = std::env::temp_dir().join(format!("refhir-host-{name}-{port}"));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("server.log");
         let file = std::fs::File::create(&log).unwrap();
         let minir4 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/fixtures/minir4");
-        let child = Command::new(env!("CARGO_BIN_EXE_refhir"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_refhir"));
+        command
             .current_dir(&dir)
             .args(["--postgres", database, "--all-tenants"])
             .args(["--bind", &format!("127.0.0.1:{port}")])
-            .arg("--package")
-            .arg(&minir4)
             .args(["--export-dir", dir.join("export").to_str().unwrap()])
-            .args(args)
-            .env("REFHIR_SKIP_DEFAULT_PACKAGES", "1")
+            .args(args);
+        match bundle {
+            Some(bundle) => command.env("REFHIR_PACKAGE_BUNDLE", bundle),
+            None => command
+                .arg("--package")
+                .arg(&minir4)
+                .env("REFHIR_SKIP_DEFAULT_PACKAGES", "1"),
+        };
+        let child = command
             .env("REFHIR_ADMIN_TOKEN", TOKEN)
             // The same on every process of a deployment, as tenants' SMART secrets come from them.
             .env("REFHIR_SMART_DCR_TOKEN", "test-dcr-token")
@@ -366,6 +430,53 @@ fn tenants_are_created_over_http_and_served_at_once_by_the_one_process() {
     let _ = std::fs::remove_dir_all(package);
 }
 
+/// What a process that serves many tenants costs per tenant depends on tenants with the same
+/// definitions holding one compiled copy of them, which happens only if every step of opening a
+/// tenant (its packages, the built-in terminology, the repair) leaves it with what the others
+/// have. The admin API says whether a tenant holds the shared one.
+#[test]
+fn tenants_given_the_same_packages_share_one_catalog() {
+    let Some(admin) = admin_url("tenants host: shared catalog") else {
+        return;
+    };
+    let (_database, app) = database_of_an_ordinary_role(&admin, "hostshare");
+    let bundle = prepared_packages("share");
+    let mut host = Host::start_with_bundle("share", &app, &[], &bundle);
+    host.wait_ready();
+    for name in ["a", "b"] {
+        let (status, created) = host.admin("POST", "/admin/tenants", Some(create_body(name)));
+        assert_eq!(status, 201, "{created}\n{}", host.log());
+        assert_eq!(created["served"]["status"], "ready", "{created}");
+        host.wait_serving(name);
+    }
+    // One with a package of its own holds a catalog of its own.
+    let own = types_package("own");
+    let mut body = create_body("own");
+    body["packages"] = json!([own.to_str().unwrap()]);
+    let (status, created) = host.admin("POST", "/admin/tenants", Some(body));
+    assert_eq!(status, 201, "{created}\n{}", host.log());
+    host.wait_serving("own");
+    for (name, shared) in [("a", true), ("b", true), ("own", false)] {
+        let (status, tenant) = host.admin("GET", &format!("/admin/tenants/{name}"), None);
+        assert_eq!(status, 200, "{tenant}");
+        assert_eq!(
+            tenant["served"]["shared_catalog"],
+            json!(shared),
+            "tenant {name}: {tenant}\n{}",
+            host.log()
+        );
+    }
+    // A restart gives the same: the tenants are opened again and put with each other's.
+    host.kill();
+    let mut host = Host::start_with_bundle("share-again", &app, &[], &bundle);
+    host.wait_ready();
+    for name in ["a", "b"] {
+        host.wait_serving(name);
+        let (_, tenant) = host.admin("GET", &format!("/admin/tenants/{name}"), None);
+        assert_eq!(tenant["served"]["shared_catalog"], json!(true), "{tenant}");
+    }
+}
+
 #[test]
 fn a_restart_serves_every_tenant_as_it_was() {
     let Some(admin) = admin_url("tenants host: restart") else {
@@ -447,6 +558,9 @@ fn deleting_a_tenant_while_it_serves_traffic_leaves_the_others_serving() {
                         call("GET", &format!("{base}/t/{name}/Patient/p1"), &[], None).0
                     };
                     *seen.entry(status).or_default() += 1;
+                    // Each request is a connection of its own: without a pause a worker uses up
+                    // the machine's ports, and a request then fails in the client.
+                    std::thread::sleep(Duration::from_millis(2));
                 }
                 (name, seen)
             })

@@ -470,3 +470,106 @@ fn storage_is_measured_per_tenant() {
     assert!(big.bytes() > 20 * 1_000, "{big:?}");
     assert!(small.bytes() < 1_000, "{small:?}");
 }
+
+/// What a tenant of a shared pool says about the catalog it can share with others (the SQL behind
+/// it reads instance 0 and the tenant's own rows, as the application's role): tenants holding the
+/// same definitions say the same key and read the same rows, a tenant's own terminology or a
+/// package of its own ends it, an expansion it changed is carried beside the shared copy, and a
+/// database of another name says another key.
+#[test]
+fn tenants_of_one_pool_with_the_same_definitions_say_the_same_catalog() {
+    use crate::tenancy_catalog_tests::{demo, install};
+    use refhir_persistence::{ConformanceStore, ExpansionChange, NewTerminology};
+
+    let Some(admin) = test_url("tenancy: shared catalog key") else {
+        return;
+    };
+    let url = shared(&admin, "tshcat", &["a", "b", "c", "d"]);
+    let pool = connections(&app_url(&url), 2);
+    let open = |name: &str| PostgresPersistence::open_tenant(&pool, name, 1).unwrap();
+    let (a, b, c, d) = (open("a"), open("b"), open("c"), open("d"));
+    let package = demo("shared", "4.0.1");
+    let (installed, _) = install(&a, &package, "sha-1").unwrap();
+    install(&b, &package, "sha-1").unwrap();
+
+    // Nothing shared yet for a tenant that has no package.
+    assert!(c.shared_catalog().unwrap().is_none());
+    let (ka, kb) = (
+        a.shared_catalog().unwrap().expect("a shares"),
+        b.shared_catalog().unwrap().expect("b shares"),
+    );
+    assert_eq!(ka.key, kb.key);
+    let database = crate::test_support::database_name(&url);
+    assert!(
+        ka.key.contains(&database),
+        "{} does not name the database {database}",
+        ka.key
+    );
+
+    // What every tenant reads from it is the shared copy, whichever tenant it was made from.
+    let url_0 = package.expansions[0].url.clone();
+    let from_base = ka.source.load_expansion_json(installed.package_id, &url_0);
+    assert_eq!(from_base.unwrap().as_deref(), Some(r#"{"expansion":0}"#));
+    assert!(ka
+        .source
+        .load_expansion_json(installed.package_id, "http://example.org/none")
+        .unwrap()
+        .is_none());
+
+    // The same package in another database says another key: the ids are each database's own.
+    let other = shared(&admin, "tshcat2", &["a"]);
+    let other_pool = connections(&app_url(&other), 2);
+    let other_a = PostgresPersistence::open_tenant(&other_pool, "a", 1).unwrap();
+    install(&other_a, &package, "sha-1").unwrap();
+    let other_key = other_a.shared_catalog().unwrap().expect("shares").key;
+    assert_ne!(other_key, ka.key);
+
+    // A tenant that changed an expansion of the shared package says another key, and its source
+    // answers with what it changed; the others' still answer with the shared copy.
+    a.apply_expansions(&[ExpansionChange {
+        package_id: installed.package_id,
+        url: url_0.clone(),
+        json: Some(r#"{"expansion":"changed by a"}"#.into()),
+    }])
+    .unwrap();
+    let changed = a.shared_catalog().unwrap().expect("a still shares");
+    assert_ne!(changed.key, kb.key);
+    assert_eq!(
+        changed
+            .source
+            .load_expansion_json(installed.package_id, &url_0)
+            .unwrap()
+            .as_deref(),
+        Some(r#"{"expansion":"changed by a"}"#)
+    );
+    assert_eq!(
+        b.shared_catalog().unwrap().unwrap().key,
+        kb.key,
+        "b's key changed with a's"
+    );
+    assert_eq!(
+        b.shared_catalog()
+            .unwrap()
+            .unwrap()
+            .source
+            .load_expansion_json(installed.package_id, &url_0)
+            .unwrap()
+            .as_deref(),
+        Some(r#"{"expansion":0}"#)
+    );
+
+    // A tenant's own terminology is not in the shared rows, so it shares nothing from then on.
+    install(&d, &package, "sha-1").unwrap();
+    assert!(d.shared_catalog().unwrap().is_some());
+    let local = d.ensure_local_package("4.0.1").unwrap();
+    d.upsert_terminology(
+        local,
+        &NewTerminology {
+            resource_type: "CodeSystem".into(),
+            url: "http://example.org/d-own".into(),
+            json: r#"{"resourceType":"CodeSystem"}"#.into(),
+        },
+    )
+    .unwrap();
+    assert!(d.shared_catalog().unwrap().is_none());
+}

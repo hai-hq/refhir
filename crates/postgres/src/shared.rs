@@ -55,6 +55,18 @@ impl Connections {
         }
     }
 
+    /// Whether the pool is one that several tenants share, and so has a share of it for each.
+    pub(crate) fn is_shared(&self) -> bool {
+        self.share.is_some()
+    }
+
+    /// The same pool, for reading as `scope` through up to `share` of its connections. `None` for
+    /// a pool of this persistence's own, which no other scope shares.
+    pub(crate) fn with_scope(&self, scope: Scope, share: usize) -> Option<Self> {
+        self.share.as_ref()?;
+        Some(Self::shared(self.pool.clone(), scope, share))
+    }
+
     /// `Mutex::lock` shape, as the pool's own: waits for a connection, which then serves this
     /// persistence's tenant.
     pub(crate) fn lock(&self) -> Result<Checkout<'_>, PersistError> {

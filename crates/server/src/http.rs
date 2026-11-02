@@ -184,6 +184,8 @@ impl Stop {
 /// tenants keeps for each.
 pub struct TenantApp {
     pub router: Router,
+    /// The server's catalog, to say what it holds (see `Catalog::reads_shared_rows`).
+    pub catalog: Arc<RwLock<Catalog>>,
     pub governance: Arc<crate::governance::Governance>,
     pub stop: Stop,
 }
@@ -444,10 +446,11 @@ pub fn tenant_app(
         .with_state(state);
     // Hooks, subscriptions and terminology fetches run where commits are made.
     if !db.is_read_only() {
-        crate::jobs::attach(db, catalog, store, &config, sockets, stop.clone());
+        crate::jobs::attach(db, catalog.clone(), store, &config, sockets, stop.clone());
     }
     TenantApp {
         router,
+        catalog,
         governance,
         stop,
     }

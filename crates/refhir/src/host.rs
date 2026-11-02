@@ -687,6 +687,19 @@ impl Manager {
                 persistence.release_writer_lease();
                 return Err(err.to_string());
             }
+            // The installs above changed the catalog in place and left it a copy of its own. If
+            // what it holds is what other tenants hold, it is put with theirs: a process that
+            // serves many tenants keeps one copy of the definitions they have in common.
+            match refhir_fhir::share_catalog(store.as_ref(), &catalog) {
+                Ok(true) => tracing::info!("tenant `{name}` shares its catalog with the others"),
+                Ok(false) => tracing::info!(
+                    "tenant `{name}` keeps a catalog of its own: its definitions are not only \
+                     what the tenants share"
+                ),
+                Err(err) => {
+                    tracing::warn!("tenant `{name}` keeps its own copy of the catalog: {err}")
+                }
+            }
             (db, catalog)
         };
         let policy = refhir_fhir::ReferencePolicy::parse(&self.cfg.references)

@@ -197,12 +197,16 @@ So a process needs the pool's size plus three connections however many tenants i
 security binds every one of these connections to the tenant it is serving at that moment, so a pool
 that is shared is not a way across tenants.
 
-**Memory.** Each tenant a process serves keeps its own copy of the catalog (the definitions,
-search parameters and terminology index it validates and searches with) in memory, so the process
-grows with the number of tenants it serves: plan on roughly 40 to 60 MB for each, with the R4 core
-packages, and give the process memory for all of them. A process opens a few tenants at a time
-when it starts, so a restart does not load every catalog at once, but it does end up holding them
-all.
+**Memory.** A tenant's catalog (the definitions, search parameters and terminology index it
+validates and searches with) is held in memory, and tens of megabytes for the R4 core packages.
+Tenants that hold the same definitions, which is every tenant given the release's own packages
+and nothing of its own, share **one compiled copy** in a process, so each adds only what is its
+own: a few megabytes for the connections, caches and search parameters it keeps. A tenant that has
+packages of its own (listed when it was created, or installed through `$install`), or whose
+catalog was changed by writing a SearchParameter, CodeSystem, ValueSet or ConceptMap, holds a catalog
+of its own, and counts the full amount. A change to a shared catalog is made to a copy for the tenant that makes it, so it is
+never seen by another tenant. A process opens a few tenants at a time when it starts, so a restart
+does not compile every catalog at once.
 
 A tenant may hold at most its **share** of the pool at once, so one busy tenant cannot keep the
 others waiting for a connection: `connections_per_tenant` (default half the pool, and at most all
@@ -239,7 +243,7 @@ on the public one.
 |---------|------|
 | `POST /admin/tenants` | Creates a tenant and opens it before it answers: `201` with the tenant. Idempotent: the same body again is `200` with the tenant that is there, and a different body for an existing name is `409`. A tenant that cannot be opened is not kept (`422`), so the request can be sent again once it is fixed |
 | `GET /admin/tenants` | Every tenant, with its status and how this process serves it |
-| `GET /admin/tenants/{name}` | One tenant: status, settings, its public URL, the packages and versions it holds, its size (documents and index rows, in rows and bytes), and this process's counters for it |
+| `GET /admin/tenants/{name}` | One tenant: status, settings, its public URL, the packages and versions it holds, its size (documents and index rows, in rows and bytes), whether it holds the compiled catalog that tenants with the same definitions share (`served.shared_catalog`), and this process's counters for it |
 | `DELETE /admin/tenants/{name}` | Soft delete: the tenant is not served from then on, and its rows are removed once the grace period is over. `?grace=24h` (`30s`, `15m`, `24h`, `7d`; default `[tenants] delete_grace`, 7 days) and `?export=false` change that. `grace=0` removes it at once |
 | `POST /admin/tenants/{name}/restore` | Brings back a deleted tenant whose rows have not been removed |
 | `GET /admin/metrics` | Per-tenant counters, as above |

@@ -185,6 +185,9 @@ pub struct PostgresPersistence {
     /// another tenant's rows whatever it asks. False for the classic layout, and for a role that
     /// bypasses row-level security (a superuser, or one with BYPASSRLS).
     row_security: bool,
+    /// For a reader of what every tenant shares: the expansions a catalog made for one tenant holds
+    /// beyond the shared copy's, which the catalog reads from here. Empty for any other.
+    overlay: Arc<std::collections::HashMap<(i64, String), String>>,
 }
 
 impl PostgresPersistence {
@@ -223,6 +226,7 @@ impl PostgresPersistence {
                 scope,
                 announcer,
                 row_security,
+                overlay: Arc::default(),
             })
         })
     }
@@ -256,6 +260,7 @@ impl PostgresPersistence {
             scope,
             announcer,
             row_security: shared.row_security,
+            overlay: Arc::default(),
         })
     }
 }
@@ -336,6 +341,32 @@ fn open_layout(client: &mut Conn, options: &ConnectOptions) -> Result<Scope, Per
 }
 
 impl PostgresPersistence {
+    /// A reader of what every tenant shares (the catalog's instance), through the same pool as this
+    /// tenant, for a catalog that tenants share to read its definitions through: it is nobody's
+    /// tenant, so it goes on working when the tenant it was made from has gone. `None` unless this
+    /// persistence is one of several tenants' of one pool.
+    pub(crate) fn base_view(
+        &self,
+        overlay: std::collections::HashMap<(i64, String), String>,
+    ) -> Option<Self> {
+        let inner = self.inner.with_scope(Scope::CATALOG, 1)?;
+        Some(Self {
+            inner: Arc::new(inner),
+            listener: Arc::new(Listener::Own(Box::new(std::sync::Mutex::new(None)))),
+            gate: Arc::new(std::sync::Mutex::new(())),
+            lease: Arc::new(lease::LeaseState::new(Scope::CATALOG)),
+            url: self.url.clone(),
+            scope: Scope::CATALOG,
+            announcer: announce::Announcer::new(
+                std::time::Duration::ZERO,
+                Scope::CATALOG.channel(),
+                self.url.clone(),
+            ),
+            row_security: self.row_security,
+            overlay: Arc::new(overlay),
+        })
+    }
+
     /// Whether the database itself keeps this process to its own tenant's rows (see the
     /// `row_security` field).
     pub fn row_security_applies(&self) -> bool {
