@@ -62,6 +62,35 @@ Installing the same version again, or a version older than the one the server ho
 | `--primary-url url` | Where a replica sends writes (or `REFHIR_PRIMARY_URL`) |
 | `--db-pool n` | Most Postgres connections (default 8), or on SQLite the read connections next to its one writer (default 4); or `REFHIR_DB_POOL` |
 | `--tenant name` | The tenant this process serves, in a Postgres database that many tenants share (`tenant` under `[database]`, or `REFHIR_TENANT`). See [Tenants](clustering.md#tenants-on-one-database) |
+| `--all-tenants` | Serve every tenant of a shared Postgres database from this process (`serve_all` under `[tenants]`, or `REFHIR_ALL_TENANTS=1`). Not with `--tenant`. See [Many tenants in one process](clustering.md#many-tenants-in-one-process) |
+| `--tenant-path-prefix path` | With `--all-tenants`, tenants are at `{path}/{tenant}/…` (default `/t`; empty turns path routing off; `path_prefix` under `[tenants]`) |
+| `--tenant-domain domain` | With `--all-tenants`, tenants are also at `{tenant}.{domain}` (`domain` under `[tenants]`) |
+| `--admin-bind host:port` | With `--all-tenants`, serve the admin API and the probes on a listener of their own (`admin_bind` under `[tenants]`) |
 | `refhir package-bundle [--out file]` | Prepare the release's FHIR packages ahead of time into one file that a first start installs instead of downloading them. See [Preparing the packages](../deploy/production.md#preparing-the-packages) |
-| `refhir tenant create\|list\|delete` | Add, list and remove the tenants of a shared Postgres database. See [Tenants](clustering.md#tenants-on-one-database) |
+| `refhir tenant create\|list\|show\|delete\|restore\|purge` | Add, list, remove and bring back the tenants of a shared Postgres database. See [Tenants](clustering.md#tenants-on-one-database) |
 | `refhir migrate --status\|--dry-run` | Report the database's schema version and what startup would do to it, without changing anything. See [Schema migrations](migrations.md) |
+
+## Serving many tenants (`[tenants]`)
+
+Read when the process is started with `--all-tenants`. See
+[Many tenants in one process](clustering.md#many-tenants-in-one-process) for what each does.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `serve_all` | `false` | Same as `--all-tenants`; or `REFHIR_ALL_TENANTS=1` |
+| `path_prefix` | `"/t"` | Tenants are at `{path_prefix}/{tenant}/…`. `""` turns it off |
+| `domain` | none | Tenants are at `{tenant}.{domain}` |
+| `public_url` | `--public-url` | Each tenant's address: `https://{tenant}.fhir.example.com`, or `https://fhir.example.com/t/{tenant}`, or a base the path prefix is added to. Required unless the bind is loopback |
+| `admin_token` | none | Bearer token of the admin API; prefer `REFHIR_ADMIN_TOKEN`. Without one the admin API refuses everything |
+| `admin_bind` | none | A listener of its own for `/admin` and the probes |
+| `connections_per_tenant` | half of `--db-pool` | Pool connections one tenant may hold at once |
+| `delete_grace` | `"7d"` | How long a deleted tenant's rows are kept (`30s`, `15m`, `24h`, `7d`) |
+| `export_on_delete` | `true` | Write a tenant's resources out before it is deleted |
+| `delete_hook` | none | A URL sent a `POST` when a tenant is deleted |
+| `storage_check_interval` | `"5m"` | How often each tenant's storage is measured |
+| `limits.requests_per_second`, `limits.burst`, `limits.storage_bytes`, `limits.connections` | none | The limits of a tenant that sets none of its own |
+
+With `--all-tenants`, `--db-pool` defaults to 16, `[health_cards] key_file` is refused (each tenant
+signs with a key of its own, from `health_cards` at creation), and what `--smart`, `--update-as-create`
+and `--package` say are the defaults and the packages for every tenant, to which a tenant's own
+settings add.

@@ -7,15 +7,19 @@
 //! mismatch is refused before anything is read or written, so a process never reads another
 //! layout's rows as its own.
 
-use postgres::error::SqlState;
 use postgres::GenericClient;
 use refhir_persistence::PersistError;
+use serde_json::Value as JsonValue;
 
 use crate::migrate;
-use crate::{connect_client, definite, off_runtime, ErrorText};
+use crate::{connect_client, definite, off_runtime, SharedConnections};
 
 /// The registry table. Its presence is what makes a database shared.
 const REGISTRY: &str = "refhir_tenants";
+
+/// The channel every change to the registry is announced on, so that the processes that serve
+/// many tenants pick a new one up, or stop serving a deleted one, at once.
+pub(crate) const REGISTRY_CHANNEL: &str = "refhir_tenants";
 
 /// Longest tenant name. Matches the check on `refhir_tenants.name`.
 const MAX_NAME: usize = 63;
@@ -102,12 +106,24 @@ pub fn validate_tenant_name(name: &str) -> Result<(), PersistError> {
     }
 }
 
-/// The id of tenant `name`, or `None` when the database has no such tenant. The reserved id 0 is
-/// never a tenant a process can serve.
+/// The id of tenant `name`, or `None` when the database has no such tenant or it is deleted (a
+/// deleted tenant is not served while it waits to be removed). The reserved id 0 is never a tenant
+/// a process can serve.
 pub(crate) fn tenant_id(
     client: &mut impl GenericClient,
     name: &str,
 ) -> Result<Option<i32>, PersistError> {
+    let row = client
+        .query_opt(
+            &format!("SELECT id FROM {REGISTRY} WHERE name = $1 AND id > 0 AND deleted_at IS NULL"),
+            &[&name],
+        )
+        .map_err(definite)?;
+    Ok(row.map(|row| row.get(0)))
+}
+
+/// The id of tenant `name`, deleted or not.
+fn any_tenant_id(client: &mut impl GenericClient, name: &str) -> Result<Option<i32>, PersistError> {
     let row = client
         .query_opt(
             &format!("SELECT id FROM {REGISTRY} WHERE name = $1 AND id > 0"),
@@ -126,14 +142,264 @@ pub struct Tenant {
     pub created_at: String,
     /// Whether some process holds this tenant's writer lease right now.
     pub primary_running: bool,
+    /// What the tenant was created with, as the server understands it. `{}` for a tenant made
+    /// before the registry kept settings, or made with none.
+    pub settings: JsonValue,
+    /// When the tenant was deleted (ISO 8601, UTC). A deleted tenant is not served.
+    pub deleted_at: Option<String>,
+    /// When a deleted tenant's rows are removed, and until when it can be restored.
+    pub purge_after: Option<String>,
+}
+
+impl Tenant {
+    pub fn is_deleted(&self) -> bool {
+        self.deleted_at.is_some()
+    }
+}
+
+/// What [`SharedConnections::create_tenant`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Created {
+    /// The tenant is new.
+    New(Tenant),
+    /// A tenant of that name was already there, with the settings it has.
+    Existing(Tenant),
 }
 
 const CREATED_AT: &str = r#"to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')"#;
 
-/// Registers tenant `name` in the database at `url`. In an empty database this first creates the
-/// shared layout, so it is how a shared database comes to exist. It refuses a database made
-/// without tenants, and a name already taken.
-pub fn create_tenant(url: &str, name: &str) -> Result<Tenant, PersistError> {
+/// The columns [`tenant_from_row`] reads, in order.
+fn tenant_columns() -> String {
+    let at = |column: &str| {
+        format!(r#"to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')"#)
+    };
+    format!(
+        "id, name, {CREATED_AT}, settings::text, {}, {}",
+        at("deleted_at"),
+        at("purge_after")
+    )
+}
+
+fn tenant_from_row(row: &postgres::Row, primary_running: bool) -> Tenant {
+    let settings: String = row.get(3);
+    Tenant {
+        id: row.get(0),
+        name: row.get(1),
+        created_at: row.get(2),
+        primary_running,
+        settings: serde_json::from_str(&settings).unwrap_or(JsonValue::Null),
+        deleted_at: row.get(4),
+        purge_after: row.get(5),
+    }
+}
+
+/// Inserts tenant `name`, or finds the one already there. The registry is announced as changed
+/// when a tenant is added.
+fn insert_tenant(
+    client: &mut impl GenericClient,
+    name: &str,
+    settings: &JsonValue,
+) -> Result<Created, PersistError> {
+    validate_tenant_name(name)?;
+    let columns = tenant_columns();
+    let inserted = client
+        .query_opt(
+            &format!(
+                "INSERT INTO {REGISTRY} (name, settings) VALUES ($1, $2::text::jsonb)                  ON CONFLICT (name) DO NOTHING RETURNING {columns}"
+            ),
+            &[&name, &settings.to_string()],
+        )
+        .map_err(definite)?;
+    if let Some(row) = inserted {
+        client
+            .batch_execute(&format!("NOTIFY {REGISTRY_CHANNEL}"))
+            .map_err(definite)?;
+        return Ok(Created::New(tenant_from_row(&row, false)));
+    }
+    let row = client
+        .query_one(
+            &format!("SELECT {columns} FROM {REGISTRY} WHERE name = $1"),
+            &[&name],
+        )
+        .map_err(definite)?;
+    let id: i32 = row.get(0);
+    let running = crate::lease::is_held(client, id)?;
+    Ok(Created::Existing(tenant_from_row(&row, running)))
+}
+
+/// Every tenant of the registry, oldest first, deleted ones included.
+fn read_tenants(client: &mut impl GenericClient) -> Result<Vec<Tenant>, PersistError> {
+    let rows = client
+        .query(
+            &format!(
+                "SELECT {} FROM {REGISTRY} WHERE id > 0 ORDER BY id",
+                tenant_columns()
+            ),
+            &[],
+        )
+        .map_err(definite)?;
+    let mut tenants = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: i32 = row.get(0);
+        let running = crate::lease::is_held(client, id)?;
+        tenants.push(tenant_from_row(&row, running));
+    }
+    Ok(tenants)
+}
+
+fn read_tenant(
+    client: &mut impl GenericClient,
+    name: &str,
+) -> Result<Option<Tenant>, PersistError> {
+    let row = client
+        .query_opt(
+            &format!(
+                "SELECT {} FROM {REGISTRY} WHERE name = $1 AND id > 0",
+                tenant_columns()
+            ),
+            &[&name],
+        )
+        .map_err(definite)?;
+    match row {
+        Some(row) => {
+            let id: i32 = row.get(0);
+            let running = crate::lease::is_held(client, id)?;
+            Ok(Some(tenant_from_row(&row, running)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Marks tenant `name` deleted, its rows to be removed once `grace_secs` have passed. A tenant
+/// that is already deleted keeps the time it was given. `None` when there is no such tenant.
+fn mark_deleted(
+    client: &mut impl GenericClient,
+    name: &str,
+    grace_secs: u64,
+) -> Result<Option<Tenant>, PersistError> {
+    let grace = i64::try_from(grace_secs).unwrap_or(i64::MAX / 1_000_000);
+    let changed = client
+        .execute(
+            &format!(
+                "UPDATE {REGISTRY} SET deleted_at = now(),                  purge_after = now() + make_interval(secs => $2::bigint::double precision),                  updated_at = now()                  WHERE name = $1 AND id > 0 AND deleted_at IS NULL"
+            ),
+            &[&name, &grace],
+        )
+        .map_err(definite)?;
+    if changed > 0 {
+        client
+            .batch_execute(&format!("NOTIFY {REGISTRY_CHANNEL}"))
+            .map_err(definite)?;
+    }
+    read_tenant(client, name)
+}
+
+/// Undoes [`mark_deleted`] while the tenant's rows are still there. `None` when there is no such
+/// tenant (it may have been removed already).
+fn mark_restored(
+    client: &mut impl GenericClient,
+    name: &str,
+) -> Result<Option<Tenant>, PersistError> {
+    let changed = client
+        .execute(
+            &format!(
+                "UPDATE {REGISTRY} SET deleted_at = NULL, purge_after = NULL, updated_at = now()                  WHERE name = $1 AND id > 0 AND deleted_at IS NOT NULL"
+            ),
+            &[&name],
+        )
+        .map_err(definite)?;
+    if changed > 0 {
+        client
+            .batch_execute(&format!("NOTIFY {REGISTRY_CHANNEL}"))
+            .map_err(definite)?;
+    }
+    read_tenant(client, name)
+}
+
+/// The deleted tenants whose grace period is over.
+fn due(client: &mut impl GenericClient) -> Result<Vec<String>, PersistError> {
+    let rows = client
+        .query(
+            &format!(
+                "SELECT name FROM {REGISTRY} WHERE id > 0 AND deleted_at IS NOT NULL                  AND purge_after <= now() ORDER BY id"
+            ),
+            &[],
+        )
+        .map_err(definite)?;
+    Ok(rows.into_iter().map(|row| row.get(0)).collect())
+}
+
+/// Something that moves with every change to the registry: the number of tenants and the newest
+/// change. Equal values mean nothing was added, deleted, restored or removed in between.
+fn signature(client: &mut impl GenericClient) -> Result<String, PersistError> {
+    let row = client
+        .query_one(
+            &format!("SELECT count(*)::text || '/' || COALESCE(max(updated_at)::text, '') FROM {REGISTRY}"),
+            &[],
+        )
+        .map_err(definite)?;
+    Ok(row.get(0))
+}
+
+impl SharedConnections {
+    /// Registers tenant `name` with `settings`, or finds the tenant of that name that is there:
+    /// asking twice is safe. A deleted tenant that is still waiting to be removed is found, not
+    /// replaced; the caller decides what to make of a tenant that differs from what it asked for.
+    pub fn create_tenant(&self, name: &str, settings: &JsonValue) -> Result<Created, PersistError> {
+        validate_tenant_name(name)?;
+        self.with_registry(|client| insert_tenant(client, name, settings))
+    }
+
+    /// Every tenant of the database, oldest first, deleted ones included.
+    pub fn list_tenants(&self) -> Result<Vec<Tenant>, PersistError> {
+        self.with_registry(read_tenants)
+    }
+
+    /// Tenant `name`, deleted or not.
+    pub fn get_tenant(&self, name: &str) -> Result<Option<Tenant>, PersistError> {
+        self.with_registry(|client| read_tenant(client, name))
+    }
+
+    /// Deletes tenant `name`: no process serves it from now on, and its rows are removed once
+    /// `grace_secs` have passed (see [`SharedConnections::purge_due`]).
+    pub fn delete_tenant(
+        &self,
+        name: &str,
+        grace_secs: u64,
+    ) -> Result<Option<Tenant>, PersistError> {
+        self.with_registry(|client| mark_deleted(client, name, grace_secs))
+    }
+
+    /// Brings back a deleted tenant whose rows have not been removed yet.
+    pub fn restore_tenant(&self, name: &str) -> Result<Option<Tenant>, PersistError> {
+        self.with_registry(|client| mark_restored(client, name))
+    }
+
+    /// The deleted tenants whose grace period is over.
+    pub fn tenants_due_for_purge(&self) -> Result<Vec<String>, PersistError> {
+        self.with_registry(due)
+    }
+
+    /// Removes the rows of tenant `name`, which must be deleted and past its grace period, and
+    /// whose lease no process holds. Returns how many rows went.
+    pub fn purge_tenant(&self, name: &str) -> Result<u64, PersistError> {
+        purge(&self.url, name, true)
+    }
+
+    /// See [`signature`].
+    pub fn registry_signature(&self) -> Result<String, PersistError> {
+        self.with_registry(signature)
+    }
+}
+
+/// Registers tenant `name` with `settings` in the database at `url`, or finds the tenant of that
+/// name that is there. In an empty database this first creates the shared layout, so it is how a
+/// shared database comes to exist. It refuses a database made without tenants.
+pub fn create_tenant_with(
+    url: &str,
+    name: &str,
+    settings: &JsonValue,
+) -> Result<Created, PersistError> {
     validate_tenant_name(name)?;
     off_runtime(|| {
         let mut client = connect_client(url)?;
@@ -146,27 +412,79 @@ pub fn create_tenant(url: &str, name: &str) -> Result<Tenant, PersistError> {
         // Applies the shared migrations: all of them on an empty database, any that a newer
         // release added on one that exists.
         migrate::run(&mut client, migrate::SHARED_MIGRATIONS)?;
-        let inserted = client.query_one(
-            &format!("INSERT INTO {REGISTRY} (name) VALUES ($1) RETURNING id, {CREATED_AT}"),
-            &[&name],
-        );
-        match inserted {
-            Ok(row) => Ok(Tenant {
-                id: row.get(0),
-                name: name.to_string(),
-                created_at: row.get(1),
-                primary_running: false,
-            }),
-            Err(err)
-                if err
-                    .as_db_error()
-                    .is_some_and(|db| db.code() == &SqlState::UNIQUE_VIOLATION) =>
-            {
-                Err(definite(format!("tenant `{name}` already exists")))
-            }
-            Err(err) => Err(definite(err.error_text())),
+        insert_tenant(&mut client, name, settings)
+    })
+}
+
+/// [`create_tenant_with`] with no settings, refusing a name that is taken.
+pub fn create_tenant(url: &str, name: &str) -> Result<Tenant, PersistError> {
+    match create_tenant_with(url, name, &JsonValue::Object(Default::default()))? {
+        Created::New(tenant) => Ok(tenant),
+        Created::Existing(_) => Err(definite(format!("tenant `{name}` already exists"))),
+    }
+}
+
+/// Tenant `name` of the database at `url`, deleted or not.
+pub fn get_tenant(url: &str, name: &str) -> Result<Option<Tenant>, PersistError> {
+    off_runtime(|| {
+        let mut client = connect_client(url)?;
+        match detect_layout(&mut client)? {
+            Layout::Shared => read_tenant(&mut client, name),
+            _ => Ok(None),
         }
     })
+}
+
+/// See [`SharedConnections::delete_tenant`]. `None` when there is no such tenant.
+pub fn soft_delete_tenant(
+    url: &str,
+    name: &str,
+    grace_secs: u64,
+) -> Result<Option<Tenant>, PersistError> {
+    validate_tenant_name(name)?;
+    off_runtime(|| {
+        let mut client = shared_client(url)?;
+        mark_deleted(&mut client, name, grace_secs)
+    })
+}
+
+/// See [`SharedConnections::restore_tenant`]. `None` when there is no such tenant.
+pub fn restore_tenant(url: &str, name: &str) -> Result<Option<Tenant>, PersistError> {
+    validate_tenant_name(name)?;
+    off_runtime(|| {
+        let mut client = shared_client(url)?;
+        mark_restored(&mut client, name)
+    })
+}
+
+/// Removes every deleted tenant whose grace period is over and that no process serves, and
+/// returns each one removed with how many rows went. One that a process still holds is left for
+/// the next time, and said so in the log.
+pub fn purge_due_tenants(url: &str) -> Result<Vec<(String, u64)>, PersistError> {
+    let names = off_runtime(|| {
+        let mut client = shared_client(url)?;
+        due(&mut client)
+    })?;
+    let mut removed = Vec::new();
+    for name in names {
+        match purge(url, &name, true) {
+            Ok(rows) => removed.push((name, rows)),
+            Err(err) => tracing::warn!(target: "refhir", "tenant `{name}` not removed yet: {err}"),
+        }
+    }
+    Ok(removed)
+}
+
+/// A connection to a database that must have the shared layout.
+fn shared_client(url: &str) -> Result<postgres::Client, PersistError> {
+    let mut client = connect_client(url)?;
+    match detect_layout(&mut client)? {
+        Layout::Shared => Ok(client),
+        Layout::Classic => Err(definite(
+            "this database was created without tenants, so it has none",
+        )),
+        Layout::Empty => Err(definite("the database is empty: it has no tenants")),
+    }
 }
 
 /// The tenants of the database at `url`, oldest first, each with whether a primary holds its
@@ -183,23 +501,7 @@ pub fn list_tenants(url: &str) -> Result<Vec<Tenant>, PersistError> {
             }
             Layout::Empty => return Ok(Vec::new()),
         }
-        let rows = client
-            .query(
-                &format!("SELECT id, name, {CREATED_AT} FROM {REGISTRY} WHERE id > 0 ORDER BY id"),
-                &[],
-            )
-            .map_err(definite)?;
-        let mut tenants = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id: i32 = row.get(0);
-            tenants.push(Tenant {
-                id,
-                name: row.get(1),
-                created_at: row.get(2),
-                primary_running: crate::lease::is_held(&mut client, id)?,
-            });
-        }
-        Ok(tenants)
+        read_tenants(&mut client)
     })
 }
 
@@ -216,6 +518,12 @@ const DELETE_BATCH: i64 = 10_000;
 /// the tables for the length of its deletion. Rows other tenants hold, and the shared catalog,
 /// are not touched. There is no undo: take a backup first.
 pub fn delete_tenant(url: &str, name: &str) -> Result<u64, PersistError> {
+    purge(url, name, false)
+}
+
+/// The rows of tenant `name` and its registry row, removed; with `only_deleted`, only a tenant
+/// that is deleted and past its grace period.
+fn purge(url: &str, name: &str, only_deleted: bool) -> Result<u64, PersistError> {
     validate_tenant_name(name)?;
     off_runtime(|| {
         let mut client = connect_client(url)?;
@@ -232,8 +540,24 @@ pub fn delete_tenant(url: &str, name: &str) -> Result<u64, PersistError> {
                 )))
             }
         }
-        let id = tenant_id(&mut client, name)?
+        let id = any_tenant_id(&mut client, name)?
             .ok_or_else(|| definite(format!("no tenant `{name}` in this database")))?;
+        if only_deleted {
+            let due: bool = client
+                .query_one(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM {REGISTRY} WHERE id = $1                          AND deleted_at IS NOT NULL AND purge_after <= now())"
+                    ),
+                    &[&id],
+                )
+                .map_err(definite)?
+                .get(0);
+            if !due {
+                return Err(definite(format!(
+                    "tenant `{name}` is not deleted, or its grace period is not over"
+                )));
+            }
+        }
         // Row-level security shows a connection only the rows of the tenant it serves, and these
         // are the rows to remove.
         crate::set_tenant(&mut client, crate::Scope::Tenant(id))?;
@@ -265,6 +589,9 @@ pub fn delete_tenant(url: &str, name: &str) -> Result<u64, PersistError> {
         }
         client
             .execute(&format!("DELETE FROM {REGISTRY} WHERE id = $1"), &[&id])
+            .map_err(definite)?;
+        client
+            .batch_execute(&format!("NOTIFY {REGISTRY_CHANNEL}"))
             .map_err(definite)?;
         // The lease is the session's, and goes with it.
         Ok(removed)

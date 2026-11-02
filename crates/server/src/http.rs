@@ -146,6 +146,56 @@ pub struct AppState {
     pub jobs: Arc<crate::jobs::JobRunner>,
     pub governance: Arc<crate::governance::Governance>,
     pub(crate) ready_probe: Arc<crate::health::ReadyProbe>,
+    /// The `$websocket` sockets of this server's Subscriptions.
+    pub(crate) sockets: Arc<crate::jobs::Sockets>,
+    /// Said when this server stops being served (a process that serves many tenants stops one),
+    /// so the sockets and tasks that would otherwise keep it alive end.
+    pub(crate) stop: Stop,
+}
+
+/// Tells what a server keeps running that it has stopped being served. Until then it is never
+/// said, and a server that runs for the life of the process never says it.
+#[derive(Clone)]
+pub struct Stop(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for Stop {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(false).0))
+    }
+}
+
+impl Stop {
+    pub fn stop(&self) {
+        self.0.send_replace(true);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Resolves once [`Stop::stop`] is called, at once if it was.
+    pub async fn stopped(&self) {
+        let mut watch = self.0.subscribe();
+        let _ = watch.wait_for(|stopped| *stopped).await;
+    }
+}
+
+/// One server's router, with what it takes to stop serving it: what a process that serves many
+/// tenants keeps for each.
+pub struct TenantApp {
+    pub router: Router,
+    pub governance: Arc<crate::governance::Governance>,
+    pub stop: Stop,
+}
+
+impl TenantApp {
+    /// Ends its sockets and background work and writes what governance buffered. Requests already
+    /// being answered finish; the caller stops sending new ones first.
+    pub async fn shut_down(&self) {
+        self.stop.stop();
+        self.governance.flush().await;
+        self.governance.leave().await;
+    }
 }
 
 /// Delete expired OAuth rows once a minute. Reads ignore expired rows, so this only reclaims
@@ -189,6 +239,17 @@ pub fn app_parts(
     store: Arc<dyn ConformanceStore>,
     config: ServerConfig,
 ) -> (Router, Arc<crate::governance::Governance>) {
+    let app = tenant_app(db, catalog, store, config);
+    (app.router, app.governance)
+}
+
+/// The router of one server and what stops it (see [`TenantApp`]).
+pub fn tenant_app(
+    db: Arc<Database>,
+    catalog: Arc<RwLock<Catalog>>,
+    store: Arc<dyn ConformanceStore>,
+    config: ServerConfig,
+) -> TenantApp {
     catalog
         .write()
         .expect("catalog")
@@ -352,7 +413,10 @@ pub fn app_parts(
         jobs,
         governance: governance.clone(),
         ready_probe: Arc::default(),
+        sockets: Arc::default(),
+        stop: Stop::default(),
     };
+    let (sockets, stop) = (state.sockets.clone(), state.stop.clone());
     // Outermost first: cors, the legacy request line (silent once governance logs instead),
     // governance's scope, authentication, the caller's own limits, and then what a replica does
     // with a request it cannot serve. The limits come before that, so that a request is turned
@@ -380,9 +444,13 @@ pub fn app_parts(
         .with_state(state);
     // Hooks, subscriptions and terminology fetches run where commits are made.
     if !db.is_read_only() {
-        crate::jobs::attach(db, catalog, store, &config);
+        crate::jobs::attach(db, catalog, store, &config, sockets, stop.clone());
     }
-    (router, governance)
+    TenantApp {
+        router,
+        governance,
+        stop,
+    }
 }
 
 pub async fn execute(
@@ -856,16 +924,20 @@ async fn sync_ws(
     ws.on_upgrade(move |socket| async move {
         // The permit is held as long as the connection is.
         let _permit = permit;
-        sync::handle_socket(
-            socket,
-            app.db,
-            app.catalog,
-            app.store,
-            session,
-            scope,
-            upstream,
-        )
-        .await
+        let stop = app.stop.clone();
+        // A server that stops being served closes its sockets.
+        tokio::select! {
+            _ = sync::handle_socket(
+                socket,
+                app.db,
+                app.catalog,
+                app.store,
+                session,
+                scope,
+                upstream,
+            ) => {}
+            _ = stop.stopped() => {}
+        }
     })
     .into_response()
 }
@@ -1686,10 +1758,12 @@ async fn subscription_socket(
             .into_response();
     }
     ws.on_upgrade(move |socket| async move {
-        let mut rx = crate::jobs::register_socket(id);
+        let mut rx = app.sockets.register(id);
         let (mut sink, mut stream) = socket.split();
+        let stop = app.stop.clone();
         loop {
             tokio::select! {
+                _ = stop.stopped() => break,
                 payload = rx.recv() => {
                     let Some(payload) = payload else { break };
                     if sink.send(Message::Text(payload)).await.is_err() {

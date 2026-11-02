@@ -9,6 +9,7 @@ mod health_cards;
 mod http;
 mod jobs;
 mod sync;
+pub mod tenancy;
 mod xml;
 
 use std::future::IntoFuture;
@@ -28,9 +29,10 @@ pub use governance::{
 };
 pub use health_cards::IssuerKey;
 pub use http::{
-    app, app_parts, app_with, AppState, ServerConfig, SharedGovernanceStore, DEFAULT_PAGE_SIZE,
+    app, app_parts, app_with, tenant_app, AppState, ServerConfig, SharedGovernanceStore, Stop,
+    TenantApp, DEFAULT_PAGE_SIZE,
 };
-pub use jobs::SharedJobStore;
+pub use jobs::{export_everything, SharedJobStore};
 
 /// How long the rows still buffered are given to reach the database once the server is told to
 /// stop. Under the ten seconds `deploy/production.md` asks a pod's termination grace to be.
@@ -111,7 +113,8 @@ fn give_up(why: &str) -> ! {
     std::process::exit(1)
 }
 
-async fn shutdown_signal() {
+/// Resolves on Ctrl-C or SIGTERM.
+pub async fn shutdown_signal() {
     let interrupt = async {
         let _ = tokio::signal::ctrl_c().await;
     };

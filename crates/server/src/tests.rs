@@ -4177,6 +4177,16 @@ async fn rest_hook_retries_after_a_failure() {
 /// An app whose `Subscription` has the elements a delivery reads (`criteria`, the channel and its
 /// headers) and the ones the server writes back (`status` and `error`), as R4's does.
 fn subscription_app() -> axum::Router {
+    let (db, catalog, store) = subscription_parts();
+    app(db, catalog, store)
+}
+
+/// What [`subscription_app`] serves.
+pub(crate) fn subscription_parts() -> (
+    Arc<Database>,
+    Arc<RwLock<Catalog>>,
+    Arc<dyn ConformanceStore>,
+) {
     // Tests run side by side, and a clock is too coarse to tell them apart.
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let package = std::env::temp_dir().join(format!(
@@ -4202,7 +4212,7 @@ fn subscription_app() -> axum::Router {
     install_package_dir(store.as_ref(), &db, &catalog, &package).unwrap();
     let _ = std::fs::remove_dir_all(&package);
     catalog.write().unwrap().set_update_create(true);
-    app(db, catalog, store)
+    (db, catalog, store)
 }
 
 /// A rest-hook receiver on a local port. It answers every request with `status` (for example
@@ -7294,6 +7304,8 @@ mod cluster {
             ))),
             governance: crate::Governance::new(crate::GovernanceConfig::default(), false, None),
             ready_probe: Default::default(),
+            sockets: Default::default(),
+            stop: Default::default(),
         };
         assert!(
             !crate::auth::patient_exists(&app, "fresh-patient"),

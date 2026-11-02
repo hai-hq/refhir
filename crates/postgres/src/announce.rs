@@ -19,13 +19,55 @@ use postgres::Client;
 /// How often an idle thread looks again whether its owner is still there.
 const IDLE: Duration = Duration::from_millis(500);
 
+/// How long the thread of an announcer that sends on a [`SharedLine`] stays after its last
+/// announcement. It holds no connection of its own, so it ends rather than idle: a process that
+/// serves many tenants keeps a thread only for those that are writing.
+const SHARED_IDLE_EXIT: Duration = Duration::from_secs(10);
+
 pub(crate) struct Announcer {
     /// Zero announces every publish, with the commit that records it.
     interval: Duration,
     channel: String,
     url: Arc<str>,
+    /// The connection every tenant of the process announces on, when it serves many.
+    line: Option<Arc<SharedLine>>,
     state: Mutex<State>,
     wake: Condvar,
+}
+
+/// One connection that the announcers of every tenant a process serves send on. `NOTIFY` names
+/// its channel and needs no tenant, so one session can announce for all of them.
+pub(crate) struct SharedLine {
+    url: Arc<str>,
+    client: Mutex<Option<Client>>,
+}
+
+impl SharedLine {
+    pub(crate) fn new(url: Arc<str>) -> Arc<Self> {
+        Arc::new(Self {
+            url,
+            client: Mutex::new(None),
+        })
+    }
+
+    fn send(&self, channel: &str) -> Result<(), String> {
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if client.is_none() {
+            *client = Some(connect(&self.url)?);
+        }
+        let sent = client
+            .as_mut()
+            .expect("connected above")
+            .batch_execute(&format!("NOTIFY {channel}"))
+            .map_err(|err| err.to_string());
+        if sent.is_err() {
+            *client = None;
+        }
+        sent
+    }
 }
 
 #[derive(Default)]
@@ -46,10 +88,20 @@ fn locked(state: &Mutex<State>) -> MutexGuard<'_, State> {
 
 impl Announcer {
     pub(crate) fn new(interval: Duration, channel: String, url: Arc<str>) -> Arc<Self> {
+        Self::with_line(interval, channel, url, None)
+    }
+
+    pub(crate) fn with_line(
+        interval: Duration,
+        channel: String,
+        url: Arc<str>,
+        line: Option<Arc<SharedLine>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             interval,
             channel,
             url,
+            line,
             state: Mutex::new(State::default()),
             wake: Condvar::new(),
         })
@@ -108,24 +160,8 @@ impl Announcer {
         }
     }
 
-    /// The connection the thread announces on. It idles between announcements, so a link that a
-    /// NAT or a load balancer forgot without a reset must be noticed in about a minute (keepalives)
-    /// and not after the kernel's retransmission timeout, and an announcement that waits long for
-    /// the cluster's announcement lock fails and is tried again.
     fn connect(&self) -> Result<Client, String> {
-        let mut client = crate::connect_client_tuned(&self.url, |config| {
-            config
-                .keepalives(true)
-                .keepalives_idle(Duration::from_secs(30))
-                .keepalives_interval(Duration::from_secs(10))
-                .keepalives_retries(3)
-                .tcp_user_timeout(Duration::from_secs(30));
-        })
-        .map_err(|err| err.to_string())?;
-        client
-            .batch_execute("SET statement_timeout = '5s'")
-            .map_err(|err| err.to_string())?;
-        Ok(client)
+        connect(&self.url)
     }
 
     /// Whether an announcement is owed and not yet sent.
@@ -135,6 +171,9 @@ impl Announcer {
     }
 
     fn send(&self, client: &mut Option<Client>) -> Result<(), String> {
+        if let Some(line) = &self.line {
+            return line.send(&self.channel);
+        }
         if client.is_none() {
             *client = Some(self.connect()?);
         }
@@ -145,11 +184,34 @@ impl Announcer {
     }
 }
 
-/// Makes the owed announcements until the persistence that owns the announcer is gone.
+/// The connection the thread announces on. It idles between announcements, so a link that a
+/// NAT or a load balancer forgot without a reset must be noticed in about a minute (keepalives)
+/// and not after the kernel's retransmission timeout, and an announcement that waits long for
+/// the cluster's announcement lock fails and is tried again.
+fn connect(url: &str) -> Result<Client, String> {
+    let mut client = crate::connect_client_tuned(url, |config| {
+        config
+            .keepalives(true)
+            .keepalives_idle(Duration::from_secs(30))
+            .keepalives_interval(Duration::from_secs(10))
+            .keepalives_retries(3)
+            .tcp_user_timeout(Duration::from_secs(30));
+    })
+    .map_err(|err| err.to_string())?;
+    client
+        .batch_execute("SET statement_timeout = '5s'")
+        .map_err(|err| err.to_string())?;
+    Ok(client)
+}
+
+/// Makes the owed announcements until the persistence that owns the announcer is gone (or, on a
+/// shared line, until it has been idle for a while).
 fn run(announcer: std::sync::Weak<Announcer>) {
     let mut client: Option<Client> = announcer
         .upgrade()
+        .filter(|announcer| announcer.line.is_none())
         .and_then(|announcer| announcer.connect().ok());
+    let mut idle_since = Instant::now();
     // How many sends in a row have failed: the first is said, and so is the end of them, and the
     // wait before trying again grows, so an outage is not ten log lines a second.
     let mut failures: u32 = 0;
@@ -160,6 +222,11 @@ fn run(announcer: std::sync::Weak<Announcer>) {
         };
         let due = {
             let mut state = locked(&announcer.state);
+            if !state.owed && announcer.line.is_some() && idle_since.elapsed() >= SHARED_IDLE_EXIT {
+                // Under the lock, so a publish that comes now starts a new thread.
+                state.running = false;
+                return;
+            }
             let wait = match (state.owed, state.last) {
                 (false, _) => Some(IDLE),
                 (true, Some(last)) => announcer
@@ -188,6 +255,7 @@ fn run(announcer: std::sync::Weak<Announcer>) {
         if !due {
             continue;
         }
+        idle_since = Instant::now();
         match announcer.send(&mut client) {
             Ok(()) => {
                 if failures > 0 {

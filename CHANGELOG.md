@@ -10,6 +10,37 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **One process can serve every tenant of a shared Postgres database, and tenants are created over
+  HTTP.** `refhir --all-tenants` (with `[tenants]` settings) replaces a process, and a Kubernetes
+  object, per tenant: each request is routed to its tenant by path (`/t/{tenant}/…`) or host name
+  (`{tenant}.{domain}`), and each tenant keeps its own resources, SMART clients and keys, health
+  card key, audit trail, `/sync` sessions, Subscriptions and export files, at its own public
+  address (`Location` headers, Bundle links, SMART discovery and `/health-cards/.well-known/jwks.json`
+  are per tenant). The tenants share one connection pool (each limited to a share of it), one
+  session for all their writer leases, one connection for announcing commits and one for listening
+  for them, so a process needs the pool plus three connections however many tenants it serves.
+  Primaries, standbys and replicas work as before, tenant by tenant.
+- **An admin API, with a bearer token of its own** (`REFHIR_ADMIN_TOKEN`, optionally on its own
+  listener): `POST /admin/tenants` (idempotent; packages, `update_as_create`, SMART, health cards,
+  limits), `GET /admin/tenants` and `/admin/tenants/{name}` (status, size, package versions),
+  `DELETE /admin/tenants/{name}` (a soft delete with a grace period, an export of the tenant's
+  resources first and a hook URL told afterwards), `POST /admin/tenants/{name}/restore`, and
+  `GET /admin/metrics`. Every process of a deployment follows the tenant registry within moments.
+- **Per-tenant limits and metrics:** requests a second, storage in bytes and a share of the
+  connection pool, and Prometheus counters labelled by tenant.
+- `refhir tenant` gained `show`, `restore` and `purge`, and `create` takes a tenant's settings as
+  flags; it changes the same registry the admin API does.
+
+### Changed
+
+- `refhir tenant delete NAME --yes` now deletes with a grace period (7 days, `--grace` changes it):
+  the tenant is not served from then on, and `restore` undoes it until the rows are removed. The old
+  behaviour, which removes everything at once and refuses while a primary runs, is `--grace 0`.
+- Shared databases get a fifth migration that adds the registry's `settings`, `deleted_at`,
+  `purge_after` and `updated_at` columns. Existing tenants are served as they were.
+
 ## [0.0.4] - 2026-10-27
 
 ### Added
