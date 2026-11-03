@@ -131,11 +131,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   and the first after a restart no longer compiles. Measured on a laptop under load with the R4
   release (the 21.5 MiB prepared file): 17.6 s for each tenant after the first before, about 5 s
   now (0.5 s of CPU); the first tenant 38 s before. A tenant made with packages of its own
-  compiles a catalog of its own, as before. [Many tenants in one
-  process](docs/clustering.md#how-long-a-new-tenant-takes) says what to expect. The process logs
-  `compiled a catalog for tenants to share` whenever it compiles one, and `ready to make tenants`
-  when it is ready. `[tenants] warm_up = false`
-  (or `REFHIR_TENANTS_WARM_UP=0`) turns the warm-up off.
+  compiles a catalog of its own, as before.
+  [How long a new tenant takes](docs/clustering.md#how-long-a-new-tenant-takes) says what to
+  expect. The process logs `compiled a catalog for tenants to share` whenever it compiles one, and
+  `ready to make tenants` when it is ready. `[tenants] warm_up = false` (or
+  `REFHIR_TENANTS_WARM_UP=0`) turns the warm-up off.
 - **A data race in the Go client's `Watch.Close`.** A watch cancelled while its `Add` was still being
   sent read its id while the session goroutine wrote it. The id is now handed over under the watch's
   lock, and a query whose watch was closed first is never registered, so none is left running on
