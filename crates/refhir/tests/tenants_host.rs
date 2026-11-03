@@ -94,16 +94,28 @@ struct Host {
 
 impl Host {
     fn start(name: &str, database: &str, args: &[&str]) -> Host {
-        Self::spawn(name, database, args, None)
+        Self::spawn(name, database, args, None, false)
     }
 
     /// A host whose tenants are given the release's packages from `bundle` (a file of prepared
     /// packages, as a release archive has), which tenants share, instead of a package directory.
     fn start_with_bundle(name: &str, database: &str, args: &[&str], bundle: &Path) -> Host {
-        Self::spawn(name, database, args, Some(bundle))
+        Self::spawn(name, database, args, Some(bundle), false)
     }
 
-    fn spawn(name: &str, database: &str, args: &[&str], bundle: Option<&Path>) -> Host {
+    /// [`Host::start_with_bundle`] for a host that gets ready for its first tenant, as it does by
+    /// default, in the background.
+    fn start_warming_up(name: &str, database: &str, args: &[&str], bundle: &Path) -> Host {
+        Self::spawn(name, database, args, Some(bundle), true)
+    }
+
+    fn spawn(
+        name: &str,
+        database: &str,
+        args: &[&str],
+        bundle: Option<&Path>,
+        warm_up: bool,
+    ) -> Host {
         let port = free_port();
         let dir = std::env::temp_dir().join(format!("refhir-host-{name}-{port}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -126,6 +138,8 @@ impl Host {
         };
         let child = command
             .env("REFHIR_ADMIN_TOKEN", TOKEN)
+            // What a host does in the background at its start is for the tests of it to ask for.
+            .env("REFHIR_TENANTS_WARM_UP", if warm_up { "1" } else { "0" })
             // The same on every process of a deployment, as tenants' SMART secrets come from them.
             .env("REFHIR_SMART_DCR_TOKEN", "test-dcr-token")
             .env(
@@ -163,6 +177,20 @@ impl Host {
                 return;
             }
             assert!(Instant::now() < deadline, "not ready:\n{}", self.log());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits until the host has made what a new tenant starts from (it does, in the background,
+    /// from its start), so that what a test measures is not slowed by it.
+    fn wait_warm(&self) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let log = self.log();
+            if log.contains("ready to make tenants") || log.contains("are not warmed up") {
+                return;
+            }
+            assert!(Instant::now() < deadline, "not warmed up:\n{log}");
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -475,6 +503,93 @@ fn tenants_given_the_same_packages_share_one_catalog() {
         let (_, tenant) = host.admin("GET", &format!("/admin/tenants/{name}"), None);
         assert_eq!(tenant["served"]["shared_catalog"], json!(true), "{tenant}");
     }
+}
+
+/// What a tenant costs to make: the process gets ready for the first before one is asked for, and
+/// a tenant made after that is given the shared packages and the catalog that was compiled, and
+/// nothing is read from the prepared file or compiled for it. A create that takes tens of seconds,
+/// as one that compiled the catalog again does, is what this keeps out; it counts what is done and
+/// not how long it takes, so a slow machine does not flake it.
+#[test]
+fn a_tenant_made_after_the_start_compiles_no_catalog() {
+    let Some(admin) = admin_url("tenants host: tenants made later") else {
+        return;
+    };
+    let (_database, app) = database_of_an_ordinary_role(&admin, "hostlater");
+    let bundle = prepared_packages("later");
+    let mut host = Host::start_warming_up("later", &app, &[], &bundle);
+    host.wait_ready();
+    // The process makes a tenant of its own to get ready, and removes it again.
+    host.wait_warm();
+    assert!(
+        host.log().contains("ready to make tenants"),
+        "{}",
+        host.log()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let (status, listed) = loop {
+        let (status, listed) = host.admin("GET", "/admin/tenants", None);
+        if status != 200
+            || listed["tenants"]
+                .as_array()
+                .is_some_and(|tenants| tenants.is_empty())
+        {
+            break (status, listed);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the warm-up tenant stayed: {listed}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(
+        listed["tenants"],
+        json!([]),
+        "no tenant is left from the warm-up"
+    );
+    // Nobody can have a tenant of that name, or see one.
+    let (status, body) = host.admin("POST", "/admin/tenants", Some(create_body("refhir-warm")));
+    assert!(status == 400 || status == 422, "{status} {body}");
+    let (status, _) = host.admin("GET", "/admin/tenants/refhir-warm", None);
+    assert_eq!(status, 404);
+    let (status, _) = host.admin("DELETE", "/admin/tenants/refhir-warm", None);
+    assert_eq!(status, 404);
+
+    let compiled = |host: &Host| {
+        host.log()
+            .matches("compiled a catalog for tenants to share")
+            .count()
+    };
+    let after_warm_up = compiled(&host);
+    assert!(
+        after_warm_up > 0,
+        "the warm-up compiles the catalog:\n{}",
+        host.log()
+    );
+    for name in ["first", "second", "third"] {
+        let started = Instant::now();
+        let (status, created) = host.admin("POST", "/admin/tenants", Some(create_body(name)));
+        assert_eq!(status, 201, "{created}\n{}", host.log());
+        assert_eq!(
+            created["served"]["shared_catalog"],
+            json!(true),
+            "{created}"
+        );
+        eprintln!("tenant {name} was made in {:.1?}", started.elapsed());
+        assert_eq!(
+            compiled(&host),
+            after_warm_up,
+            "tenant {name} compiled a catalog that the warm-up had compiled:\n{}",
+            host.log()
+        );
+    }
+    // Each was given the packages from the copy the warm-up stored, and none was read for it.
+    let log = host.log();
+    assert!(
+        log.matches("without reading it; linked").count() >= 3,
+        "{log}"
+    );
 }
 
 #[test]

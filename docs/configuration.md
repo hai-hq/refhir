@@ -2,7 +2,7 @@
 
 ## Configuration file
 
-Set `[fhir].version = "r4"` (default) to install that release’s defaults (**hl7.fhir.r4.core@4.0.1**, **hl7.fhir.uv.sdc@4.0.0**) from [packages.fhir.org](https://packages.fhir.org) on first startup (skipped when already in the database). Release archives and container images install them from a prepared file beside the binary and reach no registry; a binary you built yourself has none, and the server downloads nothing unless `[conformance].package_download = true`. `[conformance].package_bundle` names another prepared file, or `"off"` to ignore any file. A file that is there but unusable stops the start. Add other IGs with `[conformance].packages` (`name@version`, a `.tgz`, or a local folder). See [refhir.toml.example](../refhir.toml.example).
+Set `[fhir].version = "r4"` (default) to install that release’s defaults (**hl7.fhir.r4.core@4.0.1**, **hl7.fhir.uv.sdc@4.0.0**) from [packages.fhir.org](https://packages.fhir.org) on first startup (skipped when already in the database). Release archives and container images install them from a prepared file beside the binary and reach no registry; a binary you built yourself has none, and the server downloads nothing unless `[conformance].package_download = true`. `[conformance].package_bundle` names another prepared file, or `"off"` to ignore any file. A file that is there but unusable stops the start (once a package of it has to be read: the packages a database already holds are not read again). Add other IGs with `[conformance].packages` (`name@version`, a `.tgz`, or a local folder). See [refhir.toml.example](../refhir.toml.example).
 
 **Production:** [deploy/refhir.production.toml](../deploy/refhir.production.toml) and [deploy/production.md](../deploy/production.md) (Postgres, SMART secrets via env, Helm, `cargo install --git …`).
 
@@ -84,6 +84,7 @@ Read when the process is started with `--all-tenants`. See
 | `admin_token` | none | Bearer token of the admin API; prefer `REFHIR_ADMIN_TOKEN`. Without one the admin API refuses everything |
 | `admin_bind` | none | A listener of its own for `/admin` and the probes |
 | `connections_per_tenant` | half of `--db-pool` | Pool connections one tenant may hold at once |
+| `warm_up` | `true` | A primary makes what a new tenant starts from when it starts (see [How long a new tenant takes](clustering.md#how-long-a-new-tenant-takes)); `REFHIR_TENANTS_WARM_UP=0` turns it off |
 | `delete_grace` | `"7d"` | How long a deleted tenant's rows are kept (`30s`, `15m`, `24h`, `7d`) |
 | `export_on_delete` | `true` | Write a tenant's resources out before it is deleted |
 | `delete_hook` | none | A URL sent a `POST` when a tenant is deleted |

@@ -459,6 +459,39 @@ pub(crate) fn stage_package_in_pieces(
     )
 }
 
+/// Give the tenant package `name@version` from the copy its store keeps for all its tenants, if
+/// there is one made from `content`, without the package having to be read from anywhere. The
+/// outer `None` says there is no such copy, and the package is to be installed with
+/// [`stage_package_in_pieces`]; the inner is what that gives.
+pub(crate) fn stage_given_package(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    (name, version): (&str, &str),
+    content: &str,
+) -> Result<Option<Option<PendingBackfill>>, FhirError> {
+    let started = std::time::Instant::now();
+    let Some(outcome) = store
+        .give_shared_package(name, version, content)
+        .map_err(install_error)?
+    else {
+        return Ok(None);
+    };
+    let stored = started.elapsed();
+    finish_staging(
+        store,
+        db,
+        catalog,
+        (name, version),
+        (0, 0, 0),
+        &format!("linked {stored:.1?}"),
+        (started, stored),
+        outcome,
+        false,
+    )
+    .map(Some)
+}
+
 /// What follows storing a package, whichever way it was stored: publish it, say where the time
 /// went, and note the search parameters that still need their index built.
 #[allow(clippy::too_many_arguments)]
@@ -771,11 +804,37 @@ pub(crate) fn expand_waiting(store: &dyn ConformanceStore, catalog: &RwLock<Cata
 /// that it does not keep a copy of its own. A catalog is made one by an install, which changes it
 /// in place and leaves it a copy; this is done once a server has finished starting. Returns
 /// whether it is shared now. What the catalog reads and what it says are the same either way.
+///
+/// A catalog that was told to put off reading the tenant's own rows (see
+/// [`Catalog::set_detach_deferred`]) stops putting it off here, and if it does not end up shared it
+/// reads them now, so that it is what the store holds.
 pub fn share_catalog(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<bool, FhirError> {
-    let Some(shared) = Catalog::open_if_shared(store)? else {
+    let was_deferred = {
+        let mut current = catalog.write().expect("catalog");
+        let deferred = current.detach_deferred();
+        current.set_detach_deferred(false);
+        deferred
+    };
+    let shared = match Catalog::open_if_shared(store) {
+        Ok(shared) => shared,
+        Err(err) => {
+            if was_deferred {
+                // The tenant keeps a catalog of its own, as one that could not be shared does; what
+                // is an error is a catalog that cannot be made one.
+                Catalog::detach_from_shared(catalog, store)?;
+                tracing::warn!("a catalog is not shared: {err}");
+                return Ok(false);
+            }
+            return Err(err.into());
+        }
+    };
+    let Some(shared) = shared else {
+        if was_deferred {
+            Catalog::detach_from_shared(catalog, store)?;
+        }
         return Ok(false);
     };
     catalog
@@ -789,13 +848,14 @@ pub(crate) fn publish(
     store: &dyn ConformanceStore,
     catalog: &RwLock<Catalog>,
 ) -> Result<(), FhirError> {
-    let (policy, archiver, update_create, in_place, warmth) = {
+    let (policy, archiver, update_create, in_place, detach_deferred, warmth) = {
         let current = catalog.read().expect("catalog");
         (
             current.reference_policy(),
             current.sdc_archiver(),
             current.update_create(),
             current.rebuild_in_place(),
+            current.detach_deferred(),
             // Nothing is being answered while a server starts, so there is nothing to keep warm.
             (!current.rebuild_in_place()).then(|| current.warmth()),
         )
@@ -807,6 +867,7 @@ pub(crate) fn publish(
     // that mixes two states; the revision is checked before and after, and the load repeated.
     let (mut loaded, _) = Catalog::open_consistent(store, CatalogClock::Latest)?;
     loaded.set_rebuild_in_place(in_place);
+    loaded.set_detach_deferred(detach_deferred);
     loaded.set_reference_policy(policy);
     loaded.set_sdc_archiver(archiver);
     let stable = !loaded.has_pending_parameters();

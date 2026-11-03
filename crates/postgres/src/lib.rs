@@ -37,6 +37,7 @@ pub use shared::{SharedConnections, SharedOptions};
 pub use tenant::{
     create_tenant, create_tenant_with, delete_tenant, get_tenant, holds_tenants, list_tenants,
     purge_due_tenants, restore_tenant, soft_delete_tenant, validate_tenant_name, Created, Tenant,
+    WARM_TENANT,
 };
 
 pub(crate) struct Inner {
@@ -239,7 +240,8 @@ impl PostgresPersistence {
         name: &str,
         share: usize,
     ) -> Result<Self, PersistError> {
-        tenant::validate_tenant_name(name)?;
+        // The warm-up tenant is opened as any is, and is the only one with a name that is reserved.
+        tenant::validate_name_syntax(name)?;
         let id = shared.with_registry(|client| {
             tenant::tenant_id(client, name)?
                 .ok_or_else(|| definite(format!("tenant `{name}` does not exist in this database")))

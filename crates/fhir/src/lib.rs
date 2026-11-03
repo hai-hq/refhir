@@ -39,7 +39,10 @@ mod tests;
 pub use apply::apply_reads;
 pub use builtin::{install_builtin_terminology, BUILTIN_PACKAGE};
 pub use bundle::transaction;
-pub use catalog::{Catalog, CatalogClock, CatalogStamp, ReferencePolicy};
+pub use catalog::{
+    retain_shared_catalogs, shared_catalogs_compiled, Catalog, CatalogClock, CatalogStamp,
+    ReferencePolicy,
+};
 pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
 pub use memory::release_unused_memory;

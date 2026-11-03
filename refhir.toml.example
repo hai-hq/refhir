@@ -52,6 +52,7 @@ sqlite_path = "/data/refhir.sqlite"
 # admin_token = "..."     # prefer REFHIR_ADMIN_TOKEN; without one the admin API is off
 # admin_bind = "127.0.0.1:8081"  # serve /admin on a listener of its own
 # connections_per_tenant = 8     # pool connections one tenant may hold (default: half of db_pool)
+# warm_up = true          # a primary gets ready for the first tenant when it starts
 # delete_grace = "7d"     # how long a deleted tenant can be restored
 # export_on_delete = true # write a tenant's resources out before deleting it
 # delete_hook = "https://ops.example.com/hooks/tenant-deleted"

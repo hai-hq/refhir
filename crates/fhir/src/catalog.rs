@@ -213,8 +213,74 @@ struct Core {
 }
 
 /// The compiled catalogs that tenants of this process hold in common, by what they are made of.
-/// They are not kept alive by being here: one is let go when the last catalog that holds it is.
+/// They are not kept alive by being here: one is let go when the last catalog that holds it is,
+/// unless the process asked for the recent ones to be kept (see [`retain_shared_catalogs`]).
 struct SharedCores;
+
+/// How long [`SharedCores`] keeps the catalogs it handed out lately, in seconds; none by default.
+static RETAIN_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many catalogs this process has compiled for its tenants to share, since it started.
+static COMPILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many catalogs this process has compiled for tenants to share (see [`Catalog::open`]). A
+/// tenant made after the first that is given the packages every tenant has compiles none: it finds
+/// the one a tenant made before it started from, so a count that grows with the tenants made is a
+/// regression, and it is what the tests watch.
+pub fn shared_catalogs_compiled() -> u64 {
+    COMPILED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The window that never ends: what [`std::time::Duration::MAX`] is once stored as whole seconds.
+const FOREVER: std::time::Duration = std::time::Duration::from_secs(u64::MAX);
+
+/// How many catalogs are kept at most: the one a tenant starts from and the one it ends with differ.
+const RETAINED_CORES: usize = 2;
+
+/// The catalogs kept, and whether a thread is waiting to let them go.
+#[derive(Default)]
+struct Retained {
+    cores: Vec<(std::time::Instant, Arc<Core>)>,
+    sweeping: bool,
+}
+
+impl Retained {
+    /// Keep `core`, asked for at `now`, and what was asked for within `window` before it, at most
+    /// [`RETAINED_CORES`] in all: the ones asked for longest ago go first.
+    fn admit(&mut self, core: &Arc<Core>, window: std::time::Duration, now: std::time::Instant) {
+        self.cores
+            .retain(|(at, held)| !Arc::ptr_eq(held, core) && now.duration_since(*at) < window);
+        self.cores.push((now, core.clone()));
+        while self.cores.len() > RETAINED_CORES {
+            self.cores.remove(0);
+        }
+    }
+
+    /// Let go of what was asked for `window` ago or longer.
+    fn expire(&mut self, window: std::time::Duration, now: std::time::Instant) {
+        self.cores
+            .retain(|(at, _)| now.duration_since(*at) < window);
+    }
+}
+
+/// Keep the shared catalogs this process builds or hands out for `window` after they were last
+/// asked for (at most two), even when no tenant holds them. A process that serves many tenants
+/// makes a tenant by giving it the packages and then building the catalog it starts from, which
+/// is the catalog the tenant made just before it holds, and that one is let go as soon as the tenant
+/// that held it moves on: without this each new tenant compiles it again, which is most of the
+/// time it takes to be made. The cost is the memory of those catalogs for `window`. A window of zero
+/// (the default) keeps nothing, and [`std::time::Duration::MAX`] keeps them for as long as the
+/// process runs.
+pub fn retain_shared_catalogs(window: std::time::Duration) {
+    RETAIN_SECS.store(window.as_secs(), std::sync::atomic::Ordering::SeqCst);
+    if window.is_zero() {
+        SharedCores::retained()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .cores
+            .clear();
+    }
+}
 
 impl SharedCores {
     fn cores() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Core>>>
@@ -223,6 +289,53 @@ impl SharedCores {
             std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Core>>>,
         > = std::sync::OnceLock::new();
         CORES.get_or_init(Default::default)
+    }
+
+    fn retained() -> &'static std::sync::Mutex<Retained> {
+        static RETAINED: std::sync::OnceLock<std::sync::Mutex<Retained>> =
+            std::sync::OnceLock::new();
+        RETAINED.get_or_init(Default::default)
+    }
+
+    /// Remember `core` as one asked for just now, if the process keeps them.
+    fn retain(core: &Arc<Core>) {
+        let window =
+            std::time::Duration::from_secs(RETAIN_SECS.load(std::sync::atomic::Ordering::SeqCst));
+        if window.is_zero() {
+            return;
+        }
+        let mut kept = Self::retained()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        kept.admit(core, window, std::time::Instant::now());
+        // A window that never ends has nothing to sweep.
+        if !kept.sweeping && window < FOREVER {
+            kept.sweeping = true;
+            let spawned = std::thread::Builder::new()
+                .name("refhir-catalog-retention".into())
+                .spawn(Self::sweep);
+            if spawned.is_err() {
+                kept.sweeping = false;
+            }
+        }
+    }
+
+    /// Lets go of the catalogs kept for longer than the window, until there are none.
+    fn sweep() {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let window = std::time::Duration::from_secs(
+                RETAIN_SECS.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            let mut kept = Self::retained()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            kept.expire(window, std::time::Instant::now());
+            if kept.cores.is_empty() {
+                kept.sweeping = false;
+                return;
+            }
+        }
     }
 
     fn find(key: &str) -> Option<Arc<Core>> {
@@ -242,6 +355,7 @@ impl SharedCores {
         build: impl FnOnce() -> Result<Option<Arc<Core>>, PersistError>,
     ) -> Result<Option<Arc<Core>>, PersistError> {
         if let Some(core) = Self::find(key) {
+            Self::retain(&core);
             return Ok(Some(core));
         }
         static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -249,16 +363,26 @@ impl SharedCores {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(core) = Self::find(key) {
+            Self::retain(&core);
             return Ok(Some(core));
         }
+        let started = std::time::Instant::now();
         let Some(core) = build()? else {
             return Ok(None);
         };
+        COMPILED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!(
+            target: "refhir_engine",
+            "compiled a catalog for tenants to share, in {:.1?}",
+            started.elapsed()
+        );
         let mut cores = Self::cores()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cores.retain(|_, held| held.strong_count() > 0);
         cores.insert(key.to_string(), Arc::downgrade(&core));
+        drop(cores);
+        Self::retain(&core);
         Ok(Some(core))
     }
 }
@@ -275,6 +399,9 @@ pub struct Catalog {
     /// Whether a rebuild of this catalog lets go of it before it builds the new one, instead of
     /// holding both. See [`Catalog::set_rebuild_in_place`].
     rebuild_in_place: bool,
+    /// Whether a change to the tenant's own terminology is applied without first making the catalog
+    /// one that reads the tenant's own rows. See [`Catalog::set_detach_deferred`].
+    detach_deferred: bool,
 }
 
 impl Catalog {
@@ -353,6 +480,7 @@ impl Catalog {
             sdc_archiver: false,
             update_create: false,
             rebuild_in_place: false,
+            detach_deferred: false,
         }
     }
 
@@ -497,8 +625,11 @@ impl Catalog {
         catalog: &RwLock<Self>,
         store: &dyn ConformanceStore,
     ) -> Result<(), PersistError> {
-        if !catalog.read().expect("catalog").reads_shared_rows() {
-            return Ok(());
+        {
+            let current = catalog.read().expect("catalog");
+            if !current.reads_shared_rows() || current.detach_deferred() {
+                return Ok(());
+            }
         }
         let own = Self::open_own(store)?;
         let mut guard = catalog.write().expect("catalog");
@@ -573,6 +704,7 @@ impl Catalog {
             sdc_archiver: false,
             update_create: false,
             rebuild_in_place: false,
+            detach_deferred: false,
         }
     }
 
@@ -656,6 +788,22 @@ impl Catalog {
     /// catalog, so nothing can find it empty. A rebuild that then fails leaves it empty.
     pub fn set_rebuild_in_place(&mut self, enabled: bool) {
         self.rebuild_in_place = enabled;
+    }
+
+    /// Whether [`Catalog::detach_from_shared`] is put off.
+    pub fn detach_deferred(&self) -> bool {
+        self.detach_deferred
+    }
+
+    /// Put off making the catalog one of the tenant's own when the tenant's terminology changes
+    /// (it expands the value sets that waited for a package, say), until [`crate::share_catalog`]
+    /// settles which catalog the tenant holds. Loading the tenant's own rows reads and compiles
+    /// everything again, which a tenant that is about to hold the shared catalog does not need: what
+    /// it changed is kept in the copy of the catalog it changed, and what the store then says it
+    /// holds decides the catalog it ends with. Only a server that is still starting may ask for it,
+    /// since a catalog that answers requests must read what it was changed by.
+    pub fn set_detach_deferred(&mut self, deferred: bool) {
+        self.detach_deferred = deferred;
     }
 
     pub fn set_update_create(&mut self, enabled: bool) {
@@ -1241,6 +1389,52 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn some_core() -> Arc<Core> {
+        Catalog::empty().core
+    }
+
+    #[test]
+    fn the_catalogs_kept_are_the_two_asked_for_last_and_only_within_the_window() {
+        use std::time::{Duration, Instant};
+        let window = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let (a, b, c) = (some_core(), some_core(), some_core());
+        let mut kept = Retained::default();
+        kept.admit(&a, window, t0);
+        kept.admit(&b, window, t0 + Duration::from_secs(1));
+        // A third lets go of the one asked for longest ago, and the process holds it no more.
+        kept.admit(&c, window, t0 + Duration::from_secs(2));
+        assert_eq!(kept.cores.len(), RETAINED_CORES);
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 2);
+        // Asking for one again makes it the newest, and keeps it once.
+        kept.admit(&b, window, t0 + Duration::from_secs(3));
+        assert_eq!(kept.cores.len(), RETAINED_CORES);
+        assert!(Arc::ptr_eq(&kept.cores[1].1, &b) && Arc::ptr_eq(&kept.cores[0].1, &c));
+        // What was asked for `window` ago is let go, what was asked for after it is not.
+        kept.expire(window, t0 + Duration::from_secs(62));
+        assert_eq!(kept.cores.len(), 1);
+        assert!(Arc::ptr_eq(&kept.cores[0].1, &b));
+        kept.expire(window, t0 + Duration::from_secs(63));
+        assert!(kept.cores.is_empty());
+        assert_eq!(Arc::strong_count(&b), 1);
+    }
+
+    #[test]
+    fn a_window_that_never_ends_has_no_sweeper_and_a_window_of_zero_lets_everything_go() {
+        let core = some_core();
+        retain_shared_catalogs(std::time::Duration::MAX);
+        SharedCores::retain(&core);
+        {
+            let kept = SharedCores::retained().lock().unwrap();
+            assert!(kept.cores.iter().any(|(_, held)| Arc::ptr_eq(held, &core)));
+            assert!(!kept.sweeping, "nothing is swept when nothing expires");
+        }
+        retain_shared_catalogs(std::time::Duration::ZERO);
+        assert!(SharedCores::retained().lock().unwrap().cores.is_empty());
+        assert_eq!(Arc::strong_count(&core), 1);
+    }
 
     fn batched(sizes: &[usize]) -> Vec<Vec<usize>> {
         batches(sizes, |size| *size)

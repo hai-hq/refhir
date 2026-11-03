@@ -117,6 +117,25 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Fixed
 
+- **A tenant made on a `refhir --all-tenants` process took tens of seconds, and does not any
+  more.** Every new tenant compiled the whole catalog twice (once for the state its search
+  parameters had before their backfills, and again to expand the value sets that wait for another
+  package), and read the whole prepared packages file, to pass over the packages it had already
+  been given. A tenant with the release's packages now compiles nothing and does not read the
+  file: it is linked to the packages stored for all tenants, finds the catalogs that were compiled
+  before it, and has its search parameters and expansions copied. The process makes those ready
+  when it starts: its primary makes a tenant of its own (`refhir-warm`, a name no one can have; it
+  is never listed or served) in the background, opens it as any tenant is opened, and removes it,
+  keeping the catalogs it compiled in memory for as long as the process runs (two more catalogs
+  next to the tenants'). The first tenant of a database no longer pays for storing the packages,
+  and the first after a restart no longer compiles. Measured on a laptop under load with the R4
+  release (the 21.5 MiB prepared file): 17.6 s for each tenant after the first before, about 5 s
+  now (0.5 s of CPU); the first tenant 38 s before. A tenant made with packages of its own
+  compiles a catalog of its own, as before.
+  [How long a new tenant takes](docs/clustering.md#how-long-a-new-tenant-takes) says what to
+  expect. The process logs `compiled a catalog for tenants to share` whenever it compiles one, and
+  `ready to make tenants` when it is ready. `[tenants] warm_up = false` (or
+  `REFHIR_TENANTS_WARM_UP=0`) turns the warm-up off.
 - **A data race in the Go client's `Watch.Close`.** A watch cancelled while its `Add` was still being
   sent read its id while the session goroutine wrote it. The id is now handed over under the watch's
   lock, and a query whose watch was closed first is never registered, so none is left running on

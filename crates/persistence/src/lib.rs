@@ -1301,6 +1301,22 @@ pub trait ConformanceStore: Send + Sync {
         self.install_package_in_pieces(name, version, fhir_version, feed)
     }
 
+    /// Gives the tenant package `name@version` from the copy this store keeps for all its tenants,
+    /// if there is one made from `content` and the tenant does not have the package yet. Nothing of
+    /// the package is read, which is why this is asked before its rows are fetched from wherever they
+    /// come from. `None`, the default, says the package has to be installed with
+    /// [`ConformanceStore::install_shared_package_in_pieces`]: there is no copy, it is made from
+    /// other content, or the tenant has the package.
+    fn give_shared_package(
+        &self,
+        name: &str,
+        version: &str,
+        content: &str,
+    ) -> Result<Option<InstallOutcome>, InstallError> {
+        let _ = (name, version, content);
+        Ok(None)
+    }
+
     fn mark_base_ready(&self, package_id: i64, base: &str) -> Result<(), PersistError>;
 
     /// Marks the parameters snapshotted onto this backfill ready.
