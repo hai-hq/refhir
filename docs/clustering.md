@@ -211,8 +211,10 @@ of its own, and counts the full amount. A change to a shared catalog is made to 
 never seen by another tenant. A process opens a few tenants at a time when it starts, so a restart
 does not compile every catalog at once.
 
-**How long a new tenant takes.** Making a tenant (`POST /admin/tenants`, or `refhir tenant create`
-with the process running) answers once the tenant serves.
+### How long a new tenant takes
+
+Making a tenant (`POST /admin/tenants`, or `refhir tenant create` with the process running)
+answers once the tenant serves.
 
 **The process gets ready for the first tenant when it starts** (a standby, when it takes a tenant's
 lease and becomes the primary). The primary makes a tenant of its
