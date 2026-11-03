@@ -351,7 +351,10 @@ fn due(client: &mut impl GenericClient) -> Result<Vec<String>, PersistError> {
 fn signature(client: &mut impl GenericClient) -> Result<String, PersistError> {
     let row = client
         .query_one(
-            &format!("SELECT count(*)::text || '/' || COALESCE(max(updated_at)::text, '') FROM {REGISTRY}"),
+            &format!(
+                "SELECT count(*)::text || '/' || COALESCE(max(updated_at)::text, '') \
+                 FROM {REGISTRY} WHERE name <> '{WARM_TENANT}'"
+            ),
             &[],
         )
         .map_err(definite)?;

@@ -1025,7 +1025,9 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
         cfg.tenants.serve_all = on == "1" || on.eq_ignore_ascii_case("true");
     }
     if let Some(on) = env_value("REFHIR_TENANTS_WARM_UP") {
-        cfg.tenants.warm_up = !(on == "0" || on.eq_ignore_ascii_case("false"));
+        cfg.tenants.warm_up = !["0", "false", "no", "off"]
+            .iter()
+            .any(|off| on.trim().eq_ignore_ascii_case(off));
     }
     if let Some(token) = env_value("REFHIR_ADMIN_TOKEN") {
         cfg.tenants.admin_token = Some(token);
@@ -1152,6 +1154,11 @@ mod tests {
         std::env::set_var("REFHIR_TENANTS_WARM_UP", "0");
         apply_env(&mut cfg).unwrap();
         assert!(!cfg.tenants.warm_up);
+        for off in ["false", "No", " off "] {
+            std::env::set_var("REFHIR_TENANTS_WARM_UP", off);
+            apply_env(&mut cfg).unwrap();
+            assert!(!cfg.tenants.warm_up, "{off:?}");
+        }
         std::env::set_var("REFHIR_TENANTS_WARM_UP", "1");
         apply_env(&mut cfg).unwrap();
         assert!(cfg.tenants.warm_up);

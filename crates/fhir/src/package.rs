@@ -822,7 +822,11 @@ pub fn share_catalog(
         Ok(shared) => shared,
         Err(err) => {
             if was_deferred {
+                // The tenant keeps a catalog of its own, as one that could not be shared does; what
+                // is an error is a catalog that cannot be made one.
                 Catalog::detach_from_shared(catalog, store)?;
+                tracing::warn!("a catalog is not shared: {err}");
+                return Ok(false);
             }
             return Err(err.into());
         }

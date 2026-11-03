@@ -214,7 +214,8 @@ does not compile every catalog at once.
 **How long a new tenant takes.** Making a tenant (`POST /admin/tenants`, or `refhir tenant create`
 with the process running) answers once the tenant serves.
 
-**The process gets ready for the first tenant when it starts.** The primary makes a tenant of its
+**The process gets ready for the first tenant when it starts** (a standby, when it takes a tenant's
+lease and becomes the primary). The primary makes a tenant of its
 own in the background, opens it as it opens any tenant, and removes it again. It is never listed or
 served, nobody can make one of the name `refhir-warm`, and it has no access to any other tenant: it
 is a tenant like the rest, bound to its own rows. Opening it stores the release's packages for all

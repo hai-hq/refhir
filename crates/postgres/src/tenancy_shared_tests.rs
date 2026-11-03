@@ -368,8 +368,8 @@ fn the_warm_up_tenant_is_a_tenant_nobody_sees() {
     let shared = connections(&operator_url(&url), 2);
     let signature = shared.registry_signature().unwrap();
     shared.make_warm_tenant().unwrap();
-    // It is a registry row (the signature moved), that the registry's readers do not show.
-    assert_ne!(shared.registry_signature().unwrap(), signature);
+    // It is a registry row that the registry's readers do not show, and its signature does not move.
+    assert_eq!(shared.registry_signature().unwrap(), signature);
     let names = |tenants: Vec<crate::Tenant>| -> Vec<String> {
         tenants.into_iter().map(|tenant| tenant.name).collect()
     };

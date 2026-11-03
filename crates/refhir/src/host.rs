@@ -48,11 +48,11 @@ const LEASE_RETRY: Duration = Duration::from_secs(1);
 /// CPU and a good deal of memory while it does, so a process with many tenants opens them a few at
 /// a time (a tenant waiting for its lease or its primary does not count: it holds nothing yet).
 const MAX_CONCURRENT_OPENS: usize = 4;
-/// The wait before a tenant that failed to open is tried again, doubling up to the longest.
 /// How long the process keeps the compiled catalogs a new tenant starts from and ends with after
 /// they were last used: for as long as it runs, so that no tenant made after the warm-up compiles
 /// them again, however long it has been since the one before.
 const CATALOG_RETENTION: Duration = Duration::MAX;
+/// The wait before a tenant that failed to open is tried again, doubling up to the longest.
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_LONGEST: Duration = Duration::from_secs(300);
 
@@ -169,6 +169,8 @@ pub(crate) struct Manager {
     confidential_secret: String,
     /// Whether the process can sign SMART users in (an OIDC provider, or demo login).
     login: bool,
+    /// Whether the warm-up has been started: once, by the process that first writes.
+    warm_up_started: AtomicBool,
 }
 
 /// Runs the process: serves `listener` (and the admin listener, if any) until told to stop.
@@ -244,6 +246,7 @@ pub(crate) fn run(
         failed: Mutex::new(HashMap::new()),
         opens: Permits::new(MAX_CONCURRENT_OPENS),
         default_share,
+        warm_up_started: AtomicBool::new(false),
         cfg,
     });
     host.set_admin(manager.clone());
@@ -279,8 +282,9 @@ pub(crate) fn run(
     manager.sync_registry();
     host.set_ready();
     manager.clone().start_background();
-    // Only the process that writes makes tenants, and so only it has anything to get ready.
-    if role == Role::Primary && manager.cfg.tenants.warm_up {
+    // Only the process that writes makes tenants, and so only it has anything to get ready. A
+    // standby is one from when it takes a tenant's lease (see `Manager::open`).
+    if role == Role::Primary {
         manager.clone().start_warm_up();
     }
 
@@ -664,6 +668,7 @@ impl Manager {
                 // Holding a tenant's lease makes this process its primary, and so the one that
                 // changes tenants.
                 self.host.set_role("primary");
+                self.clone().start_warm_up();
             }
             let db = Arc::new(Database::open(as_persistence).map_err(|err| err.to_string())?);
             let catalog = Arc::new(RwLock::new(
@@ -711,8 +716,13 @@ impl Manager {
                     "tenant `{name}` keeps a catalog of its own: its definitions are not only \
                      what the tenants share"
                 ),
+                // A catalog that could not be made the tenant's own does not see what the tenant
+                // wrote: the tenant is not served with it.
                 Err(err) => {
-                    tracing::warn!("tenant `{name}` keeps its own copy of the catalog: {err}")
+                    persistence.release_writer_lease();
+                    return Err(format!(
+                        "tenant `{name}` could not settle its catalog: {err}"
+                    ));
                 }
             }
             (db, catalog)
@@ -846,6 +856,9 @@ impl Manager {
     /// compiles the catalogs that a new tenant starts from and ends with, which the process then
     /// keeps (see `CATALOG_RETENTION`), so the tenants made later find them.
     fn start_warm_up(self: Arc<Self>) {
+        if !self.cfg.tenants.warm_up || self.warm_up_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let spawned = std::thread::Builder::new()
             .name("refhir-warm-up".into())
             .spawn(move || self.warm_up());

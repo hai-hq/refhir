@@ -231,8 +231,8 @@ pub fn shared_catalogs_compiled() -> u64 {
     COMPILED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// A window so long that the catalogs kept are never let go.
-const FOREVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+/// The window that never ends: what [`std::time::Duration::MAX`] is once stored as whole seconds.
+const FOREVER: std::time::Duration = std::time::Duration::from_secs(u64::MAX);
 
 /// How many catalogs are kept at most: the one a tenant starts from and the one it ends with differ.
 const RETAINED_CORES: usize = 2;
@@ -244,13 +244,33 @@ struct Retained {
     sweeping: bool,
 }
 
+impl Retained {
+    /// Keep `core`, asked for at `now`, and what was asked for within `window` before it, at most
+    /// [`RETAINED_CORES`] in all: the ones asked for longest ago go first.
+    fn admit(&mut self, core: &Arc<Core>, window: std::time::Duration, now: std::time::Instant) {
+        self.cores
+            .retain(|(at, held)| !Arc::ptr_eq(held, core) && now.duration_since(*at) < window);
+        self.cores.push((now, core.clone()));
+        while self.cores.len() > RETAINED_CORES {
+            self.cores.remove(0);
+        }
+    }
+
+    /// Let go of what was asked for `window` ago or longer.
+    fn expire(&mut self, window: std::time::Duration, now: std::time::Instant) {
+        self.cores
+            .retain(|(at, _)| now.duration_since(*at) < window);
+    }
+}
+
 /// Keep the shared catalogs this process builds or hands out for `window` after they were last
 /// asked for (at most two), even when no tenant holds them. A process that serves many tenants
 /// makes a tenant by giving it the packages and then building the catalog it starts from, which
 /// is the catalog the tenant made just before it holds, and that one is let go as soon as the tenant
 /// that held it moves on: without this each new tenant compiles it again, which is most of the
 /// time it takes to be made. The cost is the memory of those catalogs for `window`. A window of zero
-/// (the default) keeps nothing.
+/// (the default) keeps nothing, and [`std::time::Duration::MAX`] keeps them for as long as the
+/// process runs.
 pub fn retain_shared_catalogs(window: std::time::Duration) {
     RETAIN_SECS.store(window.as_secs(), std::sync::atomic::Ordering::SeqCst);
     if window.is_zero() {
@@ -287,13 +307,7 @@ impl SharedCores {
         let mut kept = Self::retained()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let now = std::time::Instant::now();
-        kept.cores
-            .retain(|(at, held)| !Arc::ptr_eq(held, core) && now.duration_since(*at) < window);
-        kept.cores.push((now, core.clone()));
-        while kept.cores.len() > RETAINED_CORES {
-            kept.cores.remove(0);
-        }
+        kept.admit(core, window, std::time::Instant::now());
         // A window that never ends has nothing to sweep.
         if !kept.sweeping && window < FOREVER {
             kept.sweeping = true;
@@ -316,9 +330,7 @@ impl SharedCores {
             let mut kept = Self::retained()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let now = std::time::Instant::now();
-            kept.cores
-                .retain(|(at, _)| now.duration_since(*at) < window);
+            kept.expire(window, std::time::Instant::now());
             if kept.cores.is_empty() {
                 kept.sweeping = false;
                 return;
@@ -1377,6 +1389,52 @@ fn references_from(type_name: &str, json: &Value) -> Vec<ReferenceElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn some_core() -> Arc<Core> {
+        Catalog::empty().core
+    }
+
+    #[test]
+    fn the_catalogs_kept_are_the_two_asked_for_last_and_only_within_the_window() {
+        use std::time::{Duration, Instant};
+        let window = Duration::from_secs(60);
+        let t0 = Instant::now();
+        let (a, b, c) = (some_core(), some_core(), some_core());
+        let mut kept = Retained::default();
+        kept.admit(&a, window, t0);
+        kept.admit(&b, window, t0 + Duration::from_secs(1));
+        // A third lets go of the one asked for longest ago, and the process holds it no more.
+        kept.admit(&c, window, t0 + Duration::from_secs(2));
+        assert_eq!(kept.cores.len(), RETAINED_CORES);
+        assert_eq!(Arc::strong_count(&a), 1);
+        assert_eq!(Arc::strong_count(&b), 2);
+        // Asking for one again makes it the newest, and keeps it once.
+        kept.admit(&b, window, t0 + Duration::from_secs(3));
+        assert_eq!(kept.cores.len(), RETAINED_CORES);
+        assert!(Arc::ptr_eq(&kept.cores[1].1, &b) && Arc::ptr_eq(&kept.cores[0].1, &c));
+        // What was asked for `window` ago is let go, what was asked for after it is not.
+        kept.expire(window, t0 + Duration::from_secs(62));
+        assert_eq!(kept.cores.len(), 1);
+        assert!(Arc::ptr_eq(&kept.cores[0].1, &b));
+        kept.expire(window, t0 + Duration::from_secs(63));
+        assert!(kept.cores.is_empty());
+        assert_eq!(Arc::strong_count(&b), 1);
+    }
+
+    #[test]
+    fn a_window_that_never_ends_has_no_sweeper_and_a_window_of_zero_lets_everything_go() {
+        let core = some_core();
+        retain_shared_catalogs(std::time::Duration::MAX);
+        SharedCores::retain(&core);
+        {
+            let kept = SharedCores::retained().lock().unwrap();
+            assert!(kept.cores.iter().any(|(_, held)| Arc::ptr_eq(held, &core)));
+            assert!(!kept.sweeping, "nothing is swept when nothing expires");
+        }
+        retain_shared_catalogs(std::time::Duration::ZERO);
+        assert!(SharedCores::retained().lock().unwrap().cores.is_empty());
+        assert_eq!(Arc::strong_count(&core), 1);
+    }
 
     fn batched(sizes: &[usize]) -> Vec<Vec<usize>> {
         batches(sizes, |size| *size)
