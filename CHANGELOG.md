@@ -117,6 +117,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ### Fixed
 
+- **A tenant made on a `refhir --all-tenants` process took tens of seconds, and does not any
+  more.** Every new tenant compiled the whole catalog twice (once for the state its search
+  parameters had before their backfills, and again to expand the value sets that wait for another
+  package), and read the whole prepared packages file, to pass over the packages it had already
+  been given. A tenant after the first with the release's packages now compiles nothing and does
+  not read the file: it is linked to the packages stored for all tenants, finds the catalog the
+  tenants before it compiled (the process keeps those for ten minutes after their last use), and
+  has its search parameters and expansions copied. Measured on a laptop under load with the R4
+  release (the 21.5 MiB prepared file): 17 s for each tenant after the first before, about 5 s now
+  (0.5 s of CPU); the first tenant 38 s before and 27 s now. A tenant made with packages of its own
+  compiles a catalog of its own, as before. [Many tenants in one
+  process](docs/clustering.md#how-long-a-new-tenant-takes) says what to expect. The process logs
+  `compiled a catalog for tenants to share` whenever it compiles one.
 - **A data race in the Go client's `Watch.Close`.** A watch cancelled while its `Add` was still being
   sent read its id while the session goroutine wrote it. The id is now handed over under the watch's
   lock, and a query whose watch was closed first is never registered, so none is left running on

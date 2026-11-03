@@ -457,7 +457,7 @@ impl PostgresPersistence {
         // follows must be the shared copy that was just built.
         let mut fed = false;
         for _ in 0..3 {
-            match self.activate_shared(tenant, name, version, fhir_version, content)? {
+            match self.activate_shared(tenant, name, version, Some(fhir_version), content)? {
                 Shared::Activated(outcome) => return Ok(outcome),
                 Shared::Missing if !fed => {
                     fed = self.build_shared(name, version, fhir_version, content, feed)?;
@@ -490,13 +490,14 @@ impl PostgresPersistence {
         ))))
     }
 
-    /// Gives the tenant the shared copy of a package, if there is one made from `content`.
+    /// Gives the tenant the shared copy of a package, if there is one made from `content`. A caller
+    /// that has not read the package does not know its FHIR version: the copy's is the one checked.
     fn activate_shared(
         &self,
         tenant: i32,
         name: &str,
         version: &str,
-        fhir_version: &str,
+        fhir_version: Option<&str>,
         content: &str,
     ) -> Result<Shared, InstallError> {
         let scope = self.scope;
@@ -513,7 +514,7 @@ impl PostgresPersistence {
         }
         let Some(shared) = tx
             .query_opt(
-                "SELECT id, digest, row_counts FROM packages \
+                "SELECT id, digest, row_counts, fhir_version FROM packages \
                  WHERE instance_id = 0 AND name = $1 AND version = $2",
                 &[&name, &version],
             )
@@ -526,6 +527,8 @@ impl PostgresPersistence {
         if digest.as_deref() != Some(content) {
             return Ok(Shared::Different);
         }
+        let copy_version: String = shared.get(3);
+        let fhir_version = fhir_version.unwrap_or(&copy_version);
         if let Some(row) = tx
             .query_opt(&sql_first_fhir_version(scope), &[])
             .map_err(definite)?
@@ -1312,6 +1315,25 @@ impl ConformanceStore for PostgresPersistence {
             tx.commit().map_err(definite)?;
             retire_if_swollen(&mut guard, heaviest);
             Ok(outcome)
+        })
+    }
+
+    fn give_shared_package(
+        &self,
+        name: &str,
+        version: &str,
+        content: &str,
+    ) -> Result<Option<InstallOutcome>, InstallError> {
+        let Scope::Tenant(tenant) = self.scope else {
+            return Ok(None);
+        };
+        crate::off_runtime(|| {
+            Ok(
+                match self.activate_shared(tenant, name, version, None, content)? {
+                    Shared::Activated(outcome) => Some(outcome),
+                    Shared::Own | Shared::Missing | Shared::Different => None,
+                },
+            )
         })
     }
 

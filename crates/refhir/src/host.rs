@@ -49,6 +49,9 @@ const LEASE_RETRY: Duration = Duration::from_secs(1);
 /// a time (a tenant waiting for its lease or its primary does not count: it holds nothing yet).
 const MAX_CONCURRENT_OPENS: usize = 4;
 /// The wait before a tenant that failed to open is tried again, doubling up to the longest.
+/// How long the process keeps the compiled catalog a new tenant starts from after it was last
+/// used, so that the next tenant made within that time does not compile it again.
+const CATALOG_RETENTION: Duration = Duration::from_secs(600);
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_LONGEST: Duration = Duration::from_secs(300);
 
@@ -218,6 +221,7 @@ pub(crate) fn run(
              role that owns the database (see docs/clustering.md)"
         );
     }
+    refhir_fhir::retain_shared_catalogs(CATALOG_RETENTION);
     let host = TenantHost::new(HostConfig {
         routing: routing.clone(),
         admin_token: cfg.tenants.admin_token.clone(),
@@ -660,7 +664,13 @@ impl Manager {
             let catalog = Arc::new(RwLock::new(
                 Catalog::open(store.as_ref()).map_err(|err| err.to_string())?,
             ));
-            catalog.write().expect("catalog").set_rebuild_in_place(true);
+            {
+                // Nothing answers yet: the catalog is rebuilt in place, and what a change of the
+                // tenant's terminology would make of it waits for `share_catalog` below.
+                let mut starting = catalog.write().expect("catalog");
+                starting.set_rebuild_in_place(true);
+                starting.set_detach_deferred(true);
+            }
             let prepared = (|| -> Result<(), Box<dyn std::error::Error>> {
                 crate::config::check_release_matches_database(
                     release_from_plan(&self.cfg.packages),

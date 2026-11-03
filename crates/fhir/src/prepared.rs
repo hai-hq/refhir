@@ -36,7 +36,7 @@ use crate::error::FhirError;
 use crate::npm::{materialize, parse_package_spec, source_digest, Node, PackageFetcher, Resolver};
 use crate::package::{
     finish_install, held_at_least, package_identity, read_package, run_backfills,
-    stage_package_in_pieces, PackageHead, PendingBackfill,
+    stage_given_package, stage_package_in_pieces, PackageHead, PendingBackfill,
 };
 
 /// The name a prepared file is given when nothing else names it, and the one looked for next to
@@ -311,6 +311,10 @@ pub struct PreparedBundle {
     ahead: Option<Piece>,
     /// Why the last read failed, when it did: the file is damaged or cannot be read.
     failure: Option<FhirError>,
+    /// How many packages of the file have been named so far.
+    taken: usize,
+    /// Whether the rows of the package named last have not been taken yet.
+    unconsumed: bool,
 }
 
 impl PreparedBundle {
@@ -335,6 +339,8 @@ impl PreparedBundle {
             origin,
             ahead: None,
             failure: None,
+            taken: 0,
+            unconsumed: false,
         })
     }
 
@@ -388,12 +394,69 @@ impl PreparedBundle {
                 name,
                 version,
                 fhir_version,
-            }) => Ok(Some(PackageHead {
-                name,
-                version,
-                fhir_version,
-            })),
+            }) => {
+                self.taken += 1;
+                self.unconsumed = true;
+                Ok(Some(PackageHead {
+                    name,
+                    version,
+                    fhir_version,
+                }))
+            }
             Some(_) => Err(self.damaged("rows come before the package they belong to")),
+        }
+    }
+
+    /// The package that the header lists at `index`, named by the file. What the file holds before
+    /// it is passed over, and only now: a package that is given to its tenant from a copy the store
+    /// keeps is never read, and a file whose packages all are is never read past its header.
+    pub(crate) fn package_at(&mut self, index: usize) -> Result<PackageHead, FhirError> {
+        if self.unconsumed {
+            self.skip_package()?;
+        }
+        while self.taken < index {
+            if self.next_package()?.is_none() {
+                return Err(self.damaged(format!(
+                    "its header lists {} packages and it holds {}",
+                    self.names.len(),
+                    self.taken
+                )));
+            }
+            self.skip_package()?;
+        }
+        let Some(head) = self.next_package()? else {
+            return Err(self.damaged(format!(
+                "its header lists {} packages and it holds {}",
+                self.names.len(),
+                self.taken
+            )));
+        };
+        let listed = self.names.get(index).map(String::as_str);
+        if listed != Some(format!("{}@{}", head.name, head.version).as_str()) {
+            return Err(self.damaged(format!(
+                "its header lists {} where it holds {}@{}",
+                listed.unwrap_or("nothing"),
+                head.name,
+                head.version
+            )));
+        }
+        Ok(head)
+    }
+
+    /// Whether the file ends where its header says, if it has been read as far as that.
+    fn check_end(&mut self) -> Result<(), FhirError> {
+        if self.taken < self.names.len() {
+            return Ok(());
+        }
+        if self.unconsumed {
+            self.skip_package()?;
+        }
+        match self.next_package()? {
+            None => Ok(()),
+            Some(_) => Err(self.damaged(format!(
+                "its header lists {} packages and it holds more",
+                self.names.len()
+            ))),
         }
     }
 
@@ -411,9 +474,13 @@ impl PreparedBundle {
                 }
             };
             match piece {
-                None => return Ok(()),
+                None => {
+                    self.unconsumed = false;
+                    return Ok(());
+                }
                 Some(piece @ Piece::Package { .. }) => {
                     self.ahead = Some(piece);
+                    self.unconsumed = false;
                     return Ok(());
                 }
                 Some(Piece::StructureDefinitions(batch)) => rows.structure_definitions(&batch)?,
@@ -428,9 +495,13 @@ impl PreparedBundle {
     pub(crate) fn skip_package(&mut self) -> Result<(), FhirError> {
         loop {
             match self.next_piece()? {
-                None => return Ok(()),
+                None => {
+                    self.unconsumed = false;
+                    return Ok(());
+                }
                 Some(piece @ Piece::Package { .. }) => {
                     self.ahead = Some(piece);
+                    self.unconsumed = false;
                     return Ok(());
                 }
                 Some(_) => {}
@@ -494,31 +565,43 @@ pub fn install_prepared(
         return Ok(None);
     }
     let installed = store.load_packages().map_err(FhirError::from)?;
-    let expected = bundle.names.len();
-    let mut seen = 0;
+    let listed = bundle.names.clone();
     let mut staged = 0;
     let mut pending: Vec<PendingBackfill> = Vec::new();
     let mut result = Ok(());
-    loop {
-        let head = match bundle.next_package() {
-            Ok(None) => break,
-            Ok(Some(head)) => head,
+    // The packages are taken in the order the header lists them, which is the order they are in the
+    // file. A package the database has is not read, nor is one that the store gives from the copy
+    // it keeps for its tenants: the file is read only as far as the packages that need it.
+    for (index, spec) in listed.iter().enumerate() {
+        let Some((name, version)) = spec.rsplit_once('@') else {
+            result = Err(bundle.damaged(format!("its header lists `{spec}`, not name@version")));
+            break;
+        };
+        if held_at_least(&installed, name, version) {
+            continue;
+        }
+        staged += 1;
+        let content = bundle.content_of(name, version);
+        if let Some(content) = content.as_deref() {
+            match stage_given_package(store, db, catalog, (name, version), content) {
+                Ok(Some(backfill)) => {
+                    pending.extend(backfill);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    result = Err(err);
+                    break;
+                }
+            }
+        }
+        let head = match bundle.package_at(index) {
+            Ok(head) => head,
             Err(err) => {
                 result = Err(err);
                 break;
             }
         };
-        seen += 1;
-        if held_at_least(&installed, &head.name, &head.version) {
-            if let Err(err) = bundle.skip_package() {
-                result = Err(err);
-                break;
-            }
-            continue;
-        }
-        staged += 1;
-        let content = bundle.content_of(&head.name, &head.version);
-        // A store that gives the package from a copy it already holds does not ask for its rows.
         let mut read = false;
         let stored = stage_package_in_pieces(
             store,
@@ -550,12 +633,10 @@ pub fn install_prepared(
             }
         }
     }
-    // A stream that ends before the header's list does, or goes on past it, is not the file that
-    // was made: the packages it was made to carry may not be in it.
-    if result.is_ok() && seen != expected {
-        result = Err(bundle.damaged(format!(
-            "its header lists {expected} packages and it holds {seen}"
-        )));
+    // A file read to its end that goes on past what its header lists is not the file that was
+    // made: the packages it was made to carry may not be the ones in it.
+    if result.is_ok() {
+        result = bundle.check_end();
     }
     if staged == 0 {
         // Nothing new, but an earlier attempt may have left backfills behind.

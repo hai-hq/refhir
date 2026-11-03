@@ -477,6 +477,57 @@ fn tenants_given_the_same_packages_share_one_catalog() {
     }
 }
 
+/// What a tenant costs to make once the first exists: it is given the shared packages and the
+/// catalog the first compiled, and nothing is read from the prepared file or compiled again. A
+/// create that takes tens of seconds, as one that compiled the catalog again does, is what this
+/// keeps out; it counts what is done and not how long it takes, so a slow machine does not flake it.
+#[test]
+fn a_tenant_made_after_the_first_compiles_no_catalog() {
+    let Some(admin) = admin_url("tenants host: tenants made later") else {
+        return;
+    };
+    let (_database, app) = database_of_an_ordinary_role(&admin, "hostlater");
+    let bundle = prepared_packages("later");
+    let mut host = Host::start_with_bundle("later", &app, &[], &bundle);
+    host.wait_ready();
+    let compiled = |host: &Host| {
+        host.log()
+            .matches("compiled a catalog for tenants to share")
+            .count()
+    };
+    let (status, created) = host.admin("POST", "/admin/tenants", Some(create_body("first")));
+    assert_eq!(status, 201, "{created}\n{}", host.log());
+    let after_first = compiled(&host);
+    assert!(
+        after_first > 0,
+        "the first tenant compiles the catalog:\n{}",
+        host.log()
+    );
+    for name in ["second", "third", "fourth"] {
+        let started = Instant::now();
+        let (status, created) = host.admin("POST", "/admin/tenants", Some(create_body(name)));
+        assert_eq!(status, 201, "{created}\n{}", host.log());
+        assert_eq!(
+            created["served"]["shared_catalog"],
+            json!(true),
+            "{created}"
+        );
+        eprintln!("tenant {name} was made in {:.1?}", started.elapsed());
+        assert_eq!(
+            compiled(&host),
+            after_first,
+            "tenant {name} compiled a catalog that the first had compiled:\n{}",
+            host.log()
+        );
+    }
+    // Each was given the packages from the copy the first stored, and none was read for it.
+    let log = host.log();
+    assert!(
+        log.matches("without reading it; linked").count() >= 3,
+        "{log}"
+    );
+}
+
 #[test]
 fn a_restart_serves_every_tenant_as_it_was() {
     let Some(admin) = admin_url("tenants host: restart") else {

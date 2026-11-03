@@ -90,10 +90,13 @@ refhir --postgres $URL --tenant acme --role replica --primary-url http://acme:80
   `--public-url`. The tenant's processes share `--smart-dcr-token` and
   `--smart-confidential-secret`, as above.
 - **Packages.** The FHIR packages that ship with ReFHIR (the core definitions, terminology and
-  what they depend on) are stored once for all tenants. A new tenant is given them in moments
-  instead of reading and storing its own copy, and its start-up does not grow with the number of
-  tenants. What a tenant writes (its own definitions, code systems and search parameters) and
-  every package installed from a registry or a directory stay its own.
+  what they depend on) are stored once for all tenants. A new tenant is linked to them and is
+  given its own copy of their search parameters and value set expansions (about 20 MB of rows for
+  R4), which it keeps its index state and any change in; it does not read the prepared packages
+  file or compile anything, so it takes seconds (see
+  [How long a new tenant takes](#how-long-a-new-tenant-takes)), and its start-up does not grow
+  with the number of tenants. What a tenant writes (its own definitions, code systems and search
+  parameters) and every package installed from a registry or a directory stay its own.
 - **Files.** A tenant's package cache and export directory default to a folder named for it.
 - **Routing.** With one process per tenant, route requests to a tenant's processes by host name or
   path in front of ReFHIR, with a load balancer or ingress. To have no process per tenant at all,
@@ -207,6 +210,33 @@ catalog was changed by writing a SearchParameter, CodeSystem, ValueSet or Concep
 of its own, and counts the full amount. A change to a shared catalog is made to a copy for the tenant that makes it, so it is
 never seen by another tenant. A process opens a few tenants at a time when it starts, so a restart
 does not compile every catalog at once.
+
+**How long a new tenant takes.** Making a tenant (`POST /admin/tenants`, or `refhir tenant create`
+with the process running) answers once the tenant serves. What it does depends on what the
+process already has:
+
+- **A tenant after the first, with the release's packages only** (`"packages": []`): it is linked
+  to the packages stored for all tenants and given its rows of them, a few dozen small
+  transactions and about 20 MB of rows, and it holds the catalog that tenants made before it
+  compiled. **A few seconds**, most of it the database committing; the process uses well under a
+  second of CPU. It does not grow with the number of tenants.
+- **The first tenant made after the process starts** compiles the catalog that the tenants it
+  makes start from once (the process keeps it for ten minutes after it was last used, so a run of
+  tenants made one after another compiles it once). That adds the time of a first start of one
+  tenant, **some seconds**: five to ten on a laptop under load.
+- **The first tenant of a database** also stores the release's packages for all tenants: it reads
+  the prepared packages file and writes about 200 MB of definitions, terminology and expansions, and compiles
+  the catalog twice. **Tens of seconds, once for the database.** Nothing else of the process's start
+  waits for it, so this is paid by the first request, so a deployment that must not wait
+  makes its first tenant when it is set up.
+- **A tenant with packages of its own** (`"packages": ["name@version", …]`) holds a catalog of its
+  own, which is compiled from its definitions, every time: **tens of seconds** for the R4 release,
+  however many tenants there are. Give a tenant packages only when it needs them.
+
+Setting the provisioning timeout of a caller to a minute covers every case above on a busy
+machine; the common one is a few seconds. `refhir` logs `compiled a catalog for tenants to share`
+(with the time it took) whenever the process compiles one, and `installed … linked` for each package
+a tenant is given from the stored copy, so what a create did is in the log.
 
 A tenant may hold at most its **share** of the pool at once, so one busy tenant cannot keep the
 others waiting for a connection: `connections_per_tenant` (default half the pool, and at most all
