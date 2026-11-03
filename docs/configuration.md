@@ -84,6 +84,7 @@ Read when the process is started with `--all-tenants`. See
 | `admin_token` | none | Bearer token of the admin API; prefer `REFHIR_ADMIN_TOKEN`. Without one the admin API refuses everything |
 | `admin_bind` | none | A listener of its own for `/admin` and the probes |
 | `connections_per_tenant` | half of `--db-pool` | Pool connections one tenant may hold at once |
+| `warm_up` | `true` | A primary makes what a new tenant starts from when it starts (see [How long a new tenant takes](clustering.md#how-long-a-new-tenant-takes)); `REFHIR_TENANTS_WARM_UP=0` turns it off |
 | `delete_grace` | `"7d"` | How long a deleted tenant's rows are kept (`30s`, `15m`, `24h`, `7d`) |
 | `export_on_delete` | `true` | Write a tenant's resources out before it is deleted |
 | `delete_hook` | none | A URL sent a `POST` when a tenant is deleted |

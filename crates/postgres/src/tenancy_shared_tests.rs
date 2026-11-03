@@ -357,6 +357,53 @@ fn the_registry_creates_deletes_restores_and_purges() {
     ));
 }
 
+/// The tenant a process makes at its start to get ready (see [`crate::WARM_TENANT`]) is opened as
+/// any tenant is, and is nobody's to name, list, change or delete.
+#[test]
+fn the_warm_up_tenant_is_a_tenant_nobody_sees() {
+    let Some(admin) = test_url("tenancy: warm-up tenant") else {
+        return;
+    };
+    let url = shared(&admin, "tshwarm", &["acme"]);
+    let shared = connections(&operator_url(&url), 2);
+    let signature = shared.registry_signature().unwrap();
+    shared.make_warm_tenant().unwrap();
+    // It is a registry row (the signature moved), that the registry's readers do not show.
+    assert_ne!(shared.registry_signature().unwrap(), signature);
+    let names = |tenants: Vec<crate::Tenant>| -> Vec<String> {
+        tenants.into_iter().map(|tenant| tenant.name).collect()
+    };
+    assert_eq!(names(shared.list_tenants().unwrap()), ["acme"]);
+    assert_eq!(names(crate::list_tenants(&url).unwrap()), ["acme"]);
+    assert!(shared.get_tenant(crate::WARM_TENANT).unwrap().is_none());
+    assert!(crate::get_tenant(&url, crate::WARM_TENANT)
+        .unwrap()
+        .is_none());
+    assert!(shared
+        .delete_tenant(crate::WARM_TENANT, 0)
+        .unwrap()
+        .is_none());
+    assert!(shared.restore_tenant(crate::WARM_TENANT).unwrap().is_none());
+    assert!(shared.tenants_due_for_purge().unwrap().is_empty());
+    // Nobody can make one, or purge one, by its name.
+    assert!(shared
+        .create_tenant(crate::WARM_TENANT, &json!({}))
+        .is_err());
+    assert!(crate::create_tenant(&url, crate::WARM_TENANT).is_err());
+    assert!(crate::delete_tenant(&url, crate::WARM_TENANT).is_err());
+    // The process that made it opens it as any tenant, with rows of its own that a purge removes.
+    let warm = PostgresPersistence::open_tenant(&shared, crate::WARM_TENANT, 1).unwrap();
+    assert!(warm.try_acquire_writer_lease().is_ok());
+    warm.release_writer_lease();
+    drop(warm);
+    // Making it again removes what an earlier one left, and removing it leaves the tenants alone.
+    shared.make_warm_tenant().unwrap();
+    shared.remove_warm_tenant().unwrap();
+    assert_eq!(shared.remove_warm_tenant().unwrap(), 0);
+    assert!(PostgresPersistence::open_tenant(&shared, crate::WARM_TENANT, 1).is_err());
+    assert_eq!(names(shared.list_tenants().unwrap()), ["acme"]);
+}
+
 /// A database made by the release before the registry kept settings, holding tenants with rows,
 /// is brought up to date by the first process that serves every tenant, and every tenant is
 /// served as it was.

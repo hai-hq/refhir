@@ -56,6 +56,7 @@ pub struct TenantsSection {
     pub admin_token: Option<String>,
     pub admin_bind: Option<String>,
     pub connections_per_tenant: Option<usize>,
+    pub warm_up: Option<bool>,
     pub delete_grace: Option<String>,
     pub export_on_delete: Option<bool>,
     pub delete_hook: Option<String>,
@@ -81,6 +82,9 @@ pub struct TenantsConfig {
     pub admin_bind: Option<String>,
     /// Connections of the pool one tenant may hold at once; `None` is half the pool.
     pub connections_per_tenant: Option<usize>,
+    /// Whether a primary makes the packages and catalogs a new tenant starts from when it starts,
+    /// by making a tenant of its own for the purpose and removing it again.
+    pub warm_up: bool,
     /// How long a deleted tenant's rows are kept, and it can be restored.
     pub delete_grace: std::time::Duration,
     /// Whether a tenant's resources are written out when it is deleted.
@@ -103,6 +107,7 @@ impl Default for TenantsConfig {
             admin_token: None,
             admin_bind: None,
             connections_per_tenant: None,
+            warm_up: true,
             delete_grace: std::time::Duration::from_secs(7 * 86_400),
             export_on_delete: true,
             delete_hook: None,
@@ -139,6 +144,9 @@ impl TenantsConfig {
                 return Err("tenants.connections_per_tenant must be a positive number".into());
             }
             self.connections_per_tenant = Some(share);
+        }
+        if let Some(on) = file.warm_up {
+            self.warm_up = on;
         }
         if let Some(grace) = &file.delete_grace {
             self.delete_grace =
@@ -1016,6 +1024,9 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
     if let Some(on) = env_value("REFHIR_ALL_TENANTS") {
         cfg.tenants.serve_all = on == "1" || on.eq_ignore_ascii_case("true");
     }
+    if let Some(on) = env_value("REFHIR_TENANTS_WARM_UP") {
+        cfg.tenants.warm_up = !(on == "0" || on.eq_ignore_ascii_case("false"));
+    }
     if let Some(token) = env_value("REFHIR_ADMIN_TOKEN") {
         cfg.tenants.admin_token = Some(token);
     }
@@ -1128,6 +1139,24 @@ mod tests {
 
     /// Tests that set or read process environment variables take turns.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_primary_that_serves_every_tenant_warms_up_unless_told_not_to() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut tenants = TenantsConfig::default();
+        assert!(tenants.warm_up);
+        let file: TenantsSection = toml::from_str("warm_up = false").unwrap();
+        tenants.apply_file(&file).unwrap();
+        assert!(!tenants.warm_up);
+        let mut cfg = ResolvedConfig::defaults();
+        std::env::set_var("REFHIR_TENANTS_WARM_UP", "0");
+        apply_env(&mut cfg).unwrap();
+        assert!(!cfg.tenants.warm_up);
+        std::env::set_var("REFHIR_TENANTS_WARM_UP", "1");
+        apply_env(&mut cfg).unwrap();
+        assert!(cfg.tenants.warm_up);
+        std::env::remove_var("REFHIR_TENANTS_WARM_UP");
+    }
 
     #[test]
     fn the_health_cards_key_file_comes_from_the_file_and_the_environment_overrides_it() {

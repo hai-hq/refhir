@@ -87,9 +87,26 @@ pub fn holds_tenants(url: &str) -> Result<bool, PersistError> {
     })
 }
 
+/// The name of the tenant a process that serves every tenant makes at its start, to have what a
+/// new tenant needs ready before the first one is asked for, and removes again. It is a tenant like
+/// any other while it lasts, so that making it is exactly what making a tenant is, and nobody can
+/// make, read, change or delete one of this name: it is not listed, and not served.
+pub const WARM_TENANT: &str = "refhir-warm";
+
 /// A tenant name is lowercase letters, digits and `-`, starting with a letter or digit, at most
 /// 63 characters. It becomes part of URLs, directory names and log lines, so it stays boring.
+/// [`WARM_TENANT`] is a name no one may have.
 pub fn validate_tenant_name(name: &str) -> Result<(), PersistError> {
+    if name == WARM_TENANT {
+        return Err(definite(format!(
+            "`{name}` is reserved: use another tenant name"
+        )));
+    }
+    validate_name_syntax(name)
+}
+
+/// What a name must look like, whoever owns it.
+pub(crate) fn validate_name_syntax(name: &str) -> Result<(), PersistError> {
     let ok = !name.is_empty()
         && name.len() <= MAX_NAME
         && name
@@ -200,7 +217,7 @@ fn insert_tenant(
     name: &str,
     settings: &JsonValue,
 ) -> Result<Created, PersistError> {
-    validate_tenant_name(name)?;
+    validate_name_syntax(name)?;
     let columns = tenant_columns();
     let inserted = client
         .query_opt(
@@ -232,7 +249,7 @@ fn read_tenants(client: &mut impl GenericClient) -> Result<Vec<Tenant>, PersistE
     let rows = client
         .query(
             &format!(
-                "SELECT {} FROM {REGISTRY} WHERE id > 0 ORDER BY id",
+                "SELECT {} FROM {REGISTRY} WHERE id > 0 AND name <> '{WARM_TENANT}' ORDER BY id",
                 tenant_columns()
             ),
             &[],
@@ -254,7 +271,7 @@ fn read_tenant(
     let row = client
         .query_opt(
             &format!(
-                "SELECT {} FROM {REGISTRY} WHERE name = $1 AND id > 0",
+                "SELECT {} FROM {REGISTRY} WHERE name = $1 AND id > 0 AND name <> '{WARM_TENANT}'",
                 tenant_columns()
             ),
             &[&name],
@@ -281,7 +298,7 @@ fn mark_deleted(
     let changed = client
         .execute(
             &format!(
-                "UPDATE {REGISTRY} SET deleted_at = now(),                  purge_after = now() + make_interval(secs => $2::bigint::double precision),                  updated_at = now()                  WHERE name = $1 AND id > 0 AND deleted_at IS NULL"
+                "UPDATE {REGISTRY} SET deleted_at = now(),                  purge_after = now() + make_interval(secs => $2::bigint::double precision),                  updated_at = now()                  WHERE name = $1 AND id > 0 AND name <> '{WARM_TENANT}' AND deleted_at IS NULL"
             ),
             &[&name, &grace],
         )
@@ -303,7 +320,7 @@ fn mark_restored(
     let changed = client
         .execute(
             &format!(
-                "UPDATE {REGISTRY} SET deleted_at = NULL, purge_after = NULL, updated_at = now()                  WHERE name = $1 AND id > 0 AND deleted_at IS NOT NULL"
+                "UPDATE {REGISTRY} SET deleted_at = NULL, purge_after = NULL, updated_at = now()                  WHERE name = $1 AND id > 0 AND name <> '{WARM_TENANT}' AND deleted_at IS NOT NULL"
             ),
             &[&name],
         )
@@ -384,6 +401,28 @@ impl SharedConnections {
     /// whose lease no process holds. Returns how many rows went.
     pub fn purge_tenant(&self, name: &str) -> Result<u64, PersistError> {
         purge(&self.url, name, true)
+    }
+
+    /// Makes the [`WARM_TENANT`], with the default settings, after removing one that an earlier
+    /// process left behind. Whoever makes it opens it as any tenant is opened and then removes it
+    /// with [`SharedConnections::remove_warm_tenant`]. Fails if a process still holds the one that
+    /// is there.
+    pub fn make_warm_tenant(&self) -> Result<(), PersistError> {
+        self.remove_warm_tenant()?;
+        self.with_registry(|client| {
+            insert_tenant(client, WARM_TENANT, &JsonValue::Object(Default::default()))
+        })
+        .map(|_| ())
+    }
+
+    /// Removes the [`WARM_TENANT`] and every row it holds, if there is one. Returns how many rows
+    /// went.
+    pub fn remove_warm_tenant(&self) -> Result<u64, PersistError> {
+        let there = self.with_registry(|client| any_tenant_id(client, WARM_TENANT))?;
+        match there {
+            Some(_) => purge_rows(&self.url, WARM_TENANT, false),
+            None => Ok(0),
+        }
     }
 
     /// See [`signature`].
@@ -525,6 +564,11 @@ pub fn delete_tenant(url: &str, name: &str) -> Result<u64, PersistError> {
 /// that is deleted and past its grace period.
 fn purge(url: &str, name: &str, only_deleted: bool) -> Result<u64, PersistError> {
     validate_tenant_name(name)?;
+    purge_rows(url, name, only_deleted)
+}
+
+/// [`purge`] for a name that has been checked, or is not one a person chose.
+fn purge_rows(url: &str, name: &str, only_deleted: bool) -> Result<u64, PersistError> {
     off_runtime(|| {
         let mut client = connect_client(url)?;
         match detect_layout(&mut client)? {
@@ -627,5 +671,9 @@ mod tests {
     fn the_reserved_base_name_is_not_a_tenant_name() {
         // `_base` is how the registry names id 0, and the leading underscore is not allowed.
         assert!(validate_tenant_name("_base").is_err());
+        // The name the warm-up tenant has is not one a person can give.
+        let err = validate_tenant_name(WARM_TENANT).unwrap_err().to_string();
+        assert!(err.contains("reserved"), "{err}");
+        assert!(validate_name_syntax(WARM_TENANT).is_ok());
     }
 }

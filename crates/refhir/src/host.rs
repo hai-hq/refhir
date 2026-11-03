@@ -49,9 +49,10 @@ const LEASE_RETRY: Duration = Duration::from_secs(1);
 /// a time (a tenant waiting for its lease or its primary does not count: it holds nothing yet).
 const MAX_CONCURRENT_OPENS: usize = 4;
 /// The wait before a tenant that failed to open is tried again, doubling up to the longest.
-/// How long the process keeps the compiled catalog a new tenant starts from after it was last
-/// used, so that the next tenant made within that time does not compile it again.
-const CATALOG_RETENTION: Duration = Duration::from_secs(600);
+/// How long the process keeps the compiled catalogs a new tenant starts from and ends with after
+/// they were last used: for as long as it runs, so that no tenant made after the warm-up compiles
+/// them again, however long it has been since the one before.
+const CATALOG_RETENTION: Duration = Duration::MAX;
 const RETRY_FIRST: Duration = Duration::from_secs(5);
 const RETRY_LONGEST: Duration = Duration::from_secs(300);
 
@@ -278,6 +279,10 @@ pub(crate) fn run(
     manager.sync_registry();
     host.set_ready();
     manager.clone().start_background();
+    // Only the process that writes makes tenants, and so only it has anything to get ready.
+    if role == Role::Primary && manager.cfg.tenants.warm_up {
+        manager.clone().start_warm_up();
+    }
 
     let router = host.router();
     let admin_router = host.admin_router();
@@ -831,6 +836,60 @@ impl Manager {
             }
             opened.persistence.release_writer_lease();
             tracing::info!("stopped serving tenant {name}");
+        }
+    }
+
+    /// Gets ready, in the background, what the first tenant made over HTTP would otherwise do in its
+    /// request: the process makes a tenant of its own for the purpose (see
+    /// [`refhir_postgres::WARM_TENANT`]), opens it as it opens any, and removes it again. Opening
+    /// it stores the release's packages for all tenants if the database does not have them, and
+    /// compiles the catalogs that a new tenant starts from and ends with, which the process then
+    /// keeps (see `CATALOG_RETENTION`), so the tenants made later find them.
+    fn start_warm_up(self: Arc<Self>) {
+        let spawned = std::thread::Builder::new()
+            .name("refhir-warm-up".into())
+            .spawn(move || self.warm_up());
+        if let Err(err) = spawned {
+            tracing::warn!("cannot start the warm-up of new tenants: {err}");
+        }
+    }
+
+    fn warm_up(self: &Arc<Self>) {
+        let started = std::time::Instant::now();
+        let name = refhir_postgres::WARM_TENANT;
+        if let Err(err) = self.shared.make_warm_tenant() {
+            tracing::warn!("new tenants are not warmed up: {err}");
+            return;
+        }
+        let cancelled = AtomicBool::new(false);
+        let settings = TenantSettings::default();
+        let limits = self.limits_of(&settings);
+        let warmed = match self.open(name, &settings, &limits, &cancelled) {
+            Ok(Some(opened)) => {
+                self.runtime.block_on(opened.app.shut_down());
+                if let Some(watcher) = opened.watcher.lock().expect("watcher").take() {
+                    watcher.stop();
+                }
+                opened.persistence.release_writer_lease();
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                tracing::warn!(
+                    "new tenants are not warmed up, so the first one makes what they start from: \
+                     {err}"
+                );
+                false
+            }
+        };
+        match self.shared.remove_warm_tenant() {
+            Ok(_) if warmed => tracing::info!(
+                "ready to make tenants: the packages and catalogs they start from are in place, in \
+                 {:.1?}",
+                started.elapsed()
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::warn!("the tenant made to warm up could not be removed: {err}"),
         }
     }
 

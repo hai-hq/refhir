@@ -212,31 +212,38 @@ never seen by another tenant. A process opens a few tenants at a time when it st
 does not compile every catalog at once.
 
 **How long a new tenant takes.** Making a tenant (`POST /admin/tenants`, or `refhir tenant create`
-with the process running) answers once the tenant serves. What it does depends on what the
-process already has:
+with the process running) answers once the tenant serves.
 
-- **A tenant after the first, with the release's packages only** (`"packages": []`): it is linked
-  to the packages stored for all tenants and given its rows of them, a few dozen small
-  transactions and about 20 MB of rows, and it holds the catalog that tenants made before it
-  compiled. **A few seconds**, most of it the database committing; the process uses well under a
-  second of CPU. It does not grow with the number of tenants.
-- **The first tenant made after the process starts** compiles the catalog that the tenants it
-  makes start from once (the process keeps it for ten minutes after it was last used, so a run of
-  tenants made one after another compiles it once). That adds the time of a first start of one
-  tenant, **some seconds**: five to ten on a laptop under load.
-- **The first tenant of a database** also stores the release's packages for all tenants: it reads
-  the prepared packages file and writes about 200 MB of definitions, terminology and expansions, and compiles
-  the catalog twice. **Tens of seconds, once for the database.** Nothing else of the process's start
-  waits for it, so this is paid by the first request, so a deployment that must not wait
-  makes its first tenant when it is set up.
-- **A tenant with packages of its own** (`"packages": ["name@version", …]`) holds a catalog of its
-  own, which is compiled from its definitions, every time: **tens of seconds** for the R4 release,
-  however many tenants there are. Give a tenant packages only when it needs them.
+**The process gets ready for the first tenant when it starts.** The primary makes a tenant of its
+own in the background, opens it as it opens any tenant, and removes it again. It is never listed or
+served, nobody can make one of the name `refhir-warm`, and it has no access to any other tenant: it
+is a tenant like the rest, bound to its own rows. Opening it stores the release's packages for all
+tenants if the database does not have them (it reads the prepared packages file and writes about
+200 MB of definitions, terminology and expansions, once for the database), and compiles the catalogs
+that every new tenant starts from and ends with, which the process then keeps in memory for as long
+as it runs (the memory of two more catalogs, tens of megabytes each, next to the tenants'). The
+process answers requests while this goes on. It takes **tens of seconds** the first time for a
+database, and at each later start the time of compiling those catalogs (on a laptop under load, up
+to a minute, in the background and using a core or two), and it logs `ready to make tenants` when
+it is done. `[tenants] warm_up = false` (or `REFHIR_TENANTS_WARM_UP=0`) turns it off, and the first tenant
+made then does it. A tenant made before it is done waits for what is left of it, and one that cannot be warmed up
+(for example the packages file is missing) is logged, and makes what it needs itself.
 
-Setting the provisioning timeout of a caller to a minute covers every case above on a busy
-machine; the common one is a few seconds. `refhir` logs `compiled a catalog for tenants to share`
-(with the time it took) whenever the process compiles one, and `installed … linked` for each package
-a tenant is given from the stored copy, so what a create did is in the log.
+What a tenant costs to make after that depends on its packages:
+
+- **The release's packages only** (`"packages": []`), the first tenant or the thousandth: it is
+  linked to the stored packages and given its own rows of their search parameters and value set
+  expansions (a few dozen small transactions and about 20 MB of rows), and it holds the catalog the
+  warm-up compiled. **A few seconds**, most of it the database committing; the process uses well
+  under a second of CPU. It does not grow with the number of tenants.
+- **Packages of its own** (`"packages": ["name@version", …]`): the tenant holds a catalog of its
+  own, compiled from its definitions, every time: **tens of seconds** for the R4 release, however
+  many tenants there are. Give a tenant packages only when it needs them.
+
+Setting the provisioning timeout of a caller to a minute covers every case on a busy machine; the
+common one is a few seconds. `refhir` logs `compiled a catalog for tenants to share` (with the time
+it took) whenever the process compiles one, and `installed … linked` for each package a tenant is
+given from the stored copy, so what a create did is in the log.
 
 A tenant may hold at most its **share** of the pool at once, so one busy tenant cannot keep the
 others waiting for a connection: `connections_per_tenant` (default half the pool, and at most all

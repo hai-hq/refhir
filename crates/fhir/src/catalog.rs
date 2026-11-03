@@ -231,6 +231,9 @@ pub fn shared_catalogs_compiled() -> u64 {
     COMPILED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// A window so long that the catalogs kept are never let go.
+const FOREVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
+
 /// How many catalogs are kept at most: the one a tenant starts from and the one it ends with differ.
 const RETAINED_CORES: usize = 2;
 
@@ -291,7 +294,8 @@ impl SharedCores {
         while kept.cores.len() > RETAINED_CORES {
             kept.cores.remove(0);
         }
-        if !kept.sweeping {
+        // A window that never ends has nothing to sweep.
+        if !kept.sweeping && window < FOREVER {
             kept.sweeping = true;
             let spawned = std::thread::Builder::new()
                 .name("refhir-catalog-retention".into())
