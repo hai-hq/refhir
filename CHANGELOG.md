@@ -10,6 +10,27 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **`Patient/$health-cards-issue` answers signed SMART Health Cards over `/sync`, as it does over
+  REST.** A `Mutation` with `udfPath` `Patient/$health-cards-issue` and `{"id": ..., "resource":
+  <Parameters>}` answers the `Parameters` REST answers: a `verifiableCredential` for each card,
+  signed with the server's (or tenant's) key under the same `kid` and naming the same `iss`, and a
+  `resourceLink` for each resource at the same address. REST and `/sync` now sign through one
+  function. On `--all-tenants` it is the tenant's own issuer and newest key, including after a
+  rotation while the socket is open. A server or tenant with no Health Cards key answers REST's
+  `not-supported` `OperationOutcome` in the `MutationResponse`. With SMART on it needs the read scope
+  REST needs, and a patient-scoped token is issued only its own patient's cards.
+
+### Changed
+
+- **`/sync`: a live query of `Patient/$health-cards-issue` is refused** with a `QueryFailed` whose
+  `code` is `not-supported` (a new code in the [query failure codes](docs/sync-protocol.md#query-failure-codes)).
+  Each run signs a new card, so a subscription would issue one on every write to the patient's
+  record. Before, with SMART off, an `Add` of it was accepted and pushed the unsigned selection of
+  the record, and a `Mutation` of it answered that selection; with SMART on, both were refused as
+  `unsupported operation`, with `code` `invalid` for the `Add`.
+
 ## [0.0.6] - 2026-11-04
 
 ### Added

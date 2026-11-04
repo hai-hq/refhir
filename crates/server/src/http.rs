@@ -463,6 +463,27 @@ pub async fn execute(
     path: &str,
     args: Value,
 ) -> Result<RunResult, RunError> {
+    // The engine's half of a card is the record unsigned. Only `issue_health_cards` holds the key
+    // that makes it a card, so asked for by name anywhere else it is refused, not answered bare.
+    if path
+        .split_once('/')
+        .is_some_and(|(_, op)| op == "$health-cards-issue")
+    {
+        return Err(RunError::Fhir(FhirError::Unsupported(format!(
+            "{path} is signed with the server's health card key and is not run here"
+        ))));
+    }
+    run_engine(db, catalog, store, path, args).await
+}
+
+/// The operation at `path`, as the engine answers it.
+async fn run_engine(
+    db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
+    store: &Arc<dyn ConformanceStore>,
+    path: &str,
+    args: Value,
+) -> Result<RunResult, RunError> {
     // Whoever is running this is attributed in the audit trail by what the engine reports it
     // did, not by what the request said it would.
     let audit = crate::governance::begin_audit(path, &args);
@@ -924,6 +945,12 @@ async fn sync_ws(
     } else {
         None
     };
+    // `$health-cards-issue` over the socket signs as it does over REST: with this server's (or
+    // tenant's) key, naming the address the REST answer names.
+    let cards = sync::Cards {
+        key: app.config.health_cards.clone(),
+        base: crate::auth::issuer(&app, &headers),
+    };
     ws.on_upgrade(move |socket| async move {
         // The permit is held as long as the connection is.
         let _permit = permit;
@@ -932,9 +959,12 @@ async fn sync_ws(
         tokio::select! {
             _ = sync::handle_socket(
                 socket,
-                app.db,
-                app.catalog,
-                app.store,
+                sync::Served {
+                    db: app.db,
+                    catalog: app.catalog,
+                    store: app.store,
+                    cards,
+                },
                 session,
                 scope,
                 upstream,
@@ -1911,26 +1941,16 @@ async fn summary_type(
     summary_call(app, resource_type, None, headers, params, body).await
 }
 
-/// `$health-cards-issue`: the engine picks and shrinks what a card holds, and this signs it.
+/// `$health-cards-issue` over REST. What it answers is [`issue_health_cards`]'s, as over `/sync`.
 async fn health_cards_issue(
     State(app): State<AppState>,
     Path((resource_type, id)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let Some(key) = app.config.health_cards.clone() else {
-        return outcome(
-            StatusCode::NOT_IMPLEMENTED,
-            "not-supported",
-            "this server issues no health cards: no signing key is set",
-        );
-    };
-    if resource_type != "Patient" {
-        return outcome(
-            StatusCode::BAD_REQUEST,
-            "not-supported",
-            "$health-cards-issue is a Patient operation",
-        );
+    let key = app.config.health_cards.as_deref();
+    if let Err(refused) = cards_refusal(key, &resource_type) {
+        return fhir_json(refused.status(), refused.outcome());
     }
     let parameters = match parse_body(&body) {
         Ok(value) => value,
@@ -1938,24 +1958,98 @@ async fn health_cards_issue(
     };
     let mut args = json!({"id": id, "resource": parameters});
     stamp_sdc(&app, &headers, &mut args);
-    match execute(
+    let base = crate::auth::issuer(&app, &headers);
+    match issue_health_cards(
         &app.db,
         &app.catalog,
         &app.store,
-        "Patient/$health-cards-issue",
+        key,
+        &base,
+        &resource_type,
         args,
     )
     .await
     {
-        Ok(result) => {
-            let base = crate::auth::issuer(&app, &headers);
-            match issued_cards(&key, &base, &result.value) {
-                Ok(parameters) => fhir_json(StatusCode::OK, parameters),
-                Err(message) => outcome(StatusCode::INTERNAL_SERVER_ERROR, "exception", &message),
-            }
-        }
-        Err(err) => error_response(err),
+        Ok(result) => fhir_json(StatusCode::OK, result.value),
+        Err(OperationError::Run(err)) => error_response(err),
+        Err(refused) => fhir_json(refused.status(), refused.outcome()),
     }
+}
+
+/// Why an operation answered no result: the server refused it before the engine ran (or could not
+/// finish what the engine began, as a key that cannot sign a card), or the engine said why.
+pub(crate) enum OperationError {
+    Refused {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
+    Run(RunError),
+}
+
+impl OperationError {
+    pub(crate) fn status(&self) -> StatusCode {
+        match self {
+            Self::Refused { status, .. } => *status,
+            Self::Run(err) => run_error_status(err),
+        }
+    }
+
+    pub(crate) fn outcome(&self) -> Value {
+        match self {
+            Self::Refused { code, message, .. } => outcome_json(code, message),
+            Self::Run(err) => outcome_value(err),
+        }
+    }
+}
+
+/// What `$health-cards-issue` is refused for before anything is read: a server (or tenant) with
+/// no key, or a resource that is not a Patient.
+fn cards_refusal<'a>(
+    key: Option<&'a crate::health_cards::IssuerKey>,
+    resource_type: &str,
+) -> Result<&'a crate::health_cards::IssuerKey, OperationError> {
+    let Some(key) = key else {
+        return Err(OperationError::Refused {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "not-supported",
+            message: "this server issues no health cards: no signing key is set".into(),
+        });
+    };
+    if resource_type != "Patient" {
+        return Err(OperationError::Refused {
+            status: StatusCode::BAD_REQUEST,
+            code: "not-supported",
+            message: "$health-cards-issue is a Patient operation".into(),
+        });
+    }
+    Ok(key)
+}
+
+/// `$health-cards-issue`, however it was sent: the engine picks and shrinks what each card holds,
+/// and this signs it with `key`, the key of the server or tenant it was sent to. `base` is that
+/// server's address, which the `iss` names when the key names no issuer of its own, and which
+/// each `resourceLink` points into. REST and `/sync` both answer what this returns.
+pub(crate) async fn issue_health_cards(
+    db: &Arc<Database>,
+    catalog: &Arc<RwLock<Catalog>>,
+    store: &Arc<dyn ConformanceStore>,
+    key: Option<&crate::health_cards::IssuerKey>,
+    base: &str,
+    resource_type: &str,
+    args: Value,
+) -> Result<RunResult, OperationError> {
+    let key = cards_refusal(key, resource_type)?;
+    let mut result = run_engine(db, catalog, store, "Patient/$health-cards-issue", args)
+        .await
+        .map_err(OperationError::Run)?;
+    result.value =
+        issued_cards(key, base, &result.value).map_err(|message| OperationError::Refused {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "exception",
+            message,
+        })?;
+    Ok(result)
 }
 
 /// The response of `$health-cards-issue`: each credential signed, and a `resourceLink` for each
@@ -2520,6 +2614,11 @@ pub(crate) fn outcome_value(err: &RunError) -> Value {
         RunError::Commit(CommitError::ReadOnly) => ("transient", other_read_only()),
         RunError::Commit(other) => ("exception", other.to_string()),
     };
+    outcome_json(code, &diagnostics)
+}
+
+/// An `OperationOutcome` of one error: what every refusal the server writes itself looks like.
+pub(crate) fn outcome_json(code: &str, diagnostics: &str) -> Value {
     json!({
         "resourceType": "OperationOutcome",
         "issue": [{
@@ -2531,17 +2630,7 @@ pub(crate) fn outcome_value(err: &RunError) -> Value {
 }
 
 fn outcome(status: StatusCode, code: &str, diagnostics: &str) -> Response {
-    fhir_json(
-        status,
-        json!({
-            "resourceType": "OperationOutcome",
-            "issue": [{
-                "severity": "error",
-                "code": code,
-                "diagnostics": diagnostics
-            }]
-        }),
-    )
+    fhir_json(status, outcome_json(code, diagnostics))
 }
 
 fn fhir_status(err: &FhirError) -> StatusCode {
