@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::auth::SyncSession;
 use crate::governance::{classify_operation, json_len, Class, RequestScope, SyncMessage};
-use crate::http::{self, execute};
+use crate::http::{self, execute, CardsError};
 
 const ENGINE: &str = "refhir_engine";
 
@@ -154,11 +154,31 @@ struct LiveQuery {
     args: Value,
 }
 
+/// What a socket signs SMART Health Cards with: the key of the server (or tenant) it was opened
+/// on, and that server's address, which a card's `iss` names when the key names no issuer of its
+/// own and its `resourceLink`s point into. The key is the server's own, so an issuer set or a key
+/// rotated while the socket is open applies to the next card it issues.
+pub struct Cards {
+    pub key: Option<Arc<crate::health_cards::IssuerKey>>,
+    pub base: String,
+}
+
+/// The operation that answers signed cards. It is run as REST runs it, never as a live query.
+const HEALTH_CARDS_ISSUE: &str = "$health-cards-issue";
+
+/// The resource type a `udfPath` names, when the operation is `$health-cards-issue`.
+fn health_cards_issue(path: &str) -> Option<&str> {
+    path.split_once('/')
+        .filter(|(_, op)| *op == HEALTH_CARDS_ISSUE)
+        .map(|(resource_type, _)| resource_type)
+}
+
 /// What a socket needs from the server to run its queries and be told when they change.
 struct Engine {
     db: Arc<Database>,
     catalog: Arc<RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
+    cards: Cards,
     inv_tx: tokio::sync::mpsc::UnboundedSender<refhir_database::Invalidation>,
 }
 
@@ -234,11 +254,13 @@ impl TokenWatch {
 /// What a socket is told when it is closed because its token no longer stands.
 const TOKEN_ENDED: &str = "the token expired or was revoked";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_socket(
     socket: WebSocket,
     db: Arc<Database>,
     catalog: Arc<RwLock<Catalog>>,
     store: Arc<dyn ConformanceStore>,
+    cards: Cards,
     session: Option<SyncSession>,
     scope: Option<Arc<RequestScope>>,
     upstream: Option<Upstream>,
@@ -249,6 +271,7 @@ pub async fn handle_socket(
         db,
         catalog,
         store,
+        cards,
         inv_tx,
     };
     let mut live = Live::default();
@@ -334,7 +357,11 @@ async fn handle_text(
         }
     };
     let Engine {
-        db, catalog, store, ..
+        db,
+        catalog,
+        store,
+        cards,
+        ..
     } = engine;
     match message {
         ClientMessage::ModifyQuerySet {
@@ -418,6 +445,20 @@ async fn handle_text(
                         // client refused for going too fast keeps the subscription it had.
                         if let Some(old) = live.queries.remove(&query_id) {
                             db.unsubscribe(old.token);
+                        }
+                        // Each run of it signs a new card, so a subscription would issue one on
+                        // every write the record sees. A card is issued when it is asked for.
+                        if health_cards_issue(&udf_path).is_some() {
+                            let reason = format!(
+                                "{udf_path} signs a new card each time it runs and cannot be \
+                                 subscribed: send it as a Mutation"
+                            );
+                            message.done(400, || 0);
+                            transition.push(query_failed(
+                                query_id,
+                                QueryError::new("not-supported", reason),
+                            ));
+                            continue;
                         }
                         let args = match authorize(session, db, catalog, &udf_path, &args, true) {
                             Ok(args) => args,
@@ -532,11 +573,25 @@ async fn handle_text(
             // success. A batch that writes belongs to the primary, like any other write.
             let outcome = if udf_path == "Bundle/batch" && db.is_read_only() && batch_writes(&args)
             {
-                Err(RunError::Commit(CommitError::ReadOnly))
+                Err(CardsError::Run(RunError::Commit(CommitError::ReadOnly)))
+            } else if let Some(resource_type) = health_cards_issue(&udf_path) {
+                // Signed as REST signs it, by the same function, with this server's key.
+                message
+                    .run(http::issue_health_cards(
+                        db,
+                        catalog,
+                        store,
+                        cards.key.as_deref(),
+                        &cards.base,
+                        resource_type,
+                        args,
+                    ))
+                    .await
             } else {
                 message
                     .run(execute(db, catalog, store, &udf_path, args))
                     .await
+                    .map_err(CardsError::Run)
             };
             let (response, status) = match outcome {
                 Ok(result) => (
@@ -556,7 +611,9 @@ async fn handle_text(
                 // A replica cannot commit. The primary can, so ask it. The primary limits,
                 // meters and audits the mutation as a message of its own, so it is not counted
                 // here as well.
-                Err(RunError::Commit(CommitError::ReadOnly)) if replay.is_some() => {
+                Err(CardsError::Run(RunError::Commit(CommitError::ReadOnly)))
+                    if replay.is_some() =>
+                {
                     let (upstream, args) = (upstream.expect("checked"), replay.expect("checked"));
                     message.forwarded();
                     let response =
@@ -573,10 +630,10 @@ async fn handle_text(
                         "type": "MutationResponse",
                         "requestId": request_id,
                         "success": false,
-                        "result": http::outcome_value(&err),
+                        "result": err.outcome(),
                         "ts": Value::Null
                     }),
-                    http::run_error_status(&err).as_u16(),
+                    err.status().as_u16(),
                 ),
             };
             message.done(status, || json_len(&response));
@@ -691,6 +748,7 @@ async fn add_query(
         catalog,
         store,
         inv_tx,
+        ..
     } = engine;
     for _ in 0..8 {
         let result = execute(db, catalog, store, path, args.clone())
@@ -824,6 +882,7 @@ async fn rerun(
         catalog,
         store,
         inv_tx,
+        ..
     } = engine;
     for _ in 0..8 {
         let RunResult {

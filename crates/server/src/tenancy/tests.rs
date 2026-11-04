@@ -416,6 +416,149 @@ async fn a_subscription_is_told_only_of_its_own_tenants_commits() {
 }
 
 #[tokio::test]
+async fn over_sync_a_tenant_signs_its_cards_as_its_rest_does_with_its_issuer_and_newest_key() {
+    use crate::tests::{assert_same_cards, card_header, card_parameters, checked_claims};
+    // A tenant that names an issuer of its own, its key kept in its database as `--all-tenants`
+    // keeps it, and a tenant with cards off.
+    let keys = refhir_persistence::MemoryAuthStore::default();
+    let key = Arc::new(crate::IssuerKey::for_tenant(&keys, true).unwrap());
+    key.set_issuer(Some("https://health.clinic.example/"))
+        .unwrap();
+    let (db, catalog, store) = crate::tests::cards_parts();
+    let clinic = tenant_app(
+        db,
+        catalog,
+        store,
+        ServerConfig {
+            tenant: Some("clinic".into()),
+            public_url: Some("https://fhir.example.com/t/clinic".into()),
+            health_cards: Some(key.clone()),
+            ..ServerConfig::default()
+        },
+    );
+    let (db, catalog, store) = subscription_parts();
+    let nocards = tenant_app(
+        db,
+        catalog,
+        store,
+        ServerConfig {
+            tenant: Some("nocards".into()),
+            public_url: Some("https://fhir.example.com/t/nocards".into()),
+            ..ServerConfig::default()
+        },
+    );
+    let host = TenantHost::new(HostConfig {
+        routing: Routing {
+            path_prefix: Some("/t".into()),
+            domain: None,
+            public_url: Some("https://fhir.example.com".into()),
+        },
+        admin_token: Some(ADMIN_TOKEN.into()),
+        role: "primary".into(),
+        ..HostConfig::default()
+    });
+    for (name, app) in [("clinic", clinic), ("nocards", nocards)] {
+        host.set(
+            name,
+            TenantState::Ready(Arc::new(app)),
+            TenantLimits::default(),
+        );
+    }
+    host.set_ready();
+    let router = host.router();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let router = router.clone();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    }
+
+    // The socket is open before the key is replaced, as one would be when the admin rotates it.
+    let (mut socket, _) = connect(&format!("ws://{addr}/t/clinic/sync")).await;
+    let first = key.kid();
+    let rotated = crate::IssuerKey::rotate_tenant(&keys).unwrap();
+    assert!(key.refresh(&keys).unwrap());
+    assert_eq!(rotated.replaced, first);
+
+    let parameters = card_parameters(json!([]));
+    socket
+        .send(Message::Text(
+            json!({"type": "Mutation", "requestId": 7, "udfPath": "Patient/$health-cards-issue",
+                   "args": {"id": "p1", "resource": parameters}})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let synced = next_json(&mut socket).await;
+    assert_eq!(synced["type"], "MutationResponse", "{synced}");
+    assert_eq!(synced["success"], true, "{synced}");
+    let over_sync = &synced["result"];
+    let jwks = call(
+        &router,
+        "GET",
+        "/t/clinic/health-cards/.well-known/jwks.json",
+        &[],
+        None,
+    )
+    .await
+    .body;
+    let card = over_sync["parameter"][0]["valueString"].as_str().unwrap();
+    // The tenant's issuer, and the key that replaced the first; the key set checks it.
+    assert_eq!(card_header(card)["kid"], json!(rotated.kid));
+    assert_eq!(
+        checked_claims(card, &jwks)["iss"],
+        "https://health.clinic.example"
+    );
+    // Its links are the tenant's own addresses.
+    let link = over_sync["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|parameter| parameter["name"] == "resourceLink")
+        .expect("a resourceLink");
+    assert!(
+        link["part"][2]["valueUri"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://fhir.example.com/t/clinic/"),
+        "{link}"
+    );
+    let rest = call(
+        &router,
+        "POST",
+        "/t/clinic/Patient/p1/$health-cards-issue",
+        &[],
+        Some(parameters.clone()),
+    )
+    .await;
+    assert_eq!(rest.status, StatusCode::OK, "{}", rest.body);
+    assert_same_cards(over_sync, &rest.body, &jwks);
+
+    // A tenant with cards off answers what its REST answers, over the socket too.
+    let rest = call(
+        &router,
+        "POST",
+        "/t/nocards/Patient/p1/$health-cards-issue",
+        &[],
+        Some(parameters.clone()),
+    )
+    .await;
+    assert_eq!(rest.status, StatusCode::NOT_IMPLEMENTED, "{}", rest.body);
+    let (mut socket, _) = connect(&format!("ws://{addr}/t/nocards/sync")).await;
+    socket
+        .send(Message::Text(
+            json!({"type": "Mutation", "requestId": 8, "udfPath": "Patient/$health-cards-issue",
+                   "args": {"id": "p1", "resource": parameters}})
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let refused = next_json(&mut socket).await;
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(refused["result"], rest.body);
+}
+
+#[tokio::test]
 async fn a_stopped_tenant_answers_gone_and_closes_its_sockets() {
     let host = two_tenants();
     let router = host.router();
