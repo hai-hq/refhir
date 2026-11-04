@@ -138,7 +138,8 @@ serves the issuer address, or publish the same key set there. The resource links
 
 `issuer` and `extra_keys_file` are settings of a server that has one key file. A process that serves
 [many tenants](clustering.md#tenants-on-one-database) with `--all-tenants` keeps each tenant's own
-key in its database, and does not read them: its cards name each tenant's own address.
+key in its database and takes the issuer and the replaced keys of each tenant from the admin API
+instead: see [a tenant's issuer and keys](#a-tenants-issuer-and-keys).
 
 ## Keep a replaced key public
 
@@ -176,14 +177,79 @@ Every process that serves one deployment needs the same `issuer` and the same `e
 as well as the same signing key, or a card verifies against the key set of some of them and not
 others.
 
+## A tenant's issuer and keys
+
+A process started with `--all-tenants` signs the cards of each tenant with a key of that tenant's
+own, kept in the tenant's rows (sealed with `REFHIR_SIGNING_KEY_PASSPHRASE` when it is set, as the
+SMART signing key is), so every process that serves the tenant signs with the same key and no
+tenant's cards verify against another's. A tenant issues cards when it is created with
+`health_cards` on. Its issuer and its keys are set over the [admin API](clustering.md#the-admin-api),
+which needs the admin token, and each change is served by every process of the deployment within
+moments, with no restart.
+
+**The issuer.** Without one, a tenant's cards name its own address plus `/health-cards`. To name
+another, give `health_cards` as an object, when you create the tenant or later:
+
+```bash
+curl -X POST "$REFHIR/admin/tenants" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"name": "clinic", "health_cards": {"enabled": true, "issuer": "https://health.theclinic.example"}}'
+
+curl -X PATCH "$REFHIR/admin/tenants/clinic" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"health_cards": {"issuer": "https://cards.example.com"}}'
+```
+
+`true` and `false` are still accepted for `health_cards`. `"issuer": null` in a `PATCH` goes back to
+the tenant's own address. The issuer is checked as the setting of a server with one key file is
+(above): `https`, or `http` on `localhost`, `127.0.0.1` and `[::1]`, a host, and no user name, query
+or fragment; a trailing slash is dropped. A request with one that is not valid is a `400` and
+changes nothing. The cards a tenant issued before keep the `iss` they were signed with, and their
+key stays in its key set.
+
+Many tenants may name one issuer (a service of yours that is the issuer for all of them), and each
+may name its own. A verifier fetches `[issuer]/.well-known/jwks.json`, so that address has to serve
+the key set of every tenant whose cards name it: for an issuer of one tenant, route that path to
+the tenant's `/t/{tenant}/health-cards/.well-known/jwks.json` (or its host-name equivalent); for an
+issuer shared by many, publish a key set that holds the public keys read from each tenant's own.
+
+**Replacing a key.** `POST /admin/tenants/{name}/health-cards/rotate` makes a new P-256 key for
+the tenant. It signs every card from then on, and the key it replaces stays in the tenant's key set
+for as long as the tenant exists, so the cards that key signed still verify:
+
+```json
+{
+  "tenant": "clinic",
+  "kid": "dQ51w4a19UPq4VpjNWVv5wBz1wly3cwNwCcILtE8Idg",
+  "replaced_kid": "had9GdZLpm40kdIJjDFDKoEyAinLz9MDo_VVrBobk7c",
+  "keys": ["dQ51w4a19UPq4VpjNWVv5wBz1wly3cwNwCcILtE8Idg", "had9GdZLpm40kdIJjDFDKoEyAinLz9MDo_VVrBobk7c"]
+}
+```
+
+`kid` is the thumbprint of the new key, `replaced_kid` of the key it replaced, and `keys` every key
+the key set now holds, the signing key first. The key set at
+`/t/{tenant}/health-cards/.well-known/jwks.json` holds the public half of each, never a private
+member. Rotating again keeps all of them. The keys a tenant replaced are kept when the tenant is
+deleted and restored. `GET /admin/tenants/{name}` reports the same `kid` and `keys` for a tenant
+that issues cards. A tenant that does not issue cards is a `409`.
+
+A process other than the one that rotated the key starts signing with the new one within a few
+seconds; until then it signs with the replaced key, which is still in every key set, so a card from
+either verifies. If you publish a key set of your own that holds the tenants' keys, read each
+tenant's key set again after a rotation.
+
+Both changes are recorded in the tenant's [audit trail](governance.md) (`GET /t/{tenant}/_audit`) as an
+event with the subtype `health-cards-settings` or `health-cards-rotate`, the issuer before and
+after or the `kid`s, and the client `admin-api`. Keys are never written to it.
+
 ## Who is the issuer
 
 A card's `iss` says who vouches for it, and a verifier decides whether to trust a card by deciding
 whether to trust that address and the key published under it. ReFHIR signs with one key per
 server, and one `iss` for it: `[public_url]/health-cards` unless you
 [set an issuer](#an-issuer-of-your-own). On a database that many
-[tenants](clustering.md#tenants-on-one-database) share, each tenant is a process of its own with its
-own `public_url` and its own key, so each tenant has its own issuer. When one tenant holds the
+[tenants](clustering.md#tenants-on-one-database) share, each tenant has its own `public_url` and its
+own key, so each tenant has its own issuer, which you can [set for it](#a-tenants-issuer-and-keys). When one tenant holds the
 records of several organizations (clinics, hospitals), there are two ways to answer "who issued
 this card", and they differ in what a verifier sees and in what you look after.
 

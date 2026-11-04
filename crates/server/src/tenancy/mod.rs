@@ -35,7 +35,10 @@ use tower::ServiceExt;
 
 use crate::governance::limiter::Limiter;
 use crate::http::TenantApp;
-pub use admin::{AdminError, CreateTenant, DeleteTenant, TenantAdmin, TenantSettings};
+pub use admin::{
+    AdminError, CreateTenant, DeleteTenant, HealthCardsChange, HealthCardsSettings, TenantAdmin,
+    TenantSettings, UpdateTenant,
+};
 pub use metrics::TenantCounters;
 
 /// The prefix of the path that names a tenant when none is configured: `/t/{tenant}/…`.

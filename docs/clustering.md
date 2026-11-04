@@ -159,8 +159,9 @@ release and the same settings.
   `{tenant}` in it, since every tenant would otherwise get the same address. On a loopback bind it
   defaults to the address requests arrive at; on any other bind it is required.
 - **What a tenant is created with.** Packages to install (as `--package` takes them: `name@version`,
-  a directory or a `.tgz`), `update_as_create`, SMART on or off, health cards on or off, and its
-  limits. They are kept in the registry, so every process serves the tenant the same way and a
+  a directory or a `.tgz`), `update_as_create`, SMART on or off, health cards on or off (and the
+  issuer their `iss` names: see [a tenant's issuer and keys](health-cards.md#a-tenants-issuer-and-keys)),
+  and its limits. They are kept in the registry, so every process serves the tenant the same way and a
   restart serves it as it was. A tenant's SMART registration token and `confidential` client secret
   are made from the process's `--smart-dcr-token` and `--smart-confidential-secret` and the tenant's
   name, so every process that shares those two settings agrees on them, and no tenant's opens
@@ -284,6 +285,8 @@ on the public one.
 | `POST /admin/tenants` | Creates a tenant and opens it before it answers: `201` with the tenant. Idempotent: the same body again is `200` with the tenant that is there, and a different body for an existing name is `409`. A tenant that cannot be opened is not kept (`422`), so the request can be sent again once it is fixed |
 | `GET /admin/tenants` | Every tenant, with its status and how this process serves it |
 | `GET /admin/tenants/{name}` | One tenant: status, settings, its public URL, the packages and versions it holds, its size (documents and index rows, in rows and bytes), whether it holds the compiled catalog that tenants with the same definitions share (`served.shared_catalog`), and this process's counters for it |
+| `PATCH /admin/tenants/{name}` | Changes what the body names of a tenant that exists, and leaves the rest. Today that is `health_cards` (below). The change is kept in the registry and every process that serves the tenant applies it within moments, with no restart; a request that is not valid is a `400` and changes nothing |
+| `POST /admin/tenants/{name}/health-cards/rotate` | Makes a new Health Cards signing key for the tenant, which signs from then on, and keeps the replaced key's public half in the tenant's key set: `200` with `{"tenant", "kid", "replaced_kid", "keys"}`. `409` for a tenant that does not issue cards or whose key was changed by a request at the same time (ask again), `404` for no such tenant |
 | `DELETE /admin/tenants/{name}` | Soft delete: the tenant is not served from then on, and its rows are removed once the grace period is over. `?grace=24h` (`30s`, `15m`, `24h`, `7d`; default `[tenants] delete_grace`, 7 days) and `?export=false` change that. `grace=0` removes it at once |
 | `POST /admin/tenants/{name}/restore` | Brings back a deleted tenant whose rows have not been removed |
 | `GET /admin/metrics` | Per-tenant counters, as above |
@@ -296,10 +299,29 @@ on the public one.
   "packages": ["hl7.fhir.uv.ips@1.1.0", "/etc/refhir/packages/acme-profiles"],
   "update_as_create": false,
   "smart": true,
-  "health_cards": true,
+  "health_cards": {"enabled": true, "issuer": "https://cards.example.com"},
   "limits": {"requests_per_second": 200, "burst": 400, "storage_bytes": 53687091200, "connections": 4}
 }
 ```
+
+`health_cards` is `true`, `false` (the default), or an object: `enabled`, and `issuer`, the address
+the tenant's SMART Health Cards name as `iss` (without it, the tenant's own address plus
+`/health-cards`). An object with an `issuer` and no `enabled` is a tenant that issues cards. The
+issuer must be an `https` address (`http` on a loopback host) with no user name, query or fragment,
+and has its trailing slash dropped; one that is not valid is a `400`. The same object, with either
+member left out to leave it as it is and `"issuer": null` to take the issuer away, is what
+`PATCH /admin/tenants/{name}` takes:
+
+```bash
+curl -X PATCH "$REFHIR/admin/tenants/acme" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{"health_cards": {"issuer": "https://cards.example.com"}}'
+```
+
+Turning cards on or off for a tenant opens it again (a moment of `starting`). `GET /admin/tenants/{name}`
+reports `settings.health_cards` as `{"enabled", "issuer"}` and, for a tenant that issues cards,
+`health_cards` as `{"kid", "keys"}`: the thumbprint of the key that signs and of every key its key
+set holds. Replacing a tenant's key, keeping the cards it signed valid, and the audit trail of both
+are described under [a tenant's issuer and keys](health-cards.md#a-tenants-issuer-and-keys).
 
 With `smart` on, the response also carries the tenant's `registration_token` and the
 `confidential` client's secret, which are the only time the API hands them out (they can be made

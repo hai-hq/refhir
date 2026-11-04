@@ -1535,6 +1535,8 @@ name = "refhir"
 version = "0.0.5"
 dependencies = [
  "axum",
+ "base64 0.22.1",
+ "flate2",
  "postgres",
  "refhir-database",
  "refhir-fhir",
@@ -1543,6 +1545,7 @@ dependencies = [
  "refhir-server",
  "refhir-sqlite",
  "refhir-types",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

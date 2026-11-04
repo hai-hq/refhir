@@ -8408,7 +8408,7 @@ async fn cards_name_the_configured_issuer_and_the_key_set_keeps_retired_keys() {
         .iter()
         .map(|key| key["kid"].as_str().unwrap())
         .collect();
-    assert_eq!(kids, [current.as_str(), retired.kid()]);
+    assert_eq!(kids, [current.as_str(), retired.kid().as_str()]);
     assert!(
         jwks["keys"]
             .as_array()

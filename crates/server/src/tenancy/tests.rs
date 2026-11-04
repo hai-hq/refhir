@@ -570,11 +570,19 @@ async fn a_tenant_over_its_rate_or_storage_is_refused_and_counted() {
 #[derive(Default)]
 struct Recorder {
     created: std::sync::Mutex<Vec<String>>,
+    /// The Health Cards settings each create resolved to, and the changes `update` was given.
+    cards: std::sync::Mutex<Vec<Value>>,
+    rotated: std::sync::Mutex<Vec<String>>,
 }
 
 impl TenantAdmin for Recorder {
     fn create(&self, request: CreateTenant) -> Result<(Value, bool), AdminError> {
         self.created.lock().unwrap().push(request.name.clone());
+        let cards = request
+            .health_cards
+            .resolve(&HealthCardsSettings::default(), true)
+            .unwrap();
+        self.cards.lock().unwrap().push(cards.report());
         Ok((json!({"name": request.name}), true))
     }
     fn list(&self) -> Result<Vec<Value>, AdminError> {
@@ -594,6 +602,18 @@ impl TenantAdmin for Recorder {
     }
     fn restore(&self, name: &str) -> Result<Value, AdminError> {
         Ok(json!({"name": name}))
+    }
+    fn update(&self, name: &str, request: UpdateTenant) -> Result<Value, AdminError> {
+        let change = request.health_cards.unwrap_or_default();
+        self.cards.lock().unwrap().push(json!({
+            "enabled": change.enabled,
+            "issuer": change.issuer,
+        }));
+        Ok(json!({"name": name}))
+    }
+    fn rotate_health_cards(&self, name: &str) -> Result<Value, AdminError> {
+        self.rotated.lock().unwrap().push(name.to_string());
+        Ok(json!({"tenant": name, "kid": "new", "replaced_kid": "old", "keys": ["new", "old"]}))
     }
 }
 
@@ -619,6 +639,12 @@ async fn the_admin_api_refuses_requests_without_the_admin_token() {
             ("GET", "/admin/tenants/a", None),
             ("DELETE", "/admin/tenants/a", None),
             ("POST", "/admin/tenants/a/restore", None),
+            (
+                "PATCH",
+                "/admin/tenants/a",
+                Some(json!({"health_cards": true})),
+            ),
+            ("POST", "/admin/tenants/a/health-cards/rotate", None),
             ("GET", "/admin/metrics", None),
         ] {
             let reply = call(&router, method, uri, &headers, body).await;
@@ -733,6 +759,198 @@ async fn the_admin_api_refuses_requests_without_the_admin_token() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_tenants_health_card_settings_are_a_flag_or_an_object_and_a_bad_issuer_changes_nothing() {
+    let host = two_tenants();
+    let recorder = Arc::new(Recorder::default());
+    host.set_admin(recorder.clone());
+    let router = host.router();
+    let auth = format!("Bearer {ADMIN_TOKEN}");
+    let headers = [("authorization", auth.as_str())];
+
+    // The flag, as before, and the object with an issuer (its trailing slash is trimmed).
+    for (name, cards) in [
+        ("flag", json!(true)),
+        ("off", json!(false)),
+        (
+            "own",
+            json!({"enabled": true, "issuer": "https://cards.example.com/"}),
+        ),
+        (
+            "only-an-issuer",
+            json!({"issuer": "http://localhost:8080/c"}),
+        ),
+        ("none", Value::Null),
+    ] {
+        let mut body = json!({"name": name});
+        if !cards.is_null() {
+            body["health_cards"] = cards;
+        }
+        let reply = call(&router, "POST", "/admin/tenants", &headers, Some(body)).await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{name}: {}", reply.body);
+    }
+    assert_eq!(
+        *recorder.cards.lock().unwrap(),
+        [
+            json!({"enabled": true, "issuer": null}),
+            json!({"enabled": false, "issuer": null}),
+            json!({"enabled": true, "issuer": "https://cards.example.com"}),
+            json!({"enabled": true, "issuer": "http://localhost:8080/c"}),
+            json!({"enabled": false, "issuer": null}),
+        ]
+    );
+
+    // An issuer a verifier would not accept is refused at the API, and nothing is asked of the
+    // tenant: not created, not changed.
+    let before = recorder.cards.lock().unwrap().len();
+    for issuer in [
+        json!("http://cards.example.com"),
+        json!("https://cards.example.com/?a=b"),
+        json!("https://cards.example.com/#frag"),
+        json!("https://user:pw@cards.example.com"),
+        json!("https://user@cards.example.com"),
+        json!(""),
+        json!("/"),
+        json!("cards.example.com"),
+        json!("ftp://cards.example.com"),
+        json!(7),
+    ] {
+        let created = call(
+            &router,
+            "POST",
+            "/admin/tenants",
+            &headers,
+            Some(json!({"name": "bad", "health_cards": {"enabled": true, "issuer": issuer}})),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::BAD_REQUEST,
+            "{issuer}: {}",
+            created.body
+        );
+        let patched = call(
+            &router,
+            "PATCH",
+            "/admin/tenants/a",
+            &headers,
+            Some(json!({"health_cards": {"issuer": issuer}})),
+        )
+        .await;
+        assert_eq!(
+            patched.status,
+            StatusCode::BAD_REQUEST,
+            "{issuer}: {}",
+            patched.body
+        );
+    }
+    // An issuer for a tenant that is not to issue cards says nothing the tenant can do.
+    for body in [
+        json!({"name": "bad", "health_cards": {"enabled": false, "issuer": "https://x.example"}}),
+        json!({"name": "bad", "health_cards": "yes"}),
+        json!({"name": "bad", "health_cards": {"enabled": true, "colour": 1}}),
+    ] {
+        let created = call(
+            &router,
+            "POST",
+            "/admin/tenants",
+            &headers,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            created.body
+        );
+    }
+    for body in [
+        json!({"health_cards": {"enabled": false, "issuer": "https://x.example"}}),
+        json!({"health_cards": "yes"}),
+        json!({"other": 1}),
+    ] {
+        let patched = call(
+            &router,
+            "PATCH",
+            "/admin/tenants/a",
+            &headers,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            patched.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            patched.body
+        );
+    }
+    assert_eq!(
+        recorder.cards.lock().unwrap().len(),
+        before,
+        "nothing was asked"
+    );
+    assert_eq!(recorder.created.lock().unwrap().len(), 5);
+
+    // A change says only what it changes; `null` takes the issuer away.
+    for body in [
+        json!({"health_cards": {"issuer": "https://cards.example.com"}}),
+        json!({"health_cards": {"issuer": null}}),
+        json!({"health_cards": false}),
+    ] {
+        let patched = call(&router, "PATCH", "/admin/tenants/a", &headers, Some(body)).await;
+        assert_eq!(patched.status, StatusCode::OK, "{}", patched.body);
+    }
+    assert_eq!(
+        recorder.cards.lock().unwrap()[before..],
+        [
+            json!({"enabled": null, "issuer": "https://cards.example.com"}),
+            json!({"enabled": null, "issuer": null}),
+            json!({"enabled": false, "issuer": null}),
+        ]
+    );
+
+    let rotated = call(
+        &router,
+        "POST",
+        "/admin/tenants/a/health-cards/rotate",
+        &headers,
+        None,
+    )
+    .await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    assert_eq!(rotated.body["kid"], "new");
+    assert_eq!(*recorder.rotated.lock().unwrap(), ["a"]);
+}
+
+#[test]
+fn health_card_settings_are_stored_as_the_flag_when_there_is_no_issuer() {
+    // What a release that only had the flag wrote reads back, and writes back the same.
+    for (stored, settings) in [
+        (json!(true), HealthCardsSettings::on()),
+        (json!(false), HealthCardsSettings::default()),
+        (
+            json!({"enabled": true, "issuer": "https://cards.example.com"}),
+            HealthCardsSettings {
+                enabled: true,
+                issuer: Some("https://cards.example.com".into()),
+            },
+        ),
+    ] {
+        let read: HealthCardsSettings = serde_json::from_value(stored.clone()).unwrap();
+        assert_eq!(read, settings);
+        assert_eq!(serde_json::to_value(&read).unwrap(), stored);
+    }
+    let old: TenantSettings = serde_json::from_value(json!({"health_cards": true})).unwrap();
+    assert!(old.health_cards.enabled);
+    let none: TenantSettings = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(none.health_cards, HealthCardsSettings::default());
+    assert_eq!(
+        serde_json::to_value(&none).unwrap()["health_cards"],
+        json!(false)
+    );
 }
 
 #[tokio::test]

@@ -39,11 +39,134 @@ pub struct TenantSettings {
     /// SMART App Launch on the tenant. Needs the process to have a login configured.
     #[serde(default)]
     pub smart: bool,
-    /// The tenant issues SMART Health Cards, signed with a key of its own.
+    /// SMART Health Cards: whether the tenant issues them, signed with a key of its own, and the
+    /// `iss` they name. Written as `true` or `false` when there is no issuer to name, as
+    /// releases that only had the flag read it.
     #[serde(default)]
-    pub health_cards: bool,
+    pub health_cards: HealthCardsSettings,
     #[serde(default)]
     pub limits: TenantLimits,
+}
+
+/// A tenant's SMART Health Cards settings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HealthCardsSettings {
+    pub enabled: bool,
+    /// What `iss` says, with no trailing slash. `None`: the tenant's own address plus
+    /// `/health-cards`.
+    pub issuer: Option<String>,
+}
+
+impl HealthCardsSettings {
+    pub fn on() -> Self {
+        Self {
+            enabled: true,
+            issuer: None,
+        }
+    }
+
+    /// The settings as the admin API reports them: always an object.
+    pub fn report(&self) -> Value {
+        json!({"enabled": self.enabled, "issuer": self.issuer})
+    }
+}
+
+impl Serialize for HealthCardsSettings {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.issuer {
+            None => serializer.serialize_bool(self.enabled),
+            Some(_) => self.report().serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HealthCardsSettings {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let change = HealthCardsChange::deserialize(deserializer)?;
+        change
+            .resolve(&Self::default(), true)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// What a request says of a tenant's Health Cards: `true`, `false`, or `{"enabled": bool,
+/// "issuer": string | null}`, any member of which may be left out to say nothing about it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HealthCardsChange {
+    pub enabled: Option<bool>,
+    /// `Some(None)` takes the issuer away.
+    pub issuer: Option<Option<String>>,
+}
+
+impl<'de> Deserialize<'de> for HealthCardsChange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        const SHAPE: &str = "`health_cards` is true, false, or an object like \
+                             {\"enabled\": true, \"issuer\": \"https://cards.example.com\"}";
+        match Value::deserialize(deserializer)? {
+            Value::Bool(enabled) => Ok(Self {
+                enabled: Some(enabled),
+                issuer: None,
+            }),
+            Value::Object(members) => {
+                let mut change = Self::default();
+                for (name, value) in members {
+                    match (name.as_str(), value) {
+                        ("enabled", Value::Bool(enabled)) => change.enabled = Some(enabled),
+                        ("issuer", Value::Null) => change.issuer = Some(None),
+                        ("issuer", Value::String(issuer)) => change.issuer = Some(Some(issuer)),
+                        (other, _) => {
+                            return Err(D::Error::custom(format!(
+                                "`health_cards.{other}` is not a boolean `enabled` or a string \
+                                 (or null) `issuer`: {SHAPE}"
+                            )))
+                        }
+                    }
+                }
+                Ok(change)
+            }
+            _ => Err(D::Error::custom(SHAPE)),
+        }
+    }
+}
+
+impl HealthCardsChange {
+    /// `current` with this change made, checked. A tenant given only an issuer issues cards when
+    /// it is new (`new`), and otherwise keeps what it was. The issuer is checked as the setting
+    /// of a server with one key is, and kept with no trailing slash.
+    pub fn resolve(
+        &self,
+        current: &HealthCardsSettings,
+        new: bool,
+    ) -> Result<HealthCardsSettings, String> {
+        let issuer = match &self.issuer {
+            None => current.issuer.clone(),
+            Some(None) => None,
+            Some(Some(issuer)) => Some(crate::health_cards::validate_issuer(issuer)?),
+        };
+        let enabled = match (self.enabled, new) {
+            (Some(enabled), _) => enabled,
+            (None, true) => self.issuer.is_some(),
+            (None, false) => current.enabled,
+        };
+        if !enabled && issuer.is_some() {
+            return Err(
+                "an issuer is for a tenant that issues health cards: set `enabled` to true, or \
+                 leave the issuer out"
+                    .into(),
+            );
+        }
+        Ok(HealthCardsSettings { enabled, issuer })
+    }
+}
+
+/// The body of `PATCH /admin/tenants/{name}`: what to change of a tenant that exists. What it
+/// leaves out stays.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTenant {
+    #[serde(default)]
+    pub health_cards: Option<HealthCardsChange>,
 }
 
 /// The body of `POST /admin/tenants`.
@@ -59,7 +182,7 @@ pub struct CreateTenant {
     #[serde(default)]
     pub smart: Option<bool>,
     #[serde(default)]
-    pub health_cards: bool,
+    pub health_cards: HealthCardsChange,
     #[serde(default)]
     pub limits: TenantLimits,
 }
@@ -118,13 +241,24 @@ pub trait TenantAdmin: Send + Sync {
     fn get(&self, name: &str) -> Result<Value, AdminError>;
     fn delete(&self, name: &str, request: DeleteTenant) -> Result<Value, AdminError>;
     fn restore(&self, name: &str) -> Result<Value, AdminError>;
+    /// Changes what `request` names of tenant `name`, and answers the tenant as it is. A change
+    /// of the tenant's settings is served by every process that serves it without a restart.
+    fn update(&self, name: &str, request: UpdateTenant) -> Result<Value, AdminError>;
+    /// Replaces tenant `name`'s Health Cards signing key (see
+    /// [`IssuerKey::rotate_tenant`](crate::IssuerKey::rotate_tenant)): `{"tenant", "kid",
+    /// "replaced_kid", "keys"}`.
+    fn rotate_health_cards(&self, name: &str) -> Result<Value, AdminError>;
 }
 
 pub(super) fn routes() -> Router<Arc<TenantHost>> {
     Router::new()
         .route("/tenants", get(list).post(create))
-        .route("/tenants/:name", get(read).delete(remove))
+        .route("/tenants/:name", get(read).patch(update).delete(remove))
         .route("/tenants/:name/restore", post(restore))
+        .route(
+            "/tenants/:name/health-cards/rotate",
+            post(rotate_health_cards),
+        )
         .route("/metrics", get(metrics))
 }
 
@@ -306,6 +440,12 @@ async fn create(
     if let Err(message) = request.limits.validate() {
         return error(&AdminError::invalid(message));
     }
+    if let Err(message) = request
+        .health_cards
+        .resolve(&HealthCardsSettings::default(), true)
+    {
+        return error(&AdminError::new(StatusCode::BAD_REQUEST, message));
+    }
     let admin = match admin(&host) {
         Ok(admin) => admin,
         Err(response) => return response,
@@ -344,6 +484,88 @@ async fn read(
     };
     match blocking(move || admin.get(&name)).await {
         Ok(tenant) => reply(StatusCode::OK, with_served(&host, tenant)),
+        Err(err) => error(&err),
+    }
+}
+
+async fn update(
+    State(host): State<Arc<TenantHost>>,
+    Path(name): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(refusal) = refuse_unauthenticated(&host, &headers) {
+        return refusal;
+    }
+    if let Some(elsewhere) = not_here(
+        &host,
+        method,
+        &format!("/admin/tenants/{name}"),
+        None,
+        &headers,
+        body.clone(),
+    )
+    .await
+    {
+        return elsewhere;
+    }
+    let request: UpdateTenant = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return error(&AdminError::new(
+                StatusCode::BAD_REQUEST,
+                format!("the body: {err}"),
+            ))
+        }
+    };
+    // Whether the issuer is one is the request's to get right, whatever the tenant has now.
+    if let Some(change) = &request.health_cards {
+        let enabled = HealthCardsSettings {
+            enabled: true,
+            issuer: None,
+        };
+        if let Err(message) = change.resolve(&enabled, false) {
+            return error(&AdminError::new(StatusCode::BAD_REQUEST, message));
+        }
+    }
+    let admin = match admin(&host) {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    match blocking(move || admin.update(&name, request)).await {
+        Ok(tenant) => reply(StatusCode::OK, with_served(&host, tenant)),
+        Err(err) => error(&err),
+    }
+}
+
+async fn rotate_health_cards(
+    State(host): State<Arc<TenantHost>>,
+    Path(name): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(refusal) = refuse_unauthenticated(&host, &headers) {
+        return refusal;
+    }
+    if let Some(elsewhere) = not_here(
+        &host,
+        method,
+        &format!("/admin/tenants/{name}/health-cards/rotate"),
+        None,
+        &headers,
+        Bytes::new(),
+    )
+    .await
+    {
+        return elsewhere;
+    }
+    let admin = match admin(&host) {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    match blocking(move || admin.rotate_health_cards(&name)).await {
+        Ok(rotated) => reply(StatusCode::OK, rotated),
         Err(err) => error(&err),
     }
 }

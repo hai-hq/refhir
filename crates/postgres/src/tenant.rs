@@ -166,6 +166,10 @@ pub struct Tenant {
     pub deleted_at: Option<String>,
     /// When a deleted tenant's rows are removed, and until when it can be restored.
     pub purge_after: Option<String>,
+    /// When the registry last changed this tenant (created, settings changed, deleted, restored,
+    /// or [touched](SharedConnections::touch_tenant)), as the database writes it. A process that
+    /// serves the tenant compares it with the one it last acted on.
+    pub updated_at: String,
 }
 
 impl Tenant {
@@ -191,7 +195,7 @@ fn tenant_columns() -> String {
         format!(r#"to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')"#)
     };
     format!(
-        "id, name, {CREATED_AT}, settings::text, {}, {}",
+        "id, name, {CREATED_AT}, settings::text, {}, {}, updated_at::text",
         at("deleted_at"),
         at("purge_after")
     )
@@ -207,6 +211,7 @@ fn tenant_from_row(row: &postgres::Row, primary_running: bool) -> Tenant {
         settings: serde_json::from_str(&settings).unwrap_or(JsonValue::Null),
         deleted_at: row.get(4),
         purge_after: row.get(5),
+        updated_at: row.get(6),
     }
 }
 
@@ -333,6 +338,39 @@ fn mark_restored(
     read_tenant(client, name)
 }
 
+/// Replaces the settings of tenant `name`, or only marks it changed when `settings` is `None`, and
+/// announces the registry as changed so that every process that serves the tenant looks again. A
+/// deleted tenant is not changed. `None` when there is no such tenant.
+fn mark_changed(
+    client: &mut impl GenericClient,
+    name: &str,
+    settings: Option<&JsonValue>,
+) -> Result<Option<Tenant>, PersistError> {
+    let changed = match settings {
+        Some(settings) => client.execute(
+            &format!(
+                "UPDATE {REGISTRY} SET settings = $2::text::jsonb, updated_at = now() \
+                 WHERE name = $1 AND id > 0 AND name <> '{WARM_TENANT}' AND deleted_at IS NULL"
+            ),
+            &[&name, &settings.to_string()],
+        ),
+        None => client.execute(
+            &format!(
+                "UPDATE {REGISTRY} SET updated_at = now() \
+                 WHERE name = $1 AND id > 0 AND name <> '{WARM_TENANT}' AND deleted_at IS NULL"
+            ),
+            &[&name],
+        ),
+    }
+    .map_err(definite)?;
+    if changed > 0 {
+        client
+            .batch_execute(&format!("NOTIFY {REGISTRY_CHANNEL}"))
+            .map_err(definite)?;
+    }
+    read_tenant(client, name)
+}
+
 /// The deleted tenants whose grace period is over.
 fn due(client: &mut impl GenericClient) -> Result<Vec<String>, PersistError> {
     let rows = client
@@ -393,6 +431,23 @@ impl SharedConnections {
     /// Brings back a deleted tenant whose rows have not been removed yet.
     pub fn restore_tenant(&self, name: &str) -> Result<Option<Tenant>, PersistError> {
         self.with_registry(|client| mark_restored(client, name))
+    }
+
+    /// Replaces the settings of tenant `name` and announces the change, so every process that
+    /// serves it applies them. The tenant as it is now; `None` when there is no such tenant. A
+    /// deleted tenant keeps the settings it has.
+    pub fn update_tenant_settings(
+        &self,
+        name: &str,
+        settings: &JsonValue,
+    ) -> Result<Option<Tenant>, PersistError> {
+        self.with_registry(|client| mark_changed(client, name, Some(settings)))
+    }
+
+    /// Marks tenant `name` changed without changing its settings, and announces it: what a tenant
+    /// keeps in its own rows (a key rotated, say) reaches every process that serves it.
+    pub fn touch_tenant(&self, name: &str) -> Result<Option<Tenant>, PersistError> {
+        self.with_registry(|client| mark_changed(client, name, None))
     }
 
     /// The deleted tenants whose grace period is over.

@@ -27,7 +27,7 @@ pub use governance::{
     AuditConfig, Cidr, ClientRate, Costs, Governance, GovernanceConfig, ProxyConfig, QuotaConfig,
     QuotaLimits, RateLimitConfig, RequestLogConfig,
 };
-pub use health_cards::IssuerKey;
+pub use health_cards::{IssuerKey, RotateError, Rotated};
 pub use http::{
     app, app_parts, app_with, tenant_app, AppState, ServerConfig, SharedGovernanceStore, Stop,
     TenantApp, DEFAULT_PAGE_SIZE,
