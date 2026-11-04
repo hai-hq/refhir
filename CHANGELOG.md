@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.6] - 2026-11-04
+
 ### Added
 
 - **A tenant of `refhir --all-tenants` can name an issuer for its SMART Health Cards, and replace
@@ -889,7 +891,8 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/hai-hq/refhir/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/hai-hq/refhir/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/hai-hq/refhir/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/hai-hq/refhir/compare/v0.0.2...v0.0.3
