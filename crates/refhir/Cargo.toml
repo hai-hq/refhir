@@ -32,3 +32,6 @@ tungstenite = "0.24"
 serde_json = { workspace = true }
 refhir-types = { path = "../types" }
 rusqlite = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }
+ring = "0.17"

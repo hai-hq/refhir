@@ -94,19 +94,25 @@ struct Host {
 
 impl Host {
     fn start(name: &str, database: &str, args: &[&str]) -> Host {
-        Self::spawn(name, database, args, None, false)
+        Self::spawn(name, database, args, None, false, None)
+    }
+
+    /// A host whose tenants are given the FHIR package in `package` (a directory) instead of the
+    /// small one the other tests use.
+    fn start_with_package(name: &str, database: &str, args: &[&str], package: &Path) -> Host {
+        Self::spawn(name, database, args, None, false, Some(package))
     }
 
     /// A host whose tenants are given the release's packages from `bundle` (a file of prepared
     /// packages, as a release archive has), which tenants share, instead of a package directory.
     fn start_with_bundle(name: &str, database: &str, args: &[&str], bundle: &Path) -> Host {
-        Self::spawn(name, database, args, Some(bundle), false)
+        Self::spawn(name, database, args, Some(bundle), false, None)
     }
 
     /// [`Host::start_with_bundle`] for a host that gets ready for its first tenant, as it does by
     /// default, in the background.
     fn start_warming_up(name: &str, database: &str, args: &[&str], bundle: &Path) -> Host {
-        Self::spawn(name, database, args, Some(bundle), true)
+        Self::spawn(name, database, args, Some(bundle), true, None)
     }
 
     fn spawn(
@@ -115,13 +121,16 @@ impl Host {
         args: &[&str],
         bundle: Option<&Path>,
         warm_up: bool,
+        package: Option<&Path>,
     ) -> Host {
         let port = free_port();
         let dir = std::env::temp_dir().join(format!("refhir-host-{name}-{port}"));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("server.log");
         let file = std::fs::File::create(&log).unwrap();
-        let minir4 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/fixtures/minir4");
+        let minir4 = package.map(Path::to_path_buf).unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../fhir/fixtures/minir4")
+        });
         let mut command = Command::new(env!("CARGO_BIN_EXE_refhir"));
         command
             .current_dir(&dir)
@@ -932,4 +941,538 @@ fn a_replica_or_standby_of_the_host_refuses_to_start_without_pinned_smart_secret
         assert!(said.contains("--smart-dcr-token"), "{role:?}: {said}");
         let _ = std::fs::remove_dir_all(dir);
     }
+}
+
+/// A patient with one immunization, which is what a health card for `Immunization` holds.
+fn seed_card_material(host: &Host, tenant: &str) {
+    let base = host.base();
+    let (status, body) = call(
+        "PUT",
+        &format!("{base}/t/{tenant}/Patient/p1"),
+        &[],
+        Some(
+            &json!({"resourceType": "Patient", "id": "p1", "birthDate": "1815-12-10",
+            "name": [{"family": "Lovelace", "given": ["Ada"]}]}),
+        ),
+    );
+    assert!(status == 200 || status == 201, "{tenant}: {status} {body}");
+    let (status, body) = call(
+        "PUT",
+        &format!("{base}/t/{tenant}/Immunization/i1"),
+        &[],
+        Some(
+            &json!({"resourceType": "Immunization", "id": "i1", "status": "completed",
+            "vaccineCode": {"coding": [{"system": "http://hl7.org/fhir/sid/cvx", "code": "140"}]},
+            "patient": {"reference": "Patient/p1"}, "occurrenceDateTime": "2023-10-01"}),
+        ),
+    );
+    assert!(status == 200 || status == 201, "{tenant}: {status} {body}");
+}
+
+/// A health card for p1, as `host` issues it for `tenant`.
+fn issue_card(host: &Host, tenant: &str) -> String {
+    let (status, body) = call(
+        "POST",
+        &format!("{}/t/{tenant}/Patient/p1/$health-cards-issue", host.base()),
+        &[],
+        Some(&json!({"resourceType": "Parameters",
+            "parameter": [{"name": "credentialType", "valueUri": "Immunization"}]})),
+    );
+    assert_eq!(status, 200, "{tenant}: {body}");
+    body["parameter"][0]["valueString"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{tenant} issued no card: {body}"))
+        .to_string()
+}
+
+/// The key set `host` publishes for `tenant`, by path.
+fn key_set(host: &Host, tenant: &str) -> Value {
+    let (status, body) = call(
+        "GET",
+        &format!(
+            "{}/t/{tenant}/health-cards/.well-known/jwks.json",
+            host.base()
+        ),
+        &[],
+        None,
+    );
+    assert_eq!(status, 200, "{tenant}: {body}");
+    body
+}
+
+fn kids(key_set: &Value) -> Vec<String> {
+    key_set["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| key["kid"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The claims of `card` once its signature checks against the key of `key_set` that its header
+/// names: what a verifier does. `None` when the key set holds no such key or the signature fails.
+fn verified_claims(card: &str, key_set: &Value) -> Option<Value> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+    use std::io::Read;
+
+    let parts: Vec<&str> = card.split('.').collect();
+    assert_eq!(parts.len(), 3, "{card}");
+    let header: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+    let key = key_set["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|key| key["kid"] == header["kid"])?;
+    let mut point = vec![4u8];
+    point.extend(URL_SAFE_NO_PAD.decode(key["x"].as_str().unwrap()).unwrap());
+    point.extend(URL_SAFE_NO_PAD.decode(key["y"].as_str().unwrap()).unwrap());
+    UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, point)
+        .verify(
+            format!("{}.{}", parts[0], parts[1]).as_bytes(),
+            &URL_SAFE_NO_PAD.decode(parts[2]).unwrap(),
+        )
+        .ok()?;
+    let mut payload = String::new();
+    flate2::read::DeflateDecoder::new(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()[..])
+        .read_to_string(&mut payload)
+        .unwrap();
+    Some(serde_json::from_str(&payload).unwrap())
+}
+
+fn card_kid(card: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let header: Value = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(card.split('.').next().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    header["kid"].as_str().unwrap().to_string()
+}
+
+fn wait_until(what: &str, host: &Host, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} never happened:\n{}",
+            host.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `key_set` holds the key that signs first, and then exactly the keys that were replaced.
+fn assert_signs_then_keeps(key_set: &Value, signing: &str, replaced: &[&str]) {
+    let all = kids(key_set);
+    assert_eq!(all[0], signing, "{all:?}");
+    let mut kept: Vec<&str> = all[1..].iter().map(String::as_str).collect();
+    kept.sort_unstable();
+    let mut expected = replaced.to_vec();
+    expected.sort_unstable();
+    assert_eq!(kept, expected, "{all:?}");
+}
+
+fn card_tenant(name: &str, health_cards: Value) -> Value {
+    let mut body = create_body(name);
+    body["health_cards"] = health_cards;
+    body
+}
+
+#[test]
+fn each_tenant_names_its_own_issuer_and_keeps_every_key_it_replaced() {
+    let Some(admin) = admin_url("tenants host: health cards") else {
+        return;
+    };
+    let (_database, app) = database_of_an_ordinary_role(&admin, "hostcards");
+    let mut host = Host::start_with_package(
+        "cards",
+        &app,
+        &["--tenant-domain", "fhir.test"],
+        refhir_fhir::cards_dir(),
+    );
+    host.wait_ready();
+
+    // Tenants made with an issuer, with the flag, and with none.
+    let shared = "https://cards.example.com";
+    for (name, cards) in [
+        (
+            "shared-a",
+            json!({"enabled": true, "issuer": format!("{shared}/")}),
+        ),
+        ("shared-b", json!({"enabled": true, "issuer": shared})),
+        (
+            "clinic",
+            json!({"issuer": "https://health.theclinic.example/cards"}),
+        ),
+        ("plain", json!(true)),
+    ] {
+        let (status, body) = host.admin("POST", "/admin/tenants", Some(card_tenant(name, cards)));
+        assert_eq!(status, 201, "{name}: {body}");
+        seed_card_material(&host, name);
+    }
+    let (status, nocards) = host.admin("POST", "/admin/tenants", Some(create_body("nocards")));
+    assert_eq!(status, 201, "{nocards}");
+    assert_eq!(
+        nocards["settings"]["health_cards"],
+        json!({"enabled": false, "issuer": null})
+    );
+
+    // The cards say exactly the issuer, with the slash trimmed; with none, the tenant's address.
+    let own_address = |name: &str| format!("{}/t/{name}/health-cards", host.base());
+    let sets: Vec<(&str, Value)> = ["shared-a", "shared-b", "clinic", "plain"]
+        .into_iter()
+        .map(|name| (name, key_set(&host, name)))
+        .collect();
+    for (name, expected) in [
+        ("shared-a", shared.to_string()),
+        ("shared-b", shared.to_string()),
+        (
+            "clinic",
+            "https://health.theclinic.example/cards".to_string(),
+        ),
+        ("plain", own_address("plain")),
+    ] {
+        let card = issue_card(&host, name);
+        let set = &sets.iter().find(|(tenant, _)| *tenant == name).unwrap().1;
+        let claims = verified_claims(&card, set)
+            .unwrap_or_else(|| panic!("{name}'s card does not verify against its own key set"));
+        assert_eq!(claims["iss"], expected, "{name}");
+        assert_eq!(kids(set).len(), 1, "{name}");
+    }
+    // Two tenants of one issuer still sign with a key each, and no tenant's card checks
+    // against another's.
+    assert_ne!(kids(&sets[0].1), kids(&sets[1].1));
+    let a_card = issue_card(&host, "shared-a");
+    assert!(verified_claims(&a_card, &sets[1].1).is_none());
+
+    // The same request again is the same tenant; another issuer is a conflict.
+    let (status, again) = host.admin(
+        "POST",
+        "/admin/tenants",
+        Some(card_tenant(
+            "clinic",
+            json!({"enabled": true, "issuer": "https://health.theclinic.example/cards/"}),
+        )),
+    );
+    assert_eq!(status, 200, "{again}");
+    let (status, _) = host.admin(
+        "POST",
+        "/admin/tenants",
+        Some(card_tenant(
+            "clinic",
+            json!({"issuer": "https://elsewhere.example"}),
+        )),
+    );
+    assert_eq!(status, 409);
+
+    // An issuer a verifier would not take is refused, and nothing changes: no tenant is made,
+    // and the one that exists keeps its issuer.
+    for issuer in [
+        "http://cards.example.com",
+        "https://cards.example.com/?x=1",
+        "https://cards.example.com/#top",
+        "https://user:secret@cards.example.com",
+        "",
+    ] {
+        let (status, body) = host.admin(
+            "POST",
+            "/admin/tenants",
+            Some(card_tenant(
+                "refused",
+                json!({"enabled": true, "issuer": issuer}),
+            )),
+        );
+        assert_eq!(status, 400, "{issuer:?}: {body}");
+        let (status, body) = host.admin(
+            "PATCH",
+            "/admin/tenants/clinic",
+            Some(json!({"health_cards": {"issuer": issuer}})),
+        );
+        assert_eq!(status, 400, "{issuer:?}: {body}");
+    }
+    assert_eq!(host.admin("GET", "/admin/tenants/refused", None).0, 404);
+    let (_, clinic) = host.admin("GET", "/admin/tenants/clinic", None);
+    assert_eq!(
+        clinic["settings"]["health_cards"],
+        json!({"enabled": true, "issuer": "https://health.theclinic.example/cards"})
+    );
+    let card = issue_card(&host, "clinic");
+    assert_eq!(
+        verified_claims(&card, &key_set(&host, "clinic")).unwrap()["iss"],
+        "https://health.theclinic.example/cards"
+    );
+
+    // An issuer set afterwards is used by the next card, with no restart; the old cards are
+    // still checked by the same key. `null` takes it away.
+    let old_card = issue_card(&host, "plain");
+    let plain_set = key_set(&host, "plain");
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/plain",
+        Some(json!({"health_cards": {"issuer": "https://plain.example.org/"}})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["settings"]["health_cards"],
+        json!({"enabled": true, "issuer": "https://plain.example.org"})
+    );
+    let card = issue_card(&host, "plain");
+    let claims = verified_claims(&card, &key_set(&host, "plain")).unwrap();
+    assert_eq!(claims["iss"], "https://plain.example.org");
+    assert!(verified_claims(&old_card, &plain_set).is_some());
+    let (status, _) = host.admin(
+        "PATCH",
+        "/admin/tenants/plain",
+        Some(json!({"health_cards": {"issuer": null}})),
+    );
+    assert_eq!(status, 200);
+    let card = issue_card(&host, "plain");
+    assert_eq!(
+        verified_claims(&card, &plain_set).unwrap()["iss"],
+        own_address("plain")
+    );
+
+    // Turning cards on for a tenant that had none: it is opened again and then issues them.
+    assert_eq!(
+        call(
+            "POST",
+            &format!("{}/t/nocards/Patient/p1/$health-cards-issue", host.base()),
+            &[],
+            Some(&json!({"resourceType": "Parameters"}))
+        )
+        .0,
+        501
+    );
+    // An issuer alone does not turn them on: it is for a tenant that issues cards.
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/nocards",
+        Some(json!({"health_cards": {"issuer": "https://late.example.org"}})),
+    );
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/nocards",
+        Some(json!({"health_cards": {"enabled": true, "issuer": "https://late.example.org"}})),
+    );
+    assert_eq!(status, 200, "{body}");
+    host.wait_serving("nocards");
+    seed_card_material(&host, "nocards");
+    wait_until("nocards issuing cards", &host, || {
+        call(
+            "GET",
+            &format!(
+                "{}/t/nocards/health-cards/.well-known/jwks.json",
+                host.base()
+            ),
+            &[],
+            None,
+        )
+        .0 == 200
+    });
+    let card = issue_card(&host, "nocards");
+    assert_eq!(
+        verified_claims(&card, &key_set(&host, "nocards")).unwrap()["iss"],
+        "https://late.example.org"
+    );
+
+    // Turning cards off takes the issuer with it and the tenant stops issuing them; turning them
+    // on again makes the key it had.
+    let nocards_kid = kids(&key_set(&host, "nocards"));
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/nocards",
+        Some(json!({"health_cards": false})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["settings"]["health_cards"],
+        json!({"enabled": false, "issuer": null})
+    );
+    host.wait_serving("nocards");
+    wait_until("nocards issuing no cards", &host, || {
+        call(
+            "POST",
+            &format!("{}/t/nocards/Patient/p1/$health-cards-issue", host.base()),
+            &[],
+            Some(&json!({"resourceType": "Parameters"})),
+        )
+        .0 == 501
+    });
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/nocards",
+        Some(json!({"health_cards": true})),
+    );
+    assert_eq!(status, 200, "{body}");
+    host.wait_serving("nocards");
+    wait_until("nocards issuing cards again", &host, || {
+        call(
+            "GET",
+            &format!(
+                "{}/t/nocards/health-cards/.well-known/jwks.json",
+                host.base()
+            ),
+            &[],
+            None,
+        )
+        .0 == 200
+    });
+    assert_eq!(kids(&key_set(&host, "nocards")), nocards_kid);
+
+    // A rotation: the new key signs, the replaced key stays, and each is a thumbprint kid.
+    let before = issue_card(&host, "plain");
+    let first = kids(&plain_set);
+    let clinic_set = key_set(&host, "clinic");
+    let (status, rotated) = host.admin("POST", "/admin/tenants/plain/health-cards/rotate", None);
+    assert_eq!(status, 200, "{rotated}");
+    assert_eq!(rotated["replaced_kid"], json!(first[0]));
+    let second = rotated["kid"].as_str().unwrap().to_string();
+    assert_ne!(second, first[0]);
+    assert_eq!(rotated["keys"], json!([second, first[0]]));
+    let set = key_set(&host, "plain");
+    assert_eq!(kids(&set), [second.clone(), first[0].clone()]);
+    for key in set["keys"].as_array().unwrap() {
+        assert!(key.get("d").is_none(), "no private member: {key}");
+    }
+    assert!(!set.to_string().contains("PRIVATE"));
+    let after = issue_card(&host, "plain");
+    assert_eq!(card_kid(&before), first[0]);
+    assert_eq!(card_kid(&after), second);
+    assert!(
+        verified_claims(&before, &set).is_some(),
+        "signed before the rotation"
+    );
+    assert!(verified_claims(&after, &set).is_some(), "signed after it");
+    // The key set by host name is the same.
+    let (status, by_host) = call(
+        "GET",
+        &format!("{}/health-cards/.well-known/jwks.json", host.base()),
+        &[("host", "plain.fhir.test")],
+        None,
+    );
+    assert_eq!(status, 200, "{by_host}");
+    assert_eq!(by_host, set);
+    // Another tenant's key set did not change, and its cards do not check against this one.
+    assert_eq!(key_set(&host, "clinic"), clinic_set);
+    assert!(verified_claims(&issue_card(&host, "clinic"), &set).is_none());
+    let (_, described) = host.admin("GET", "/admin/tenants/plain", None);
+    assert_eq!(described["health_cards"]["kid"], json!(second));
+
+    // Twice: all three keys.
+    let (status, rotated_again) =
+        host.admin("POST", "/admin/tenants/plain/health-cards/rotate", None);
+    assert_eq!(status, 200, "{rotated_again}");
+    assert_eq!(rotated_again["replaced_kid"], json!(second));
+    let third = rotated_again["kid"].as_str().unwrap().to_string();
+    let set = key_set(&host, "plain");
+    assert_signs_then_keeps(&set, &third, &[&second, &first[0]]);
+    for card in [&before, &after, &issue_card(&host, "plain")] {
+        assert!(verified_claims(card, &set).is_some());
+    }
+
+    // Rotation needs a tenant that exists and issues cards.
+    assert_eq!(
+        host.admin("POST", "/admin/tenants/ghost/health-cards/rotate", None)
+            .0,
+        404
+    );
+    let (status, _) = host.admin("POST", "/admin/tenants", Some(create_body("silent")));
+    assert_eq!(status, 201);
+    assert_eq!(
+        host.admin("POST", "/admin/tenants/silent/health-cards/rotate", None)
+            .0,
+        409
+    );
+
+    // A replica follows: it publishes the same keys, signs with the new one when another process
+    // rotates, and sends an admin request that changes a tenant to the primary.
+    let mut replica = Host::start_with_package(
+        "cards-replica",
+        &app,
+        &["--role", "replica", "--primary-url", &host.base()],
+        refhir_fhir::cards_dir(),
+    );
+    replica.wait_ready();
+    replica.wait_serving("plain");
+    assert_eq!(kids(&key_set(&replica, "plain")), kids(&set));
+    let (status, via) = replica.admin("POST", "/admin/tenants/plain/health-cards/rotate", None);
+    assert_eq!(status, 200, "{via}");
+    let fourth = via["kid"].as_str().unwrap().to_string();
+    let latest = key_set(&host, "plain");
+    assert_signs_then_keeps(&latest, &fourth, &[&third, &second, &first[0]]);
+    wait_until("the replica following the rotation", &replica, || {
+        kids(&key_set(&replica, "plain")) == kids(&latest)
+    });
+    let from_replica = issue_card(&replica, "plain");
+    assert_eq!(card_kid(&from_replica), fourth);
+    assert!(verified_claims(&from_replica, &latest).is_some());
+    let (status, _) = replica.admin(
+        "PATCH",
+        "/admin/tenants/plain",
+        Some(json!({"health_cards": {"issuer": "https://replica.example.org"}})),
+    );
+    assert_eq!(status, 200);
+    wait_until("the replica naming the issuer", &replica, || {
+        verified_claims(&issue_card(&replica, "plain"), &latest)
+            .is_some_and(|claims| claims["iss"] == "https://replica.example.org")
+    });
+    assert_eq!(
+        verified_claims(&issue_card(&host, "plain"), &latest).unwrap()["iss"],
+        "https://replica.example.org"
+    );
+
+    // A tenant that is closed and restored keeps the keys it replaced.
+    let (status, body) = host.admin("DELETE", "/admin/tenants/plain?export=false", None);
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = host.admin("POST", "/admin/tenants/plain/restore", None);
+    assert_eq!(status, 200, "{body}");
+    host.wait_serving("plain");
+    assert_eq!(key_set(&host, "plain"), latest);
+    for card in [&before, &after, &from_replica] {
+        assert!(verified_claims(card, &key_set(&host, "plain")).is_some());
+    }
+    assert_eq!(
+        card_kid(&issue_card(&host, "plain")),
+        fourth,
+        "it signs with the key it had"
+    );
+
+    // The settings change and the rotations are in the tenant's audit trail: who, which tenant,
+    // which keys, never a key.
+    let audit_text = |tenant: &str| {
+        call(
+            "GET",
+            &format!("{}/t/{tenant}/_audit?_count=100", host.base()),
+            &[],
+            None,
+        )
+        .1
+        .to_string()
+    };
+    wait_until("the rotations in the audit trail", &host, || {
+        let text = audit_text("plain");
+        text.contains("health-cards-rotate") && text.contains("health-cards-settings")
+    });
+    let trail = audit_text("plain");
+    for kid in [&first[0], &second, &third, &fourth] {
+        assert!(
+            trail.contains(kid.as_str()),
+            "{kid} is not in the audit trail: {trail}"
+        );
+    }
+    assert!(trail.contains("admin-api") && trail.contains("https://replica.example.org"));
+    assert!(
+        !trail.contains("PRIVATE") && !trail.contains("\"d\\\":"),
+        "{trail}"
+    );
+    assert!(
+        !audit_text("clinic").contains("health-cards-rotate"),
+        "another tenant's audit trail holds nothing of it"
+    );
+    replica.kill();
 }

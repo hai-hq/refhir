@@ -299,7 +299,10 @@ fn execute(parsed: Parsed) -> Result<(), Box<dyn std::error::Error>> {
                     packages: settings.packages,
                     update_as_create: settings.update_as_create,
                     smart: settings.smart.unwrap_or(cfg.auth),
-                    health_cards: settings.health_cards,
+                    health_cards: refhir_server::tenancy::HealthCardsSettings {
+                        enabled: settings.health_cards,
+                        issuer: None,
+                    },
                     limits: settings.limits,
                 };
                 let settings = serde_json::to_value(settings)?;

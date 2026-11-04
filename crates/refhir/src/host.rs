@@ -26,8 +26,8 @@ use refhir_fhir::{Catalog, CatalogClock};
 use refhir_persistence::{AuthStore, ConformanceStore, Lease, Persistence};
 use refhir_postgres::{Created, PostgresPersistence, SharedConnections, SharedOptions, Tenant};
 use refhir_server::tenancy::{
-    tenant_secret, AdminError, CreateTenant, DeleteTenant, HostConfig, Routing, TenantAdmin,
-    TenantHost, TenantLimits, TenantSettings, TenantState,
+    tenant_secret, AdminError, CreateTenant, DeleteTenant, HealthCardsSettings, HostConfig,
+    Routing, TenantAdmin, TenantHost, TenantLimits, TenantSettings, TenantState, UpdateTenant,
 };
 use refhir_server::TenantApp;
 use serde_json::{json, Value};
@@ -137,6 +137,11 @@ struct Opened {
     app: Arc<TenantApp>,
     /// A replica's catalog follower, stopped with the tenant.
     watcher: Mutex<Option<refhir_fhir::CatalogWatcher>>,
+    /// The tenant's Health Cards key, when it issues cards, and the rows it is read from.
+    cards: Option<Arc<refhir_server::IssuerKey>>,
+    auth_store: Arc<dyn AuthStore>,
+    /// The registry's `updated_at` of the tenant as this process last acted on it.
+    applied: Mutex<String>,
 }
 
 /// One tenant's place in the process: being opened, open, or neither.
@@ -171,6 +176,8 @@ pub(crate) struct Manager {
     login: bool,
     /// Whether the warm-up has been started: once, by the process that first writes.
     warm_up_started: AtomicBool,
+    /// Set when a change to a tenant's Health Cards could not be applied, until it is.
+    cards_retry: AtomicBool,
 }
 
 /// Runs the process: serves `listener` (and the admin listener, if any) until told to stop.
@@ -190,6 +197,18 @@ pub(crate) fn run(
              leave it out, and create tenants with health_cards on"
                 .into(),
         );
+    }
+    for (set, name) in [
+        (&cfg.health_cards_issuer, "issuer"),
+        (&cfg.health_cards_extra_keys_file, "extra_keys_file"),
+    ] {
+        if set.is_some() {
+            tracing::warn!(
+                "[health_cards] {name} is the setting of a server with one key file, and this \
+                 process does not read it: set a tenant's issuer with PATCH /admin/tenants/{{name}} \
+                 and replace its key with POST /admin/tenants/{{name}}/health-cards/rotate"
+            );
+        }
     }
     let role = cfg.role;
     let local = listener.local_addr()?;
@@ -247,6 +266,7 @@ pub(crate) fn run(
         opens: Permits::new(MAX_CONCURRENT_OPENS),
         default_share,
         warm_up_started: AtomicBool::new(false),
+        cards_retry: AtomicBool::new(false),
         cfg,
     });
     host.set_admin(manager.clone());
@@ -423,8 +443,12 @@ impl Manager {
             .is_none_or(|(_, again)| *again <= std::time::Instant::now())
     }
 
-    /// Whether some tenant that failed to open is due another try.
+    /// Whether some tenant that failed to open is due another try, or a change to a tenant's
+    /// Health Cards is waiting to be applied.
     fn retry_due(&self) -> bool {
+        if self.cards_retry.load(Ordering::SeqCst) {
+            return true;
+        }
         let now = std::time::Instant::now();
         self.failed
             .lock()
@@ -436,6 +460,8 @@ impl Manager {
     /// Opens what the registry has and this process does not serve, and stops what it no longer
     /// has.
     fn sync_registry(self: &Arc<Self>) {
+        // A change that still cannot be applied sets this again below.
+        self.cards_retry.store(false, Ordering::SeqCst);
         let tenants = match self.shared.list_tenants() {
             Ok(tenants) => tenants,
             Err(err) => {
@@ -493,7 +519,71 @@ impl Manager {
                         }
                     })
                     .expect("opener thread");
+            } else {
+                self.apply_changes(&name, &tenant);
             }
+        }
+    }
+
+    /// Makes an open tenant serve what the registry now says of it: the issuer its cards name, the
+    /// key another process rotated. A tenant that starts or stops issuing cards is opened again,
+    /// since what it is made of changes. Does nothing for a tenant it already acted on.
+    fn apply_changes(self: &Arc<Self>, name: &str, tenant: &Tenant) {
+        let Some(opened) = self.opened(name) else {
+            return;
+        };
+        {
+            let applied = opened.applied.lock().expect("applied");
+            if *applied == tenant.updated_at {
+                return;
+            }
+        }
+        let settings = Self::settings_of(tenant);
+        if settings.health_cards.enabled != opened.cards.is_some() {
+            // What the tenant is made of changes: it is opened again, from what the registry says
+            // by then.
+            *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
+            self.reopen(name);
+            return;
+        }
+        let Some(cards) = &opened.cards else {
+            *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
+            return;
+        };
+        let applied = cards
+            .set_issuer(settings.health_cards.issuer.as_deref())
+            .and_then(|()| cards.refresh(opened.auth_store.as_ref()));
+        match applied {
+            Ok(rotated) => {
+                if rotated {
+                    tracing::info!(
+                        "tenant `{name}` signs its health cards with key {}",
+                        cards.kid()
+                    );
+                }
+                *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "tenant `{name}`: its health card settings are not applied yet: {err}"
+                );
+                self.cards_retry.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Stops serving tenant `name` and opens it again, from a thread of its own.
+    fn reopen(self: &Arc<Self>, name: &str) {
+        let manager = self.clone();
+        let name = name.to_string();
+        let spawned = std::thread::Builder::new()
+            .name(format!("refhir-reopen-{name}"))
+            .spawn(move || {
+                manager.stop(&name, TenantState::Starting);
+                manager.reopen_later(&name);
+            });
+        if let Err(err) = spawned {
+            tracing::warn!("cannot open the tenant again: {err}");
         }
     }
 
@@ -527,6 +617,7 @@ impl Manager {
         self.host.set(name, TenantState::Starting, limits.clone());
         match self.open(name, &settings, &limits, &cancelled) {
             Ok(Some(opened)) => {
+                *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
                 let opened = Arc::new(opened);
                 self.host
                     .set(name, TenantState::Ready(opened.app.clone()), limits);
@@ -535,6 +626,12 @@ impl Manager {
                 }
                 self.forget_failures(name);
                 tracing::info!("serving tenant {name}");
+                // Changed while it opened: it was opened as the registry said when it was read.
+                if let Ok(Some(latest)) = self.shared.get_tenant(name) {
+                    if !latest.is_deleted() && latest.updated_at != tenant.updated_at {
+                        self.apply_changes(name, &latest);
+                    }
+                }
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -754,7 +851,7 @@ impl Manager {
         } else {
             None
         };
-        let health_cards = if settings.health_cards {
+        let health_cards = if settings.health_cards.enabled {
             let key = if replica {
                 wait_for(name, cancelled, "its health card key", || {
                     refhir_server::IssuerKey::for_tenant(auth_store.as_ref(), false).map(|_| ())
@@ -763,6 +860,8 @@ impl Manager {
             } else {
                 refhir_server::IssuerKey::for_tenant(auth_store.as_ref(), true)?
             };
+            key.set_issuer(settings.health_cards.issuer.as_deref())
+                .map_err(|err| format!("the tenant's health card issuer: {err}"))?;
             Some(Arc::new(key))
         } else {
             None
@@ -781,7 +880,7 @@ impl Manager {
             smart_confidential_secret: Some(confidential),
             oidc: self.cfg.oidc.clone(),
             smart_demo_login: self.cfg.smart_demo_login,
-            health_cards,
+            health_cards: health_cards.clone(),
             smart,
             primary_url: self.cfg.primary_url.clone(),
             tenant: Some(name.to_string()),
@@ -810,6 +909,9 @@ impl Manager {
             catalog,
             app: Arc::new(app),
             watcher: Mutex::new(watcher),
+            cards: health_cards,
+            auth_store,
+            applied: Mutex::new(String::new()),
         }))
     }
 
@@ -977,11 +1079,16 @@ impl Manager {
             "primary_running": tenant.primary_running,
             "public_url": self.routing.public_url(&tenant.name),
         });
+        // Always the object, whether the tenant was made with `true` or with an issuer.
+        body["settings"]["health_cards"] = Self::settings_of(tenant).health_cards.report();
         if let Some(at) = &tenant.deleted_at {
             body["deleted_at"] = json!(at);
             body["purge_after"] = json!(tenant.purge_after);
         }
         if let Some(opened) = self.opened(&tenant.name) {
+            if let Some(cards) = &opened.cards {
+                body["health_cards"] = Self::cards_report(cards);
+            }
             let store: &dyn ConformanceStore = &opened.persistence;
             if let Ok(packages) = store.load_packages() {
                 let mut packages: Vec<Value> = packages
@@ -994,6 +1101,16 @@ impl Manager {
             body["latest_ts"] = json!(opened.db.latest_ts().to_string());
         }
         body
+    }
+
+    /// The key that signs a tenant's cards, and every key its key set holds (this one first):
+    /// thumbprints, which are public.
+    fn cards_report(cards: &refhir_server::IssuerKey) -> Value {
+        let kids: Vec<Value> = cards.jwks()["keys"]
+            .as_array()
+            .map(|keys| keys.iter().map(|key| key["kid"].clone()).collect())
+            .unwrap_or_default();
+        json!({"kid": cards.kid(), "keys": kids})
     }
 
     /// The SMART credentials of tenant `name`, which only the admin API's create hands out.
@@ -1080,11 +1197,15 @@ impl TenantAdmin for Manager {
     fn create(&self, request: CreateTenant) -> Result<(Value, bool), AdminError> {
         refhir_postgres::validate_tenant_name(&request.name)
             .map_err(|err| AdminError::invalid(err.to_string()))?;
+        let health_cards = request
+            .health_cards
+            .resolve(&HealthCardsSettings::default(), true)
+            .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
         let settings = TenantSettings {
             packages: request.packages,
             update_as_create: request.update_as_create,
             smart: request.smart.unwrap_or(self.cfg.auth),
-            health_cards: request.health_cards,
+            health_cards,
             limits: request.limits,
         };
         if settings.smart && !self.login {
@@ -1277,9 +1398,169 @@ impl TenantAdmin for Manager {
             .map_err(|err| AdminError::new(StatusCode::SERVICE_UNAVAILABLE, err))?;
         Ok(self.describe(&tenant))
     }
+
+    fn update(&self, name: &str, request: UpdateTenant) -> Result<Value, AdminError> {
+        let tenant = self.live_tenant(name)?;
+        let current = Self::settings_of(&tenant);
+        let mut raw = match &tenant.settings {
+            Value::Object(_) => tenant.settings.clone(),
+            _ => json!({}),
+        };
+        let mut changes = Vec::new();
+        if let Some(change) = &request.health_cards {
+            let cards = change
+                .resolve(&current.health_cards, false)
+                .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
+            if cards != current.health_cards {
+                changes.push((
+                    "health-cards-settings",
+                    json!({
+                        "tenant": name,
+                        "health_cards": {
+                            "from": current.health_cards.report(),
+                            "to": cards.report(),
+                        },
+                    }),
+                ));
+                raw["health_cards"] = serde_json::to_value(&cards).expect("settings json");
+            }
+        }
+        if changes.is_empty() {
+            return Ok(self.describe(&tenant));
+        }
+        let updated = self
+            .shared
+            .update_tenant_settings(name, &raw)
+            .map_err(Self::admin_error)?
+            .ok_or_else(|| AdminError::not_found(name))?;
+        // Recorded before it is applied: a tenant that is opened again flushes its audit trail
+        // as it stops, and a row recorded after that would be lost.
+        match self.opened(name) {
+            Some(opened) => {
+                for (subtype, detail) in &changes {
+                    opened.app.governance.record_admin(subtype, "U", detail);
+                }
+            }
+            None => {
+                for (subtype, detail) in &changes {
+                    tracing::warn!(
+                        "tenant `{name}` is not open here, so this change is not in its audit \
+                         trail: {subtype} {detail}"
+                    );
+                }
+            }
+        }
+        // Served from now on, here and (when they hear of it) elsewhere, with no restart.
+        let this = self.arc();
+        this.apply_changes(name, &updated);
+        Ok(self.describe(&updated))
+    }
+
+    fn rotate_health_cards(&self, name: &str) -> Result<Value, AdminError> {
+        let tenant = self.live_tenant(name)?;
+        if !Self::settings_of(&tenant).health_cards.enabled {
+            return Err(AdminError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "tenant `{name}` does not issue health cards: turn them on with \
+                     PATCH /admin/tenants/{name} before rotating a key"
+                ),
+            ));
+        }
+        let opened = self.opened(name).ok_or_else(|| {
+            AdminError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("tenant `{name}` is not open here: try again when it is"),
+            )
+        })?;
+        let Some(cards) = &opened.cards else {
+            return Err(AdminError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("tenant `{name}` is opening again with health cards: try again shortly"),
+            ));
+        };
+        let rotated =
+            refhir_server::IssuerKey::rotate_tenant(opened.auth_store.as_ref()).map_err(|err| {
+                match err {
+                    refhir_server::RotateError::Raced => AdminError::new(
+                        StatusCode::CONFLICT,
+                        format!("tenant `{name}`'s key was changed by another request: ask again"),
+                    ),
+                    refhir_server::RotateError::NoKey => {
+                        AdminError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string())
+                    }
+                    refhir_server::RotateError::Failed(why) => AdminError::internal(why),
+                }
+            })?;
+        // The key is replaced for good: what follows only spreads the news, so none of it fails
+        // the request (asking again would replace the key a second time).
+        // The other processes that serve the tenant take the new key when they hear of this.
+        let touched = match self.shared.touch_tenant(name) {
+            Ok(touched) => touched,
+            Err(err) => {
+                tracing::warn!(
+                    "tenant `{name}`: other processes are not told of the new health card key: \
+                     {err}"
+                );
+                None
+            }
+        };
+        match cards.refresh(opened.auth_store.as_ref()) {
+            Ok(_) => {
+                if let Some(touched) = touched {
+                    *opened.applied.lock().expect("applied") = touched.updated_at;
+                }
+            }
+            Err(err) => {
+                // This process signs with the replaced key, which is still published, until the
+                // next pass over the registry reads the new one.
+                tracing::warn!("tenant `{name}`: the new health card key is not read yet: {err}");
+                self.cards_retry.store(true, Ordering::SeqCst);
+            }
+        }
+        tracing::info!(
+            "tenant `{name}` signs its health cards with key {} (replacing {})",
+            rotated.kid,
+            rotated.replaced
+        );
+        opened.app.governance.record_admin(
+            "health-cards-rotate",
+            "E",
+            &json!({"tenant": name, "kid": rotated.kid, "replaced_kid": rotated.replaced}),
+        );
+        let mut keys = Self::cards_report(cards)["keys"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if keys.first() != Some(&json!(rotated.kid)) {
+            keys.insert(0, json!(rotated.kid));
+        }
+        Ok(json!({
+            "tenant": name,
+            "kid": rotated.kid,
+            "replaced_kid": rotated.replaced,
+            "keys": keys,
+        }))
+    }
 }
 
 impl Manager {
+    /// Tenant `name` as the registry has it, which must be there and not deleted.
+    fn live_tenant(&self, name: &str) -> Result<Tenant, AdminError> {
+        let tenant = self
+            .shared
+            .get_tenant(name)
+            .map_err(Self::admin_error)?
+            .ok_or_else(|| AdminError::not_found(name))?;
+        if tenant.is_deleted() {
+            return Err(AdminError::new(
+                StatusCode::CONFLICT,
+                format!("tenant `{name}` is deleted: restore it first"),
+            ));
+        }
+        Ok(tenant)
+    }
+
     /// `self` as the `Arc` it lives in (the admin API holds it as one).
     fn arc(&self) -> Arc<Self> {
         self.me.upgrade().expect("the manager outlives its calls")

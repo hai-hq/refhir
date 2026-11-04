@@ -10,6 +10,25 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **A tenant of `refhir --all-tenants` can name an issuer for its SMART Health Cards, and replace
+  its signing key without ending the cards the old key signed.** `health_cards` on
+  `POST /admin/tenants` is now `true`, `false` or an object, `{"enabled": true, "issuer":
+  "https://cards.example.com"}`, and `PATCH /admin/tenants/{name}` changes it on a tenant that
+  exists: its cards then carry exactly that `iss` (trailing slash dropped; `https`, or `http` on
+  loopback, with no user name, query or fragment, otherwise a `400` and nothing changes), served by
+  every process of the deployment within moments with no restart. `POST
+  /admin/tenants/{name}/health-cards/rotate` makes a new P-256 key that signs from then on and keeps
+  the replaced key's public half in the tenant's key set for good (at
+  `/t/{name}/health-cards/.well-known/jwks.json` and its host-name equivalent, each under its
+  thumbprint `kid`, never a private member); it answers the new and the replaced `kid`. Replaced keys
+  survive a tenant being deleted and restored. Both changes are recorded in the tenant's audit trail
+  (`health-cards-settings`, `health-cards-rotate`: who, which tenant, which `kid`s; never a key).
+  `GET /admin/tenants/{name}` reports `settings.health_cards` as an object and the `kid`s of the
+  tenant's key set. Set an issuer only once every process runs this release: an earlier one cannot
+  read it. [A tenant's issuer and keys](docs/health-cards.md#a-tenants-issuer-and-keys).
+
 ## [0.0.5] - 2026-11-04
 
 ### Added

@@ -92,6 +92,8 @@ Read when the process is started with `--all-tenants`. See
 | `limits.requests_per_second`, `limits.burst`, `limits.storage_bytes`, `limits.connections` | none | The limits of a tenant that sets none of its own |
 
 With `--all-tenants`, `--db-pool` defaults to 16, `[health_cards] key_file` is refused (each tenant
-signs with a key of its own, from `health_cards` at creation), and what `--smart`, `--update-as-create`
+signs with a key of its own, from `health_cards` at creation; its issuer and its replaced keys are
+set per tenant [over the admin API](health-cards.md#a-tenants-issuer-and-keys), and `[health_cards]`
+`issuer` and `extra_keys_file` are not read), and what `--smart`, `--update-as-create`
 and `--package` say are the defaults and the packages for every tenant, to which a tenant's own
 settings add.

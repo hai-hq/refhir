@@ -7,6 +7,7 @@
 
 use std::io::Write;
 use std::path::Path;
+use std::sync::RwLock;
 
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
@@ -20,21 +21,88 @@ use sha2::{Digest, Sha256};
 /// The credential type every health card carries.
 pub const HEALTH_CARD_TYPE: &str = "https://smarthealth.cards#health-card";
 
+/// What a tenant's key is kept as in its own database (beside its SMART signing key): the one
+/// that signs, sealed when a passphrase is set, and the public halves of those it replaced.
+const KEY_KIND: &str = "health_cards_key";
+const ACTIVE: &str = "active";
+const RETIRED_KIND: &str = "health_cards_retired";
+
 /// The issuer's signing key: a P-256 key that signs every card this server issues.
+///
+/// What it signs with, the `iss` it names and the key set it publishes can change while the server
+/// runs (a tenant's key is rotated, its issuer set), so they are held behind a lock that a card
+/// being signed reads for as long as it takes to sign.
 pub struct IssuerKey {
-    pair: EcdsaKeyPair,
     rng: SystemRandom,
+    live: RwLock<Live>,
+}
+
+struct Live {
+    pair: EcdsaKeyPair,
     kid: String,
+    /// The public half of `pair`, as the key set publishes it.
+    current: Value,
     /// What `iss` says when it is not the server's own address, with no trailing slash.
     issuer: Option<String>,
-    /// The key set that checks the cards, made once: this key, then any retired public keys.
+    /// Public keys that signed cards before, never `current`.
+    retired: Vec<Value>,
+    /// The key set that checks the cards, made when anything above changes: `current`, then
+    /// `retired`.
     jwks: Value,
+}
+
+impl Live {
+    fn publish(&mut self) {
+        let mut keys = vec![self.current.clone()];
+        keys.extend(self.retired.iter().cloned());
+        self.jwks = json!({ "keys": keys });
+    }
+
+    fn retire(&mut self, keys: Vec<Value>) {
+        for key in keys {
+            if key["kid"] != self.current["kid"]
+                && !self.retired.iter().any(|known| known["kid"] == key["kid"])
+            {
+                self.retired.push(key);
+            }
+        }
+        self.publish();
+    }
 }
 
 impl std::fmt::Debug for IssuerKey {
     // The key itself is never printed.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "IssuerKey({})", self.kid)
+        write!(f, "IssuerKey({})", self.kid())
+    }
+}
+
+/// What [`IssuerKey::rotate_tenant`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rotated {
+    /// The thumbprint of the key that signs from now on.
+    pub kid: String,
+    /// The thumbprint of the key that signed until now, which stays in the key set.
+    pub replaced: String,
+}
+
+/// Why [`IssuerKey::rotate_tenant`] changed nothing (or nothing that matters).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RotateError {
+    /// The tenant has no key yet: its primary makes one the first time it opens it.
+    NoKey,
+    /// Another process changed the key while this one rotated it. Nothing was lost; ask again.
+    Raced,
+    Failed(String),
+}
+
+impl std::fmt::Display for RotateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoKey => f.write_str("the tenant's health card key has not been made yet"),
+            Self::Raced => f.write_str("the key was changed by another request meanwhile"),
+            Self::Failed(why) => f.write_str(why),
+        }
     }
 }
 
@@ -66,7 +134,7 @@ impl IssuerKey {
         let x = URL_SAFE_NO_PAD.encode(&point[1..33]);
         let y = URL_SAFE_NO_PAD.encode(&point[33..65]);
         let kid = thumbprint(&x, &y);
-        let jwks = json!({"keys": [{
+        let current = json!({
             "kty": "EC",
             "kid": kid,
             "use": "sig",
@@ -74,30 +142,55 @@ impl IssuerKey {
             "crv": "P-256",
             "x": x,
             "y": y
-        }]});
-        Ok(Self {
+        });
+        let mut live = Live {
             pair,
-            rng,
             kid,
+            current,
             issuer: None,
-            jwks,
+            retired: Vec::new(),
+            jwks: Value::Null,
+        };
+        live.publish();
+        Ok(Self {
+            rng,
+            live: RwLock::new(live),
         })
     }
 
-    pub fn kid(&self) -> &str {
-        &self.kid
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Live> {
+        self.live
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Live> {
+        self.live
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn kid(&self) -> String {
+        self.read().kid.clone()
     }
 
     /// Cards name `issuer` as `iss`, not an address of this server's. It is checked by
     /// [`validate_issuer`] and kept with no trailing slash.
-    pub fn with_issuer(mut self, issuer: &str) -> Result<Self, String> {
-        self.issuer = Some(validate_issuer(issuer)?);
+    pub fn with_issuer(self, issuer: &str) -> Result<Self, String> {
+        self.set_issuer(Some(issuer))?;
         Ok(self)
     }
 
+    /// Names `issuer` as `iss` from now on, or with `None` this server's own address again.
+    pub fn set_issuer(&self, issuer: Option<&str>) -> Result<(), String> {
+        let issuer = issuer.map(validate_issuer).transpose()?;
+        self.write().issuer = issuer;
+        Ok(())
+    }
+
     /// The `iss` the cards name when one was set.
-    pub fn issuer(&self) -> Option<&str> {
-        self.issuer.as_deref()
+    pub fn issuer(&self) -> Option<String> {
+        self.read().issuer.clone()
     }
 
     /// Also publish the public keys in the JWKS file at `path`, so a key that was replaced stays
@@ -106,15 +199,9 @@ impl IssuerKey {
         self.with_retired_keys(&read_file(path.as_ref())?)
     }
 
-    pub fn with_retired_keys(mut self, jwks: &str) -> Result<Self, String> {
-        for key in public_keys(jwks)? {
-            let published = self.jwks["keys"]
-                .as_array_mut()
-                .expect("the key set has keys");
-            if !published.iter().any(|known| known["kid"] == key["kid"]) {
-                published.push(key);
-            }
-        }
+    pub fn with_retired_keys(self, jwks: &str) -> Result<Self, String> {
+        let keys = public_keys(jwks)?;
+        self.write().retire(keys);
         Ok(self)
     }
 
@@ -136,36 +223,66 @@ impl IssuerKey {
     /// The key a tenant of a process that serves many signs its cards with: its own, kept in its
     /// own database (beside its SMART signing key), so every process that serves the tenant signs
     /// with the same one and no tenant's cards verify against another's. The tenant's primary
-    /// makes it the first time (`create`); another process waits for it to be there.
+    /// makes it the first time (`create`); another process waits for it to be there. The key set
+    /// also holds the public keys of the ones [`IssuerKey::rotate_tenant`] replaced.
     pub fn for_tenant(
         store: &dyn refhir_persistence::AuthStore,
         create: bool,
     ) -> Result<Self, String> {
-        const KIND: &str = "health_cards_key";
-        const ACTIVE: &str = "active";
-        // The same passphrase seals this key as seals the SMART signing key.
-        let passphrase = std::env::var("REFHIR_SIGNING_KEY_PASSPHRASE")
+        Self::for_tenant_sealed(store, create, Self::tenant_passphrase().as_deref())
+    }
+
+    fn for_tenant_sealed(
+        store: &dyn refhir_persistence::AuthStore,
+        create: bool,
+        passphrase: Option<&str>,
+    ) -> Result<Self, String> {
+        let key = Self::tenant_signing_key(store, create, passphrase)?;
+        let retired = tenant_retired_keys(store)?;
+        key.write().retire(retired);
+        Ok(key)
+    }
+
+    /// The passphrase that seals the tenant's keys: the one that seals its SMART signing key.
+    fn tenant_passphrase() -> Option<String> {
+        std::env::var("REFHIR_SIGNING_KEY_PASSPHRASE")
             .ok()
-            .filter(|value| !value.is_empty());
+            .filter(|value| !value.is_empty())
+    }
+
+    /// A stored key (sealed or not) as a key.
+    fn open_stored(pem: &str, passphrase: Option<&str>) -> Result<Self, String> {
+        if pem.contains(ENCRYPTED_BEGIN) {
+            let passphrase = passphrase
+                .ok_or("the health card key is encrypted: set REFHIR_SIGNING_KEY_PASSPHRASE")?;
+            return Self::from_der(&unseal(pem, passphrase)?);
+        }
+        Self::from_pem(pem)
+    }
+
+    /// The tenant's signing key alone, made if there is none and `create`.
+    fn tenant_signing_key(
+        store: &dyn refhir_persistence::AuthStore,
+        create: bool,
+        passphrase: Option<&str>,
+    ) -> Result<Self, String> {
         let stored = |store: &dyn refhir_persistence::AuthStore| -> Result<Option<Self>, String> {
-            match store.auth_get(KIND, ACTIVE, 0) {
+            match store.auth_get(KEY_KIND, ACTIVE, 0) {
                 Ok(Some(json)) => {
                     let pem: String = serde_json::from_str(&json)
                         .map_err(|err| format!("the stored health card key: {err}"))?;
-                    if pem.contains(ENCRYPTED_BEGIN) {
-                        let passphrase = passphrase.as_deref().ok_or(
-                            "the health card key is encrypted: set REFHIR_SIGNING_KEY_PASSPHRASE",
-                        )?;
-                        return Self::from_der(&unseal(&pem, passphrase)?).map(Some);
-                    }
-                    let key = Self::from_pem(&pem)?;
-                    if let (true, Some(passphrase)) = (create, passphrase.as_deref()) {
+                    let key = Self::open_stored(&pem, passphrase)?;
+                    if let (true, false, Some(passphrase)) =
+                        (create, pem.contains(ENCRYPTED_BEGIN), passphrase)
+                    {
                         // A key stored before a passphrase was set is sealed now.
                         match seal(&pem, passphrase).and_then(|sealed| {
                             serde_json::to_string(&sealed).map_err(|err| err.to_string())
                         }) {
                             Ok(sealed) => {
-                                if let Err(err) = store.auth_put(KIND, ACTIVE, &sealed, u64::MAX) {
+                                if let Err(err) =
+                                    store.auth_put(KEY_KIND, ACTIVE, &sealed, u64::MAX)
+                                {
                                     tracing::warn!("health card key not encrypted: {err}");
                                 }
                             }
@@ -185,19 +302,9 @@ impl IssuerKey {
             return Err("the tenant's health card key has not been made yet".into());
         }
         let (key, pem) = Self::generate()?;
-        let pem = match passphrase.as_deref() {
-            Some(passphrase) => seal(&pem, passphrase)?,
-            None => {
-                tracing::warn!(
-                    "a health card signing key is stored unencrypted in the database; set \
-                     REFHIR_SIGNING_KEY_PASSPHRASE"
-                );
-                pem
-            }
-        };
-        let json = serde_json::to_string(&pem).expect("pem json");
+        let json = sealed_json(&pem, passphrase)?;
         let inserted = store
-            .auth_insert(KIND, ACTIVE, &json, u64::MAX, 0)
+            .auth_insert(KEY_KIND, ACTIVE, &json, u64::MAX, 0)
             .map_err(|err| format!("cannot store the health card key: {err}"))?;
         if inserted {
             return Ok(key);
@@ -206,9 +313,82 @@ impl IssuerKey {
         stored(store)?.ok_or_else(|| "the health card key vanished".to_string())
     }
 
+    /// Reads the tenant's key and the keys it replaced again, and uses them if another process
+    /// rotated the key. Whether anything changed. The issuer is not touched.
+    pub fn refresh(&self, store: &dyn refhir_persistence::AuthStore) -> Result<bool, String> {
+        let passphrase = Self::tenant_passphrase();
+        let fresh = Self::tenant_signing_key(store, false, passphrase.as_deref())?;
+        let retired = tenant_retired_keys(store)?;
+        let mut fresh = fresh.live.into_inner().unwrap_or_else(|p| p.into_inner());
+        fresh.retire(retired);
+        let mut live = self.write();
+        if live.kid == fresh.kid && live.retired == fresh.retired {
+            return Ok(false);
+        }
+        fresh.issuer = live.issuer.take();
+        *live = fresh;
+        Ok(true)
+    }
+
+    /// Replaces the tenant's signing key with a new one. The key it replaces keeps its place in
+    /// the key set, as a public key, for as long as the tenant has one: a card never expires, and
+    /// the key that signed it must stay there to check it. Nothing is read or written but the
+    /// tenant's own rows, and a process that serves the tenant uses the new key after it
+    /// [refreshes](IssuerKey::refresh).
+    pub fn rotate_tenant(
+        store: &dyn refhir_persistence::AuthStore,
+    ) -> Result<Rotated, RotateError> {
+        Self::rotate_tenant_sealed(store, Self::tenant_passphrase().as_deref())
+    }
+
+    fn rotate_tenant_sealed(
+        store: &dyn refhir_persistence::AuthStore,
+        passphrase: Option<&str>,
+    ) -> Result<Rotated, RotateError> {
+        let failed =
+            |what: &str, err: &dyn std::fmt::Display| RotateError::Failed(format!("{what}: {err}"));
+        let stored = store
+            .auth_get(KEY_KIND, ACTIVE, 0)
+            .map_err(|err| failed("cannot read the health card key", &err))?
+            .ok_or(RotateError::NoKey)?;
+        let pem: String = serde_json::from_str(&stored)
+            .map_err(|err| failed("the stored health card key", &err))?;
+        let old = Self::open_stored(&pem, passphrase).map_err(RotateError::Failed)?;
+        let (new, new_pem) = Self::generate().map_err(RotateError::Failed)?;
+        let replacement = sealed_json(&new_pem, passphrase).map_err(RotateError::Failed)?;
+        let (old_kid, old_public) = {
+            let live = old.read();
+            (live.kid.clone(), live.current.clone())
+        };
+        // The old key is published before it stops signing, so there is never a moment when a card
+        // it signed has no key to check it.
+        let row = json!({"retired_at_ms": crate::governance::now_ms(), "jwk": old_public});
+        store
+            .auth_put(RETIRED_KIND, &old_kid, &row.to_string(), u64::MAX)
+            .map_err(|err| failed("cannot keep the replaced key", &err))?;
+        // Only if it is still the key that was read: of two rotations at once, one wins.
+        match store.auth_delete_if(KEY_KIND, ACTIVE, &stored) {
+            Ok(true) => {}
+            Ok(false) => return Err(RotateError::Raced),
+            Err(err) => return Err(failed("cannot replace the health card key", &err)),
+        }
+        match store.auth_insert(KEY_KIND, ACTIVE, &replacement, u64::MAX, 0) {
+            Ok(true) => Ok(Rotated {
+                kid: new.kid(),
+                replaced: old_kid,
+            }),
+            Ok(false) => Err(RotateError::Raced),
+            Err(err) => {
+                // Put the old key back, so the tenant is not left with none.
+                let _ = store.auth_insert(KEY_KIND, ACTIVE, &stored, u64::MAX, 0);
+                Err(failed("cannot store the new health card key", &err))
+            }
+        }
+    }
+
     /// The key set that checks the cards: this key and any retired ones, never a private part.
     pub fn jwks(&self) -> Value {
-        self.jwks.clone()
+        self.read().jwks.clone()
     }
 
     /// A health card: the claims of a credential, compressed and signed. `types` are the
@@ -241,14 +421,15 @@ impl IssuerKey {
             .write_all(&minified)
             .map_err(|err| err.to_string())?;
         let compressed = compressor.finish().map_err(|err| err.to_string())?;
-        let header = json!({"zip": "DEF", "alg": "ES256", "kid": self.kid});
+        let live = self.read();
+        let header = json!({"zip": "DEF", "alg": "ES256", "kid": live.kid});
         let signing_input = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).map_err(|err| err.to_string())?),
             URL_SAFE_NO_PAD.encode(compressed)
         );
         // `FIXED` is the JWS form of an ECDSA signature: r then s, 32 bytes each.
-        let signature = self
+        let signature = live
             .pair
             .sign(&self.rng, signing_input.as_bytes())
             .map_err(|_| "the key could not sign".to_string())?;
@@ -257,6 +438,55 @@ impl IssuerKey {
             URL_SAFE_NO_PAD.encode(signature.as_ref())
         ))
     }
+}
+
+/// The JSON a tenant's key is stored as: its PEM, sealed when there is a passphrase.
+fn sealed_json(pem: &str, passphrase: Option<&str>) -> Result<String, String> {
+    let pem = match passphrase {
+        Some(passphrase) => seal(pem, passphrase)?,
+        None => {
+            tracing::warn!(
+                "a health card signing key is stored unencrypted in the database; set \
+                 REFHIR_SIGNING_KEY_PASSPHRASE"
+            );
+            pem.to_string()
+        }
+    };
+    Ok(serde_json::to_string(&pem).expect("pem json"))
+}
+
+/// The public keys of the keys the tenant replaced, the earliest replaced first.
+fn tenant_retired_keys(store: &dyn refhir_persistence::AuthStore) -> Result<Vec<Value>, String> {
+    let rows = store
+        .auth_list(RETIRED_KIND, 0)
+        .map_err(|err| format!("cannot read the replaced health card keys: {err}"))?;
+    let mut jwks: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut retired_at: std::collections::HashMap<String, u64> = Default::default();
+    for row in rows {
+        let row: Value = serde_json::from_str(&row)
+            .map_err(|err| format!("a stored replaced health card key: {err}"))?;
+        if let Some(kid) = row["jwk"]["kid"].as_str() {
+            retired_at.insert(kid.to_string(), row["retired_at_ms"].as_u64().unwrap_or(0));
+        }
+        jwks.push(row["jwk"].clone());
+    }
+    // The same checks as a key set a person wrote: public, P-256, and a thumbprint `kid`.
+    let mut keys: Vec<(u64, Value)> = public_keys_of(&jwks)?
+        .into_iter()
+        .map(|key| {
+            let at = key["kid"]
+                .as_str()
+                .and_then(|kid| retired_at.get(kid))
+                .copied()
+                .unwrap_or(0);
+            (at, key)
+        })
+        .collect();
+    keys.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1["kid"].as_str().cmp(&b.1["kid"].as_str()))
+    });
+    Ok(keys.into_iter().map(|(_, key)| key).collect())
 }
 
 fn read_file(path: &Path) -> Result<String, String> {
@@ -367,6 +597,11 @@ fn public_keys(jwks: &str) -> Result<Vec<Value>, String> {
         .get("keys")
         .and_then(Value::as_array)
         .ok_or("not a JWKS: no `keys` array")?;
+    public_keys_of(keys)
+}
+
+/// [`public_keys`] for the members of a `keys` array that are already parsed.
+fn public_keys_of(keys: &[Value]) -> Result<Vec<Value>, String> {
     let mut out: Vec<Value> = Vec::new();
     for (index, key) in keys.iter().enumerate() {
         let at = |what: &str| format!("key {index}: {what}");
@@ -536,6 +771,7 @@ pub(crate) fn generated_pem() -> String {
 mod tests {
     use super::*;
     use flate2::read::DeflateDecoder;
+    use refhir_persistence::AuthStore;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
     use std::io::Read;
 
@@ -744,7 +980,10 @@ mod tests {
         let key = IssuerKey::from_pem(&generated_pem()).unwrap();
         assert_eq!(key.issuer(), None);
         let key = key.with_issuer("https://health.clinic.example/").unwrap();
-        assert_eq!(key.issuer(), Some("https://health.clinic.example"));
+        assert_eq!(
+            key.issuer().as_deref(),
+            Some("https://health.clinic.example")
+        );
         let bad = IssuerKey::from_pem(&generated_pem()).unwrap();
         assert!(bad.with_issuer("http://health.clinic.example").is_err());
     }
@@ -836,5 +1075,227 @@ mod tests {
             .with_retired_keys_file("/nonexistent/keys.json")
             .unwrap_err()
             .contains("cannot read"));
+    }
+
+    /// Whether the card's own `kid` names a key of `jwks` that checks its signature.
+    fn verifies(jwks: &Value, card: &str) -> bool {
+        let parts: Vec<&str> = card.split('.').collect();
+        let header: Value = serde_json::from_slice(&decode(parts[0])).unwrap();
+        let Some(jwk) = jwks["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|key| key["kid"] == header["kid"])
+        else {
+            return false;
+        };
+        checks(
+            jwk,
+            format!("{}.{}", parts[0], parts[1]).as_bytes(),
+            &decode(parts[2]),
+        )
+    }
+
+    fn card(key: &IssuerKey) -> String {
+        let bundle = json!({"resourceType": "Bundle", "type": "collection", "entry": []});
+        key.sign(
+            "https://tenant.example/health-cards",
+            1,
+            &[],
+            "4.0.1",
+            &bundle,
+        )
+        .unwrap()
+    }
+
+    fn kids(key: &IssuerKey) -> Vec<String> {
+        key.jwks()["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|key| key["kid"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_rotated_tenant_key_keeps_the_replaced_key_public_so_the_old_cards_still_verify() {
+        let store = refhir_persistence::MemoryAuthStore::default();
+        let key = IssuerKey::for_tenant(&store, true).unwrap();
+        let first = key.kid();
+        let before = card(&key);
+        assert_eq!(kids(&key), [first.clone()]);
+
+        let rotated = IssuerKey::rotate_tenant(&store).unwrap();
+        assert_eq!(rotated.replaced, first);
+        assert_ne!(rotated.kid, first);
+        // This process signs with the new key once it reads what the rotation wrote.
+        assert_eq!(key.kid(), first);
+        assert!(key.refresh(&store).unwrap());
+        assert!(!key.refresh(&store).unwrap(), "nothing more to read");
+        assert_eq!(key.kid(), rotated.kid);
+        assert_eq!(kids(&key), [rotated.kid.clone(), first.clone()]);
+
+        let after = card(&key);
+        let jwks = key.jwks();
+        assert!(verifies(&jwks, &before), "a card the replaced key signed");
+        assert!(verifies(&jwks, &after), "a card the new key signs");
+        let header: Value =
+            serde_json::from_slice(&decode(after.split('.').next().unwrap())).unwrap();
+        assert_eq!(header["kid"], rotated.kid);
+
+        // Each key is a public key under its thumbprint, and no private member is published.
+        for published in jwks["keys"].as_array().unwrap() {
+            assert!(published.get("d").is_none(), "{published}");
+            assert_eq!(
+                published["kid"],
+                thumbprint(
+                    published["x"].as_str().unwrap(),
+                    published["y"].as_str().unwrap()
+                )
+            );
+        }
+        assert!(!jwks.to_string().contains("PRIVATE"));
+
+        // Twice: all three keys, the one that signs first.
+        let again = IssuerKey::rotate_tenant(&store).unwrap();
+        assert_eq!(again.replaced, rotated.kid);
+        key.refresh(&store).unwrap();
+        let all = kids(&key);
+        assert_eq!(all[0], again.kid);
+        let mut replaced = all[1..].to_vec();
+        replaced.sort();
+        let mut expected = vec![rotated.kid.clone(), first.clone()];
+        expected.sort();
+        assert_eq!(replaced, expected);
+        let newest = card(&key);
+        for old in [&before, &after, &newest] {
+            assert!(verifies(&key.jwks(), old));
+        }
+
+        // A process that opens the tenant afterwards (or a replica) has the same key set.
+        let reopened = IssuerKey::for_tenant(&store, false).unwrap();
+        assert_eq!(kids(&reopened), kids(&key));
+        assert!(verifies(&reopened.jwks(), &before));
+    }
+
+    #[test]
+    fn a_process_that_did_not_rotate_the_key_signs_with_the_new_one_after_it_refreshes() {
+        let store = refhir_persistence::MemoryAuthStore::default();
+        let primary = IssuerKey::for_tenant(&store, true).unwrap();
+        let replica = IssuerKey::for_tenant(&store, false).unwrap();
+        replica
+            .set_issuer(Some("https://cards.example.com"))
+            .unwrap();
+        let before = card(&replica);
+        let rotated = IssuerKey::rotate_tenant(&store).unwrap();
+        primary.refresh(&store).unwrap();
+        assert_eq!(replica.kid(), rotated.replaced, "until it reads the change");
+        replica.refresh(&store).unwrap();
+        assert_eq!(replica.kid(), rotated.kid);
+        assert_eq!(replica.jwks(), primary.jwks());
+        assert!(verifies(&replica.jwks(), &before));
+        // The issuer is a setting, not part of the key: a refresh leaves it.
+        assert_eq!(
+            replica.issuer().as_deref(),
+            Some("https://cards.example.com")
+        );
+    }
+
+    #[test]
+    fn rotating_a_tenant_without_a_key_or_a_key_changed_meanwhile_changes_nothing() {
+        let store = refhir_persistence::MemoryAuthStore::default();
+        assert_eq!(IssuerKey::rotate_tenant(&store), Err(RotateError::NoKey));
+        assert!(store.auth_list(RETIRED_KIND, 0).unwrap().is_empty());
+
+        let key = IssuerKey::for_tenant(&store, true).unwrap();
+        // The key stored is replaced by another between the read and the swap.
+        struct Races<'a>(&'a refhir_persistence::MemoryAuthStore);
+        impl refhir_persistence::AuthStore for Races<'_> {
+            fn auth_put(
+                &self,
+                kind: &str,
+                id: &str,
+                json: &str,
+                exp: u64,
+            ) -> Result<(), refhir_persistence::PersistError> {
+                self.0.auth_put(kind, id, json, exp)
+            }
+            fn auth_insert(
+                &self,
+                kind: &str,
+                id: &str,
+                json: &str,
+                exp: u64,
+                now: u64,
+            ) -> Result<bool, refhir_persistence::PersistError> {
+                self.0.auth_insert(kind, id, json, exp, now)
+            }
+            fn auth_get(
+                &self,
+                kind: &str,
+                id: &str,
+                now: u64,
+            ) -> Result<Option<String>, refhir_persistence::PersistError> {
+                self.0.auth_get(kind, id, now)
+            }
+            fn auth_take(
+                &self,
+                kind: &str,
+                id: &str,
+                now: u64,
+            ) -> Result<Option<String>, refhir_persistence::PersistError> {
+                self.0.auth_take(kind, id, now)
+            }
+            fn auth_delete_if(
+                &self,
+                kind: &str,
+                id: &str,
+                json: &str,
+            ) -> Result<bool, refhir_persistence::PersistError> {
+                // Another rotation lands first.
+                IssuerKey::rotate_tenant(self.0).unwrap();
+                self.0.auth_delete_if(kind, id, json)
+            }
+            fn auth_list(
+                &self,
+                kind: &str,
+                now: u64,
+            ) -> Result<Vec<String>, refhir_persistence::PersistError> {
+                self.0.auth_list(kind, now)
+            }
+            fn auth_prune(&self, now: u64) -> Result<(), refhir_persistence::PersistError> {
+                self.0.auth_prune(now)
+            }
+        }
+        assert_eq!(
+            IssuerKey::rotate_tenant(&Races(&store)),
+            Err(RotateError::Raced)
+        );
+        // The other rotation stands, and no key that signed anything was lost: the original is
+        // public, and the tenant has a key that signs.
+        key.refresh(&store).unwrap();
+        assert_eq!(kids(&key).len(), 2);
+        assert!(verifies(&key.jwks(), &card(&key)));
+    }
+
+    #[test]
+    fn a_sealed_tenant_key_stays_sealed_when_it_is_rotated_and_the_replaced_key_is_public_only() {
+        let store = refhir_persistence::MemoryAuthStore::default();
+        let passphrase = Some("a long enough passphrase");
+        let key = IssuerKey::for_tenant_sealed(&store, true, passphrase).unwrap();
+        let first = key.kid();
+        IssuerKey::rotate_tenant_sealed(&store, passphrase).unwrap();
+        let stored = store.auth_get(KEY_KIND, ACTIVE, 0).unwrap().unwrap();
+        assert!(stored.contains("ENCRYPTED PRIVATE KEY"), "{stored}");
+        let retired = store.auth_list(RETIRED_KIND, 0).unwrap().join("");
+        assert!(
+            !retired.contains("PRIVATE") && !retired.contains("\"d\""),
+            "{retired}"
+        );
+        let reopened = IssuerKey::for_tenant_sealed(&store, false, passphrase).unwrap();
+        assert!(kids(&reopened).contains(&first));
+        assert_ne!(reopened.kid(), first);
+        // Without the passphrase it does not open.
+        assert!(IssuerKey::for_tenant_sealed(&store, false, None).is_err());
     }
 }

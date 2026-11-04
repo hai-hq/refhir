@@ -677,6 +677,30 @@ impl Governance {
         }
     }
 
+    /// Records what an operator did through the admin API to this server's tenant, in the audit
+    /// trail it keeps (it reads back at `/_audit` with the rest). `subtype` names the change,
+    /// `action` is the FHIR `AuditEvent.action` (`U` for a change of settings, `E` for an
+    /// operation), and `detail` says who and what: never a key or a secret. Does nothing when
+    /// the audit trail is off.
+    pub fn record_admin(&self, subtype: &str, action: &str, detail: &serde_json::Value) {
+        if !self.config.audit.enabled {
+            return;
+        }
+        self.push_audit(vec![AuditRow {
+            ts_ms: now_ms(),
+            request_id: self.new_request_id(),
+            source: "admin".into(),
+            action: action.into(),
+            subtype: subtype.into(),
+            outcome: 0,
+            status: 200,
+            principal: "client:admin-api".into(),
+            client_id: Some("admin-api".into()),
+            detail: Some(detail.to_string()),
+            ..AuditRow::default()
+        }]);
+    }
+
     pub(crate) fn push_audit(&self, mut rows: Vec<AuditRow>) {
         if rows.is_empty() {
             return;

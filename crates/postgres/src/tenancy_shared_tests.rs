@@ -404,6 +404,64 @@ fn the_warm_up_tenant_is_a_tenant_nobody_sees() {
     assert_eq!(names(shared.list_tenants().unwrap()), ["acme"]);
 }
 
+/// A change to a tenant's settings, or a mark that something it keeps changed, moves the registry
+/// (so every process looks again) and the tenant's own `updated_at` (so each knows it is that
+/// tenant to look at), and touches no other tenant. A deleted tenant keeps what it has.
+#[test]
+fn a_tenants_settings_are_changed_in_the_registry_and_announced() {
+    let Some(admin) = test_url("tenancy: change settings") else {
+        return;
+    };
+    let url = shared(&admin, "tshset", &["acme", "other"]);
+    let shared = connections(&operator_url(&url), 2);
+    let before = shared.get_tenant("acme").unwrap().unwrap();
+    let other = shared.get_tenant("other").unwrap().unwrap();
+    let signature = shared.registry_signature().unwrap();
+    let heard = shared.watch_registry();
+    // Time moves on in the database, so the stamps differ.
+    std::thread::sleep(Duration::from_millis(20));
+
+    let settings = json!({"health_cards": {"enabled": true, "issuer": "https://cards.example"}});
+    let changed = shared
+        .update_tenant_settings("acme", &settings)
+        .unwrap()
+        .unwrap();
+    assert_eq!(changed.settings, settings);
+    assert_ne!(changed.updated_at, before.updated_at);
+    assert_eq!(changed.created_at, before.created_at);
+    assert_ne!(shared.registry_signature().unwrap(), signature);
+    assert!(
+        heard.wait(Duration::from_secs(5)),
+        "the change was announced"
+    );
+    assert_eq!(shared.get_tenant("other").unwrap().unwrap(), other);
+
+    // A touch changes no setting and is announced all the same.
+    std::thread::sleep(Duration::from_millis(20));
+    let touched = shared.touch_tenant("acme").unwrap().unwrap();
+    assert_eq!(touched.settings, settings);
+    assert_ne!(touched.updated_at, changed.updated_at);
+    assert!(
+        heard.wait(Duration::from_secs(5)),
+        "the touch was announced"
+    );
+
+    // No such tenant, and a deleted one, are left as they are.
+    assert!(shared
+        .update_tenant_settings("nobody", &settings)
+        .unwrap()
+        .is_none());
+    assert!(shared.touch_tenant("nobody").unwrap().is_none());
+    shared.delete_tenant("other", 3600).unwrap();
+    let deleted = shared.get_tenant("other").unwrap().unwrap();
+    let again = shared
+        .update_tenant_settings("other", &settings)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again, deleted);
+    assert_eq!(shared.touch_tenant("other").unwrap().unwrap(), deleted);
+}
+
 /// A database made by the release before the registry kept settings, holding tenants with rows,
 /// is brought up to date by the first process that serves every tenant, and every tenant is
 /// served as it was.

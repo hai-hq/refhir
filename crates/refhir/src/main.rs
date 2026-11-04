@@ -1290,7 +1290,10 @@ mod tests {
         let own = cards(Some("https://health.clinic.example/"), None)
             .unwrap()
             .expect("a key");
-        assert_eq!(own.issuer(), Some("https://health.clinic.example"));
+        assert_eq!(
+            own.issuer().as_deref(),
+            Some("https://health.clinic.example")
+        );
 
         for bad in [
             "http://health.clinic.example",
