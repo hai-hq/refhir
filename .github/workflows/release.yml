@@ -33,10 +33,10 @@ jobs:
       prerelease: ${{ steps.version.outputs.prerelease }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Read the version
         id: version
@@ -75,7 +75,7 @@ jobs:
         run: scripts/release-notes.sh "${{ steps.version.outputs.version }}" > release-notes.md
 
       - name: Keep the release notes
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-notes
           path: release-notes.md
@@ -98,10 +98,10 @@ jobs:
             os: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.120.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -134,7 +134,7 @@ jobs:
           (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
       - name: Keep the archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.name }}
           path: |
@@ -165,14 +165,14 @@ jobs:
             os: ubuntu-24.04-arm
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to the registry
         if: github.ref_type == 'tag'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -180,7 +180,7 @@ jobs:
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           labels: |
@@ -190,7 +190,7 @@ jobs:
 
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -206,7 +206,7 @@ jobs:
 
       - name: Keep the digest
         if: github.ref_type == 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: digest-${{ strategy.job-index }}
           path: ${{ runner.temp }}/digests/*
@@ -223,18 +223,18 @@ jobs:
       packages: write
     steps:
       - name: Collect the digests
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ${{ runner.temp }}/digests
           pattern: digest-*
           merge-multiple: true
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Image metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           # 1.2.3, 1.2 and (from 1.0 on) 1. A pre-release such as 1.2.3-rc.1 gets its own tag
@@ -245,7 +245,7 @@ jobs:
             type=semver,pattern={{major}},enable=${{ !startsWith(github.ref_name, 'v0.') }}
 
       - name: Log in to the registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -273,13 +273,13 @@ jobs:
       # Ask for these by name. A bare download fetches every artifact of the run, including the
       # Docker build records, which cannot be downloaded and fail the step.
       - name: Download the archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           pattern: dist-*
 
       - name: Download the release notes
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: release-notes
           path: artifacts/release-notes
@@ -312,7 +312,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Create the module tag
         env:
@@ -360,10 +360,10 @@ jobs:
       id-token: write # npm provenance
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
           registry-url: https://registry.npmjs.org
@@ -465,10 +465,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
