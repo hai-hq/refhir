@@ -3384,6 +3384,43 @@ async fn access_token_query_is_decoded_and_patient_compartment_holds() {
     assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
 }
 
+#[test]
+fn a_patients_token_asks_for_its_own_patients_health_card_by_id() {
+    let (db, catalog, _) = memory();
+    let loaded = catalog.read().expect("catalog");
+    for id in ["p1", "p2"] {
+        refhir_fhir::import_resource(&db, &loaded, &patient(id)).unwrap();
+    }
+    let parameters = json!({"resourceType": "Parameters", "parameter": [
+        {"name": "credentialType", "valueUri": "Immunization"}
+    ]});
+    let guard = |args: Value| {
+        crate::auth::guard_patient_operation(
+            &db,
+            &loaded,
+            "Patient/p1",
+            "Patient/$health-cards-issue",
+            &args,
+        )
+    };
+    // The body is parameters, which are in no patient's compartment: the id is what is checked.
+    assert_eq!(
+        guard(json!({"id": "p1", "resource": parameters.clone()})),
+        Ok(())
+    );
+    for args in [
+        json!({"id": "p2", "resource": parameters.clone()}),
+        json!({"resource": parameters.clone()}),
+        json!({"id": "", "resource": parameters}),
+    ] {
+        assert_eq!(
+            guard(args.clone()),
+            Err("token is limited to a different patient".to_string()),
+            "{args}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn patient_scope_cannot_leave_its_compartment() {
     let (db, catalog, store) = memory();

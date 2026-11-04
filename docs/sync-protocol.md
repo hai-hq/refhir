@@ -199,7 +199,7 @@ It cannot be subscribed. Each run signs a new card, so a live query would issue 
 
 A `Mutation` is not limited to writes: any name above is accepted and returns its result with a `ts`. An unknown operation fails with a message such as `unsupported operation Patient/frobnicate`. With SMART on, a name the scope table does not know is refused as `unsupported operation {op}`, and a name with no `/` as `bad operation {path}`.
 
-Only read-only names can be subscribed. A write name, or a Bundle, is refused before it runs, with SMART on or off (`{op} writes and cannot be subscribed`, `bundle cannot be subscribed`), and nothing is written. An operation that is read-only by name but writes anyway is answered `QueryFailed` (`{path} writes and cannot be subscribed`) after it ran, and its write is not undone.
+Only read-only names can be subscribed. A write name, or a Bundle, is refused before it runs, with SMART on or off (`{op} writes and cannot be subscribed`, `bundle cannot be subscribed`), and nothing is written. An operation that is read-only by name but writes anyway is answered `QueryFailed` (`{path} writes and cannot be subscribed`) after it ran, and its write is not undone. One read-only name is never subscribed: `Patient/$health-cards-issue`, which signs a new card each time it runs, is refused before it runs with `code` `not-supported` (see [Health Cards over /sync](#health-cards-over-sync)), and a query the client held under the same `queryId` is kept.
 
 ## Server-to-client messages
 
@@ -303,7 +303,7 @@ When the server ends a connection itself, as after a `FatalError`, it does not s
 
 `OperationOutcome` issue codes the server produces for mutations: `forbidden` (scope), `throttled`, `transient` (a replica that cannot reach the primary), `not-found`, `deleted`, `conflict`, `invalid`, `not-supported`, `exception`, or the issues of a validation outcome. Scope refusals are plain text in `diagnostics`, such as `scope does not allow Patient/create`.
 
-`QueryFailed.error` strings written by the server itself include `{path} writes and cannot be subscribed`, `scope does not allow {path}`, `invalid value "{value}" for search parameter {name} on {type}: {what was expected}` (a search value that cannot be read as its type, such as a date that is not one: a live query is never lenient, so it fails now rather than staying empty, and `Prefer: handling=lenient` has no say in it), `token is limited to a different patient`, `too many live queries: a connection may hold {cap}`, `query stayed stale` (the server gave up after 8 attempts to take a consistent snapshot), and the rate and quota messages in the next section.
+`QueryFailed.error` strings written by the server itself include `{path} writes and cannot be subscribed`, `{path} signs a new card each time it runs and cannot be subscribed: send it as a Mutation`, `scope does not allow {path}`, `invalid value "{value}" for search parameter {name} on {type}: {what was expected}` (a search value that cannot be read as its type, such as a date that is not one: a live query is never lenient, so it fails now rather than staying empty, and `Prefer: handling=lenient` has no say in it), `token is limited to a different patient`, `too many live queries: a connection may hold {cap}`, `query stayed stale` (the server gave up after 8 attempts to take a consistent snapshot), and the rate and quota messages in the next section.
 
 ### Query failure codes
 

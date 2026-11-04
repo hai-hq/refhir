@@ -27,9 +27,9 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 - **`/sync`: a live query of `Patient/$health-cards-issue` is refused** with a `QueryFailed` whose
   `code` is `not-supported` (a new code in the [query failure codes](docs/sync-protocol.md#query-failure-codes)).
   Each run signs a new card, so a subscription would issue one on every write to the patient's
-  record. Before, an `Add` of it was accepted and pushed the unsigned selection of the record.
-  Before, too, a `Mutation` of it answered that unsigned selection with SMART off, and was refused as
-  `unsupported operation` with SMART on.
+  record. Before, with SMART off, an `Add` of it was accepted and pushed the unsigned selection of
+  the record, and a `Mutation` of it answered that selection; with SMART on, both were refused as
+  `unsupported operation`, with `code` `invalid` for the `Add`.
 
 ## [0.0.6] - 2026-11-04
 

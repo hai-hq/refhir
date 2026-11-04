@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use crate::auth::SyncSession;
 use crate::governance::{classify_operation, json_len, Class, RequestScope, SyncMessage};
-use crate::http::{self, execute, CardsError};
+use crate::http::{self, execute, OperationError};
 
 const ENGINE: &str = "refhir_engine";
 
@@ -254,17 +254,28 @@ impl TokenWatch {
 /// What a socket is told when it is closed because its token no longer stands.
 const TOKEN_ENDED: &str = "the token expired or was revoked";
 
-#[allow(clippy::too_many_arguments)]
+/// What a socket is served from: the server's (or tenant's) records and definitions, and the key
+/// it signs Health Cards with.
+pub struct Served {
+    pub db: Arc<Database>,
+    pub catalog: Arc<RwLock<Catalog>>,
+    pub store: Arc<dyn ConformanceStore>,
+    pub cards: Cards,
+}
+
 pub async fn handle_socket(
     socket: WebSocket,
-    db: Arc<Database>,
-    catalog: Arc<RwLock<Catalog>>,
-    store: Arc<dyn ConformanceStore>,
-    cards: Cards,
+    served: Served,
     session: Option<SyncSession>,
     scope: Option<Arc<RequestScope>>,
     upstream: Option<Upstream>,
 ) {
+    let Served {
+        db,
+        catalog,
+        store,
+        cards,
+    } = served;
     let (mut sink, mut stream) = socket.split();
     let (inv_tx, mut inv_rx) = tokio::sync::mpsc::unbounded_channel();
     let engine = Engine {
@@ -441,13 +452,9 @@ async fn handle_text(
                             ));
                             continue;
                         }
-                        // Only now, with the new query let in, is the one it replaces let go: a
-                        // client refused for going too fast keeps the subscription it had.
-                        if let Some(old) = live.queries.remove(&query_id) {
-                            db.unsubscribe(old.token);
-                        }
                         // Each run of it signs a new card, so a subscription would issue one on
-                        // every write the record sees. A card is issued when it is asked for.
+                        // every write the record sees. A card is issued when it is asked for. The
+                        // name alone refuses it, so the query it would replace is kept.
                         if health_cards_issue(&udf_path).is_some() {
                             let reason = format!(
                                 "{udf_path} signs a new card each time it runs and cannot be \
@@ -459,6 +466,11 @@ async fn handle_text(
                                 QueryError::new("not-supported", reason),
                             ));
                             continue;
+                        }
+                        // Only now, with the new query let in, is the one it replaces let go: a
+                        // client refused for going too fast keeps the subscription it had.
+                        if let Some(old) = live.queries.remove(&query_id) {
+                            db.unsubscribe(old.token);
                         }
                         let args = match authorize(session, db, catalog, &udf_path, &args, true) {
                             Ok(args) => args,
@@ -573,7 +585,7 @@ async fn handle_text(
             // success. A batch that writes belongs to the primary, like any other write.
             let outcome = if udf_path == "Bundle/batch" && db.is_read_only() && batch_writes(&args)
             {
-                Err(CardsError::Run(RunError::Commit(CommitError::ReadOnly)))
+                Err(OperationError::Run(RunError::Commit(CommitError::ReadOnly)))
             } else if let Some(resource_type) = health_cards_issue(&udf_path) {
                 // Signed as REST signs it, by the same function, with this server's key.
                 message
@@ -591,7 +603,7 @@ async fn handle_text(
                 message
                     .run(execute(db, catalog, store, &udf_path, args))
                     .await
-                    .map_err(CardsError::Run)
+                    .map_err(OperationError::Run)
             };
             let (response, status) = match outcome {
                 Ok(result) => (
@@ -611,7 +623,7 @@ async fn handle_text(
                 // A replica cannot commit. The primary can, so ask it. The primary limits,
                 // meters and audits the mutation as a message of its own, so it is not counted
                 // here as well.
-                Err(CardsError::Run(RunError::Commit(CommitError::ReadOnly)))
+                Err(OperationError::Run(RunError::Commit(CommitError::ReadOnly)))
                     if replay.is_some() =>
                 {
                     let (upstream, args) = (upstream.expect("checked"), replay.expect("checked"));
@@ -704,10 +716,7 @@ fn query_failed(query_id: u64, error: QueryError) -> Value {
 }
 
 fn throttled_outcome(message: &str) -> Value {
-    json!({
-        "resourceType": "OperationOutcome",
-        "issue": [{"severity": "error", "code": "throttled", "diagnostics": message}]
-    })
+    http::outcome_json("throttled", message)
 }
 
 fn authorize(
