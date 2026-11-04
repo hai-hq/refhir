@@ -201,11 +201,16 @@ curl -X PATCH "$REFHIR/admin/tenants/clinic" -H "authorization: Bearer $ADMIN_TO
 ```
 
 `true` and `false` are still accepted for `health_cards`. `"issuer": null` in a `PATCH` goes back to
-the tenant's own address. The issuer is checked as the setting of a server with one key file is
+the tenant's own address, and turning cards off (`false`) takes the issuer with it. The issuer is checked as the setting of a server with one key file is
 (above): `https`, or `http` on `localhost`, `127.0.0.1` and `[::1]`, a host, and no user name, query
 or fragment; a trailing slash is dropped. A request with one that is not valid is a `400` and
 changes nothing. The cards a tenant issued before keep the `iss` they were signed with, and their
 key stays in its key set.
+
+**Upgrade every process first.** A tenant with an issuer is stored with `health_cards` as an
+object, which a process of an earlier release cannot read: it would serve that tenant with no
+health cards and none of its other settings. Set an issuer only once every process of the
+deployment runs this release.
 
 Many tenants may name one issuer (a service of yours that is the issuer for all of them), and each
 may name its own. A verifier fetches `[issuer]/.well-known/jwks.json`, so that address has to serve

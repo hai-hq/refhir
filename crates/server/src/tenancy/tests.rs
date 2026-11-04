@@ -926,6 +926,47 @@ async fn a_tenants_health_card_settings_are_a_flag_or_an_object_and_a_bad_issuer
 }
 
 #[test]
+fn a_change_to_health_cards_turns_them_on_only_for_an_issuer_and_off_with_its_issuer() {
+    let issuer = |text: &str| HealthCardsChange {
+        enabled: None,
+        issuer: Some(Some(text.into())),
+    };
+    let none = HealthCardsSettings::default();
+    // A new tenant given only an issuer issues cards; one given `null` (or nothing) does not.
+    let on = issuer("https://cards.example.com/")
+        .resolve(&none, true)
+        .unwrap();
+    assert!(on.enabled);
+    assert_eq!(on.issuer.as_deref(), Some("https://cards.example.com"));
+    let null = HealthCardsChange {
+        enabled: None,
+        issuer: Some(None),
+    };
+    assert_eq!(null.resolve(&none, true).unwrap(), none);
+    assert_eq!(
+        HealthCardsChange::default().resolve(&none, true).unwrap(),
+        none
+    );
+    // Turning cards off takes the issuer they named; asking for both is refused.
+    let off = HealthCardsChange {
+        enabled: Some(false),
+        issuer: None,
+    };
+    assert_eq!(off.resolve(&on, false).unwrap(), none);
+    let both = HealthCardsChange {
+        enabled: Some(false),
+        issuer: Some(Some("https://cards.example.com".into())),
+    };
+    assert!(both.resolve(&on, false).is_err());
+    // Leaving the issuer out of a change that keeps cards on keeps it.
+    let keep = HealthCardsChange {
+        enabled: Some(true),
+        issuer: None,
+    };
+    assert_eq!(keep.resolve(&on, false).unwrap(), on);
+}
+
+#[test]
 fn health_card_settings_are_stored_as_the_flag_when_there_is_no_issuer() {
     // What a release that only had the flag wrote reads back, and writes back the same.
     for (stored, settings) in [

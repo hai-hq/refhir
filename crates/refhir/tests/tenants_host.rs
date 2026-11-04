@@ -1280,6 +1280,50 @@ fn each_tenant_names_its_own_issuer_and_keeps_every_key_it_replaced() {
         "https://late.example.org"
     );
 
+    // Turning cards off takes the issuer with it and the tenant stops issuing them; turning them
+    // on again makes the key it had.
+    let nocards_kid = kids(&key_set(&host, "nocards"));
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/nocards",
+        Some(json!({"health_cards": false})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["settings"]["health_cards"],
+        json!({"enabled": false, "issuer": null})
+    );
+    host.wait_serving("nocards");
+    wait_until("nocards issuing no cards", &host, || {
+        call(
+            "POST",
+            &format!("{}/t/nocards/Patient/p1/$health-cards-issue", host.base()),
+            &[],
+            Some(&json!({"resourceType": "Parameters"})),
+        )
+        .0 == 501
+    });
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/nocards",
+        Some(json!({"health_cards": true})),
+    );
+    assert_eq!(status, 200, "{body}");
+    host.wait_serving("nocards");
+    wait_until("nocards issuing cards again", &host, || {
+        call(
+            "GET",
+            &format!(
+                "{}/t/nocards/health-cards/.well-known/jwks.json",
+                host.base()
+            ),
+            &[],
+            None,
+        )
+        .0 == 200
+    });
+    assert_eq!(kids(&key_set(&host, "nocards")), nocards_kid);
+
     // A rotation: the new key signs, the replaced key stays, and each is a thumbprint kid.
     let before = issue_card(&host, "plain");
     let first = kids(&plain_set);

@@ -460,15 +460,28 @@ fn tenant_retired_keys(store: &dyn refhir_persistence::AuthStore) -> Result<Vec<
     let rows = store
         .auth_list(RETIRED_KIND, 0)
         .map_err(|err| format!("cannot read the replaced health card keys: {err}"))?;
-    let mut keys: Vec<(u64, Value)> = Vec::with_capacity(rows.len());
+    let mut jwks: Vec<Value> = Vec::with_capacity(rows.len());
+    let mut retired_at: std::collections::HashMap<String, u64> = Default::default();
     for row in rows {
         let row: Value = serde_json::from_str(&row)
             .map_err(|err| format!("a stored replaced health card key: {err}"))?;
-        let at = row["retired_at_ms"].as_u64().unwrap_or(0);
-        // The same checks as a key set a person wrote: public, P-256, and a thumbprint `kid`.
-        let published = public_keys(&json!({ "keys": [row["jwk"].clone()] }).to_string())?;
-        keys.extend(published.into_iter().map(|key| (at, key)));
+        if let Some(kid) = row["jwk"]["kid"].as_str() {
+            retired_at.insert(kid.to_string(), row["retired_at_ms"].as_u64().unwrap_or(0));
+        }
+        jwks.push(row["jwk"].clone());
     }
+    // The same checks as a key set a person wrote: public, P-256, and a thumbprint `kid`.
+    let mut keys: Vec<(u64, Value)> = public_keys_of(&jwks)?
+        .into_iter()
+        .map(|key| {
+            let at = key["kid"]
+                .as_str()
+                .and_then(|kid| retired_at.get(kid))
+                .copied()
+                .unwrap_or(0);
+            (at, key)
+        })
+        .collect();
     keys.sort_by(|a, b| {
         a.0.cmp(&b.0)
             .then_with(|| a.1["kid"].as_str().cmp(&b.1["kid"].as_str()))
@@ -584,6 +597,11 @@ fn public_keys(jwks: &str) -> Result<Vec<Value>, String> {
         .get("keys")
         .and_then(Value::as_array)
         .ok_or("not a JWKS: no `keys` array")?;
+    public_keys_of(keys)
+}
+
+/// [`public_keys`] for the members of a `keys` array that are already parsed.
+fn public_keys_of(keys: &[Value]) -> Result<Vec<Value>, String> {
     let mut out: Vec<Value> = Vec::new();
     for (index, key) in keys.iter().enumerate() {
         let at = |what: &str| format!("key {index}: {what}");

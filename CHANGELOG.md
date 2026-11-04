@@ -26,7 +26,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   survive a tenant being deleted and restored. Both changes are recorded in the tenant's audit trail
   (`health-cards-settings`, `health-cards-rotate`: who, which tenant, which `kid`s; never a key).
   `GET /admin/tenants/{name}` reports `settings.health_cards` as an object and the `kid`s of the
-  tenant's key set. [A tenant's issuer and keys](docs/health-cards.md#a-tenants-issuer-and-keys).
+  tenant's key set. Set an issuer only once every process runs this release: an earlier one cannot
+  read it. [A tenant's issuer and keys](docs/health-cards.md#a-tenants-issuer-and-keys).
 
 ## [0.0.5] - 2026-11-04
 

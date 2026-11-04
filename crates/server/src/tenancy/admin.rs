@@ -132,7 +132,8 @@ impl<'de> Deserialize<'de> for HealthCardsChange {
 
 impl HealthCardsChange {
     /// `current` with this change made, checked. A tenant given only an issuer issues cards when
-    /// it is new (`new`), and otherwise keeps what it was. The issuer is checked as the setting
+    /// it is new (`new`), and otherwise keeps what it was; one turned off has no issuer unless the
+    /// same request names one (which is refused). The issuer is checked as the setting
     /// of a server with one key is, and kept with no trailing slash.
     pub fn resolve(
         &self,
@@ -140,13 +141,15 @@ impl HealthCardsChange {
         new: bool,
     ) -> Result<HealthCardsSettings, String> {
         let issuer = match &self.issuer {
+            // Turning cards off takes the issuer with it, as there is nothing for it to name.
+            None if self.enabled == Some(false) => None,
             None => current.issuer.clone(),
             Some(None) => None,
             Some(Some(issuer)) => Some(crate::health_cards::validate_issuer(issuer)?),
         };
         let enabled = match (self.enabled, new) {
             (Some(enabled), _) => enabled,
-            (None, true) => self.issuer.is_some(),
+            (None, true) => matches!(self.issuer, Some(Some(_))),
             (None, false) => current.enabled,
         };
         if !enabled && issuer.is_some() {

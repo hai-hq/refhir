@@ -460,6 +460,8 @@ impl Manager {
     /// Opens what the registry has and this process does not serve, and stops what it no longer
     /// has.
     fn sync_registry(self: &Arc<Self>) {
+        // A change that still cannot be applied sets this again below.
+        self.cards_retry.store(false, Ordering::SeqCst);
         let tenants = match self.shared.list_tenants() {
             Ok(tenants) => tenants,
             Err(err) => {
@@ -520,15 +522,6 @@ impl Manager {
             } else {
                 self.apply_changes(&name, &tenant);
             }
-        }
-        if !self
-            .entries
-            .lock()
-            .expect("entries")
-            .values()
-            .any(|entry| entry.opened.is_some())
-        {
-            self.cards_retry.store(false, Ordering::SeqCst);
         }
     }
 
@@ -1440,14 +1433,26 @@ impl TenantAdmin for Manager {
             .update_tenant_settings(name, &raw)
             .map_err(Self::admin_error)?
             .ok_or_else(|| AdminError::not_found(name))?;
+        // Recorded before it is applied: a tenant that is opened again flushes its audit trail
+        // as it stops, and a row recorded after that would be lost.
+        match self.opened(name) {
+            Some(opened) => {
+                for (subtype, detail) in &changes {
+                    opened.app.governance.record_admin(subtype, "U", detail);
+                }
+            }
+            None => {
+                for (subtype, detail) in &changes {
+                    tracing::warn!(
+                        "tenant `{name}` is not open here, so this change is not in its audit \
+                         trail: {subtype} {detail}"
+                    );
+                }
+            }
+        }
         // Served from now on, here and (when they hear of it) elsewhere, with no restart.
         let this = self.arc();
         this.apply_changes(name, &updated);
-        if let Some(opened) = self.opened(name) {
-            for (subtype, detail) in &changes {
-                opened.app.governance.record_admin(subtype, "U", detail);
-            }
-        }
         Ok(self.describe(&updated))
     }
 
@@ -1487,16 +1492,31 @@ impl TenantAdmin for Manager {
                     refhir_server::RotateError::Failed(why) => AdminError::internal(why),
                 }
             })?;
-        cards
-            .refresh(opened.auth_store.as_ref())
-            .map_err(AdminError::internal)?;
+        // The key is replaced for good: what follows only spreads the news, so none of it fails
+        // the request (asking again would replace the key a second time).
         // The other processes that serve the tenant take the new key when they hear of this.
-        match self.shared.touch_tenant(name) {
-            Ok(Some(touched)) => *opened.applied.lock().expect("applied") = touched.updated_at,
-            Ok(None) => {}
-            Err(err) => tracing::warn!(
-                "tenant `{name}`: other processes are not told of the new health card key: {err}"
-            ),
+        let touched = match self.shared.touch_tenant(name) {
+            Ok(touched) => touched,
+            Err(err) => {
+                tracing::warn!(
+                    "tenant `{name}`: other processes are not told of the new health card key: \
+                     {err}"
+                );
+                None
+            }
+        };
+        match cards.refresh(opened.auth_store.as_ref()) {
+            Ok(_) => {
+                if let Some(touched) = touched {
+                    *opened.applied.lock().expect("applied") = touched.updated_at;
+                }
+            }
+            Err(err) => {
+                // This process signs with the replaced key, which is still published, until the
+                // next pass over the registry reads the new one.
+                tracing::warn!("tenant `{name}`: the new health card key is not read yet: {err}");
+                self.cards_retry.store(true, Ordering::SeqCst);
+            }
         }
         tracing::info!(
             "tenant `{name}` signs its health cards with key {} (replacing {})",
@@ -1508,12 +1528,18 @@ impl TenantAdmin for Manager {
             "E",
             &json!({"tenant": name, "kid": rotated.kid, "replaced_kid": rotated.replaced}),
         );
-        let report = Self::cards_report(cards);
+        let mut keys = Self::cards_report(cards)["keys"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if keys.first() != Some(&json!(rotated.kid)) {
+            keys.insert(0, json!(rotated.kid));
+        }
         Ok(json!({
             "tenant": name,
             "kid": rotated.kid,
             "replaced_kid": rotated.replaced,
-            "keys": report["keys"],
+            "keys": keys,
         }))
     }
 }
