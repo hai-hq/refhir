@@ -29,8 +29,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   match. A RelatedPerson with `active` false is never returned. A `patient` that is missing, is not
   `Patient/id` or is not on the server is a `400`; so is a Patient whose `managingOrganization` is not
   `Organization/id`. More than 20,000 RelatedPersons of the organization sharing a name, number or
-  identifier with the request (or 100,000 of every organization) is a `422` (`too-costly`). The scope
-  to search it is `RelatedPerson.rs`. See
+  identifier with the request (or 100,000 of every organization) is a `422` (`too-costly`). A token needs
+  `RelatedPerson.rs` and `Patient.rs`, as the Patient is read for its organization. See
   [FHIR API](docs/fhir-api.md#finding-a-carer-or-parent-relatedpersonmatch).
 
 ## [0.0.6] - 2026-11-04

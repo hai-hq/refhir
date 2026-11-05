@@ -216,6 +216,9 @@ pub(crate) struct Rules {
     /// own, and every name and telecom is compared with every candidate, so a request is refused
     /// that has more of them than a registration has.
     pub max_elements: usize,
+    /// Fewest characters a name term needs to be searched for: a search is by prefix, so `a` or
+    /// `ad` would read every name that begins with it. A shorter term is still compared.
+    pub min_name_search_chars: usize,
     /// How many Patients one page of candidates holds.
     pub page: usize,
     /// Most candidates one request may compare. More than this is refused: an answer that left
@@ -266,6 +269,7 @@ impl Rules {
             cap: Grade::Probable,
         }),
         max_elements: 50,
+        min_name_search_chars: 3,
         page: 500,
         max_candidates: 20_000,
         max_reads: usize::MAX,
@@ -583,6 +587,27 @@ impl Subject {
         }
         subject.gender = text(patient, "gender", ty)?.map(str::to_string);
         Ok(subject)
+    }
+
+    /// What a search by name is asked for: each name's strings as written and each of its words as
+    /// compared, lower case, no term of fewer than `min_chars` characters (they are compared, not
+    /// searched for), and no term that another is the beginning of (the search is by prefix, so
+    /// that one finds it).
+    fn name_terms(&self, min_chars: usize) -> BTreeSet<String> {
+        let all: BTreeSet<String> = self
+            .names
+            .iter()
+            .flat_map(|name| name.written.iter().chain(&name.words))
+            .map(|term| term.to_lowercase())
+            .filter(|term| term.chars().count() >= min_chars)
+            .collect();
+        all.iter()
+            .filter(|term| {
+                !all.iter()
+                    .any(|other| other != *term && term.starts_with(other.as_str()))
+            })
+            .cloned()
+            .collect()
     }
 
     /// Whether this can be looked up by name: with its birth date for a Patient, whose name alone
@@ -956,6 +981,20 @@ impl Request {
         };
         limit_elements(&resource, rules)?;
         let subject = Subject::read(&resource, rules)?;
+        // Each term of a RelatedPerson's names is a search of its own.
+        if rules.kind == Kind::RelatedPerson {
+            let terms: usize = subject
+                .names
+                .iter()
+                .map(|name| name.written.len() + name.words.len())
+                .sum();
+            if terms > rules.max_elements {
+                return Err(invalid(format!(
+                    "{ty}.name has {terms} strings and words, and $match compares at most {}",
+                    rules.max_elements
+                )));
+            }
+        }
         Ok(Request {
             subject,
             only_certain,
@@ -1026,6 +1065,10 @@ pub(crate) fn operation(
         )));
     };
     catalog.deny_response_read(type_name)?;
+    if rules.kind == Kind::RelatedPerson {
+        // The Patients are read to find the organization.
+        catalog.deny_response_read("Patient")?;
+    }
     let mut request = Request::from_args(args, &rules)?;
     request.resolve_scope(tx, catalog)?;
     find(tx, catalog, &request, &rules)
@@ -1333,21 +1376,8 @@ impl Candidates {
                     ask("email", bare_token(key));
                 }
                 if subject.can_match_by_name(rules) {
-                    // The search is by prefix, so a term that begins with another is found by that
-                    // one, and is not asked for twice.
-                    let terms: BTreeSet<String> = subject
-                        .names
-                        .iter()
-                        .flat_map(|name| name.written.iter().chain(&name.words))
-                        .map(|term| term.to_lowercase())
-                        .collect();
-                    for term in &terms {
-                        let covered = terms
-                            .iter()
-                            .any(|other| other != term && term.starts_with(other.as_str()));
-                        if !covered {
-                            ask("name", bare_token(term));
-                        }
+                    for term in subject.name_terms(rules.min_name_search_chars) {
+                        ask("name", bare_token(&term));
                     }
                 }
             }
@@ -1362,40 +1392,6 @@ impl Candidates {
             reads: 0,
             organizations: BTreeMap::new(),
         }
-    }
-
-    /// Whether the candidate is one of the organization's.
-    fn in_scope(
-        &mut self,
-        tx: &mut Transaction,
-        catalog: &Catalog,
-        resource: &Value,
-        scope: &str,
-    ) -> Result<bool, FhirError> {
-        if self.kind == Kind::Patient {
-            return Ok(in_scope(resource, scope));
-        }
-        // Only a relative `Patient/id` is a Patient in this store, as it is for a `replaced-by` link.
-        let Some(id) = resource
-            .pointer("/patient/reference")
-            .and_then(Value::as_str)
-            .and_then(|reference| reference.strip_prefix("Patient/"))
-            .filter(|id| valid_id(id))
-        else {
-            return Ok(false);
-        };
-        if !self.organizations.contains_key(id) {
-            let organization = match ops::read(tx, catalog.get("Patient")?, id) {
-                Ok(patient) => patient
-                    .pointer("/managingOrganization/reference")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                Err(FhirError::NotFound(_) | FhirError::Gone(_) | FhirError::Invalid(_)) => None,
-                Err(err) => return Err(err),
-            };
-            self.organizations.insert(id.to_string(), organization);
-        }
-        Ok(self.organizations[id].as_deref() == Some(scope))
     }
 
     /// The next Patients not given before, `(id, resource)`, or `None` when there are no more.
@@ -1432,8 +1428,15 @@ impl Candidates {
                 };
                 // Not in the search itself: an index range of every Patient of the organization is
                 // more to read than the few that share the birth date, and the planner would pick it.
-                if let Some(scope) = self.scope.clone() {
-                    if !self.in_scope(tx, catalog, resource, &scope)? {
+                if let Some(scope) = self.scope.as_deref() {
+                    if !candidate_in_scope(
+                        self.kind,
+                        &mut self.organizations,
+                        tx,
+                        catalog,
+                        resource,
+                        scope,
+                    )? {
                         continue;
                     }
                 }
@@ -1462,6 +1465,43 @@ impl Candidates {
         }
         Ok(None)
     }
+}
+
+/// Whether a candidate is one of the organization's: a Patient by its own `managingOrganization`,
+/// a RelatedPerson by that of the Patient it is for, which is read once for each Patient and kept
+/// in `organizations`.
+fn candidate_in_scope(
+    kind: Kind,
+    organizations: &mut BTreeMap<String, Option<String>>,
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    resource: &Value,
+    scope: &str,
+) -> Result<bool, FhirError> {
+    if kind == Kind::Patient {
+        return Ok(in_scope(resource, scope));
+    }
+    // Only a relative `Patient/id` is a Patient in this store, as it is for a `replaced-by` link.
+    let Some(id) = resource
+        .pointer("/patient/reference")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("Patient/"))
+        .filter(|id| valid_id(id))
+    else {
+        return Ok(false);
+    };
+    if !organizations.contains_key(id) {
+        let organization = match ops::read(tx, catalog.get("Patient")?, id) {
+            Ok(patient) => patient
+                .pointer("/managingOrganization/reference")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(FhirError::NotFound(_) | FhirError::Gone(_) | FhirError::Invalid(_)) => None,
+            Err(err) => return Err(err),
+        };
+        organizations.insert(id.to_string(), organization);
+    }
+    Ok(organizations[id].as_deref() == Some(scope))
 }
 
 /// How a phone number the server may hold is written, when all that is known is what it dials: as
@@ -2494,6 +2534,43 @@ mod tests {
             "birthDate": "1985-03-02",
             "telecom": [{"system": "phone", "value": "0803 123 4567"}]
         }))
+    }
+
+    #[test]
+    fn a_name_too_short_to_search_by_prefix_is_compared_and_not_searched_for() {
+        let subject = carer(related(
+            json!({"family": "Li", "given": ["A.", "Adaeze"]}),
+            json!({}),
+        ));
+        let candidates = Candidates::of(&subject, None, &CARER);
+        let names: Vec<&str> = candidates
+            .queries
+            .iter()
+            .filter(|(name, _)| *name == "name")
+            .map(|(_, value)| value.as_str())
+            .collect();
+        // `a.` and `li` are shorter than a search is worth, and `a` is the beginning of the rest.
+        assert_eq!(names, ["adaeze"]);
+        // They are still the name: the same words are the same name.
+        assert!(carer_graded(
+            related(
+                json!({"family": "Li", "given": ["A.", "Adaeze"]}),
+                json!({})
+            ),
+            related(json!({"family": "li", "given": ["adaeze", "a"]}), json!({})),
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_related_person_with_more_name_strings_than_it_compares_is_refused() {
+        let given: Vec<String> = (0..60).map(|n| format!("name{n}")).collect();
+        let args = json!({"resource": {
+            "resourceType": "RelatedPerson", "patient": {"reference": "Patient/kid-1"},
+            "name": [{"family": "Eke", "given": given}]}});
+        let error = Request::from_args(&args, &CARER).unwrap_err().to_string();
+        assert!(error.contains("RelatedPerson.name"), "{error}");
+        assert!(error.contains("at most 50"), "{error}");
     }
 
     #[test]

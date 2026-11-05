@@ -669,15 +669,18 @@ How candidates are found: by identifier, by name, and by the phone number and em
 request wrote them and in the forms a number is usually stored in (`+2348031234567`,
 `2348031234567`, `08031234567`, `8031234567`). A number stored with spaces or dashes is found
 through the name, which has to be the same anyway for a match. A name is looked for as written
-and word by word, and the search does not fold accents (the comparison does): a RelatedPerson whose
-name differs from the request only in accents, and whose number is stored with spaces, is not
-found. More than 20,000 RelatedPersons of
-the organization sharing a name, a number or an identifier with the request, or more than 100,000
-RelatedPersons of every organization, is a `422` (`too-costly`).
+and word by word, by prefix, and the search does not fold accents (the comparison does): a
+RelatedPerson whose name differs from the request only in accents, and whose number is stored with
+spaces, is not found. A word of fewer than 3 characters (an initial) is compared but not searched
+for, because it would read every name that begins with it. An email address is searched for as
+written and in lower case, and the search is case-sensitive, so one stored in another case is
+found through the name. A request with more than 50 name strings and words is a `400`. More than
+20,000 RelatedPersons of the organization sharing a name, a number or an identifier with the
+request, or more than 100,000 RelatedPersons of every organization, is a `422` (`too-costly`).
 
-The caller needs a scope that may search RelatedPersons (`user/RelatedPerson.rs`), and the server
-reads the Patient named in `resource.patient` to find its organization. A token limited to one
-patient is refused. Over `/sync` it is a `Mutation` named `RelatedPerson/$match` under the same
+The caller needs a scope that may search RelatedPersons (`user/RelatedPerson.rs`) and one that may
+search Patients (`user/Patient.rs`), because the server reads the Patient named in
+`resource.patient` to find its organization. A token limited to one patient is refused. Over `/sync` it is a `Mutation` named `RelatedPerson/$match` under the same
 rules as `Patient/$match`.
 
 ## Subscriptions

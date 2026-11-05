@@ -9,12 +9,14 @@
 use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::http::StatusCode;
+use futures_util::SinkExt;
 use refhir_database::Database;
 use refhir_fhir::{import_resource, install_package_dir, patient_match_dir, Catalog};
 use refhir_sqlite::SqlitePersistence;
 use serde_json::{json, Value};
+use tokio_tungstenite::tungstenite::Message;
 
-use crate::tests::{send, Reply};
+use crate::tests::{connect, next_json, send, Reply};
 use crate::{app_with, ServerConfig};
 
 const BOOLBYTE_ID: &str = "https://boolbyte.health/fhir/NamingSystem/boolbyte-id";
@@ -57,10 +59,10 @@ fn identifier(value: &str) -> Value {
 
 fn seeded() -> axum::Router {
     static SEEDED: OnceLock<axum::Router> = OnceLock::new();
-    SEEDED.get_or_init(seed).clone()
+    SEEDED.get_or_init(|| seed(true)).clone()
 }
 
-fn seed() -> axum::Router {
+fn seed(auth: bool) -> axum::Router {
     let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
     let db = Arc::new(Database::open(store.clone()).unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::empty()));
@@ -132,6 +134,12 @@ fn seed() -> axum::Router {
         carer("adrift", "kid-gone", "Eke", &["Ngozi"]),
         // Nobody's organization.
         carer("free", "kid-free", "Adamu", &["Hauwa"]),
+        // A number that was given up is no evidence: only the name is left.
+        with(
+            carer("olive", "kid-a1", "Peters", &["Olive"]),
+            "telecom",
+            json!([{"system": "phone", "value": "0807 111 2222", "use": "old"}]),
+        ),
     ];
     for record in &records {
         import_resource(&db, &catalog.read().unwrap(), record)
@@ -146,15 +154,17 @@ fn seed() -> axum::Router {
     )
     .unwrap_or_else(|err| panic!("{err}"));
     let smart = Arc::new(crate::auth::SmartStore::with_defaults());
-    smart.install_token("carer", &["user/RelatedPerson.rs"], None);
+    // The Patients are read to find the organization, so the token needs to search them too.
+    smart.install_token("carer", &["user/RelatedPerson.rs", "user/Patient.rs"], None);
+    smart.install_token("carer-only", &["user/RelatedPerson.rs"], None);
     smart.install_token("patients", &["user/Patient.read"], None);
     app_with(
         db,
         catalog,
         store,
         ServerConfig {
-            auth: true,
-            smart: Some(smart),
+            auth,
+            smart: auth.then_some(smart),
             ..Default::default()
         },
     )
@@ -510,9 +520,21 @@ async fn what_cannot_be_matched_is_refused_and_not_answered_for_every_organizati
 }
 
 #[tokio::test]
-async fn a_token_that_cannot_search_related_persons_cannot_match_them() {
-    let reply = post_match("patients", asking("kid-a1", "Eke", &["Ngozi"]), &[]).await;
+async fn a_token_needs_to_search_related_persons_and_the_patients_it_reads() {
+    let asked = || asking("kid-a1", "Eke", &["Ngozi"]);
+    // No RelatedPerson scope.
+    let reply = post_match("patients", asked(), &[]).await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+    // The organization is read from the Patient, so a token that may not search Patients may not
+    // learn which exist: not by the answer, and not by the difference between two refusals.
+    for patient in ["kid-a1", "nobody"] {
+        let reply = post_match("carer-only", asking(patient, "Eke", &["Ngozi"]), &[]).await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
+    }
+    assert_eq!(
+        post_match("carer", asked(), &[]).await.status,
+        StatusCode::OK
+    );
 }
 
 #[tokio::test]
@@ -532,4 +554,59 @@ async fn the_capability_statement_says_it_is_there() {
     };
     assert_eq!(operations("RelatedPerson"), ["match"]);
     assert!(operations("Patient").contains(&"match".to_string()));
+}
+
+#[tokio::test]
+async fn a_number_that_was_given_up_is_no_evidence() {
+    let request = with(
+        asking("kid-a1", "Peters", &["Olive"]),
+        "telecom",
+        json!([phone("08071112222")]),
+    );
+    assert_eq!(grades(request).await, graded(&[("olive", "possible")]));
+}
+
+#[tokio::test]
+async fn a_phone_search_is_for_phones_and_an_email_search_for_addresses() {
+    let total = |query: &'static str| async move {
+        let reply = send(
+            &seeded(),
+            "GET",
+            &format!("/RelatedPerson?{query}&access_token=carer"),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        reply.body["total"].as_u64().unwrap()
+    };
+    assert_eq!(total("phone=%2B234%20803%20123%204567").await, 2);
+    assert_eq!(total("email=Ngozi.Eke@example.org").await, 1);
+    // The address is not a phone number, and the number is not an address.
+    assert_eq!(total("phone=Ngozi.Eke@example.org").await, 0);
+    assert_eq!(total("email=%2B234%20803%20123%204567").await, 0);
+}
+
+#[tokio::test]
+async fn over_sync_a_server_without_smart_matches_related_persons_as_rest_does() {
+    let app = seed(false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (mut socket, _) = connect(&format!("ws://{addr}/sync")).await;
+    let request = json!({"resourceType": "Parameters", "parameter": [
+        {"name": "resource", "resource": asking("kid-a1", "Bello", &["Tunde"])}]});
+    socket
+        .send(Message::Text(
+            json!({"type": "Mutation", "requestId": 1, "udfPath": "RelatedPerson/$match", "args": request})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let answer = next_json(&mut socket).await;
+    assert_eq!(answer["success"], true, "{answer}");
+    assert_eq!(answer["result"]["total"], 1, "{answer}");
+    assert_eq!(answer["result"]["entry"][0]["resource"]["id"], "tunde");
 }

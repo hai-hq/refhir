@@ -46,8 +46,8 @@ pub fn extra_dir() -> &'static Path {
 /// for it to point at), and the search parameters that find a candidate (`identifier`, `name`,
 /// `active`, `birthdate`), and the `RelatedPerson` that `RelatedPerson/$match` compares, with the
 /// search parameters that find one (`identifier`, `name`, `phone`, `email`, `active`, `patient`;
-/// `phone` and `email` read all of `telecom`, as the small package has no `ContactPoint` to
-/// filter on). It stands alone, so it is not installed with
+/// `phone` and `email` filter `telecom` by `system`, so the small `ContactPoint` is here too).
+/// It stands alone, so it is not installed with
 /// `minir4_dir`, which has its own `Patient`. A test that does not need the whole release loads
 /// this instead.
 pub fn patient_match_dir() -> &'static Path {

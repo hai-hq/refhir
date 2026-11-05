@@ -6,5 +6,5 @@
   "code": "phone",
   "base": ["RelatedPerson"],
   "type": "token",
-  "expression": "RelatedPerson.telecom"
+  "expression": "RelatedPerson.telecom.where(system='phone')"
 }
