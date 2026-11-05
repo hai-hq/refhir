@@ -144,4 +144,6 @@ mod match_tests;
 #[cfg(test)]
 mod near_tests;
 #[cfg(test)]
+mod related_person_match_tests;
+#[cfg(test)]
 mod tests;

@@ -169,6 +169,7 @@ Names you may send as a `Mutation`:
 | `Bundle/transaction`, `Bundle/batch` | `resource` (the Bundle), or the Bundle itself as `args` |
 | `ImplementationGuide/$install` | Needs authentication, and runs on the primary. |
 | `Patient/$match` | The `Parameters` resource of the [REST operation](fhir-api.md#finding-a-patient-patientmatch) as `args`. The answer is the `searchset` Bundle of matches, as `result`. |
+| `RelatedPerson/$match` | The same, for [RelatedPersons](fhir-api.md#finding-a-carer-or-parent-relatedpersonmatch). |
 | `ChargeItemDefinition/$apply` | `{"id": "...", "resource": <Parameters>}`: the definition's id, and the `Parameters` the [REST operation](fhir-api.md#pricing-a-charge-item-chargeitemdefinitionapply) takes. The answer is the draft `Invoice`. |
 | `Patient/$health-cards-issue` | `{"id": "...", "resource": <Parameters>}`: the patient's id, and the `Parameters` the [REST operation](health-cards.md#ask-for-a-card) takes (`credentialType`, and optionally `credentialValueSet`, `includeIdentityClaim` and `_since`). The answer is the `Parameters` REST answers: a signed `verifiableCredential` for each card and a `resourceLink` for each resource in it. See [Health Cards over /sync](#health-cards-over-sync). |
 

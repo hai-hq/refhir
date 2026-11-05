@@ -5,7 +5,8 @@ pub(crate) fn http_interaction(method: &str, path: &str) -> &'static str {
         if op == "$install" {
             return "install";
         }
-        // It looks for Patients, whatever it is sent with: a token that may search them may match.
+        // It looks for Patients (or RelatedPersons), whatever it is sent with: a token that may search
+        // them may match.
         // Only a POST is the operation; any other method on the path is not one, and is judged as
         // what the method is.
         if op == "$match" && method == "POST" {

@@ -142,12 +142,13 @@ pub fn check(
 pub(crate) fn require_scopes(
     app: &AppState,
     headers: &HeaderMap,
+    query: Option<&str>,
     needs: &[(String, &str)],
 ) -> Option<Response> {
     if !app.config.auth {
         return None;
     }
-    let scopes = token_scopes(app, headers, None).unwrap_or_default();
+    let scopes = token_scopes(app, headers, query).unwrap_or_default();
     for (resource_type, interaction) in needs {
         if !scopes
             .iter()

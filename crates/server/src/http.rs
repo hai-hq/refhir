@@ -1339,7 +1339,7 @@ async fn submit_op(
     };
     let update_creates = app.catalog.read().expect("catalog").update_create();
     let writes = refhir_fhir::submission_writes(&resource_type, &resource, update_creates);
-    if let Some(response) = crate::auth::require_scopes(&app, &headers, &writes) {
+    if let Some(response) = crate::auth::require_scopes(&app, &headers, None, &writes) {
         return response;
     }
     match execute(
@@ -1383,7 +1383,7 @@ async fn apply_op(
         Err(response) => return response,
     };
     if let Some(response) =
-        crate::auth::require_scopes(&app, &headers, &refhir_fhir::apply_reads(&resource))
+        crate::auth::require_scopes(&app, &headers, None, &refhir_fhir::apply_reads(&resource))
     {
         return response;
     }
@@ -1412,6 +1412,7 @@ async fn apply_op(
 async fn match_op(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
     body: Bytes,
 ) -> Response {
@@ -1434,6 +1435,16 @@ async fn match_op(
             "invalid",
             "unknown parameter organization: $match takes resource, onlyCertainMatches and count",
         );
+    }
+    // A RelatedPerson is matched within the organization of its Patient, which is read: a token
+    // that may not search Patients may not learn which exist or whose they are.
+    if resource_type == "RelatedPerson" {
+        let reads = [("Patient".to_string(), "search")];
+        if let Some(response) =
+            crate::auth::require_scopes(&app, &headers, query.as_deref(), &reads)
+        {
+            return response;
+        }
     }
     terminology_op(app, resource_type, "$match", body).await
 }
