@@ -51,7 +51,7 @@ rand = "0.8"
 rsa = { version = "0.9", features = ["pem", "pkcs5"] }
 sha2 = "0.10"
 hmac = "0.12"
-toml = "0.8"
+toml = "1.1"
 unicode-normalization = "0.1"
 
 # Key derivation and RSA are unusably slow unoptimised; the SMART key tests depend on them.
