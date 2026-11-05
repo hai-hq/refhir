@@ -252,7 +252,7 @@ is every parameter of the type: `date` on an `Encounter` or an `Observation`, `c
 | `$everything` | `Patient/[id]` | Holds only the kinds of resource the caller's scopes let them read |
 | `$export` | system, type, instance | Asynchronous (`202`, then `GET /export/{job}` and `GET /export/{job}/file`). Jobs are durable; see [Operations](operations.md#export-jobs) |
 | `$validate` | type, instance | Validates against the installed StructureDefinitions |
-| `$match` | `Patient` | Finds the Patients that may be the person a Patient resource describes. See [Finding a patient](#finding-a-patient-patientmatch) |
+| `$match` | `Patient`, `RelatedPerson` | Finds the Patients that may be the person a Patient resource describes, or the RelatedPersons that may be the person a RelatedPerson resource describes. See [Finding a patient](#finding-a-patient-patientmatch) and [Finding a carer or parent](#finding-a-carer-or-parent-relatedpersonmatch) |
 | `$meta`, `$meta-add`, `$meta-delete` | instance | |
 | `$document` | `Composition/[id]` | A document Bundle of the Composition and what it references; see [Documents](#documents) |
 | `$summary` | `Patient`, `Patient/[id]` | An International Patient Summary. See [Patient summary](patient-summary.md) |
@@ -608,6 +608,77 @@ Beyond REST:
 - **Governance endpoints** `/_usage`, `/_requests`, `/_audit` and `/_audit/verify`; see
   [governance](governance.md).
 - **Health probes** `/livez`, `/readyz` and `/healthz`; see [Operations](operations.md#health-probes).
+
+### Finding a carer or parent: `RelatedPerson/$match`
+
+Before a parent or carer is registered for a patient, `POST [base]/RelatedPerson/$match` says
+whether they already are. FHIR R4 defines `$match` on `Patient` only, so this is the same operation
+for the other type, with the parameters and the answer of [`Patient/$match`](#finding-a-patient-patientmatch)
+(`resource`, `onlyCertainMatches`, `count`; a `searchset` Bundle, best first, with `search.score`,
+the `match-grade` extension and `match-evidence`), and its own entry in the CapabilityStatement,
+`https://refhir.dev/OperationDefinition/RelatedPerson-match`. `Patient/$match` is unchanged: it
+still takes a Patient, and a RelatedPerson sent to it is a `400`. `resource` is a RelatedPerson, and
+what is returned is RelatedPersons.
+
+```bash
+curl -s -X POST http://localhost:8080/RelatedPerson/\$match -H 'content-type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [
+    {"name": "resource", "resource": {
+      "resourceType": "RelatedPerson",
+      "patient": {"reference": "Patient/kid-1"},
+      "name": [{"family": "Eke", "given": ["Ngozi"]}],
+      "telecom": [{"system": "phone", "value": "08031234567"}]
+    }},
+    {"name": "count", "valueInteger": 5}
+  ]
+}'
+```
+
+A RelatedPerson has no `managingOrganization`: it belongs to the organization of the Patient it is
+for. So `resource.patient` (`Patient/id`, a Patient of this server) is required, and only the
+RelatedPersons of Patients that have the same `managingOrganization` as that Patient are compared.
+What a RelatedPerson of another organization has in common with the request is never returned and
+never counts: not towards `count`, not towards `onlyCertainMatches` (one certain match at the
+organization is returned although another organization has one too). A Patient with no
+`managingOrganization` limits nothing, as for `Patient/$match`. A `patient` that is missing, is not
+`Patient/id`, or names a Patient that is not there is a `400`, because there would be no
+organization to limit the answer to; so is a Patient whose `managingOrganization` is not
+`Organization/id`. The Patient is only where the organization comes from: RelatedPersons of other
+Patients of the organization are compared too, because one person can be the carer of two children
+(a mother registered for each), and she is a match.
+
+A carer is identified by who they are, and a birth date is often not recorded, so it is not needed:
+
+| Grade | When | Score |
+|-------|------|-------|
+| `certain` | An identifier has the same `system` and the same `value`, compared exactly | 1 |
+| `probable` | The name and a phone number or email address in `telecom` are the same | 0.75 to 0.95 |
+| `possible` | The name is the same | 0.40 to 0.70 |
+
+A birth date that both have and that is the same raises the score within the grade (`birth-date`
+in the evidence); a full birth date that both have and that differs is not a match, whatever the
+name and number. A year is not compared. A phone number or email address alone is not a match: it
+is shared by a family. Names, phone numbers and email addresses are compared as `Patient/$match`
+compares them, so `0803 123 4567` is `+234 803 123 4567`, and `Okafor Ada` is `ada OKAFOR`.
+
+A RelatedPerson with `active` false is never returned. Nothing replaces a RelatedPerson, so there
+are no `replaced-record` entries. The audit trail records it as an operation on `RelatedPerson`.
+
+How candidates are found: by identifier, by name, and by the phone number and email address as the
+request wrote them and in the forms a number is usually stored in (`+2348031234567`,
+`2348031234567`, `08031234567`, `8031234567`). A number stored with spaces or dashes is found
+through the name, which has to be the same anyway for a match. A name is looked for as written
+and word by word, and the search does not fold accents (the comparison does): a RelatedPerson whose
+name differs from the request only in accents, and whose number is stored with spaces, is not
+found. More than 20,000 RelatedPersons of
+the organization sharing a name, a number or an identifier with the request, or more than 100,000
+RelatedPersons of every organization, is a `422` (`too-costly`).
+
+The caller needs a scope that may search RelatedPersons (`user/RelatedPerson.rs`), and the server
+reads the Patient named in `resource.patient` to find its organization. A token limited to one
+patient is refused. Over `/sync` it is a `Mutation` named `RelatedPerson/$match` under the same
+rules as `Patient/$match`.
 
 ## Subscriptions
 

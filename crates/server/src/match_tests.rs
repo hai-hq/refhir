@@ -1095,10 +1095,11 @@ async fn the_capability_statement_lists_the_operation() {
         !documentation.contains("?organization=Organization/id"),
         "{documentation}"
     );
-    // And only Patient has it.
+    // And only Patient has it, but for RelatedPerson, which has its own (see
+    // `related_person_match_tests`).
     for resource in resources
         .iter()
-        .filter(|resource| resource["type"] != "Patient")
+        .filter(|resource| !matches!(resource["type"].as_str(), Some("Patient" | "RelatedPerson")))
     {
         let names: Vec<_> = resource["operation"]
             .as_array()

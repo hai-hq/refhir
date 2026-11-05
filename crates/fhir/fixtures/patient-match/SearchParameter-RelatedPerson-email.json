@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/individual-email",
+  "name": "email",
+  "status": "active",
+  "code": "email",
+  "base": ["RelatedPerson"],
+  "type": "token",
+  "expression": "RelatedPerson.telecom"
+}

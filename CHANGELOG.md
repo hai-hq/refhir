@@ -10,6 +10,29 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **`POST [base]/RelatedPerson/$match`: is this parent or carer already registered?** A system
+  that registers a person for a patient had to search RelatedPersons by name, phone number, email
+  address and identifier and score the hits itself. R4 defines `$match` on Patient only, so this is
+  the same operation on RelatedPerson, with the parameters and the answer of `Patient/$match`
+  (`resource`, `onlyCertainMatches`, `count`; a `searchset` Bundle, best first, with `search.score`,
+  the `match-grade` extension and `match-evidence`), and its own CapabilityStatement entry,
+  `https://refhir.dev/OperationDefinition/RelatedPerson-match`. `Patient/$match` is unchanged and
+  still refuses a RelatedPerson. A RelatedPerson has no organization of its own, so `resource.patient`
+  (`Patient/id`, required) says which: only the RelatedPersons of Patients with the same
+  `managingOrganization` as that Patient are compared, and another organization's are never returned
+  or counted. A carer's birth date is often not recorded, so the grades differ: `certain` for the
+  same identifier, `probable` for the same name and the same phone number or email address (written
+  any way: spacing and country code are ignored, as for Patients), `possible` for the same name. A full
+  birth date that both have and that is the same raises the score, and one that differs is not a
+  match. A RelatedPerson with `active` false is never returned. A `patient` that is missing, is not
+  `Patient/id` or is not on the server is a `400`; so is a Patient whose `managingOrganization` is not
+  `Organization/id`. More than 20,000 RelatedPersons of the organization sharing a name, number or
+  identifier with the request (or 100,000 of every organization) is a `422` (`too-costly`). The scope
+  to search it is `RelatedPerson.rs`. See
+  [FHIR API](docs/fhir-api.md#finding-a-carer-or-parent-relatedpersonmatch).
+
 ## [0.0.6] - 2026-11-04
 
 ### Added

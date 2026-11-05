@@ -169,6 +169,7 @@ Names you may send as a `Mutation`:
 | `Bundle/transaction`, `Bundle/batch` | `resource` (the Bundle), or the Bundle itself as `args` |
 | `ImplementationGuide/$install` | Needs authentication, and runs on the primary. |
 | `Patient/$match` | The `Parameters` resource of the [REST operation](fhir-api.md#finding-a-patient-patientmatch) as `args`. The answer is the `searchset` Bundle of matches, as `result`. |
+| `RelatedPerson/$match` | The same, for [RelatedPersons](fhir-api.md#finding-a-carer-or-parent-relatedpersonmatch). |
 | `ChargeItemDefinition/$apply` | `{"id": "...", "resource": <Parameters>}`: the definition's id, and the `Parameters` the [REST operation](fhir-api.md#pricing-a-charge-item-chargeitemdefinitionapply) takes. The answer is the draft `Invoice`. |
 
 An operation that REST sends to one instance (`POST ChargeItemDefinition/[id]/$apply`) takes the id as `id` and the body as `resource`, as `update` does. One that REST sends to a type (`POST Patient/$match`) takes the body as `args`.

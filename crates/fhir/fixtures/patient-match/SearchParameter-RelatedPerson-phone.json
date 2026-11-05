@@ -1,0 +1,10 @@
+{
+  "resourceType": "SearchParameter",
+  "url": "http://hl7.org/fhir/SearchParameter/individual-phone",
+  "name": "phone",
+  "status": "active",
+  "code": "phone",
+  "base": ["RelatedPerson"],
+  "type": "token",
+  "expression": "RelatedPerson.telecom"
+}

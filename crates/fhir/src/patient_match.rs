@@ -4,6 +4,16 @@
 //! algorithm is this server's own, written here as data ([`Rules`]) so that it can be read and
 //! tuned in one place.
 //!
+//! **RelatedPerson.** R4 defines `$match` on Patient only, so a parent or carer is matched by the
+//! same operation on the other type, `RelatedPerson/$match`, rather than by a RelatedPerson sent
+//! to `Patient/$match`: that would answer a Patient operation with another type, and a client
+//! written to the specification would not expect it. It takes and answers the same things, graded
+//! by [`Rules::RELATED_PERSON`], which does not need a birth date (a name is `possible`, a name and
+//! a phone number or email address `probable`). A RelatedPerson has no `managingOrganization`, so
+//! the scope is the organization of the Patient in `resource.patient`, which is read, and a stored
+//! RelatedPerson is in it when its own Patient is the organization's. The rest of this page
+//! describes Patients; where it matters it says what is otherwise.
+//!
 //! **Evidence.** A stored Patient is compared with the one in the request, and what they have in
 //! common is recorded as [`Need`]s:
 //!
@@ -101,6 +111,27 @@ const MATCH_EVIDENCE: &str = "https://refhir.dev/StructureDefinition/match-evide
 /// The core definition of the operation, for the CapabilityStatement.
 const DEFINITION: &str = "http://hl7.org/fhir/OperationDefinition/Patient-match";
 
+/// What a RelatedPerson's is called: R4 defines the operation on Patient only, so this server
+/// names its own, with the same parameters and the same answer.
+const RELATED_PERSON_DEFINITION: &str =
+    "https://refhir.dev/OperationDefinition/RelatedPerson-match";
+
+/// What is matched: the type of `resource` and of what is found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Patient,
+    RelatedPerson,
+}
+
+impl Kind {
+    fn name(self) -> &'static str {
+        match self {
+            Kind::Patient => "Patient",
+            Kind::RelatedPerson => "RelatedPerson",
+        }
+    }
+}
+
 /// How sure a match is. Declared weakest first, so that `Ord` puts a stronger grade higher.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Grade {
@@ -155,6 +186,7 @@ pub(crate) struct ReplacedBy {
 /// Everything the algorithm decides, in one place.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Rules {
+    pub kind: Kind,
     /// The grades, strongest first. The first whose needs are all found is the match's grade.
     pub grades: &'static [GradeRule],
     /// Fewest words a name needs to be evidence.
@@ -165,6 +197,11 @@ pub(crate) struct Rules {
     pub swapped_names_score: i32,
     pub gender_agrees_score: i32,
     pub gender_differs_score: i32,
+    /// What a birth date that agrees adds to a score, where it is not one of a grade's needs.
+    pub birth_date_agrees_score: i32,
+    /// Whether two full birth dates that differ rule out every grade but the one an identifier
+    /// gives, where a birth date is not one of a grade's needs.
+    pub different_birth_date_refuses: bool,
     /// The country code a phone number is taken to have when it is written without one, as
     /// `0803 …` is. Nigeria's.
     pub country_code: &'static str,
@@ -184,10 +221,13 @@ pub(crate) struct Rules {
     /// Most candidates one request may compare. More than this is refused: an answer that left
     /// some out would look like a complete one.
     pub max_candidates: usize,
+    /// Most records one request may read to find them, those of other organizations included.
+    pub max_reads: usize,
 }
 
 impl Rules {
     pub(crate) const STANDARD: Rules = Rules {
+        kind: Kind::Patient,
         grades: &[
             GradeRule {
                 grade: Grade::Certain,
@@ -216,6 +256,8 @@ impl Rules {
         swapped_names_score: -5,
         gender_agrees_score: 5,
         gender_differs_score: -10,
+        birth_date_agrees_score: 0,
+        different_birth_date_refuses: false,
         country_code: "234",
         ignored_identifier_uses: &["temp"],
         ignored_contact_uses: &["old"],
@@ -226,7 +268,52 @@ impl Rules {
         max_elements: 50,
         page: 500,
         max_candidates: 20_000,
+        max_reads: usize::MAX,
     };
+
+    /// A RelatedPerson is matched on who they are, not on a birth date: a carer's is often not
+    /// recorded, so a name alone is `possible` and a name with a phone number or an email address
+    /// is `probable`. A birth date that agrees raises the score within the grade, and one that
+    /// differs rules the name out. Nothing replaces a RelatedPerson, so nothing is followed.
+    pub(crate) const RELATED_PERSON: Rules = Rules {
+        kind: Kind::RelatedPerson,
+        grades: &[
+            GradeRule {
+                grade: Grade::Certain,
+                needs: &[Need::Identifier],
+                base: 100,
+                floor: 100,
+                ceiling: 100,
+            },
+            GradeRule {
+                grade: Grade::Probable,
+                needs: &[Need::Name, Need::Contact],
+                base: 85,
+                floor: 75,
+                ceiling: 95,
+            },
+            GradeRule {
+                grade: Grade::Possible,
+                needs: &[Need::Name],
+                base: 55,
+                floor: 40,
+                ceiling: 70,
+            },
+        ],
+        birth_date_agrees_score: 5,
+        different_birth_date_refuses: true,
+        replaced_by: None,
+        max_reads: 100_000,
+        ..Rules::STANDARD
+    };
+
+    fn for_type(type_name: &str) -> Option<Rules> {
+        match type_name {
+            "Patient" => Some(Rules::STANDARD),
+            "RelatedPerson" => Some(Rules::RELATED_PERSON),
+            _ => None,
+        }
+    }
 }
 
 /// What two Patients have in common. What the request says it has in common, in the words the
@@ -237,6 +324,8 @@ struct Evidence {
     identifiers: Vec<(String, String)>,
     name: Option<NameOrder>,
     birth_date: bool,
+    /// Both have a full birth date, and they are not the same.
+    birth_date_differs: bool,
     /// The phone numbers and the email addresses of the request, as it wrote them, that the
     /// Patient has too.
     phones: Vec<String>,
@@ -335,7 +424,16 @@ impl Rules {
             .grades
             .iter()
             .find(|rule| rule.needs.iter().all(|need| evidence.has(*need)))?;
+        if self.different_birth_date_refuses
+            && evidence.birth_date_differs
+            && !rule.needs.contains(&Need::Identifier)
+        {
+            return None;
+        }
         let mut score = rule.base;
+        if evidence.birth_date {
+            score += self.birth_date_agrees_score;
+        }
         if evidence.name == Some(NameOrder::Swapped) {
             score += self.swapped_names_score;
         }
@@ -369,6 +467,9 @@ struct Name {
     words: Vec<String>,
     /// The words of the family name, in order of spelling.
     family: Vec<String>,
+    /// The strings the name is written in, each given name and the family name whole, as written:
+    /// what a search by name can be asked for.
+    written: Vec<String>,
 }
 
 impl Subject {
@@ -376,10 +477,11 @@ impl Subject {
     /// than something left out: the request would be answered for a different person.
     fn read(patient: &Value, rules: &Rules) -> Result<Subject, FhirError> {
         let mut subject = Subject::default();
-        for identifier in elements(patient, "identifier")? {
-            let system = text(identifier, "system", "Patient.identifier")?;
-            let value = text(identifier, "value", "Patient.identifier")?;
-            let usage = text(identifier, "use", "Patient.identifier")?;
+        let ty = rules.kind.name();
+        for identifier in elements(patient, "identifier", ty)? {
+            let system = text(identifier, "system", &format!("{ty}.identifier"))?;
+            let value = text(identifier, "value", &format!("{ty}.identifier"))?;
+            let usage = text(identifier, "use", &format!("{ty}.identifier"))?;
             if usage.is_some_and(|usage| rules.ignored_identifier_uses.contains(&usage)) {
                 continue;
             }
@@ -392,51 +494,60 @@ impl Subject {
                 }
             }
         }
-        for name in elements(patient, "name")? {
+        for name in elements(patient, "name", ty)? {
             let mut words = Vec::new();
             let mut family = Vec::new();
+            let mut written = Vec::new();
             if let Some(given) = name.get("given") {
-                let given = given
-                    .as_array()
-                    .ok_or_else(|| invalid("Patient.name.given must be an array of strings"))?;
+                let given = given.as_array().ok_or_else(|| {
+                    invalid(format!("{ty}.name.given must be an array of strings"))
+                })?;
                 for item in given {
-                    let item = item
-                        .as_str()
-                        .ok_or_else(|| invalid("Patient.name.given must be an array of strings"))?;
+                    let item = item.as_str().ok_or_else(|| {
+                        invalid(format!("{ty}.name.given must be an array of strings"))
+                    })?;
                     words.extend(words_of(item));
+                    written.push(item.trim().to_string());
                 }
             }
-            if let Some(text) = text(name, "family", "Patient.name")? {
+            if let Some(text) = text(name, "family", &format!("{ty}.name"))? {
                 family = words_of(text);
                 words.extend(family.iter().cloned());
+                written.push(text.trim().to_string());
             }
             if words.is_empty() {
                 // A name written out whole has no parts to say which word is the family's.
-                if let Some(text) = text(name, "text", "Patient.name")? {
+                if let Some(text) = text(name, "text", &format!("{ty}.name"))? {
                     words = words_of(text);
+                    written.push(text.trim().to_string());
                 }
             }
             if words.len() >= rules.min_name_words {
                 words.sort();
                 family.sort();
-                subject.names.push(Name { words, family });
+                written.retain(|text| !text.is_empty());
+                subject.names.push(Name {
+                    words,
+                    family,
+                    written,
+                });
             }
         }
-        if let Some(date) = text(patient, "birthDate", "Patient")? {
+        if let Some(date) = text(patient, "birthDate", ty)? {
             if !is_date(date) {
                 // Not the value: it is a person's date of birth, and error text is logged.
-                return Err(invalid(
-                    "Patient.birthDate is not a date (YYYY, YYYY-MM or YYYY-MM-DD)",
-                ));
+                return Err(invalid(format!(
+                    "{ty}.birthDate is not a date (YYYY, YYYY-MM or YYYY-MM-DD)"
+                )));
             }
             if date.len() == 10 {
                 subject.birth_date = Some(date.to_string());
             }
         }
-        for point in elements(patient, "telecom")? {
-            let system = text(point, "system", "Patient.telecom")?;
-            let usage = text(point, "use", "Patient.telecom")?;
-            let Some(value) = text(point, "value", "Patient.telecom")? else {
+        for point in elements(patient, "telecom", ty)? {
+            let system = text(point, "system", &format!("{ty}.telecom"))?;
+            let usage = text(point, "use", &format!("{ty}.telecom"))?;
+            let Some(value) = text(point, "value", &format!("{ty}.telecom"))? else {
                 continue;
             };
             if usage.is_some_and(|usage| rules.ignored_contact_uses.contains(&usage)) {
@@ -470,18 +581,19 @@ impl Subject {
                 None => {}
             }
         }
-        subject.gender = text(patient, "gender", "Patient")?.map(str::to_string);
+        subject.gender = text(patient, "gender", ty)?.map(str::to_string);
         Ok(subject)
     }
 
-    /// Whether this Patient can be looked up by name and birth date.
-    fn can_match_by_name(&self) -> bool {
-        self.birth_date.is_some() && !self.names.is_empty()
+    /// Whether this can be looked up by name: with its birth date for a Patient, whose name alone
+    /// is not a grade, and by the name alone for a RelatedPerson.
+    fn can_match_by_name(&self, rules: &Rules) -> bool {
+        !self.names.is_empty() && (rules.kind == Kind::RelatedPerson || self.birth_date.is_some())
     }
 
     /// Whether there is anything at all to look for.
-    fn can_match(&self) -> bool {
-        !self.identifiers.is_empty() || self.can_match_by_name()
+    fn can_match(&self, rules: &Rules) -> bool {
+        !self.identifiers.is_empty() || self.can_match_by_name(rules)
     }
 
     fn compare(&self, stored: &Subject, rules: &Rules) -> Evidence {
@@ -500,6 +612,9 @@ impl Subject {
                 .cloned()
                 .collect(),
             birth_date: self.birth_date.is_some() && self.birth_date == stored.birth_date,
+            birth_date_differs: self.birth_date.is_some()
+                && stored.birth_date.is_some()
+                && self.birth_date != stored.birth_date,
             phones: shared(&self.phones, &stored.phones),
             emails: shared(&self.emails, &stored.emails),
             ..Evidence::default()
@@ -529,16 +644,16 @@ fn invalid(message: impl Into<String>) -> FhirError {
     FhirError::Invalid(message.into())
 }
 
-/// The elements of a repeating field of a Patient, none if it is not there.
-fn elements<'a>(patient: &'a Value, field: &str) -> Result<&'a [Value], FhirError> {
+/// The elements of a repeating field of a Patient or RelatedPerson, none if it is not there.
+fn elements<'a>(patient: &'a Value, field: &str, ty: &str) -> Result<&'a [Value], FhirError> {
     let Some(items) = patient.get(field) else {
         return Ok(&[]);
     };
     let items = items
         .as_array()
-        .ok_or_else(|| invalid(format!("Patient.{field} must be an array")))?;
+        .ok_or_else(|| invalid(format!("{ty}.{field} must be an array")))?;
     if items.iter().any(|item| !item.is_object()) {
-        return Err(invalid(format!("Patient.{field} must hold objects")));
+        return Err(invalid(format!("{ty}.{field} must hold objects")));
     }
     Ok(items)
 }
@@ -675,6 +790,7 @@ fn is_date(text: &str) -> bool {
 /// A request with more identifiers, names or telecoms than `rules` allow is refused, before any of
 /// them is read.
 fn limit_elements(patient: &Value, rules: &Rules) -> Result<(), FhirError> {
+    let ty = rules.kind.name();
     for field in ["identifier", "name", "telecom"] {
         let count = patient
             .get(field)
@@ -682,7 +798,7 @@ fn limit_elements(patient: &Value, rules: &Rules) -> Result<(), FhirError> {
             .map_or(0, Vec::len);
         if count > rules.max_elements {
             return Err(invalid(format!(
-                "Patient.{field} has {count} entries, and $match compares at most {}",
+                "{ty}.{field} has {count} entries, and $match compares at most {}",
                 rules.max_elements
             )));
         }
@@ -691,6 +807,7 @@ fn limit_elements(patient: &Value, rules: &Rules) -> Result<(), FhirError> {
 }
 
 /// The request, read.
+#[derive(Debug)]
 struct Request {
     subject: Subject,
     only_certain: bool,
@@ -698,6 +815,9 @@ struct Request {
     /// `Organization/id`, the `managingOrganization` of the Patient in `resource`: only the Patients
     /// it is the `managingOrganization` of are looked at.
     scope: Option<String>,
+    /// For a RelatedPerson, the id of the Patient it relates to. The organization that Patient
+    /// belongs to is the scope, which `resolve_scope` reads: a RelatedPerson has none of its own.
+    patient: Option<String>,
 }
 
 const PARAMETERS: &str = "resource, onlyCertainMatches and count";
@@ -812,8 +932,9 @@ impl Request {
             return Err(invalid("the body must be a Parameters resource"));
         }
         let resource = resource.ok_or_else(|| invalid("resource is required"))?;
-        if resource.get("resourceType").and_then(Value::as_str) != Some("Patient") {
-            return Err(invalid("resource must be a Patient"));
+        let ty = rules.kind.name();
+        if resource.get("resourceType").and_then(Value::as_str) != Some(ty) {
+            return Err(invalid(format!("resource must be a {ty}")));
         }
         let only_certain = match only_certain {
             None => false,
@@ -829,7 +950,10 @@ impl Request {
                     .ok_or_else(|| invalid("count must be a whole number, 0 or more"))?,
             ),
         };
-        let scope = scope_of(&resource)?;
+        let (scope, patient) = match rules.kind {
+            Kind::Patient => (scope_of(&resource)?, None),
+            Kind::RelatedPerson => (None, Some(patient_of(&resource)?)),
+        };
         limit_elements(&resource, rules)?;
         let subject = Subject::read(&resource, rules)?;
         Ok(Request {
@@ -837,8 +961,56 @@ impl Request {
             only_certain,
             count,
             scope,
+            patient,
         })
     }
+
+    /// For a RelatedPerson: the scope is the organization of the Patient it relates to, as the
+    /// scope of a Patient is its own. A Patient with no `managingOrganization` limits nothing, as
+    /// for `Patient/$match`. What is wrong with the reference is not in the message: it is whatever
+    /// the caller sent.
+    fn resolve_scope(&mut self, tx: &mut Transaction, catalog: &Catalog) -> Result<(), FhirError> {
+        let Some(id) = &self.patient else {
+            return Ok(());
+        };
+        let patient = match ops::read(tx, catalog.get("Patient")?, id) {
+            Ok(patient) => patient,
+            Err(FhirError::NotFound(_) | FhirError::Gone(_) | FhirError::Invalid(_)) => {
+                return Err(invalid(
+                    "RelatedPerson.patient must be a Patient of this server: $match limits the \
+                     answer to the organization that Patient belongs to",
+                ))
+            }
+            Err(err) => return Err(err),
+        };
+        self.scope = scope_of(&patient).map_err(|_| {
+            invalid(
+                "the Patient that RelatedPerson.patient names has a managingOrganization that is \
+                 not Organization/id, so $match cannot tell which organization's RelatedPersons \
+                 to compare with",
+            )
+        })?;
+        Ok(())
+    }
+}
+
+/// The id of the Patient a RelatedPerson in the request relates to. Required by FHIR, and here
+/// because it says which organization's RelatedPersons the request is compared with: without it
+/// the request would be answered for every organization.
+fn patient_of(related: &Value) -> Result<String, FhirError> {
+    related
+        .pointer("/patient/reference")
+        .and_then(Value::as_str)
+        .and_then(|reference| reference.strip_prefix("Patient/"))
+        .filter(|id| valid_id(id))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            invalid(
+                "RelatedPerson.patient must be a reference to a Patient of this server, \
+                 Patient/id: $match compares with the RelatedPersons of the organization that \
+                 Patient belongs to",
+            )
+        })
 }
 
 /// The operation: the Bundle of Patients that may be the one in `args`.
@@ -848,14 +1020,14 @@ pub(crate) fn operation(
     type_name: &str,
     args: &Value,
 ) -> Result<Value, FhirError> {
-    if type_name != "Patient" {
+    let Some(rules) = Rules::for_type(type_name) else {
         return Err(FhirError::Unsupported(format!(
             "unsupported operation {type_name}/$match"
         )));
-    }
+    };
     catalog.deny_response_read(type_name)?;
-    let rules = Rules::STANDARD;
-    let request = Request::from_args(args, &rules)?;
+    let mut request = Request::from_args(args, &rules)?;
+    request.resolve_scope(tx, catalog)?;
     find(tx, catalog, &request, &rules)
 }
 
@@ -876,8 +1048,8 @@ fn find(
 ) -> Result<Value, FhirError> {
     // By id, so that a Patient reached in two ways is one match, the better of the two.
     let mut found: BTreeMap<String, Match> = BTreeMap::new();
-    if request.subject.can_match() {
-        let mut candidates = Candidates::of(&request.subject, request.scope.as_deref());
+    if request.subject.can_match(rules) {
+        let mut candidates = Candidates::of(&request.subject, request.scope.as_deref(), rules);
         while let Some(page) = candidates.next_page(tx, catalog, rules)? {
             for (id, resource) in page {
                 let standing = standing(&resource);
@@ -1104,7 +1276,14 @@ fn survivors(
 /// and each is given once, so no more than a page of them is held, whatever the search finds. With
 /// a scope, a Patient that is not one of that organization's is not a candidate: it is dropped as
 /// it is read, and does not count towards the most candidates a request may compare.
+///
+/// For a RelatedPerson there is no birth date to look for, so they are those that have one of its
+/// identifiers, one of its phone numbers or email addresses (as the server stores them, which is
+/// as they were written: a number written another way is found by its name), or one of the words
+/// or strings of one of its names. A RelatedPerson is in the scope when the Patient it relates to
+/// is one of the organization's, which is read once for each Patient.
 struct Candidates {
+    kind: Kind,
     /// `(search parameter, value)`, one search each.
     queries: Vec<(&'static str, String)>,
     /// `Organization/id`: only the Patients it is the `managingOrganization` of are candidates.
@@ -1114,25 +1293,109 @@ struct Candidates {
     offset: usize,
     /// The ids already given, which is also how many there are.
     seen: BTreeSet<String>,
+    /// How many records the searches have returned, in the scope or not.
+    reads: usize,
+    /// The `managingOrganization` of each Patient a RelatedPerson was found to relate to, or none
+    /// when it has none or is not there.
+    organizations: BTreeMap<String, Option<String>>,
 }
 
 impl Candidates {
-    fn of(subject: &Subject, scope: Option<&str>) -> Candidates {
+    fn of(subject: &Subject, scope: Option<&str>, rules: &Rules) -> Candidates {
         let mut queries: Vec<(&'static str, String)> = subject
             .identifiers
             .iter()
             .filter_map(|(system, value)| Some(("identifier", token(system, value)?)))
             .collect();
-        if let (true, Some(date)) = (subject.can_match_by_name(), &subject.birth_date) {
-            queries.push(("birthdate", date.clone()));
+        match rules.kind {
+            Kind::Patient => {
+                if let (true, Some(date)) = (subject.can_match_by_name(rules), &subject.birth_date)
+                {
+                    queries.push(("birthdate", date.clone()));
+                }
+            }
+            Kind::RelatedPerson => {
+                let mut asked = BTreeSet::new();
+                let mut ask = |parameter: &'static str, value: Option<String>| {
+                    if let Some(value) = value {
+                        if asked.insert((parameter, value.clone())) {
+                            queries.push((parameter, value));
+                        }
+                    }
+                };
+                for (key, written) in &subject.phones {
+                    for spelling in phone_spellings(key, written, rules.country_code) {
+                        ask("phone", bare_token(&spelling));
+                    }
+                }
+                for (key, written) in &subject.emails {
+                    ask("email", bare_token(written));
+                    ask("email", bare_token(key));
+                }
+                if subject.can_match_by_name(rules) {
+                    // The search is by prefix, so a term that begins with another is found by that
+                    // one, and is not asked for twice.
+                    let terms: BTreeSet<String> = subject
+                        .names
+                        .iter()
+                        .flat_map(|name| name.written.iter().chain(&name.words))
+                        .map(|term| term.to_lowercase())
+                        .collect();
+                    for term in &terms {
+                        let covered = terms
+                            .iter()
+                            .any(|other| other != term && term.starts_with(other.as_str()));
+                        if !covered {
+                            ask("name", bare_token(term));
+                        }
+                    }
+                }
+            }
         }
         Candidates {
+            kind: rules.kind,
             queries,
             scope: scope.map(str::to_string),
             at: 0,
             offset: 0,
             seen: BTreeSet::new(),
+            reads: 0,
+            organizations: BTreeMap::new(),
         }
+    }
+
+    /// Whether the candidate is one of the organization's.
+    fn in_scope(
+        &mut self,
+        tx: &mut Transaction,
+        catalog: &Catalog,
+        resource: &Value,
+        scope: &str,
+    ) -> Result<bool, FhirError> {
+        if self.kind == Kind::Patient {
+            return Ok(in_scope(resource, scope));
+        }
+        // Only a relative `Patient/id` is a Patient in this store, as it is for a `replaced-by` link.
+        let Some(id) = resource
+            .pointer("/patient/reference")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix("Patient/"))
+            .filter(|id| valid_id(id))
+        else {
+            return Ok(false);
+        };
+        if !self.organizations.contains_key(id) {
+            let organization = match ops::read(tx, catalog.get("Patient")?, id) {
+                Ok(patient) => patient
+                    .pointer("/managingOrganization/reference")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                Err(FhirError::NotFound(_) | FhirError::Gone(_) | FhirError::Invalid(_)) => None,
+                Err(err) => return Err(err),
+            };
+            self.organizations.insert(id.to_string(), organization);
+        }
+        Ok(self.organizations[id].as_deref() == Some(scope))
     }
 
     /// The next Patients not given before, `(id, resource)`, or `None` when there are no more.
@@ -1142,7 +1405,7 @@ impl Candidates {
         catalog: &Catalog,
         rules: &Rules,
     ) -> Result<Option<Vec<(String, Value)>>, FhirError> {
-        let model = catalog.get("Patient")?;
+        let model = catalog.get(self.kind.name())?;
         // A page of nothing would never reach the end of a search.
         let size = rules.page.max(1);
         while let Some((parameter, value)) = self.queries.get(self.at).cloned() {
@@ -1169,12 +1432,10 @@ impl Candidates {
                 };
                 // Not in the search itself: an index range of every Patient of the organization is
                 // more to read than the few that share the birth date, and the planner would pick it.
-                if self
-                    .scope
-                    .as_deref()
-                    .is_some_and(|scope| !in_scope(resource, scope))
-                {
-                    continue;
+                if let Some(scope) = self.scope.clone() {
+                    if !self.in_scope(tx, catalog, resource, &scope)? {
+                        continue;
+                    }
                 }
                 if let Some(id) = resource.get("id").and_then(Value::as_str) {
                     if self.seen.insert(id.to_string()) {
@@ -1182,8 +1443,12 @@ impl Candidates {
                     }
                 }
             }
+            self.reads += read;
             if self.seen.len() > rules.max_candidates {
-                return Err(too_costly(rules));
+                return Err(too_costly(self.kind, rules.max_candidates));
+            }
+            if self.reads > rules.max_reads {
+                return Err(too_costly(self.kind, rules.max_reads));
             }
             if read < size {
                 self.at += 1;
@@ -1199,16 +1464,51 @@ impl Candidates {
     }
 }
 
-fn too_costly(rules: &Rules) -> FhirError {
+/// How a phone number the server may hold is written, when all that is known is what it dials: as
+/// the request wrote it, with and without its `+`, and the national number with and without the
+/// zero it is dialled with at home. Spacing is not guessed at: a number written with spaces is
+/// found by its name, and compared by what it dials.
+fn phone_spellings(key: &str, written: &str, country_code: &str) -> Vec<String> {
+    let mut spellings = vec![
+        written.trim().to_string(),
+        format!("+{key}"),
+        key.to_string(),
+    ];
+    if let Some(national) = key.strip_prefix(country_code) {
+        spellings.push(format!("0{national}"));
+        spellings.push(national.to_string());
+    }
+    let mut seen = BTreeSet::new();
+    spellings.retain(|spelling| seen.insert(spelling.clone()));
+    spellings
+}
+
+/// `value` as a search reads it with no system and no prefix, or `None` for one it cannot say: a
+/// comma separates alternatives and a backslash, `|`, `$` or the control character that joins
+/// repeated parameters would be read as something else. No name, number or address in use has one.
+fn bare_token(value: &str) -> Option<String> {
+    if value.is_empty() || value.contains(['\\', '|', '$', search::AND, ',']) {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+/// A request that would read more than `limit` records is refused.
+fn too_costly(kind: Kind, limit: usize) -> FhirError {
+    let what = match kind {
+        Kind::Patient => "Patients share an identifier or a birth date",
+        Kind::RelatedPerson => {
+            "RelatedPersons share an identifier, a phone number, an email address or a name"
+        }
+    };
     FhirError::Unprocessable(json!({
         "resourceType": "OperationOutcome",
         "issue": [{
             "severity": "error",
             "code": "too-costly",
             "diagnostics": format!(
-                "more than {} Patients share an identifier or a birth date with the resource, \
-                 which is more than $match compares; the answer would not be complete",
-                rules.max_candidates
+                "more than {limit} {what} with the resource, \
+                 which is more than $match compares; the answer would not be complete"
             )
         }]
     }))
@@ -1239,13 +1539,24 @@ pub(crate) fn annotate_capability(statement: &mut Value) {
         return;
     };
     for resource in resources {
-        if resource.get("type").and_then(Value::as_str) != Some("Patient") {
-            continue;
-        }
+        let (definition, documentation) = match resource.get("type").and_then(Value::as_str) {
+            Some("Patient") => (DEFINITION, PATIENT_DOCUMENTATION),
+            Some("RelatedPerson") => (RELATED_PERSON_DEFINITION, RELATED_PERSON_DOCUMENTATION),
+            _ => continue,
+        };
         let operation = json!({
             "name": "match",
-            "definition": DEFINITION,
-            "documentation": "POST [base]/Patient/$match finds the Patients in this server that \
+            "definition": definition,
+            "documentation": documentation
+        });
+        match resource.get_mut("operation").and_then(Value::as_array_mut) {
+            Some(operations) => operations.push(operation),
+            None => resource["operation"] = json!([operation]),
+        }
+    }
+}
+
+const PATIENT_DOCUMENTATION: &str = "POST [base]/Patient/$match finds the Patients in this server that \
                 may be the person the `resource` parameter describes, best first. Each entry has \
                 `search.score` (0 to 1) and the `match-grade` extension: `certain` when an \
                 identifier has the same system and value; `probable` when the name, the full \
@@ -1264,14 +1575,20 @@ pub(crate) fn annotate_capability(statement: &mut Value) {
                 `count` then apply to that organization's Patients only, and a replaced-by link is \
                 not followed to a Patient of another organization. It is not compared, so it adds \
                 no evidence and changes no grade. Without it every organization's \
-                Patients are compared."
-        });
-        match resource.get_mut("operation").and_then(Value::as_array_mut) {
-            Some(operations) => operations.push(operation),
-            None => resource["operation"] = json!([operation]),
-        }
-    }
-}
+                Patients are compared.";
+
+const RELATED_PERSON_DOCUMENTATION: &str = "POST [base]/RelatedPerson/$match finds the RelatedPersons \
+    in this server that may be the person the `resource` parameter (a RelatedPerson) describes, \
+    with the parameters and the answer of Patient/$match. R4 defines $match on Patient only; this \
+    is the same operation for a RelatedPerson. Only RelatedPersons that are in use (`active` is not \
+    false) are returned. `resource.patient` (Patient/id, required) names the Patient the \
+    RelatedPerson relates to, and the operation is limited to the RelatedPersons of Patients \
+    whose managingOrganization is that Patient's. `certain` when an identifier has the same \
+    system and value; `probable` when the name and a phone number or email address \
+    (RelatedPerson.telecom) are the same; `possible` when the name is the same. A birth date \
+    that agrees raises the score, and one that differs is not a match, but neither is needed. \
+    Names, phone numbers and email addresses are compared as Patient/$match does. \
+    `onlyCertainMatches` and `count` work as they do there.";
 
 #[cfg(test)]
 mod tests {
@@ -1885,11 +2202,14 @@ mod tests {
             json!({"resourceType": "Patient", "birthDate": "1985", "name": [{"family": "Okafor", "given": ["Ada"]}]}),
             json!({"resourceType": "Patient", "identifier": [{"value": "1"}]}),
         ] {
-            assert!(!subject(patient.clone()).can_match(), "{patient}");
+            assert!(
+                !subject(patient.clone()).can_match(&Rules::STANDARD),
+                "{patient}"
+            );
         }
         assert!(subject(json!({"resourceType": "Patient",
             "identifier": [{"system": "urn:x", "value": "1"}]}))
-        .can_match());
+        .can_match(&Rules::STANDARD));
     }
 
     #[test]
@@ -2052,6 +2372,310 @@ mod tests {
         let answer = ask(&db, &catalog, &RULES).unwrap();
         assert_eq!(answer["total"], 0);
         assert!(answer.get("entry").is_none());
+    }
+
+    const CARER: Rules = Rules::RELATED_PERSON;
+
+    fn carer(value: Value) -> Subject {
+        Subject::read(&value, &CARER).unwrap()
+    }
+
+    fn carer_graded(input: Value, stored: Value) -> Option<(Grade, i32)> {
+        CARER.grade(&carer(input).compare(&carer(stored), &CARER))
+    }
+
+    fn related(name: Value, more: Value) -> Value {
+        let mut person = json!({"resourceType": "RelatedPerson", "name": [name]});
+        for (key, value) in more.as_object().unwrap() {
+            person[key] = value.clone();
+        }
+        person
+    }
+
+    #[test]
+    fn a_related_person_is_graded_on_who_they_are_and_needs_no_birth_date() {
+        let ada = json!({"family": "Okafor", "given": ["Ada"]});
+        let number = json!({"telecom": [{"system": "phone", "value": "+234 803 123 4567"}]});
+        let same_number = json!({"telecom": [{"system": "phone", "value": "08031234567"}]});
+        let name_only = related(ada.clone(), json!({}));
+        // The same number written two ways, and the same name: probable. No birth date is on
+        // either, which a Patient would need.
+        let probable = carer_graded(
+            related(ada.clone(), same_number.clone()),
+            related(ada.clone(), number.clone()),
+        );
+        assert_eq!(probable.map(|(grade, _)| grade), Some(Grade::Probable));
+        // The same name and nothing else: possible. A number with another name is no one.
+        let possible = carer_graded(name_only.clone(), related(ada.clone(), number.clone()));
+        assert_eq!(possible.map(|(grade, _)| grade), Some(Grade::Possible));
+        let other = json!({"family": "Bello", "given": ["Tunde"]});
+        assert_eq!(
+            carer_graded(related(other, same_number), related(ada.clone(), number)),
+            None
+        );
+        // The same name is a name for a Patient and nothing without the birth date.
+        assert_eq!(
+            graded(
+                json!({"name": [ada.clone()]}),
+                json!({"name": [ada.clone()]})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_birth_date_raises_a_score_and_a_different_one_refuses_everything_but_an_identifier() {
+        let ada = json!({"family": "Okafor", "given": ["Ada"]});
+        let born = |date: &str| related(ada.clone(), json!({"birthDate": date}));
+        let (_, plain) = carer_graded(related(ada.clone(), json!({})), born("1985-03-02")).unwrap();
+        let (grade, higher) = carer_graded(born("1985-03-02"), born("1985-03-02")).unwrap();
+        assert_eq!(grade, Grade::Possible);
+        assert_eq!(higher, plain + CARER.birth_date_agrees_score);
+        assert_eq!(carer_graded(born("1985-03-02"), born("1985-03-03")), None);
+        // A year, or a date on one side only, says nothing either way.
+        assert!(carer_graded(born("1985"), born("1985-03-02")).is_some());
+        // The identifier is still the same person.
+        let id = json!({"identifier": [{"system": "urn:x", "value": "1"}]});
+        let with_id = |date: &str| {
+            related(
+                ada.clone(),
+                json!({"identifier": id["identifier"], "birthDate": date}),
+            )
+        };
+        assert_eq!(
+            carer_graded(with_id("1985-03-02"), with_id("1999-09-09")).map(|(grade, _)| grade),
+            Some(Grade::Certain)
+        );
+    }
+
+    #[test]
+    fn a_related_person_is_found_by_the_numbers_it_may_be_stored_with_and_by_its_names() {
+        let subject = carer(related(
+            json!({"family": "Ékwé", "given": ["Chíoma Grace"]}),
+            json!({"telecom": [
+                {"system": "phone", "value": "0805 550 0001"},
+                {"system": "email", "value": "Chioma@Example.org"}]}),
+        ));
+        let candidates = Candidates::of(&subject, None, &CARER);
+        let asked = |parameter: &str| -> Vec<&str> {
+            candidates
+                .queries
+                .iter()
+                .filter(|(name, _)| *name == parameter)
+                .map(|(_, value)| value.as_str())
+                .collect()
+        };
+        assert_eq!(
+            asked("phone"),
+            [
+                "0805 550 0001",
+                "+2348055500001",
+                "2348055500001",
+                "08055500001",
+                "8055500001"
+            ]
+        );
+        assert_eq!(asked("email"), ["Chioma@Example.org", "chioma@example.org"]);
+        // Each name as written and each word of it as compared, lower case. One that begins with
+        // another is left to it: `ekwe` is not asked for twice.
+        assert_eq!(
+            asked("name"),
+            ["chioma", "chíoma grace", "ekwe", "grace", "ékwé"]
+        );
+        // A Patient is looked for by its birth date, and has no use for these.
+        let patient = subject_with_date();
+        let queries = Candidates::of(&patient, None, &RULES).queries;
+        assert_eq!(queries, [("birthdate", "1985-03-02".to_string())]);
+    }
+
+    fn subject_with_date() -> Subject {
+        subject(json!({
+            "resourceType": "Patient", "name": [{"family": "Okafor", "given": ["Ada"]}],
+            "birthDate": "1985-03-02",
+            "telecom": [{"system": "phone", "value": "0803 123 4567"}]
+        }))
+    }
+
+    #[test]
+    fn what_a_search_cannot_say_is_not_asked() {
+        assert_eq!(bare_token("Okafor"), Some("Okafor".to_string()));
+        for value in ["", "a,b", "a|b", "a\\b", "a$b", "a\u{1f}b"] {
+            assert_eq!(bare_token(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_related_person_names_the_patient_it_is_of_and_nothing_else_will_do() {
+        let of = |reference: Value| json!({"resourceType": "RelatedPerson", "patient": reference});
+        assert_eq!(
+            patient_of(&of(json!({"reference": "Patient/kid-1"}))).unwrap(),
+            "kid-1"
+        );
+        for bad in [
+            json!({"reference": "Patient/"}),
+            json!({"reference": "Patient/a/b"}),
+            json!({"reference": "Patient/a b"}),
+            json!({"reference": "kid-1"}),
+            json!({"reference": "https://example.org/Patient/kid-1"}),
+            json!({"reference": "#kid"}),
+            json!({"identifier": {"system": "urn:x", "value": "1"}}),
+        ] {
+            let error = patient_of(&of(bad.clone())).unwrap_err().to_string();
+            assert!(error.contains("RelatedPerson.patient"), "{bad}: {error}");
+        }
+        assert!(patient_of(&json!({"resourceType": "RelatedPerson"})).is_err());
+        // The request is read as a RelatedPerson, and a Patient is not one.
+        let args = |resource: Value| json!({"resource": resource});
+        let ok = json!({"resourceType": "RelatedPerson",
+            "patient": {"reference": "Patient/kid-1"},
+            "name": [{"family": "Eke", "given": ["Ngozi"]}]});
+        let request = Request::from_args(&args(ok), &CARER).unwrap();
+        assert_eq!(request.patient.as_deref(), Some("kid-1"));
+        assert_eq!(request.scope, None);
+        let error = Request::from_args(&args(json!({"resourceType": "Patient"})), &CARER);
+        assert!(error
+            .unwrap_err()
+            .to_string()
+            .contains("must be a RelatedPerson"));
+        let error = Request::from_args(
+            &args(json!({"resourceType": "RelatedPerson", "patient": {"reference": "Patient/k"}})),
+            &RULES,
+        );
+        assert!(error.unwrap_err().to_string().contains("must be a Patient"));
+    }
+
+    /// A store of one organization's Patient, an organization-less one, and `count` RelatedPersons of
+    /// the first who share a name, and one of the second.
+    fn carers_of(count: usize) -> (refhir_database::Database, Catalog) {
+        let (db, catalog) = store_of(0);
+        let put = |resource: Value| {
+            crate::run::import_resource(&db, &catalog, &resource).unwrap();
+        };
+        put(json!({"resourceType": "Organization", "id": "org-1"}));
+        put(json!({"resourceType": "Patient", "id": "kid-1",
+            "managingOrganization": {"reference": "Organization/org-1"}}));
+        put(json!({"resourceType": "Patient", "id": "kid-2"}));
+        for n in 0..count {
+            put(json!({
+                "resourceType": "RelatedPerson", "id": format!("c{n}"),
+                "patient": {"reference": "Patient/kid-1"},
+                "name": [{"family": "Eke", "given": ["Ngozi"]}]
+            }));
+        }
+        put(json!({
+            "resourceType": "RelatedPerson", "id": "elsewhere",
+            "patient": {"reference": "Patient/kid-2"},
+            "name": [{"family": "Eke", "given": ["Ngozi"]}]
+        }));
+        (db, catalog)
+    }
+
+    fn ask_carer(
+        db: &refhir_database::Database,
+        catalog: &Catalog,
+        patient: &str,
+        rules: &Rules,
+    ) -> Result<Value, FhirError> {
+        let args = json!({"resource": {
+            "resourceType": "RelatedPerson", "patient": {"reference": patient},
+            "name": [{"family": "Eke", "given": ["Ngozi"]}]}});
+        let mut tx = db.begin();
+        let mut request = Request::from_args(&args, rules)?;
+        request.resolve_scope(&mut tx, catalog)?;
+        find(&mut tx, catalog, &request, rules)
+    }
+
+    #[test]
+    fn the_scope_of_a_related_person_is_the_organization_of_its_patient() {
+        let (db, catalog) = carers_of(3);
+        let ids = |answer: &Value| -> Vec<String> {
+            answer["entry"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|entry| entry["resource"]["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let answer = ask_carer(&db, &catalog, "Patient/kid-1", &CARER).unwrap();
+        assert_eq!(ids(&answer), ["c0", "c1", "c2"]);
+        // A Patient with no organization limits nothing.
+        let answer = ask_carer(&db, &catalog, "Patient/kid-2", &CARER).unwrap();
+        assert_eq!(answer["total"], 4);
+        // One that is not there, or is deleted, is refused: it cannot say whose organization.
+        for gone in ["Patient/nobody", "Patient/kid-3"] {
+            let error = ask_carer(&db, &catalog, gone, &CARER).unwrap_err();
+            assert!(
+                error.to_string().contains("RelatedPerson.patient"),
+                "{error}"
+            );
+        }
+        crate::run::run(&db, &catalog, "Patient/delete", &json!({"id": "kid-1"})).unwrap();
+        assert!(ask_carer(&db, &catalog, "Patient/kid-1", &CARER).is_err());
+    }
+
+    #[test]
+    fn other_organizations_related_persons_do_not_count_towards_the_most_it_compares() {
+        let (db, catalog) = carers_of(3);
+        let tight = Rules {
+            max_candidates: 3,
+            page: 2,
+            ..CARER
+        };
+        // The three of the organization are compared; the one of another is dropped as it is read.
+        assert_eq!(
+            ask_carer(&db, &catalog, "Patient/kid-1", &tight).unwrap()["total"],
+            3
+        );
+        // Every one of them is more than it compares, wherever it is.
+        match ask_carer(&db, &catalog, "Patient/kid-2", &tight) {
+            Err(FhirError::Unprocessable(outcome)) => {
+                assert_eq!(outcome["issue"][0]["code"], "too-costly");
+                let text = outcome["issue"][0]["diagnostics"].as_str().unwrap();
+                assert!(
+                    text.contains("RelatedPersons") && text.contains('3'),
+                    "{text}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn what_it_reads_in_other_organizations_is_bounded_too() {
+        let (db, catalog) = carers_of(5);
+        let reading = Rules {
+            max_reads: 4,
+            page: 2,
+            ..CARER
+        };
+        match ask_carer(&db, &catalog, "Patient/kid-1", &reading) {
+            Err(FhirError::Unprocessable(outcome)) => {
+                assert_eq!(outcome["issue"][0]["code"], "too-costly");
+                assert!(outcome["issue"][0]["diagnostics"]
+                    .as_str()
+                    .unwrap()
+                    .contains('4'));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_capability_statement_lists_the_operation_on_related_person_with_its_own_definition() {
+        let mut statement = json!({"rest": [{"resource": [
+            {"type": "RelatedPerson"}, {"type": "Patient"}, {"type": "Observation"}
+        ]}]});
+        annotate_capability(&mut statement);
+        let resources = statement["rest"][0]["resource"].as_array().unwrap();
+        let related = &resources[0]["operation"][0];
+        assert_eq!(related["name"], "match");
+        assert_eq!(related["definition"], RELATED_PERSON_DEFINITION);
+        assert!(related["documentation"]
+            .as_str()
+            .unwrap()
+            .contains("resource.patient"));
+        assert_eq!(resources[1]["operation"][0]["definition"], DEFINITION);
+        assert!(resources[2].get("operation").is_none());
     }
 
     #[test]
@@ -2593,6 +3217,22 @@ mod tests {
             (
                 crate::package::extra_dir(),
                 "SearchParameter-Patient-birthdate.json",
+            ),
+            (
+                crate::package::r4_dir(),
+                "SearchParameter-RelatedPerson-identifier.json",
+            ),
+            (
+                crate::package::r4_dir(),
+                "SearchParameter-RelatedPerson-name.json",
+            ),
+            (
+                crate::package::r4_dir(),
+                "SearchParameter-RelatedPerson-active.json",
+            ),
+            (
+                crate::package::r4_dir(),
+                "SearchParameter-RelatedPerson-patient.json",
             ),
         ];
         for (original, file) in pairs {
