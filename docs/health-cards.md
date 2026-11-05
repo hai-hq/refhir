@@ -89,6 +89,28 @@ When the patient has nothing to put in the card, the answer is an empty `Paramet
 
 Resources that are entered in error or refuted are not put in a card.
 
+### Over /sync
+
+A client that talks to the server over [`/sync`](sync-protocol.md) asks for a card with a
+`Mutation`, the patient's id as `id` and the same `Parameters` as `resource`:
+
+```json
+{"type": "Mutation", "requestId": 9, "udfPath": "Patient/$health-cards-issue", "args": {"id": "p1", "resource": {"resourceType": "Parameters", "parameter": [
+  {"name": "credentialType", "valueUri": "Immunization"}
+]}}}
+```
+
+The `result` of the `MutationResponse` is the `Parameters` above, made by the same code as the REST
+answer: signed with the same key under the same `kid`, with the same `iss` and the same
+`resourceLink` addresses. On a tenant it is the tenant's key and issuer, and a key replaced or an
+issuer changed while the socket is open applies to the next card. A refusal is REST's
+`OperationOutcome`, with `success: false`: without a key, the `not-supported` that REST answers with a
+`501`.
+
+A card cannot be a live query. Each run signs a new one, so a subscription would issue a card on
+every write to the patient's record. An `Add` of `Patient/$health-cards-issue` is answered
+`QueryFailed` with `code` `not-supported`; ask for the card when it is needed.
+
 ## What a card holds
 
 A card is a compact JWS signed with ES256. Its header names the key (`kid`, the RFC 7638
@@ -320,7 +342,8 @@ that must be told apart by their `iss`. The server does A today. B is not built.
 
 The caller needs to be able to read `Patient`, and the card holds only the kinds of resource their
 scopes let them read. Under SMART a token that is tied to one patient asks for that patient's
-card; another patient's is a `403`. See [SMART on FHIR](smart.md).
+card; another patient's is a `403`. See [SMART on FHIR](smart.md). Over `/sync` the scopes are the
+same, and a refusal is a `MutationResponse` whose `OperationOutcome` says `forbidden`.
 
 ## Look after the key
 

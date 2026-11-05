@@ -171,6 +171,7 @@ Names you may send as a `Mutation`:
 | `Patient/$match` | The `Parameters` resource of the [REST operation](fhir-api.md#finding-a-patient-patientmatch) as `args`. The answer is the `searchset` Bundle of matches, as `result`. |
 | `RelatedPerson/$match` | The same, for [RelatedPersons](fhir-api.md#finding-a-carer-or-parent-relatedpersonmatch). |
 | `ChargeItemDefinition/$apply` | `{"id": "...", "resource": <Parameters>}`: the definition's id, and the `Parameters` the [REST operation](fhir-api.md#pricing-a-charge-item-chargeitemdefinitionapply) takes. The answer is the draft `Invoice`. |
+| `Patient/$health-cards-issue` | `{"id": "...", "resource": <Parameters>}`: the patient's id, and the `Parameters` the [REST operation](health-cards.md#ask-for-a-card) takes (`credentialType`, and optionally `credentialValueSet`, `includeIdentityClaim` and `_since`). The answer is the `Parameters` REST answers: a signed `verifiableCredential` for each card and a `resourceLink` for each resource in it. See [Health Cards over /sync](#health-cards-over-sync). |
 
 An operation that REST sends to one instance (`POST ChargeItemDefinition/[id]/$apply`) takes the id as `id` and the body as `resource`, as `update` does. One that REST sends to a type (`POST Patient/$match`) takes the body as `args`.
 
@@ -183,9 +184,23 @@ An operation that REST sends to one instance (`POST ChargeItemDefinition/[id]/$a
 
 **With SMART on**, `$match` and `$apply` are not available here. The scope table that `/sync` checks every operation against has no entry for them, so a `Mutation` answers `forbidden` with the text `unsupported operation $match` (or `$apply`), whatever the token's scopes. Use REST for them. They need on REST what the pages above say: a scope that may search Patients for `$match`, and a scope that may read the definition, the ChargeItem and any Account for `$apply`. With SMART off they run as they do on REST, with no scopes to check.
 
+#### Health Cards over /sync
+
+`Patient/$health-cards-issue` answers over `/sync` exactly what it answers over REST, because both run the same code: the same signed cards, the same `iss`, signed with the same key under the same `kid`, and `resourceLink`s at the same addresses. On a tenant of `refhir --all-tenants` that is the tenant's own key and issuer, as its REST answers: an issuer set with `PATCH /admin/tenants/{name}` or a key replaced with `.../health-cards/rotate` applies to the next card a socket asks for, even one opened before the change. Only `nbf`, the time the card was signed, differs between two cards of the same record.
+
+```json
+{"type": "Mutation", "requestId": 9, "udfPath": "Patient/$health-cards-issue", "args": {"id": "p1", "resource": {"resourceType": "Parameters", "parameter": [
+  {"name": "credentialType", "valueUri": "Immunization"}
+]}}}
+```
+
+A refusal is the `OperationOutcome` REST answers, as the `result` of a `MutationResponse` with `success: false`: `not-supported` when the server or tenant has no Health Cards key (REST's `501`) or the type is not `Patient` (REST's `400`), and the engine's own outcome for a request it cannot meet, such as no `credentialType` or a patient that does not exist. With SMART on, it needs what REST needs, a scope that may read the patient, and a patient-scoped token is issued only its own patient's cards; otherwise `forbidden`.
+
+It cannot be subscribed. Each run signs a new card, so a live query would issue one on every write the patient's record sees, each pushed to the client unasked. A card is issued when it is asked for, so an `Add` of it is answered `QueryFailed` with `code` `not-supported` before anything runs (`Patient/$health-cards-issue signs a new card each time it runs and cannot be subscribed: send it as a Mutation`). Send it as a `Mutation`, and subscribe to the records it reads if the client needs to know when to ask again.
+
 A `Mutation` is not limited to writes: any name above is accepted and returns its result with a `ts`. An unknown operation fails with a message such as `unsupported operation Patient/frobnicate`. With SMART on, a name the scope table does not know is refused as `unsupported operation {op}`, and a name with no `/` as `bad operation {path}`.
 
-Only read-only names can be subscribed. A write name, or a Bundle, is refused before it runs, with SMART on or off (`{op} writes and cannot be subscribed`, `bundle cannot be subscribed`), and nothing is written. An operation that is read-only by name but writes anyway is answered `QueryFailed` (`{path} writes and cannot be subscribed`) after it ran, and its write is not undone.
+Only read-only names can be subscribed. A write name, or a Bundle, is refused before it runs, with SMART on or off (`{op} writes and cannot be subscribed`, `bundle cannot be subscribed`), and nothing is written. An operation that is read-only by name but writes anyway is answered `QueryFailed` (`{path} writes and cannot be subscribed`) after it ran, and its write is not undone. One read-only name is never subscribed: `Patient/$health-cards-issue`, which signs a new card each time it runs, is refused before it runs with `code` `not-supported` (see [Health Cards over /sync](#health-cards-over-sync)), and a query the client held under the same `queryId` is kept.
 
 ## Server-to-client messages
 
@@ -289,7 +304,7 @@ When the server ends a connection itself, as after a `FatalError`, it does not s
 
 `OperationOutcome` issue codes the server produces for mutations: `forbidden` (scope), `throttled`, `transient` (a replica that cannot reach the primary), `not-found`, `deleted`, `conflict`, `invalid`, `not-supported`, `exception`, or the issues of a validation outcome. Scope refusals are plain text in `diagnostics`, such as `scope does not allow Patient/create`.
 
-`QueryFailed.error` strings written by the server itself include `{path} writes and cannot be subscribed`, `scope does not allow {path}`, `invalid value "{value}" for search parameter {name} on {type}: {what was expected}` (a search value that cannot be read as its type, such as a date that is not one: a live query is never lenient, so it fails now rather than staying empty, and `Prefer: handling=lenient` has no say in it), `token is limited to a different patient`, `too many live queries: a connection may hold {cap}`, `query stayed stale` (the server gave up after 8 attempts to take a consistent snapshot), and the rate and quota messages in the next section.
+`QueryFailed.error` strings written by the server itself include `{path} writes and cannot be subscribed`, `{path} signs a new card each time it runs and cannot be subscribed: send it as a Mutation`, `scope does not allow {path}`, `invalid value "{value}" for search parameter {name} on {type}: {what was expected}` (a search value that cannot be read as its type, such as a date that is not one: a live query is never lenient, so it fails now rather than staying empty, and `Prefer: handling=lenient` has no say in it), `token is limited to a different patient`, `too many live queries: a connection may hold {cap}`, `query stayed stale` (the server gave up after 8 attempts to take a consistent snapshot), and the rate and quota messages in the next section.
 
 ### Query failure codes
 
@@ -303,6 +318,7 @@ When the server ends a connection itself, as after a `FatalError`, it does not s
 | `throttled` | A rate limit or quota refused the `Add`. Trying again later can work |
 | `too-costly` | A cap refused it: `max_live_queries`, or an operation the server will not run because the answer would be too large to be complete (`Patient/$match` over more candidates than it compares) |
 | `invalid` | The operation or its arguments cannot be run as a live query: a write name or a Bundle, a search value that cannot be read, a missing argument |
+| `not-supported` | The operation is read-only but is never run as a live query: `Patient/$health-cards-issue`, which signs a new card each time it runs. Send it as a `Mutation` |
 | `transient` | The server could not answer now (`query stayed stale`, or a replica with no primary) and may later |
 | `exception` | The server failed |
 

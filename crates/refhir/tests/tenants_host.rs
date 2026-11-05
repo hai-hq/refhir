@@ -985,6 +985,40 @@ fn issue_card(host: &Host, tenant: &str) -> String {
         .to_string()
 }
 
+/// The `MutationResponse` to `Patient/$health-cards-issue` for p1, sent over `tenant`'s `/sync`.
+fn issue_over_sync(host: &Host, tenant: &str) -> Value {
+    let url = format!(
+        "{}/t/{tenant}/sync",
+        host.base().replacen("http://", "ws://", 1)
+    );
+    let (mut socket, _) = tungstenite::connect(url).expect("open /sync");
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type": "Mutation", "requestId": 1, "udfPath": "Patient/$health-cards-issue",
+                "args": {"id": "p1", "resource": {"resourceType": "Parameters",
+                    "parameter": [{"name": "credentialType", "valueUri": "Immunization"}]}}})
+            .to_string(),
+        ))
+        .unwrap();
+    loop {
+        if let tungstenite::Message::Text(text) = socket.read().expect("a reply") {
+            let reply: Value = serde_json::from_str(&text).unwrap();
+            if reply["type"] == "MutationResponse" {
+                return reply;
+            }
+        }
+    }
+}
+
+/// The card of a `/sync` answer to `$health-cards-issue`.
+fn synced_card(tenant: &str, reply: &Value) -> String {
+    assert_eq!(reply["success"], true, "{tenant}: {reply}");
+    reply["result"]["parameter"][0]["valueString"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{tenant} issued no card over /sync: {reply}"))
+        .to_string()
+}
+
 /// The key set `host` publishes for `tenant`, by path.
 fn key_set(host: &Host, tenant: &str) -> Value {
     let (status, body) = call(
@@ -1142,6 +1176,15 @@ fn each_tenant_names_its_own_issuer_and_keeps_every_key_it_replaced() {
             .unwrap_or_else(|| panic!("{name}'s card does not verify against its own key set"));
         assert_eq!(claims["iss"], expected, "{name}");
         assert_eq!(kids(set).len(), 1, "{name}");
+        // Over `/sync`, the same card from the same key: only when it was signed differs.
+        let synced = synced_card(name, &issue_over_sync(&host, name));
+        assert_eq!(card_kid(&synced), card_kid(&card), "{name}");
+        let mut synced_claims = verified_claims(&synced, set)
+            .unwrap_or_else(|| panic!("{name}'s /sync card does not verify"));
+        let mut claims = claims;
+        synced_claims.as_object_mut().unwrap().remove("nbf");
+        claims.as_object_mut().unwrap().remove("nbf");
+        assert_eq!(synced_claims, claims, "{name}");
     }
     // Two tenants of one issuer still sign with a key each, and no tenant's card checks
     // against another's.
@@ -1237,16 +1280,18 @@ fn each_tenant_names_its_own_issuer_and_keeps_every_key_it_replaced() {
     );
 
     // Turning cards on for a tenant that had none: it is opened again and then issues them.
-    assert_eq!(
-        call(
-            "POST",
-            &format!("{}/t/nocards/Patient/p1/$health-cards-issue", host.base()),
-            &[],
-            Some(&json!({"resourceType": "Parameters"}))
-        )
-        .0,
-        501
+    let (status, no_key) = call(
+        "POST",
+        &format!("{}/t/nocards/Patient/p1/$health-cards-issue", host.base()),
+        &[],
+        Some(&json!({"resourceType": "Parameters",
+            "parameter": [{"name": "credentialType", "valueUri": "Immunization"}]})),
     );
+    assert_eq!(status, 501, "{no_key}");
+    // Over `/sync`, the same OperationOutcome.
+    let refused = issue_over_sync(&host, "nocards");
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(refused["result"], no_key);
     // An issuer alone does not turn them on: it is for a tenant that issues cards.
     let (status, body) = host.admin(
         "PATCH",
@@ -1343,6 +1388,12 @@ fn each_tenant_names_its_own_issuer_and_keeps_every_key_it_replaced() {
     let after = issue_card(&host, "plain");
     assert_eq!(card_kid(&before), first[0]);
     assert_eq!(card_kid(&after), second);
+    let synced = synced_card("plain", &issue_over_sync(&host, "plain"));
+    assert_eq!(card_kid(&synced), second, "/sync signs with the new key");
+    assert_eq!(
+        verified_claims(&synced, &set).unwrap()["iss"],
+        own_address("plain")
+    );
     assert!(
         verified_claims(&before, &set).is_some(),
         "signed before the rotation"

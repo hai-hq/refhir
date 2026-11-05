@@ -538,6 +538,15 @@ pub fn guard_patient_operation(
             }
         }
     }
+    // Its body is parameters, which belong to no patient's compartment, as over REST: the
+    // patient it reads is the id, checked above, and there must be one.
+    if op == "$health-cards-issue" {
+        let named = args
+            .get("id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|id| !id.is_empty());
+        return if named { Ok(()) } else { Err(OUTSIDE.into()) };
+    }
     if let Some(resource_body) = args.get("resource") {
         if !body_in_patient(db, catalog, resource_body, patient_id)? {
             return Err(OUTSIDE.into());

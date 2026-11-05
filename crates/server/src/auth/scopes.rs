@@ -97,6 +97,9 @@ pub(crate) fn interaction_for(op: &str, subscribe: bool) -> Result<&'static str,
         "$next-question",
         "$behavior",
         "$extract",
+        // It reads the patient's record and stores nothing, as over REST. It is never subscribed:
+        // `/sync` refuses that before it asks here.
+        "$health-cards-issue",
     ];
     const SEARCH_OPS: &[&str] = &["search"];
     const CREATE_OPS: &[&str] = &["create", "conditional-create"];

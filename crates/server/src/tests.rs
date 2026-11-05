@@ -3384,6 +3384,43 @@ async fn access_token_query_is_decoded_and_patient_compartment_holds() {
     assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
 }
 
+#[test]
+fn a_patients_token_asks_for_its_own_patients_health_card_by_id() {
+    let (db, catalog, _) = memory();
+    let loaded = catalog.read().expect("catalog");
+    for id in ["p1", "p2"] {
+        refhir_fhir::import_resource(&db, &loaded, &patient(id)).unwrap();
+    }
+    let parameters = json!({"resourceType": "Parameters", "parameter": [
+        {"name": "credentialType", "valueUri": "Immunization"}
+    ]});
+    let guard = |args: Value| {
+        crate::auth::guard_patient_operation(
+            &db,
+            &loaded,
+            "Patient/p1",
+            "Patient/$health-cards-issue",
+            &args,
+        )
+    };
+    // The body is parameters, which are in no patient's compartment: the id is what is checked.
+    assert_eq!(
+        guard(json!({"id": "p1", "resource": parameters.clone()})),
+        Ok(())
+    );
+    for args in [
+        json!({"id": "p2", "resource": parameters.clone()}),
+        json!({"resource": parameters.clone()}),
+        json!({"id": "", "resource": parameters}),
+    ] {
+        assert_eq!(
+            guard(args.clone()),
+            Err("token is limited to a different patient".to_string()),
+            "{args}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn patient_scope_cannot_leave_its_compartment() {
     let (db, catalog, store) = memory();
@@ -8250,6 +8287,35 @@ fn cards_app(signing: bool) -> axum::Router {
 }
 
 fn cards_app_signing_with(key: Option<crate::IssuerKey>) -> axum::Router {
+    let (db, catalog, store) = cards_parts();
+    let smart = Arc::new(crate::auth::SmartStore::with_defaults());
+    smart.install_token("p1-reader", &["patient/*.read"], Some("p1"));
+    smart.install_token("admin", &["user/*.read"], None);
+    smart.install_token("observations-only", &["user/Observation.read"], None);
+    crate::app_with(
+        db,
+        catalog,
+        store,
+        crate::ServerConfig {
+            auth: true,
+            smart_demo_login: true,
+            export_dir: "export".into(),
+            terminology_urls: Vec::new(),
+            sdc_archiver: false,
+            smart: Some(smart),
+            public_url: Some("https://refhir.example.org/fhir".into()),
+            health_cards: key.map(Arc::new),
+            ..Default::default()
+        },
+    )
+}
+
+/// The records the card tests issue cards from, on the R4 release.
+pub(crate) fn cards_parts() -> (
+    Arc<Database>,
+    Arc<RwLock<Catalog>>,
+    Arc<dyn ConformanceStore>,
+) {
     let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
     let db = Arc::new(Database::open(store.clone()).unwrap());
     let catalog = Arc::new(RwLock::new(Catalog::empty()));
@@ -8277,36 +8343,17 @@ fn cards_app_signing_with(key: Option<crate::IssuerKey>) -> axum::Router {
             refhir_fhir::import_resource(&db, &loaded, &resource).unwrap();
         }
     }
-    let smart = Arc::new(crate::auth::SmartStore::with_defaults());
-    smart.install_token("p1-reader", &["patient/*.read"], Some("p1"));
-    smart.install_token("admin", &["user/*.read"], None);
-    smart.install_token("observations-only", &["user/Observation.read"], None);
-    crate::app_with(
-        db,
-        catalog,
-        store,
-        crate::ServerConfig {
-            auth: true,
-            smart_demo_login: true,
-            export_dir: "export".into(),
-            terminology_urls: Vec::new(),
-            sdc_archiver: false,
-            smart: Some(smart),
-            public_url: Some("https://refhir.example.org/fhir".into()),
-            health_cards: key.map(Arc::new),
-            ..Default::default()
-        },
-    )
+    (db, catalog, store)
 }
 
-fn card_parameters(extra: Value) -> Value {
+pub(crate) fn card_parameters(extra: Value) -> Value {
     let mut parameter = vec![json!({"name": "credentialType", "valueUri": "Immunization"})];
     parameter.extend(extra.as_array().cloned().unwrap_or_default());
     json!({"resourceType": "Parameters", "parameter": parameter})
 }
 
 /// The claims of a card, once its signature has been checked against `jwks`.
-fn checked_claims(card: &str, jwks: &Value) -> Value {
+pub(crate) fn checked_claims(card: &str, jwks: &Value) -> Value {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
@@ -8375,6 +8422,200 @@ async fn a_server_with_a_signing_key_issues_cards_that_its_published_key_checks(
     a_health_card_request_that_cannot_be_met_is_refused_and_says_why(&app).await;
     a_health_card_for_what_is_new_holds_only_what_is_new(&app).await;
     a_server_with_a_key_says_it_issues_cards(&app).await;
+    a_health_card_over_sync_is_the_card_rest_issues(&app).await;
+    over_sync_a_health_card_is_refused_as_rest_refuses_it(&app).await;
+}
+
+/// One `Mutation` on a socket of its own at `url`: the `MutationResponse`.
+pub(crate) async fn sync_mutation(url: &str, path: &str, args: Value) -> Value {
+    let (mut socket, _) = connect(url).await;
+    socket
+        .send(Message::Text(
+            json!({"type": "Mutation", "requestId": 1, "udfPath": path, "args": args}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let reply = next_json(&mut socket).await;
+    assert_eq!(reply["type"], "MutationResponse", "{reply}");
+    reply
+}
+
+/// The JWS header of a card: which key signed it, and how.
+pub(crate) fn card_header(card: &str) -> Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    let header = card.split('.').next().unwrap();
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header).unwrap()).unwrap()
+}
+
+/// What two answers of `$health-cards-issue` must share: the claims of each card but when it was
+/// signed, its header, and every `resourceLink`.
+pub(crate) fn assert_same_cards(over_sync: &Value, over_rest: &Value, jwks: &Value) {
+    let (synced, rested) = (
+        over_sync["parameter"].as_array().unwrap(),
+        over_rest["parameter"].as_array().unwrap(),
+    );
+    assert_eq!(synced.len(), rested.len(), "{over_sync}\n{over_rest}");
+    for (from_sync, from_rest) in synced.iter().zip(rested) {
+        assert_eq!(from_sync["name"], from_rest["name"]);
+        if from_sync["name"] != "verifiableCredential" {
+            assert_eq!(from_sync, from_rest, "a resourceLink");
+            continue;
+        }
+        let (card, rest_card) = (
+            from_sync["valueString"].as_str().unwrap(),
+            from_rest["valueString"].as_str().unwrap(),
+        );
+        assert_eq!(card_header(card), card_header(rest_card));
+        let mut claims = checked_claims(card, jwks);
+        let mut rest_claims = checked_claims(rest_card, jwks);
+        assert!(claims["nbf"].as_u64().unwrap() >= rest_claims["nbf"].as_u64().unwrap() - 5);
+        claims.as_object_mut().unwrap().remove("nbf");
+        rest_claims.as_object_mut().unwrap().remove("nbf");
+        assert_eq!(claims, rest_claims);
+    }
+}
+
+/// `$health-cards-issue` sent as a `/sync` Mutation answers the signed card REST answers.
+async fn a_health_card_over_sync_is_the_card_rest_issues(app: &axum::Router) {
+    let addr = sync_gaps::serve(app.clone()).await;
+    let jwks = send(
+        app,
+        "GET",
+        "/health-cards/.well-known/jwks.json",
+        None,
+        None,
+    )
+    .await
+    .body;
+    let args = json!({"id": "p1", "resource": card_parameters(json!([]))});
+    let synced = sync_mutation(
+        &format!("ws://{addr}/sync?access_token=admin"),
+        "Patient/$health-cards-issue",
+        args.clone(),
+    )
+    .await;
+    assert_eq!(synced["success"], true, "{synced}");
+    let over_sync = &synced["result"];
+    assert_eq!(over_sync["resourceType"], "Parameters");
+    assert_eq!(over_sync["parameter"][0]["name"], "verifiableCredential");
+    let card = over_sync["parameter"][0]["valueString"].as_str().unwrap();
+    let claims = checked_claims(card, &jwks);
+    assert_eq!(
+        claims["iss"],
+        "https://refhir.example.org/fhir/health-cards"
+    );
+    assert_eq!(card_header(card)["kid"], jwks["keys"][0]["kid"]);
+    assert!(over_sync["parameter"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|parameter| parameter["name"] == "resourceLink"));
+
+    let rest = post_as(
+        app,
+        "admin",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(rest.0, StatusCode::OK, "{}", rest.1);
+    assert_same_cards(over_sync, &rest.1, &jwks);
+
+    // A patient's own token is issued its own card over the socket, as over REST.
+    let own = sync_mutation(
+        &format!("ws://{addr}/sync?access_token=p1-reader"),
+        "Patient/$health-cards-issue",
+        args.clone(),
+    )
+    .await;
+    assert_eq!(own["success"], true, "{own}");
+    assert_eq!(
+        own["result"]["parameter"][0]["name"],
+        "verifiableCredential"
+    );
+
+    // A live query of it is refused: each run would sign a new card.
+    let (mut socket, _) = connect(&format!("ws://{addr}/sync?access_token=admin")).await;
+    sync_gaps::add(&mut socket, 0, 1, "Patient/$health-cards-issue", args).await;
+    let reply = next_json(&mut socket).await;
+    let failed = &reply["modifications"][0];
+    assert_eq!(failed["type"], "QueryFailed", "{reply}");
+    assert_eq!(failed["code"], "not-supported", "{reply}");
+    assert!(
+        failed["error"].as_str().unwrap().contains("Mutation"),
+        "{reply}"
+    );
+}
+
+/// What REST refuses, `/sync` refuses with the same OperationOutcome; and the scopes are REST's.
+async fn over_sync_a_health_card_is_refused_as_rest_refuses_it(app: &axum::Router) {
+    let addr = sync_gaps::serve(app.clone()).await;
+    let url = |token: &str| format!("ws://{addr}/sync?access_token={token}");
+    for (resource_type, id, parameters) in [
+        // Not a Patient.
+        ("Immunization", "i1", card_parameters(json!([]))),
+        // A request the engine cannot meet.
+        (
+            "Patient",
+            "p1",
+            json!({"resourceType": "Parameters", "parameter": []}),
+        ),
+        // A patient that is not there.
+        ("Patient", "nobody", card_parameters(json!([]))),
+    ] {
+        let rest = post_as(
+            app,
+            "admin",
+            &format!("/{resource_type}/{id}/$health-cards-issue"),
+            &parameters,
+        )
+        .await;
+        assert!(rest.0.is_client_error(), "{}", rest.1);
+        let synced = sync_mutation(
+            &url("admin"),
+            &format!("{resource_type}/$health-cards-issue"),
+            json!({"id": id, "resource": parameters}),
+        )
+        .await;
+        assert_eq!(synced["success"], false, "{synced}");
+        assert_eq!(synced["result"], rest.1, "{resource_type}/{id}");
+    }
+
+    // A token that may not read the patient is refused over both.
+    let rest = post_as(
+        app,
+        "observations-only",
+        "/Patient/p1/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(rest.0, StatusCode::FORBIDDEN, "{}", rest.1);
+    for (token, id) in [("observations-only", "p1"), ("p1-reader", "p2")] {
+        let refused = sync_mutation(
+            &url(token),
+            "Patient/$health-cards-issue",
+            json!({"id": id, "resource": card_parameters(json!([]))}),
+        )
+        .await;
+        assert_eq!(refused["success"], false, "{token}: {refused}");
+        assert_eq!(
+            refused["result"]["issue"][0]["code"], "forbidden",
+            "{token}: {refused}"
+        );
+        assert!(
+            refused["result"].get("parameter").is_none(),
+            "{token}: {refused}"
+        );
+    }
+    let rest = post_as(
+        app,
+        "p1-reader",
+        "/Patient/p2/$health-cards-issue",
+        &card_parameters(json!([])),
+    )
+    .await;
+    assert_eq!(rest.0, StatusCode::FORBIDDEN, "{}", rest.1);
 }
 
 #[tokio::test]
@@ -8704,6 +8945,16 @@ async fn a_server_without_a_signing_key_issues_no_cards_and_does_not_say_it_does
         .as_str()
         .unwrap()
         .contains("no signing key"));
+    // Over `/sync`, the same OperationOutcome, and no selection of the record unsigned.
+    let addr = sync_gaps::serve(app.clone()).await;
+    let synced = sync_mutation(
+        &format!("ws://{addr}/sync?access_token=admin"),
+        "Patient/$health-cards-issue",
+        json!({"id": "p1", "resource": card_parameters(json!([]))}),
+    )
+    .await;
+    assert_eq!(synced["success"], false, "{synced}");
+    assert_eq!(synced["result"], reply.1);
     let keys = send(
         &app,
         "GET",
