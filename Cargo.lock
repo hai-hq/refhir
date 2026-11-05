@@ -1535,7 +1535,7 @@ name = "refhir"
 version = "0.0.7"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "flate2",
  "postgres",
  "refhir-database",
@@ -1677,7 +1677,7 @@ name = "refhir-server"
 version = "0.0.7"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "flate2",
  "futures-util",
  "hmac 0.12.1",
