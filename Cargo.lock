@@ -1532,7 +1532,7 @@ dependencies = [
 
 [[package]]
 name = "refhir"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1560,14 +1560,14 @@ dependencies = [
 
 [[package]]
 name = "refhir-cql"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "refhir-database"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "refhir-persistence",
  "refhir-sqlite",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-fhir"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "flate2",
  "hmac 0.12.1",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-fhirpath"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "regex",
  "roxmltree",
@@ -1617,7 +1617,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-map"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "refhir-fhirpath",
  "serde_json",
@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-persistence"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "hmac 0.12.1",
  "refhir-types",
@@ -1637,7 +1637,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-postgres"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "percent-encoding",
  "postgres",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-sdc"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "refhir-cql",
  "refhir-fhirpath",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-sdc-wasm"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "refhir-sdc",
  "serde_json",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-server"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1704,7 +1704,7 @@ dependencies = [
 
 [[package]]
 name = "refhir-sqlite"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "libc",
  "refhir-persistence",
@@ -1716,11 +1716,11 @@ dependencies = [
 
 [[package]]
 name = "refhir-types"
-version = "0.0.6"
+version = "0.0.7"
 
 [[package]]
 name = "refhir-validate"
-version = "0.0.6"
+version = "0.0.7"
 dependencies = [
  "refhir-fhirpath",
  "regex",
