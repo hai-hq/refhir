@@ -340,13 +340,16 @@ curl -X PATCH "$REFHIR/admin/tenants/acme-1" -H "authorization: Bearer $ADMIN_TO
 
 It is written out in full (`{tenant}` is for the host's template only), and must be an absolute
 `http` or `https` URL with a host and no user name, query or fragment. A trailing slash is dropped,
-and one that is not valid is a `400` and changes nothing. `"public_url": null` takes it away, so the
-template makes the address again. The tenant's server names it wherever it would name the
+and one that is not valid is a `400` and changes nothing. An address another tenant is reached at
+(its own, or the one the template makes for it) is a `409`. `"public_url": null` takes it away, so
+the template makes the address again. The tenant's server names it wherever it would name the
 template's address: SMART discovery, the token issuer and audience, Bundle and `/export` links, and
-the `iss` of its Health Cards. A change is served from the tenant's next request on, by every
-process that serves it, with no restart, and is recorded in the tenant's audit trail with the
-subtype `public-url`. `GET /admin/tenants/{name}` reports the address in effect as `public_url`,
-and the tenant's own, when it has one, as `settings.public_url`.
+the `iss` of its Health Cards (a tenant that issues cards under an `http` address is logged as a
+warning, since verifiers accept only `https`). A change is served from the tenant's next request
+on, `/sync` sockets that are already open included, by every process that serves it, with no
+restart. When the [audit trail](governance.md) is on, it is recorded there with the subtype
+`public-url`. `GET /admin/tenants/{name}` reports the address in effect as `public_url`, and the
+tenant's own, when it has one, as `settings.public_url`.
 
 It changes only the address the tenant names, not how a request reaches it. The process still finds
 the tenant by its path or host name, so the gateway sends `…/fhir/acme_1/Patient/1` on to
@@ -358,7 +361,10 @@ still name the old address as `iss`, and a verifier fetches their keys from
 for as long as those cards are in use, or give the tenant a
 [Health Cards issuer](health-cards.md#a-tenants-issuer-and-keys) that does not move. Access tokens
 already issued keep working, but a SMART client should read `/.well-known/smart-configuration` again:
-a new authorization's `aud` and a `private_key_jwt` assertion have to name the new address.
+a new authorization's `aud` and a `private_key_jwt` assertion have to name the new address. With
+`[smart.oidc]` and no `redirect_uri` of its own, the tenant's sign-in callback is
+`[address]/oauth/oidc/callback`, so it moves too: register the new one with the identity provider
+before the change, or sign-ins fail.
 
 With `smart` on, the response also carries the tenant's `registration_token` and the
 `confidential` client's secret, which are the only time the API hands them out (they can be made
@@ -380,7 +386,8 @@ On a replica, a request that changes tenants is sent on to the primary (`--prima
 write is; a standby answers `503` until it has taken over.
 
 `refhir tenant` does the same against the database, without the process: `create` takes the same
-settings as flags, `delete` the grace period, an export directory and `--yes`, and the processes
+settings as flags (except a tenant's own `public_url`, which only the admin API sets), `delete` the
+grace period, an export directory and `--yes`, and the processes
 that serve every tenant follow what it changes. (It does not open the tenant, so a `create` that
 names a package the process cannot install shows up as the tenant being `unavailable` instead of
 being refused.)

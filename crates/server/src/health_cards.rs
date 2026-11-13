@@ -547,7 +547,7 @@ pub(crate) fn plain_address<'a>(
     }
     let (scheme, rest) = url
         .split_once("://")
-        .ok_or_else(|| format!("{what} {url} is not an http or https address"))?;
+        .ok_or_else(|| format!("{what} {url} has no scheme: write it out, as https://…"))?;
     let mut segments = rest.split('/');
     let authority = segments.next().unwrap_or_default();
     if authority.is_empty() || authority.contains('@') {

@@ -457,10 +457,8 @@ pub async fn accept_export(
             "issue": [{"severity": "information", "code": "informational", "diagnostics": "export accepted"}]
         }),
     );
-    let base = app
-        .public_url()
-        .map(|url| url.trim_end_matches('/').to_string())
-        .unwrap_or_default();
+    let base = app.public_url();
+    let base = base.as_deref().unwrap_or("");
     if let Ok(location) = format!("{base}/export/{job_id}").parse() {
         response
             .headers_mut()

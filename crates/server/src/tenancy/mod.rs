@@ -193,6 +193,17 @@ pub fn validate_public_url(url: &str) -> Result<String, String> {
             "public_url {url} has a character a URL cannot hold: percent-encode it"
         ));
     }
+    let bytes = url.as_bytes();
+    let escaped = |at: usize| {
+        bytes
+            .get(at + 1..at + 3)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    };
+    if (0..bytes.len()).any(|at| bytes[at] == b'%' && !escaped(at)) {
+        return Err(format!(
+            "public_url {url} has a `%` that is not followed by two hex digits"
+        ));
+    }
     Ok(url.to_string())
 }
 

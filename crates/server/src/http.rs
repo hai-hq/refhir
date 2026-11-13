@@ -28,7 +28,8 @@ pub struct ServerConfig {
     pub sdc_archiver: bool,
     /// Absolute FHIR base URL used in SMART discovery (issuer, endpoints). It is the address the
     /// server starts with: a tenant's can be changed while it is served
-    /// ([`TenantApp::set_public_url`]), so a request reads [`AppState::public_url`].
+    /// ([`TenantApp::set_public_url`]), so the server keeps it only where a request reads it,
+    /// [`AppState::public_url`], and its `AppState::config` has none.
     pub public_url: Option<String>,
     /// Patient id established for `launch/patient` when none is supplied.
     pub smart_patient: Option<String>,
@@ -158,28 +159,31 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The absolute address the server is reached at from outside, as it is now, when it is set.
-    pub fn public_url(&self) -> Option<String> {
+    /// The absolute address the server is reached at from outside, as it is now, with no trailing
+    /// slash, when it is set.
+    pub fn public_url(&self) -> Option<Arc<str>> {
         self.public_url.get()
     }
 }
 
 /// The address a server is reached at, which every request reads and a process that serves many
-/// tenants can change for one while it is served.
+/// tenants can change for one while it is served. Kept with no trailing slash.
 #[derive(Clone, Default)]
-pub(crate) struct PublicUrl(Arc<RwLock<Option<String>>>);
+pub(crate) struct PublicUrl(Arc<RwLock<Option<Arc<str>>>>);
 
 impl PublicUrl {
     fn new(url: Option<String>) -> Self {
-        Self(Arc::new(RwLock::new(url)))
+        let cell = Self::default();
+        cell.set(url);
+        cell
     }
 
-    fn get(&self) -> Option<String> {
+    pub(crate) fn get(&self) -> Option<Arc<str>> {
         self.0.read().expect("public url").clone()
     }
 
     fn set(&self, url: Option<String>) {
-        *self.0.write().expect("public url") = url;
+        *self.0.write().expect("public url") = url.map(|url| Arc::from(url.trim_end_matches('/')));
     }
 }
 
@@ -445,7 +449,11 @@ pub fn tenant_app(
         db: db.clone(),
         catalog: catalog.clone(),
         store: store.clone(),
-        config: config.clone(),
+        // The address is read from `public_url` below, which can change; a copy here would not.
+        config: ServerConfig {
+            public_url: None,
+            ..config.clone()
+        },
         smart,
         oidc: config.oidc.clone().map(|cfg| {
             Arc::new(crate::auth::Oidc::new(cfg).expect("oidc config is validated at startup"))
@@ -987,10 +995,11 @@ async fn sync_ws(
         None
     };
     // `$health-cards-issue` over the socket signs as it does over REST: with this server's (or
-    // tenant's) key, naming the address the REST answer names.
+    // tenant's) key, naming the address the REST answer names, as it is when each card is signed.
     let cards = sync::Cards {
         key: app.config.health_cards.clone(),
-        base: crate::auth::issuer(&app, &headers),
+        public_url: app.public_url.clone(),
+        fallback: crate::auth::issuer(&app, &headers),
     };
     ws.on_upgrade(move |socket| async move {
         // The permit is held as long as the connection is.

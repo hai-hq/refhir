@@ -24,7 +24,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   template). It is kept with the tenant, comes before the template wherever the tenant names its
   address, and a change is served from the tenant's next request by every process, with no restart.
   It must be an absolute `http` or `https` URL with no user name, query or fragment (its trailing
-  slash is dropped); one that is not is a `400`, and nothing is created or changed. How a request
+  slash is dropped); one that is not is a `400`, and one another tenant is reached at is a `409`,
+  and nothing is created or changed. How a request
   finds its tenant does not change. `GET /admin/tenants/{name}` reports the address in effect as
   `public_url` and the tenant's own as `settings.public_url`. Health Cards issued before an address
   changes still name the old one as `iss`. A process of an earlier release cannot read a tenant

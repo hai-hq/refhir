@@ -156,11 +156,23 @@ struct LiveQuery {
 
 /// What a socket signs SMART Health Cards with: the key of the server (or tenant) it was opened
 /// on, and that server's address, which a card's `iss` names when the key names no issuer of its
-/// own and its `resourceLink`s point into. The key is the server's own, so an issuer set or a key
-/// rotated while the socket is open applies to the next card it issues.
+/// own and its `resourceLink`s point into. The key and the address are the server's own, so an
+/// issuer set, a key rotated or an address changed while the socket is open applies to the next
+/// card it issues.
 pub struct Cards {
     pub key: Option<Arc<crate::health_cards::IssuerKey>>,
-    pub base: String,
+    pub(crate) public_url: crate::http::PublicUrl,
+    /// The address when the server has none set: the one the socket's request arrived at.
+    pub fallback: String,
+}
+
+impl Cards {
+    /// The server's address now.
+    fn base(&self) -> String {
+        self.public_url
+            .get()
+            .map_or_else(|| self.fallback.clone(), |url| url.to_string())
+    }
 }
 
 /// The operation that answers signed cards. It is run as REST runs it, never as a live query.
@@ -594,7 +606,7 @@ async fn handle_text(
                         catalog,
                         store,
                         cards.key.as_deref(),
-                        &cards.base,
+                        &cards.base(),
                         resource_type,
                         args,
                     ))
