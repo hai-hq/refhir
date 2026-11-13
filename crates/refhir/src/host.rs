@@ -26,8 +26,9 @@ use refhir_fhir::{Catalog, CatalogClock};
 use refhir_persistence::{AuthStore, ConformanceStore, Lease, Persistence};
 use refhir_postgres::{Created, PostgresPersistence, SharedConnections, SharedOptions, Tenant};
 use refhir_server::tenancy::{
-    tenant_secret, AdminError, CreateTenant, DeleteTenant, HealthCardsSettings, HostConfig,
-    Routing, TenantAdmin, TenantHost, TenantLimits, TenantSettings, TenantState, UpdateTenant,
+    tenant_secret, validate_public_url, AdminError, CreateTenant, DeleteTenant,
+    HealthCardsSettings, HostConfig, Routing, TenantAdmin, TenantHost, TenantLimits,
+    TenantSettings, TenantState, UpdateTenant,
 };
 use refhir_server::TenantApp;
 use serde_json::{json, Value};
@@ -525,9 +526,10 @@ impl Manager {
         }
     }
 
-    /// Makes an open tenant serve what the registry now says of it: the issuer its cards name, the
-    /// key another process rotated. A tenant that starts or stops issuing cards is opened again,
-    /// since what it is made of changes. Does nothing for a tenant it already acted on.
+    /// Makes an open tenant serve what the registry now says of it: its address, the issuer its
+    /// cards name, the key another process rotated. A tenant that starts or stops issuing cards is
+    /// opened again, since what it is made of changes. Does nothing for a tenant it already acted
+    /// on.
     fn apply_changes(self: &Arc<Self>, name: &str, tenant: &Tenant) {
         let Some(opened) = self.opened(name) else {
             return;
@@ -546,6 +548,7 @@ impl Manager {
             self.reopen(name);
             return;
         }
+        opened.app.set_public_url(self.address(name, &settings));
         let Some(cards) = &opened.cards else {
             *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
             return;
@@ -599,6 +602,15 @@ impl Manager {
 
     fn limits_of(&self, settings: &TenantSettings) -> TenantLimits {
         settings.limits.or(&self.cfg.tenants.limits)
+    }
+
+    /// The address tenant `name` is reached at: its own, or else the one the host's template
+    /// makes.
+    fn address(&self, name: &str, settings: &TenantSettings) -> Option<String> {
+        settings
+            .public_url
+            .clone()
+            .or_else(|| self.routing.public_url(name))
     }
 
     /// Opens tenant `name` unless it is open, and waits until it is. Blocks.
@@ -872,7 +884,7 @@ impl Manager {
             export_dir: export_dir.to_string_lossy().into_owned(),
             terminology_urls: self.cfg.terminology_urls.clone(),
             sdc_archiver: self.cfg.sdc_archiver,
-            public_url: self.routing.public_url(name),
+            public_url: self.address(name, settings),
             smart_patient: self.cfg.smart_patient.clone(),
             smart_encounter: self.cfg.smart_encounter.clone(),
             smart_fhir_user: self.cfg.smart_fhir_user.clone(),
@@ -1070,6 +1082,7 @@ impl Manager {
 
     /// The JSON the admin API answers with for `tenant`.
     fn describe(&self, tenant: &Tenant) -> Value {
+        let settings = Self::settings_of(tenant);
         let mut body = json!({
             "name": tenant.name,
             "id": tenant.id,
@@ -1077,10 +1090,11 @@ impl Manager {
             "status": if tenant.is_deleted() { "deleted" } else { "active" },
             "settings": tenant.settings,
             "primary_running": tenant.primary_running,
-            "public_url": self.routing.public_url(&tenant.name),
+            // The address in effect: the tenant's own (`settings.public_url`), or the template's.
+            "public_url": self.address(&tenant.name, &settings),
         });
         // Always the object, whether the tenant was made with `true` or with an issuer.
-        body["settings"]["health_cards"] = Self::settings_of(tenant).health_cards.report();
+        body["settings"]["health_cards"] = settings.health_cards.report();
         if let Some(at) = &tenant.deleted_at {
             body["deleted_at"] = json!(at);
             body["purge_after"] = json!(tenant.purge_after);
@@ -1201,12 +1215,19 @@ impl TenantAdmin for Manager {
             .health_cards
             .resolve(&HealthCardsSettings::default(), true)
             .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
+        let public_url = request
+            .public_url
+            .as_deref()
+            .map(validate_public_url)
+            .transpose()
+            .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
         let settings = TenantSettings {
             packages: request.packages,
             update_as_create: request.update_as_create,
             smart: request.smart.unwrap_or(self.cfg.auth),
             health_cards,
             limits: request.limits,
+            public_url,
         };
         if settings.smart && !self.login {
             return Err(AdminError::invalid(
@@ -1423,6 +1444,33 @@ impl TenantAdmin for Manager {
                     }),
                 ));
                 raw["health_cards"] = serde_json::to_value(&cards).expect("settings json");
+            }
+        }
+        if let Some(change) = &request.public_url {
+            let url = change
+                .as_deref()
+                .map(validate_public_url)
+                .transpose()
+                .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
+            if url != current.public_url {
+                changes.push((
+                    "public-url",
+                    json!({
+                        "tenant": name,
+                        "public_url": {
+                            "from": self.address(name, &current),
+                            "to": url.clone().or_else(|| self.routing.public_url(name)),
+                        },
+                    }),
+                ));
+                match url {
+                    Some(url) => raw["public_url"] = json!(url),
+                    None => {
+                        if let Some(members) = raw.as_object_mut() {
+                            members.remove("public_url");
+                        }
+                    }
+                }
             }
         }
         if changes.is_empty() {

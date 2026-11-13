@@ -46,6 +46,13 @@ pub struct TenantSettings {
     pub health_cards: HealthCardsSettings,
     #[serde(default)]
     pub limits: TenantLimits,
+    /// The address the tenant is reached at from outside, when it is not the one the host's
+    /// `public_url` template makes: where a proxy in front of the host serves it. SMART
+    /// discovery, token audiences, the Health Cards issuer and the links the tenant's server
+    /// writes are made from it. Checked by [`validate_public_url`](super::validate_public_url).
+    /// Left out when there is none, so releases without it still read the tenant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
 }
 
 /// A tenant's SMART Health Cards settings.
@@ -170,6 +177,17 @@ impl HealthCardsChange {
 pub struct UpdateTenant {
     #[serde(default)]
     pub health_cards: Option<HealthCardsChange>,
+    /// The tenant's own address (see [`TenantSettings::public_url`]); `Some(None)`, from `null`,
+    /// takes it away, so the host's template makes it again.
+    #[serde(default, deserialize_with = "present")]
+    pub public_url: Option<Option<String>>,
+}
+
+/// A member that is there, as `Some`, whether it is `null` (`Some(None)`) or not.
+fn present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// The body of `POST /admin/tenants`.
@@ -188,6 +206,10 @@ pub struct CreateTenant {
     pub health_cards: HealthCardsChange,
     #[serde(default)]
     pub limits: TenantLimits,
+    /// The tenant's own address (see [`TenantSettings::public_url`]). `None`: the host's template
+    /// makes it.
+    #[serde(default)]
+    pub public_url: Option<String>,
 }
 
 /// How `DELETE /admin/tenants/{name}` was asked to delete.

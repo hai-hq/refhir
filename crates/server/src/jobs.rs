@@ -458,11 +458,9 @@ pub async fn accept_export(
         }),
     );
     let base = app
-        .config
-        .public_url
-        .as_deref()
-        .map(|url| url.trim_end_matches('/'))
-        .unwrap_or("");
+        .public_url()
+        .map(|url| url.trim_end_matches('/').to_string())
+        .unwrap_or_default();
     if let Ok(location) = format!("{base}/export/{job_id}").parse() {
         response
             .headers_mut()

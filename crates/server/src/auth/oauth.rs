@@ -1457,7 +1457,7 @@ fn aud_matches(app: &AppState, headers: &HeaderMap, aud: &str) -> bool {
 }
 
 pub(crate) fn issuer(app: &AppState, headers: &HeaderMap) -> String {
-    if let Some(url) = &app.config.public_url {
+    if let Some(url) = app.public_url() {
         return url.trim_end_matches('/').to_string();
     }
     let host = headers

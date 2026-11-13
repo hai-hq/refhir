@@ -304,6 +304,7 @@ fn execute(parsed: Parsed) -> Result<(), Box<dyn std::error::Error>> {
                         issuer: None,
                     },
                     limits: settings.limits,
+                    public_url: None,
                 };
                 let settings = serde_json::to_value(settings)?;
                 match refhir_postgres::create_tenant_with(&url, &name, &settings)? {

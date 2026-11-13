@@ -10,6 +10,25 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **A tenant of `refhir --all-tenants` can have an address of its own.** Before, a tenant's address
+  came only from the host's `[tenants] public_url` template, with `{tenant}` standing for its name,
+  so a tenant served by a gateway at an address no template could make (one with an `_`, which a
+  tenant name cannot hold) named the wrong address in its SMART discovery, its token issuer and
+  audience, its links and the `iss` of its Health Cards, and its cards could not be verified.
+  `POST /admin/tenants` now takes an optional `public_url`, and `PATCH /admin/tenants/{name}` sets
+  or changes it (`{"public_url": "https://gw.example.com/fhir/acme_1"}`; `null` goes back to the
+  template). It is kept with the tenant, comes before the template wherever the tenant names its
+  address, and a change is served from the tenant's next request by every process, with no restart.
+  It must be an absolute `http` or `https` URL with no user name, query or fragment (its trailing
+  slash is dropped); one that is not is a `400`, and nothing is created or changed. How a request
+  finds its tenant does not change. `GET /admin/tenants/{name}` reports the address in effect as
+  `public_url` and the tenant's own as `settings.public_url`. Health Cards issued before an address
+  changes still name the old one as `iss`. A process of an earlier release cannot read a tenant
+  that has one, so upgrade every process before setting it. See
+  [a tenant's own address](docs/clustering.md#a-tenants-own-address).
+
 ## [0.0.7] - 2026-11-05
 
 ### Added

@@ -222,6 +222,15 @@ curl -X PATCH "$REFHIR/admin/tenants/clinic" -H "authorization: Bearer $ADMIN_TO
   -d '{"health_cards": {"issuer": "https://cards.example.com"}}'
 ```
 
+**Its address.** A tenant's own address is the one the host's `[tenants] public_url` makes for it,
+unless the tenant was given a `public_url` of its own over the admin API, such as the address a
+gateway in front serves it at (see [a tenant's own address](clustering.md#a-tenants-own-address)).
+Its cards then name that address plus `/health-cards`, from the next card on, and the gateway has to
+serve `[address]/health-cards/.well-known/jwks.json` from the tenant's key set. **Cards issued
+before the address changed still name the old address as `iss`**, and a verifier fetches their keys
+from `[old address]/health-cards/.well-known/jwks.json`, so keep that served for as long as those
+cards are in use. A tenant whose address may change can be given an issuer that does not, below.
+
 `true` and `false` are still accepted for `health_cards`. `"issuer": null` in a `PATCH` goes back to
 the tenant's own address, and turning cards off (`false`) takes the issuer with it. The issuer is checked as the setting of a server with one key file is
 (above): `https`, or `http` on `localhost`, `127.0.0.1` and `[::1]`, a host, and no user name, query

@@ -7371,6 +7371,7 @@ mod cluster {
             ready_probe: Default::default(),
             sockets: Default::default(),
             stop: Default::default(),
+            public_url: Default::default(),
         };
         assert!(
             !crate::auth::patient_exists(&app, "fresh-patient"),
