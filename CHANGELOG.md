@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-11-13
+
 ### Added
 
 - **A tenant of `refhir --all-tenants` can have an address of its own.** Before, a tenant's address
@@ -953,7 +955,8 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/hai-hq/refhir/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/hai-hq/refhir/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/hai-hq/refhir/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/hai-hq/refhir/compare/v0.0.4...v0.0.5
