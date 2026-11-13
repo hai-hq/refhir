@@ -56,12 +56,13 @@ pub struct Routing {
     /// without `{tenant}` is the base the path prefix is added to. SMART discovery, token
     /// audiences, health card issuers and the links a server writes are made from it, so each
     /// tenant gets its own. `None` leaves a tenant's server to work its address out as a process
-    /// that serves one does.
+    /// that serves one does. A tenant with a `public_url` of its own ([`TenantSettings`]) is
+    /// reached at that instead; how a request finds its tenant does not change.
     pub public_url: Option<String>,
 }
 
 impl Routing {
-    /// The address tenant `name` is reached at, from [`Routing::public_url`].
+    /// The address tenant `name` is reached at by the template, from [`Routing::public_url`].
     pub fn public_url(&self, name: &str) -> Option<String> {
         let template = self.public_url.as_deref()?.trim_end_matches('/');
         if template.contains("{tenant}") {
@@ -170,6 +171,40 @@ impl Routing {
         };
         Some((name.to_string(), rewritten.parse().ok()))
     }
+}
+
+/// A tenant's own address, as its `public_url` setting takes it: an absolute `http` or `https` URL
+/// with a host, and no user, query or fragment. A trailing slash is dropped. It is written out in
+/// full, since it stands in for what the host's template would make.
+pub fn validate_public_url(url: &str) -> Result<String, String> {
+    let (url, scheme, _) = crate::health_cards::plain_address(url, "public_url")?;
+    if !matches!(scheme, "http" | "https") {
+        return Err(format!("public_url {url} is not an http or https address"));
+    }
+    if url.contains("{tenant}") {
+        return Err(format!(
+            "public_url {url} holds `{{tenant}}`: a tenant's own address is written out in full, \
+             and only the host's [tenants] public_url is a template"
+        ));
+    }
+    let url_character = |c: char| c.is_ascii_alphanumeric() || "-._~:/[]@!$&'()*+,;=%".contains(c);
+    if !url.chars().all(url_character) {
+        return Err(format!(
+            "public_url {url} has a character a URL cannot hold: percent-encode it"
+        ));
+    }
+    let bytes = url.as_bytes();
+    let escaped = |at: usize| {
+        bytes
+            .get(at + 1..at + 3)
+            .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+    };
+    if (0..bytes.len()).any(|at| bytes[at] == b'%' && !escaped(at)) {
+        return Err(format!(
+            "public_url {url} has a `%` that is not followed by two hex digits"
+        ));
+    }
+    Ok(url.to_string())
 }
 
 /// What a tenant may use of the process, beyond what its own governance settings say. `None` is

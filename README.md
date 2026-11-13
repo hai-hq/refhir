@@ -39,7 +39,7 @@ cd refhir
 docker compose up --build
 ```
 
-Or with Rust 1.88 (installed by `rustup` from `rust-toolchain.toml`):
+Or with Rust 1.89 (installed by `rustup` from `rust-toolchain.toml`):
 
 ```bash
 REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory      # a throwaway server; use --sqlite refhir.sqlite to keep data
@@ -77,7 +77,7 @@ console.log(await watch.next());  // the next committed result
 In React, `useFHIRQuery` from `@haihq/refhir/react` does the same and re-renders on every
 change. A Go client is in [`clients/go`](clients/go/README.md). Both share the
 [`/sync` wire protocol](docs/sync-protocol.md), so a client in another language is small. The Go
-client is published (`go get github.com/hai-hq/refhir/clients/go@v0.0.7`), and so is the
+client is published (`go get github.com/hai-hq/refhir/clients/go@v0.0.8`), and so is the
 TypeScript client (`npm install @haihq/refhir`).
 
 ## What is in it

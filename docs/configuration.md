@@ -80,7 +80,7 @@ Read when the process is started with `--all-tenants`. See
 | `serve_all` | `false` | Same as `--all-tenants`; or `REFHIR_ALL_TENANTS=1` |
 | `path_prefix` | `"/t"` | Tenants are at `{path_prefix}/{tenant}/…`. `""` turns it off |
 | `domain` | none | Tenants are at `{tenant}.{domain}` |
-| `public_url` | `--public-url` | Each tenant's address: `https://{tenant}.fhir.example.com`, or `https://fhir.example.com/t/{tenant}`, or a base the path prefix is added to. Required unless the bind is loopback |
+| `public_url` | `--public-url` | Each tenant's address: `https://{tenant}.fhir.example.com`, or `https://fhir.example.com/t/{tenant}`, or a base the path prefix is added to. Required unless the bind is loopback. A tenant given an address of its own over the admin API is reached at that instead ([a tenant's own address](clustering.md#a-tenants-own-address)); Health Cards a tenant issued before its address changed still name the old one as `iss` |
 | `admin_token` | none | Bearer token of the admin API; prefer `REFHIR_ADMIN_TOKEN`. Without one the admin API refuses everything |
 | `admin_bind` | none | A listener of its own for `/admin` and the probes |
 | `connections_per_tenant` | half of `--db-pool` | Pool connections one tenant may hold at once |

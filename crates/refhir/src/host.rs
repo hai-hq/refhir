@@ -26,8 +26,9 @@ use refhir_fhir::{Catalog, CatalogClock};
 use refhir_persistence::{AuthStore, ConformanceStore, Lease, Persistence};
 use refhir_postgres::{Created, PostgresPersistence, SharedConnections, SharedOptions, Tenant};
 use refhir_server::tenancy::{
-    tenant_secret, AdminError, CreateTenant, DeleteTenant, HealthCardsSettings, HostConfig,
-    Routing, TenantAdmin, TenantHost, TenantLimits, TenantSettings, TenantState, UpdateTenant,
+    tenant_secret, validate_public_url, AdminError, CreateTenant, DeleteTenant,
+    HealthCardsSettings, HostConfig, Routing, TenantAdmin, TenantHost, TenantLimits,
+    TenantSettings, TenantState, UpdateTenant,
 };
 use refhir_server::TenantApp;
 use serde_json::{json, Value};
@@ -176,7 +177,8 @@ pub(crate) struct Manager {
     login: bool,
     /// Whether the warm-up has been started: once, by the process that first writes.
     warm_up_started: AtomicBool,
-    /// Set when a change to a tenant's Health Cards could not be applied, until it is.
+    /// Set when a change to a tenant (its Health Cards, its address) could not be applied, until it
+    /// is.
     cards_retry: AtomicBool,
 }
 
@@ -525,35 +527,51 @@ impl Manager {
         }
     }
 
-    /// Makes an open tenant serve what the registry now says of it: the issuer its cards name, the
-    /// key another process rotated. A tenant that starts or stops issuing cards is opened again,
-    /// since what it is made of changes. Does nothing for a tenant it already acted on.
+    /// Makes an open tenant serve what the registry now says of it: its address, the issuer its
+    /// cards name, the key another process rotated. A tenant that starts or stops issuing cards is
+    /// opened again, since what it is made of changes. Does nothing for a tenant it already acted
+    /// on.
     fn apply_changes(self: &Arc<Self>, name: &str, tenant: &Tenant) {
         let Some(opened) = self.opened(name) else {
             return;
         };
-        {
-            let applied = opened.applied.lock().expect("applied");
-            if *applied == tenant.updated_at {
+        // One pass at a time, from the registry as it is now: a pass that read the tenant before a
+        // newer change was made must not put back what that change replaced.
+        let mut applied = opened.applied.lock().expect("applied");
+        if *applied == tenant.updated_at {
+            return;
+        }
+        let tenant = match self.shared.get_tenant(name) {
+            Ok(Some(latest)) if !latest.is_deleted() => latest,
+            // Deleted or gone: the registry pass stops serving it.
+            Ok(_) => return,
+            Err(err) => {
+                tracing::warn!("tenant `{name}`: its changes are not applied yet: {err}");
+                self.cards_retry.store(true, Ordering::SeqCst);
                 return;
             }
+        };
+        if *applied == tenant.updated_at {
+            return;
         }
-        let settings = Self::settings_of(tenant);
+        let settings = Self::settings_of(&tenant);
         if settings.health_cards.enabled != opened.cards.is_some() {
             // What the tenant is made of changes: it is opened again, from what the registry says
             // by then.
-            *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
+            *applied = tenant.updated_at;
             self.reopen(name);
             return;
         }
+        opened.app.set_public_url(self.address(name, &settings));
+        self.warn_of_cards_address(name, &settings);
         let Some(cards) = &opened.cards else {
-            *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
+            *applied = tenant.updated_at;
             return;
         };
-        let applied = cards
+        let result = cards
             .set_issuer(settings.health_cards.issuer.as_deref())
             .and_then(|()| cards.refresh(opened.auth_store.as_ref()));
-        match applied {
+        match result {
             Ok(rotated) => {
                 if rotated {
                     tracing::info!(
@@ -561,7 +579,7 @@ impl Manager {
                         cards.kid()
                     );
                 }
-                *opened.applied.lock().expect("applied") = tenant.updated_at.clone();
+                *applied = tenant.updated_at;
             }
             Err(err) => {
                 tracing::warn!(
@@ -599,6 +617,54 @@ impl Manager {
 
     fn limits_of(&self, settings: &TenantSettings) -> TenantLimits {
         settings.limits.or(&self.cfg.tenants.limits)
+    }
+
+    /// The address tenant `name` is reached at: its own, or else the one the host's template
+    /// makes.
+    fn address(&self, name: &str, settings: &TenantSettings) -> Option<String> {
+        settings
+            .public_url
+            .clone()
+            .or_else(|| self.routing.public_url(name))
+    }
+
+    /// Logs when tenant `name`'s cards name its address as their issuer and no verifier accepts
+    /// it, as a server with one key file says at its start.
+    fn warn_of_cards_address(&self, name: &str, settings: &TenantSettings) {
+        if !settings.health_cards.enabled || settings.health_cards.issuer.is_some() {
+            return;
+        }
+        if let Some(address) = self.address(name, settings) {
+            if let Ok(Some(warning)) = crate::health_cards_address(Some(&address), true) {
+                tracing::warn!("tenant `{name}`: {warning}");
+            }
+        }
+    }
+
+    /// Refuses `address` for tenant `name` when another tenant is reached at it: the two would
+    /// name one SMART issuer and one card `iss`, each with keys of its own.
+    fn refuse_taken_address(&self, name: &str, address: Option<&str>) -> Result<(), AdminError> {
+        let Some(address) = address else {
+            return Ok(());
+        };
+        let tenants = self.shared.list_tenants().map_err(Self::admin_error)?;
+        let taken = tenants.iter().find(|other| {
+            other.name != name
+                && self
+                    .address(&other.name, &Self::settings_of(other))
+                    .as_deref()
+                    == Some(address)
+        });
+        match taken {
+            Some(other) => Err(AdminError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "{address} is the address of tenant `{}`: each tenant needs one of its own",
+                    other.name
+                ),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Opens tenant `name` unless it is open, and waits until it is. Blocks.
@@ -866,13 +932,14 @@ impl Manager {
         } else {
             None
         };
+        self.warn_of_cards_address(name, settings);
         let export_dir = PathBuf::from(&self.cfg.export_dir).join(name);
         let config = refhir_server::ServerConfig {
             auth: settings.smart,
             export_dir: export_dir.to_string_lossy().into_owned(),
             terminology_urls: self.cfg.terminology_urls.clone(),
             sdc_archiver: self.cfg.sdc_archiver,
-            public_url: self.routing.public_url(name),
+            public_url: self.address(name, settings),
             smart_patient: self.cfg.smart_patient.clone(),
             smart_encounter: self.cfg.smart_encounter.clone(),
             smart_fhir_user: self.cfg.smart_fhir_user.clone(),
@@ -1070,6 +1137,7 @@ impl Manager {
 
     /// The JSON the admin API answers with for `tenant`.
     fn describe(&self, tenant: &Tenant) -> Value {
+        let settings = Self::settings_of(tenant);
         let mut body = json!({
             "name": tenant.name,
             "id": tenant.id,
@@ -1077,10 +1145,11 @@ impl Manager {
             "status": if tenant.is_deleted() { "deleted" } else { "active" },
             "settings": tenant.settings,
             "primary_running": tenant.primary_running,
-            "public_url": self.routing.public_url(&tenant.name),
+            // The address in effect: the tenant's own (`settings.public_url`), or the template's.
+            "public_url": self.address(&tenant.name, &settings),
         });
         // Always the object, whether the tenant was made with `true` or with an issuer.
-        body["settings"]["health_cards"] = Self::settings_of(tenant).health_cards.report();
+        body["settings"]["health_cards"] = settings.health_cards.report();
         if let Some(at) = &tenant.deleted_at {
             body["deleted_at"] = json!(at);
             body["purge_after"] = json!(tenant.purge_after);
@@ -1168,6 +1237,14 @@ impl Manager {
     }
 }
 
+/// A `public_url` the admin API was given, checked (see `validate_public_url`): one that is not an
+/// address is a `400`.
+fn checked_public_url(url: Option<&str>) -> Result<Option<String>, AdminError> {
+    url.map(validate_public_url)
+        .transpose()
+        .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))
+}
+
 /// Waits for something the tenant's primary makes, unless the tenant is cancelled meanwhile.
 fn wait_for<T>(
     name: &str,
@@ -1201,12 +1278,14 @@ impl TenantAdmin for Manager {
             .health_cards
             .resolve(&HealthCardsSettings::default(), true)
             .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
+        let public_url = checked_public_url(request.public_url.as_deref())?;
         let settings = TenantSettings {
             packages: request.packages,
             update_as_create: request.update_as_create,
             smart: request.smart.unwrap_or(self.cfg.auth),
             health_cards,
             limits: request.limits,
+            public_url,
         };
         if settings.smart && !self.login {
             return Err(AdminError::invalid(
@@ -1219,6 +1298,10 @@ impl TenantAdmin for Manager {
                 "a package is name@version, a directory or a .tgz",
             ));
         }
+        self.refuse_taken_address(
+            &request.name,
+            self.address(&request.name, &settings).as_deref(),
+        )?;
         let wanted = serde_json::to_value(&settings).expect("settings json");
         let name = request.name;
         let (tenant, created) = match self
@@ -1423,6 +1506,32 @@ impl TenantAdmin for Manager {
                     }),
                 ));
                 raw["health_cards"] = serde_json::to_value(&cards).expect("settings json");
+            }
+        }
+        if let Some(change) = &request.public_url {
+            let url = checked_public_url(change.as_deref())?;
+            if url != current.public_url {
+                let next = TenantSettings {
+                    public_url: url.clone(),
+                    ..current.clone()
+                };
+                let to = self.address(name, &next);
+                self.refuse_taken_address(name, to.as_deref())?;
+                changes.push((
+                    "public-url",
+                    json!({
+                        "tenant": name,
+                        "public_url": {"from": self.address(name, &current), "to": to},
+                    }),
+                ));
+                match url {
+                    Some(url) => raw["public_url"] = json!(url),
+                    None => {
+                        if let Some(members) = raw.as_object_mut() {
+                            members.remove("public_url");
+                        }
+                    }
+                }
             }
         }
         if changes.is_empty() {

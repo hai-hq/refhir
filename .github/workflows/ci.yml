@@ -37,7 +37,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: rustfmt
 
@@ -148,7 +148,7 @@ jobs:
           DOMAIN=links.example.org ADMIN_TOKEN=ci-token-of-sixteen-characters POSTGRES_PASSWORD=ci docker compose config --quiet
           DOMAIN=links.example.org ADMIN_TOKEN=ci-token-of-sixteen-characters docker compose -f compose.sqlite.yaml config --quiet
 
-  # Warnings fail the build, so the code base stays clean. The toolchain is the pinned 1.88.0,
+  # Warnings fail the build, so the code base stays clean. The toolchain is the pinned 1.89.0,
   # whose lints are the ones that count: a newer clippy knows lints this one does not.
   clippy:
     name: Clippy
@@ -159,7 +159,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.89.0
         with:
           components: clippy
 
@@ -196,7 +196,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -245,7 +245,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -407,7 +407,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.88.0
+        uses: dtolnay/rust-toolchain@1.89.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2

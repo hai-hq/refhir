@@ -10,6 +10,42 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.8] - 2026-11-13
+
+### Added
+
+- **A tenant of `refhir --all-tenants` can have an address of its own.** Before, a tenant's address
+  came only from the host's `[tenants] public_url` template, with `{tenant}` standing for its name,
+  so a tenant served by a gateway at an address no template could make (one with an `_`, which a
+  tenant name cannot hold) named the wrong address in its SMART discovery, its token issuer and
+  audience, its links and the `iss` of its Health Cards, and its cards could not be verified.
+  `POST /admin/tenants` now takes an optional `public_url`, and `PATCH /admin/tenants/{name}` sets
+  or changes it (`{"public_url": "https://gw.example.com/fhir/acme_1"}`; `null` goes back to the
+  template). It is kept with the tenant, comes before the template wherever the tenant names its
+  address, and a change is served from the tenant's next request by every process, with no restart.
+  It must be an absolute `http` or `https` URL with no user name, query or fragment (its trailing
+  slash is dropped); one that is not is a `400`, and one another tenant is reached at is a `409`,
+  and nothing is created or changed. How a request
+  finds its tenant does not change. `GET /admin/tenants/{name}` reports the address in effect as
+  `public_url` and the tenant's own as `settings.public_url`. Health Cards issued before an address
+  changes still name the old one as `iss`. A process of an earlier release cannot read a tenant
+  that has one, so upgrade every process before setting it. See
+  [a tenant's own address](docs/clustering.md#a-tenants-own-address).
+
+### Changed
+
+- **Building ReFHIR from source needs Rust 1.89** (it was 1.88). `rust-toolchain.toml`, the
+  workspace `rust-version` and the image's build stage say 1.89. The SQLite update below needs
+  `rusqlite` 0.41, which needs Rust 1.89.
+
+### Security
+
+- **The SQLite built into ReFHIR is 3.54.1** (it was 3.46.0), for RUSTSEC-2026-0459
+  (CVE-2026-119375). An earlier SQLite can return memory it never filled in when it opens a
+  database file together with a `-wal` file whose page size differs, so ordinary queries can read
+  stale bytes from the process. It needs a pair of files someone else wrote, so a server is exposed
+  only if someone it does not trust can write its SQLite database or its `-wal` file.
+
 ## [0.0.7] - 2026-11-05
 
 ### Added
@@ -934,7 +970,8 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/hai-hq/refhir/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/hai-hq/refhir/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/hai-hq/refhir/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/hai-hq/refhir/compare/v0.0.4...v0.0.5

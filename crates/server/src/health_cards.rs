@@ -507,32 +507,57 @@ fn on_curve(point: &[u8]) -> bool {
 /// a valid port if it has one, no user, query, fragment or empty or dot path segment. A trailing slash is dropped, because the specification has the
 /// key set at `[iss]/.well-known/jwks.json` and `iss` with none.
 pub fn validate_issuer(issuer: &str) -> Result<String, String> {
-    let trimmed = issuer.trim();
-    let url = trimmed.trim_end_matches('/');
+    let (url, scheme, host) = plain_address(issuer, "the issuer")?;
+    let loopback = matches!(
+        host.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    );
+    match scheme {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => {
+            return Err(format!(
+                "the issuer {url} is an http address: a verifier accepts only https \
+                 (http is allowed for localhost only)"
+            ))
+        }
+        _ => return Err(format!("the issuer {url} is not an https address")),
+    }
+    Ok(url.to_string())
+}
+
+/// `given` as an address that paths are added to: a scheme, a host, a valid port if it has one, no
+/// user, query, fragment or empty or dot path segment, and no trailing slash. Answers it with its
+/// scheme and host, which the caller checks; `what` names it in a refusal.
+pub(crate) fn plain_address<'a>(
+    given: &'a str,
+    what: &str,
+) -> Result<(&'a str, &'a str, &'a str), String> {
+    let url = given.trim().trim_end_matches('/');
     if url.is_empty() {
-        return Err("the issuer is empty".into());
+        return Err(format!("{what} is empty"));
     }
     if url.contains(char::is_whitespace) {
-        return Err(format!("the issuer {issuer:?} has a space in it"));
+        return Err(format!("{what} {given:?} has a space in it"));
     }
     if url.contains('?') || url.contains('#') {
         return Err(format!(
-            "the issuer {url} has a query or fragment: it must be a plain address"
+            "{what} {url} has a query or fragment: it must be a plain address"
         ));
     }
     let (scheme, rest) = url
         .split_once("://")
-        .ok_or_else(|| format!("the issuer {url} is not an https address"))?;
+        .ok_or_else(|| format!("{what} {url} has no scheme: write it out, as https://…"))?;
     let mut segments = rest.split('/');
     let authority = segments.next().unwrap_or_default();
     if authority.is_empty() || authority.contains('@') {
         return Err(format!(
-            "the issuer {url} needs a host, and no user name or password"
+            "{what} {url} needs a host, and no user name or password"
         ));
     }
     if segments.any(|segment| matches!(segment, "" | "." | "..")) {
         return Err(format!(
-            "the issuer {url} has an empty or `.` or `..` part in its path"
+            "{what} {url} has an empty or `.` or `..` part in its path"
         ));
     }
     // The host and the port, if any; an IPv6 address is bracketed.
@@ -561,30 +586,13 @@ pub fn validate_issuer(issuer: &str) -> Result<String, String> {
     if let Some(port) = port {
         let digits = !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit());
         if !digits || port.parse::<u16>().map_or(true, |port| port == 0) {
-            return Err(format!(
-                "the issuer {url} has a port that is not 1 to 65535"
-            ));
+            return Err(format!("{what} {url} has a port that is not 1 to 65535"));
         }
-    }
-    let loopback = matches!(
-        host.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    );
-    match scheme {
-        "https" => {}
-        "http" if loopback => {}
-        "http" => {
-            return Err(format!(
-                "the issuer {url} is an http address: a verifier accepts only https \
-                 (http is allowed for localhost only)"
-            ))
-        }
-        _ => return Err(format!("the issuer {url} is not an https address")),
     }
     if host.is_empty() {
-        return Err(format!("the issuer {url} needs a host"));
+        return Err(format!("{what} {url} needs a host"));
     }
-    Ok(url.to_string())
+    Ok((url, scheme, host))
 }
 
 /// The keys in a JWKS, each as the public key the key set publishes it as, with the `kid` the
@@ -1123,7 +1131,7 @@ mod tests {
         let key = IssuerKey::for_tenant(&store, true).unwrap();
         let first = key.kid();
         let before = card(&key);
-        assert_eq!(kids(&key), [first.clone()]);
+        assert_eq!(kids(&key), std::slice::from_ref(&first));
 
         let rotated = IssuerKey::rotate_tenant(&store).unwrap();
         assert_eq!(rotated.replaced, first);

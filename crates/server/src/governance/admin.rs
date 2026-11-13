@@ -257,12 +257,8 @@ fn link(app: &AppState, path: &str, params: &Params, before: Option<u64>) -> Str
     if let Some(before) = before {
         parts.push(format!("before={before}"));
     }
-    let base = app
-        .config
-        .public_url
-        .as_deref()
-        .map(|url| url.trim_end_matches('/'))
-        .unwrap_or("");
+    let base = app.public_url();
+    let base = base.as_deref().unwrap_or("");
     if parts.is_empty() {
         format!("{base}{path}")
     } else {

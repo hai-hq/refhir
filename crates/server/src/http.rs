@@ -26,7 +26,10 @@ pub struct ServerConfig {
     pub terminology_urls: Vec<String>,
     /// Form Archiver: QuestionnaireResponse may be created, not read.
     pub sdc_archiver: bool,
-    /// Absolute FHIR base URL used in SMART discovery (issuer, endpoints).
+    /// Absolute FHIR base URL used in SMART discovery (issuer, endpoints). It is the address the
+    /// server starts with: a tenant's can be changed while it is served
+    /// ([`TenantApp::set_public_url`]), so the server keeps it only where a request reads it,
+    /// [`AppState::public_url`], and its `AppState::config` has none.
     pub public_url: Option<String>,
     /// Patient id established for `launch/patient` when none is supplied.
     pub smart_patient: Option<String>,
@@ -151,6 +154,37 @@ pub struct AppState {
     /// Said when this server stops being served (a process that serves many tenants stops one),
     /// so the sockets and tasks that would otherwise keep it alive end.
     pub(crate) stop: Stop,
+    /// The address the server is reached at now (see [`ServerConfig::public_url`]).
+    pub(crate) public_url: PublicUrl,
+}
+
+impl AppState {
+    /// The absolute address the server is reached at from outside, as it is now, with no trailing
+    /// slash, when it is set.
+    pub fn public_url(&self) -> Option<Arc<str>> {
+        self.public_url.get()
+    }
+}
+
+/// The address a server is reached at, which every request reads and a process that serves many
+/// tenants can change for one while it is served. Kept with no trailing slash.
+#[derive(Clone, Default)]
+pub(crate) struct PublicUrl(Arc<RwLock<Option<Arc<str>>>>);
+
+impl PublicUrl {
+    fn new(url: Option<String>) -> Self {
+        let cell = Self::default();
+        cell.set(url);
+        cell
+    }
+
+    pub(crate) fn get(&self) -> Option<Arc<str>> {
+        self.0.read().expect("public url").clone()
+    }
+
+    fn set(&self, url: Option<String>) {
+        *self.0.write().expect("public url") = url.map(|url| Arc::from(url.trim_end_matches('/')));
+    }
 }
 
 /// Tells what a server keeps running that it has stopped being served. Until then it is never
@@ -188,9 +222,17 @@ pub struct TenantApp {
     pub catalog: Arc<RwLock<Catalog>>,
     pub governance: Arc<crate::governance::Governance>,
     pub stop: Stop,
+    public_url: PublicUrl,
 }
 
 impl TenantApp {
+    /// Changes the address the server is reached at, from its next request on: what SMART
+    /// discovery, token audiences, the Health Cards issuer and links name. How requests reach it
+    /// does not change.
+    pub fn set_public_url(&self, url: Option<String>) {
+        self.public_url.set(url);
+    }
+
     /// Ends its sockets and background work and writes what governance buffered. Requests already
     /// being answered finish; the caller stops sending new ones first.
     pub async fn shut_down(&self) {
@@ -407,7 +449,11 @@ pub fn tenant_app(
         db: db.clone(),
         catalog: catalog.clone(),
         store: store.clone(),
-        config: config.clone(),
+        // The address is read from `public_url` below, which can change; a copy here would not.
+        config: ServerConfig {
+            public_url: None,
+            ..config.clone()
+        },
         smart,
         oidc: config.oidc.clone().map(|cfg| {
             Arc::new(crate::auth::Oidc::new(cfg).expect("oidc config is validated at startup"))
@@ -417,8 +463,10 @@ pub fn tenant_app(
         ready_probe: Arc::default(),
         sockets: Arc::default(),
         stop: Stop::default(),
+        public_url: PublicUrl::new(config.public_url.clone()),
     };
     let (sockets, stop) = (state.sockets.clone(), state.stop.clone());
+    let public_url = state.public_url.clone();
     // Outermost first: cors, the legacy request line (silent once governance logs instead),
     // governance's scope, authentication, the caller's own limits, and then what a replica does
     // with a request it cannot serve. The limits come before that, so that a request is turned
@@ -453,6 +501,7 @@ pub fn tenant_app(
         catalog,
         governance,
         stop,
+        public_url,
     }
 }
 
@@ -946,10 +995,11 @@ async fn sync_ws(
         None
     };
     // `$health-cards-issue` over the socket signs as it does over REST: with this server's (or
-    // tenant's) key, naming the address the REST answer names.
+    // tenant's) key, naming the address the REST answer names, as it is when each card is signed.
     let cards = sync::Cards {
         key: app.config.health_cards.clone(),
-        base: crate::auth::issuer(&app, &headers),
+        public_url: app.public_url.clone(),
+        fallback: crate::auth::issuer(&app, &headers),
     };
     ws.on_upgrade(move |socket| async move {
         // The permit is held as long as the connection is.

@@ -13,7 +13,7 @@ Everyone taking part is expected to follow the [Code of Conduct](CODE_OF_CONDUCT
 
 ## Set up
 
-You need Rust 1.88 (`rustup` installs it from `rust-toolchain.toml`). Go 1.23+ and Node 20+ are
+You need Rust 1.89 (`rustup` installs it from `rust-toolchain.toml`). Go 1.23+ and Node 20+ are
 needed only for the clients, and Docker only for the image and the Postgres TLS tests. The full
 list is in [docs/development.md](docs/development.md).
 

@@ -1413,12 +1413,12 @@ mod tests {
         reader.on_commit(commits);
 
         let ts = Timestamp::from_u64(1).unwrap();
-        assert!(reader.apply_external_commit(ts, &[key.clone()]));
+        assert!(reader.apply_external_commit(ts, std::slice::from_ref(&key)));
         assert_eq!(reader.latest_ts(), ts);
         assert_eq!(receiver.try_recv().expect("invalidation").write_ts, ts);
         assert_eq!(seen.try_recv().expect("commit listener"), ts);
         // An older or repeated commit changes nothing.
-        assert!(!reader.apply_external_commit(ts, &[key.clone()]));
+        assert!(!reader.apply_external_commit(ts, std::slice::from_ref(&key)));
         assert!(receiver.try_recv().is_err());
         // A writer takes no commits from elsewhere.
         assert!(!writer.apply_external_commit(Timestamp::from_u64(9).unwrap(), &[key]));

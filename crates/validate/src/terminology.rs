@@ -4099,13 +4099,13 @@ mod tests {
             let flag = format!("{sample}#CodeSystem.content = example");
             let only = terms.expand("http://example.org/only", None).unwrap();
             assert_eq!(only["expansion"]["contains"].as_array().unwrap().len(), 2);
-            assert_eq!(parameters_of(&only), [flag.clone()]);
+            assert_eq!(parameters_of(&only), std::slice::from_ref(&flag));
             // An include that names its concepts is complete, however sparse its system is, and
             // an include of a value set that is not complete is not either.
             let listed = terms.expand("http://example.org/listed", None).unwrap();
             assert!(parameters_of(&listed).is_empty());
             let nested = terms.expand("http://example.org/nested", None).unwrap();
-            assert_eq!(parameters_of(&nested), [flag.clone()]);
+            assert_eq!(parameters_of(&nested), std::slice::from_ref(&flag));
             let mixed = terms.expand("http://example.org/mixed", None).unwrap();
             assert_eq!(mixed["expansion"]["contains"].as_array().unwrap().len(), 3);
             assert_eq!(parameters_of(&mixed), [flag]);

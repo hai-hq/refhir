@@ -512,7 +512,7 @@ fn upgrading_a_shared_database_keeps_every_tenant() {
         assert_eq!(tenant.settings, json!({}));
         assert!(!tenant.is_deleted());
         let served = PostgresPersistence::open_tenant(&shared, &tenant.name, 1).unwrap();
-        assert_eq!(read_all(&served), [tenant.name.clone()]);
+        assert_eq!(read_all(&served), std::slice::from_ref(&tenant.name));
     }
     // A second process finds nothing left to do.
     let _again = connections(&app, 1);

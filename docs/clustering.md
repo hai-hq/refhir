@@ -157,7 +157,9 @@ release and the same settings.
   issuer and audience, and the issuer its SMART Health Cards name
   (`…/health-cards/.well-known/jwks.json`, served per tenant). Tenants told apart by host name need
   `{tenant}` in it, since every tenant would otherwise get the same address. On a loopback bind it
-  defaults to the address requests arrive at; on any other bind it is required.
+  defaults to the address requests arrive at; on any other bind it is required. A tenant can be
+  given an address of its own instead, which comes first: see
+  [a tenant's own address](#a-tenants-own-address).
 - **What a tenant is created with.** Packages to install (as `--package` takes them: `name@version`,
   a directory or a `.tgz`), `update_as_create`, SMART on or off, health cards on or off (and the
   issuer their `iss` names: see [a tenant's issuer and keys](health-cards.md#a-tenants-issuer-and-keys)),
@@ -285,7 +287,7 @@ on the public one.
 | `POST /admin/tenants` | Creates a tenant and opens it before it answers: `201` with the tenant. Idempotent: the same body again is `200` with the tenant that is there, and a different body for an existing name is `409`. A tenant that cannot be opened is not kept (`422`), so the request can be sent again once it is fixed |
 | `GET /admin/tenants` | Every tenant, with its status and how this process serves it |
 | `GET /admin/tenants/{name}` | One tenant: status, settings, its public URL, the packages and versions it holds, its size (documents and index rows, in rows and bytes), whether it holds the compiled catalog that tenants with the same definitions share (`served.shared_catalog`), and this process's counters for it |
-| `PATCH /admin/tenants/{name}` | Changes what the body names of a tenant that exists, and leaves the rest. Today that is `health_cards` (below). The change is kept in the registry and every process that serves the tenant applies it within moments, with no restart; a request that is not valid is a `400` and changes nothing |
+| `PATCH /admin/tenants/{name}` | Changes what the body names of a tenant that exists, and leaves the rest. Today that is `health_cards` and `public_url` (below). The change is kept in the registry and every process that serves the tenant applies it within moments, with no restart; a request that is not valid is a `400` and changes nothing |
 | `POST /admin/tenants/{name}/health-cards/rotate` | Makes a new Health Cards signing key for the tenant, which signs from then on, and keeps the replaced key's public half in the tenant's key set: `200` with `{"tenant", "kid", "replaced_kid", "keys"}`. `409` for a tenant that does not issue cards or whose key was changed by a request at the same time (ask again), `404` for no such tenant |
 | `DELETE /admin/tenants/{name}` | Soft delete: the tenant is not served from then on, and its rows are removed once the grace period is over. `?grace=24h` (`30s`, `15m`, `24h`, `7d`; default `[tenants] delete_grace`, 7 days) and `?export=false` change that. `grace=0` removes it at once |
 | `POST /admin/tenants/{name}/restore` | Brings back a deleted tenant whose rows have not been removed |
@@ -300,7 +302,8 @@ on the public one.
   "update_as_create": false,
   "smart": true,
   "health_cards": {"enabled": true, "issuer": "https://cards.example.com"},
-  "limits": {"requests_per_second": 200, "burst": 400, "storage_bytes": 53687091200, "connections": 4}
+  "limits": {"requests_per_second": 200, "burst": 400, "storage_bytes": 53687091200, "connections": 4},
+  "public_url": "https://gw.example.com/fhir/acme"
 }
 ```
 
@@ -323,6 +326,46 @@ reports `settings.health_cards` as `{"enabled", "issuer"}` and, for a tenant tha
 set holds. Replacing a tenant's key, keeping the cards it signed valid, and the audit trail of both
 are described under [a tenant's issuer and keys](health-cards.md#a-tenants-issuer-and-keys).
 
+#### A tenant's own address
+
+`public_url` is the address the tenant is reached at from outside when it is not the one
+`[tenants] public_url` makes: where a proxy or gateway in front of the process serves it. A gateway
+that names its servers in a way a tenant name cannot hold (`https://gw.example.com/fhir/acme_1`,
+with an underscore) needs one. Give it when you create the tenant, or set or change it later:
+
+```bash
+curl -X PATCH "$REFHIR/admin/tenants/acme-1" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{"public_url": "https://gw.example.com/fhir/acme_1"}'
+```
+
+It is written out in full (`{tenant}` is for the host's template only), and must be an absolute
+`http` or `https` URL with a host and no user name, query or fragment. A trailing slash is dropped,
+and one that is not valid is a `400` and changes nothing. An address another tenant is reached at
+(its own, or the one the template makes for it) is a `409`. `"public_url": null` takes it away, so
+the template makes the address again. The tenant's server names it wherever it would name the
+template's address: SMART discovery, the token issuer and audience, Bundle and `/export` links, and
+the `iss` of its Health Cards (a tenant that issues cards under an `http` address is logged as a
+warning, since verifiers accept only `https`). A change is served from the tenant's next request
+on, `/sync` sockets that are already open included, by every process that serves it, with no
+restart. When the [audit trail](governance.md) is on, it is recorded there with the subtype
+`public-url`. `GET /admin/tenants/{name}` reports the address in effect as `public_url`, and the
+tenant's own, when it has one, as `settings.public_url`.
+
+It changes only the address the tenant names, not how a request reaches it. The process still finds
+the tenant by its path or host name, so the gateway sends `…/fhir/acme_1/Patient/1` on to
+`/t/acme-1/Patient/1` (or to the host `acme-1.{domain}`).
+
+**Moving a tenant does not move what it handed out before.** Health Cards issued before the change
+still name the old address as `iss`, and a verifier fetches their keys from
+`[old address]/health-cards/.well-known/jwks.json`: keep that path served from the tenant's key set
+for as long as those cards are in use, or give the tenant a
+[Health Cards issuer](health-cards.md#a-tenants-issuer-and-keys) that does not move. Access tokens
+already issued keep working, but a SMART client should read `/.well-known/smart-configuration` again:
+a new authorization's `aud` and a `private_key_jwt` assertion have to name the new address. With
+`[smart.oidc]` and no `redirect_uri` of its own, the tenant's sign-in callback is
+`[address]/oauth/oidc/callback`, so it moves too: register the new one with the identity provider
+before the change, or sign-ins fail.
+
 With `smart` on, the response also carries the tenant's `registration_token` and the
 `confidential` client's secret, which are the only time the API hands them out (they can be made
 again from the process's two secrets and the name). A tenant name is lowercase letters, digits and
@@ -343,7 +386,8 @@ On a replica, a request that changes tenants is sent on to the primary (`--prima
 write is; a standby answers `503` until it has taken over.
 
 `refhir tenant` does the same against the database, without the process: `create` takes the same
-settings as flags, `delete` the grace period, an export directory and `--yes`, and the processes
+settings as flags (except a tenant's own `public_url`, which only the admin API sets), `delete` the
+grace period, an export directory and `--yes`, and the processes
 that serve every tenant follow what it changes. (It does not open the tenant, so a `create` that
 names a package the process cannot install shows up as the tenant being `unavailable` instead of
 being refused.)
@@ -355,4 +399,6 @@ release that starts, however many tenants the database holds (the migrations tha
 rows take them in turn, each under its own row-level security setting). Start the processes of a
 deployment one release at a time as for [any upgrade](migrations.md). The release that added the
 registry's settings column adds it with an empty settings object to every tenant that was already
-there, and each is served as it was.
+there, and each is served as it was. A tenant given a `public_url` of its own is stored with it,
+which a process of a release before 0.0.8 cannot read: it would serve that tenant with none of its
+settings. Give tenants their own address only once every process runs 0.0.8 or later.

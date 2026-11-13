@@ -1527,3 +1527,113 @@ fn each_tenant_names_its_own_issuer_and_keeps_every_key_it_replaced() {
     );
     replica.kill();
 }
+
+#[test]
+fn a_tenant_given_its_own_address_names_it_and_can_be_moved_without_a_restart() {
+    let Some(admin) = admin_url("tenants host: a tenant's own address") else {
+        return;
+    };
+    let (_database, app) = database_of_an_ordinary_role(&admin, "hostaddress");
+    let mut host = Host::start_with_package("address", &app, &[], refhir_fhir::cards_dir());
+    host.wait_ready();
+
+    // A proxy in front serves the tenant at an address no template makes: its server ID, with an
+    // underscore that a tenant name cannot hold.
+    let tenant = "fs-9f71220f06a50a94";
+    let gateway = "http://localhost:3007/fhir/fs_9f71220f06a50a94";
+    let mut body = card_tenant(tenant, json!(true));
+    body["public_url"] = json!(format!("{gateway}/"));
+    let (status, own) = host.admin("POST", "/admin/tenants", Some(body));
+    assert_eq!(status, 201, "{own}");
+    assert_eq!(own["public_url"], gateway, "{own}");
+    assert_eq!(own["settings"]["public_url"], gateway, "{own}");
+    let (status, plain) = host.admin(
+        "POST",
+        "/admin/tenants",
+        Some(card_tenant("plain", json!(true))),
+    );
+    assert_eq!(status, 201, "{plain}");
+    let template = |name: &str| format!("{}/t/{name}", host.base());
+    assert_eq!(plain["public_url"], template("plain"));
+    assert!(plain["settings"].get("public_url").is_none(), "{plain}");
+
+    // SMART discovery and the cards name it; requests still find the tenant by its path.
+    let smart = |name: &str| {
+        let (status, document) = call(
+            "GET",
+            &format!("{}/t/{name}/.well-known/smart-configuration", host.base()),
+            &[],
+            None,
+        );
+        assert_eq!(status, 200, "{name}: {document}");
+        document
+    };
+    let iss = |name: &str| {
+        let card = issue_card(&host, name);
+        verified_claims(&card, &key_set(&host, name)).unwrap()["iss"].clone()
+    };
+    let document = smart(tenant);
+    assert_eq!(document["issuer"], gateway);
+    for (member, path) in [
+        ("authorization_endpoint", "/oauth/authorize"),
+        ("token_endpoint", "/oauth/token"),
+        ("jwks_uri", "/.well-known/jwks.json"),
+    ] {
+        assert_eq!(document[member], format!("{gateway}{path}"), "{member}");
+    }
+    seed_card_material(&host, tenant);
+    seed_card_material(&host, "plain");
+    assert_eq!(iss(tenant), format!("{gateway}/health-cards"));
+    // The tenant without one keeps the template's address.
+    assert_eq!(smart("plain")["issuer"], template("plain"));
+    assert_eq!(iss("plain"), format!("{}/health-cards", template("plain")));
+
+    // What is not an absolute http(s) address with no query or fragment is refused: no tenant is
+    // made, and the one that exists keeps its address.
+    for url in [
+        "gw.example.org/fhir",
+        "ftp://gw.example.org/fhir",
+        "https://gw.example.org/fhir?server=1",
+        "https://gw.example.org/fhir#top",
+        "https://gw.example.org/fhir/{tenant}",
+        "",
+    ] {
+        let mut body = create_body("refused");
+        body["public_url"] = json!(url);
+        let (status, body) = host.admin("POST", "/admin/tenants", Some(body));
+        assert_eq!(status, 400, "{url:?}: {body}");
+        let (status, body) = host.admin(
+            "PATCH",
+            &format!("/admin/tenants/{tenant}"),
+            Some(json!({"public_url": url})),
+        );
+        assert_eq!(status, 400, "{url:?}: {body}");
+    }
+    assert_eq!(host.admin("GET", "/admin/tenants/refused", None).0, 404);
+    assert_eq!(smart(tenant)["issuer"], gateway);
+
+    // Moved with PATCH, it names the new address from the next request, with no restart; `null`
+    // gives it the template's again.
+    let moved = "https://gw.example.org/fhir/fs_9f71220f06a50a94";
+    let (status, body) = host.admin(
+        "PATCH",
+        &format!("/admin/tenants/{tenant}"),
+        Some(json!({"public_url": moved})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["public_url"], moved);
+    assert_eq!(
+        smart(tenant)["token_endpoint"],
+        format!("{moved}/oauth/token")
+    );
+    assert_eq!(iss(tenant), format!("{moved}/health-cards"));
+    let (status, body) = host.admin(
+        "PATCH",
+        &format!("/admin/tenants/{tenant}"),
+        Some(json!({"public_url": null})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["public_url"], template(tenant));
+    assert!(body["settings"].get("public_url").is_none(), "{body}");
+    assert_eq!(smart(tenant)["issuer"], template(tenant));
+}
