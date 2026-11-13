@@ -7,7 +7,7 @@ rules about contributing see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 | Tool | Version | For |
 |------|---------|-----|
-| Rust | 1.88, installed by `rustup` from [rust-toolchain.toml](../rust-toolchain.toml) | the server |
+| Rust | 1.89, installed by `rustup` from [rust-toolchain.toml](../rust-toolchain.toml) | the server |
 | Go | 1.23+ | the Go client, `seed` and `loadgen` |
 | Node | 22.12+ (the TypeScript client alone needs 20+) | the website, and the TypeScript client |
 | Docker | any recent | the image, and the Postgres TLS tests |
@@ -15,7 +15,7 @@ rules about contributing see [CONTRIBUTING.md](../CONTRIBUTING.md).
 | Python 3 | optional | `scripts/` and the fixture generator |
 
 The pinned toolchain is installed without `clippy` and `rustfmt`. Add them once with
-`rustup component add clippy rustfmt`. Use that toolchain for the checks: CI runs 1.88.0, and a
+`rustup component add clippy rustfmt`. Use that toolchain for the checks: CI runs 1.89.0, and a
 newer clippy reports lints that one does not know.
 
 ## Layout

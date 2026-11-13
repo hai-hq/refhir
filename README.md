@@ -39,7 +39,7 @@ cd refhir
 docker compose up --build
 ```
 
-Or with Rust 1.88 (installed by `rustup` from `rust-toolchain.toml`):
+Or with Rust 1.89 (installed by `rustup` from `rust-toolchain.toml`):
 
 ```bash
 REFHIR_PACKAGE_DOWNLOAD=true cargo run -p refhir -- --memory      # a throwaway server; use --sqlite refhir.sqlite to keep data

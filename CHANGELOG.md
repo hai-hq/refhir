@@ -32,6 +32,20 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   that has one, so upgrade every process before setting it. See
   [a tenant's own address](docs/clustering.md#a-tenants-own-address).
 
+### Changed
+
+- **Building ReFHIR from source needs Rust 1.89** (it was 1.88). `rust-toolchain.toml`, the
+  workspace `rust-version` and the image's build stage say 1.89. The SQLite update below needs
+  `rusqlite` 0.41, which needs Rust 1.89.
+
+### Security
+
+- **The SQLite built into ReFHIR is 3.54.1** (it was 3.46.0), for RUSTSEC-2026-0459
+  (CVE-2026-119375). An earlier SQLite can return memory it never filled in when it opens a
+  database file together with a `-wal` file whose page size differs, so ordinary queries can read
+  stale bytes from the process. It needs a pair of files someone else wrote, so a server is exposed
+  only if someone it does not trust can write its SQLite database or its `-wal` file.
+
 ## [0.0.7] - 2026-11-05
 
 ### Added

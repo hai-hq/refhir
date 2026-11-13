@@ -4,7 +4,7 @@ Pick one path. **Docker** is for running a server (your machine, VM, or cluster)
 
 | | Docker | From source |
 |---|--------|-------------------|
-| **You need** | Docker (and optionally Docker Compose) | Rust 1.88 ([rust-toolchain.toml](../rust-toolchain.toml)), Git |
+| **You need** | Docker (and optionally Docker Compose) | Rust 1.89 ([rust-toolchain.toml](../rust-toolchain.toml)), Git |
 | **You get** | A `refhir` process in a container | `cargo run -p refhir` from a clone |
 | **Config** | `refhir.toml` on the host (recommended) | `refhir.toml` in the clone and/or command-line flags |
 | **Data** | Docker volume (e.g. `/data`) | `refhir.sqlite` in the clone, or `--memory` |
@@ -65,7 +65,7 @@ Use this when you want to run ReFHIR from a clone of the repository.
 ```bash
 git clone https://github.com/hai-hq/refhir.git
 cd refhir
-# rustup installs 1.88 from rust-toolchain.toml
+# rustup installs 1.89 from rust-toolchain.toml
 ```
 
 **2. Configuration (optional)**

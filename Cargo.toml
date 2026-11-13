@@ -20,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.0.8"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "Apache-2.0"
 repository = "https://github.com/hai-hq/refhir"
 homepage = "https://github.com/hai-hq/refhir"
@@ -30,7 +30,7 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-serde_json-1"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "signal"] }
 axum = { version = "0.7", features = ["ws", "json"] }

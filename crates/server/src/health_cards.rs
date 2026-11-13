@@ -1131,7 +1131,7 @@ mod tests {
         let key = IssuerKey::for_tenant(&store, true).unwrap();
         let first = key.kid();
         let before = card(&key);
-        assert_eq!(kids(&key), [first.clone()]);
+        assert_eq!(kids(&key), std::slice::from_ref(&first));
 
         let rotated = IssuerKey::rotate_tenant(&store).unwrap();
         assert_eq!(rotated.replaced, first);
