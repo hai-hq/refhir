@@ -246,6 +246,96 @@ fn losing_one_tenants_lease_leaves_the_others() {
     assert_eq!(first.lease.held().len(), 1);
 }
 
+/// A lease check that Postgres cancels (it waited past the session's `statement_timeout`, here on a
+/// lock someone holds on `persistence_globals`, on a busy machine on a slow disk) leaves the
+/// session and its locks in place. The process keeps every tenant and checks again; it used to
+/// exit, which ends this test binary.
+#[test]
+fn a_lease_check_that_runs_out_of_time_keeps_the_leases() {
+    let Some(admin) = test_url("tenancy: slow lease check") else {
+        return;
+    };
+    let url = shared(&admin, "tshslow", &["a", "b"]);
+    let first = connections(&operator_url(&url), 2);
+    let a = PostgresPersistence::open_tenant(&first, "a", 1).unwrap();
+    let b = PostgresPersistence::open_tenant(&first, "b", 1).unwrap();
+    for tenant in [&a, &b] {
+        assert!(matches!(
+            tenant.try_acquire_writer_lease().unwrap(),
+            Lease::Held { .. }
+        ));
+    }
+    // Longer than the check's 5 s timeout, so at least one check (every 2 s) is canceled.
+    let mut blocker = client(&url);
+    let mut tx = blocker.transaction().unwrap();
+    tx.batch_execute("LOCK TABLE persistence_globals IN ACCESS EXCLUSIVE MODE")
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(8));
+    tx.commit().unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+
+    assert_eq!(first.lease.held().len(), 2);
+    assert!(!a.writer_lease_lost() && !b.writer_lease_lost());
+    a.write(&[doc("after", 5, "x")], &[], ConflictStrategy::Error)
+        .unwrap();
+    // Still the lock holder: another process finds the tenant busy.
+    let second = connections(&operator_url(&url), 1);
+    let again = PostgresPersistence::open_tenant(&second, "a", 1).unwrap();
+    assert!(matches!(
+        again.try_acquire_writer_lease().unwrap(),
+        Lease::Busy
+    ));
+}
+
+/// A lease session that dies (the server ended it, the network dropped it) takes its locks with
+/// it. Nobody took the tenants in between, so their epochs are still this process's: it takes the
+/// leases back on a new session and goes on, rather than exiting.
+#[test]
+fn a_lease_session_that_dies_is_reopened_and_its_leases_taken_back() {
+    let Some(admin) = test_url("tenancy: lease session reopened") else {
+        return;
+    };
+    let url = shared(&admin, "tshreopen", &["a", "b"]);
+    let first = connections(&operator_url(&url), 2);
+    let a = PostgresPersistence::open_tenant(&first, "a", 1).unwrap();
+    let b = PostgresPersistence::open_tenant(&first, "b", 1).unwrap();
+    for tenant in [&a, &b] {
+        assert!(matches!(
+            tenant.try_acquire_writer_lease().unwrap(),
+            Lease::Held { .. }
+        ));
+    }
+    let lease_session = |url: &str| -> Option<i32> {
+        client(url)
+            .query_opt(
+                "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted \
+                 AND objsubid = 2 AND classid = $1::int4::oid \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                 LIMIT 1",
+                &[&crate::lease::LEASE_NAMESPACE],
+            )
+            .unwrap()
+            .map(|row| row.get(0))
+    };
+    let old = lease_session(&url).expect("a lease session");
+    client(&url)
+        .execute("SELECT pg_terminate_backend($1)", &[&old])
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let new = loop {
+        match lease_session(&url) {
+            Some(pid) if pid != old => break pid,
+            _ if std::time::Instant::now() > deadline => panic!("the leases were not taken back"),
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
+    };
+    assert_ne!(new, old);
+    assert_eq!(first.lease.held().len(), 2);
+    assert!(!a.writer_lease_lost() && !b.writer_lease_lost());
+    b.write(&[doc("back", 5, "x")], &[], ConflictStrategy::Error)
+        .unwrap();
+}
+
 /// A replica of each tenant listens on the one connection the process shares, and hears only
 /// its own tenant's publishes.
 #[test]
