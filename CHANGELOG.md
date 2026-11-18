@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-11-20
+
 ### Added
 
 - **`Binary` as FHIR R4 has it.** A `Binary` can be created or updated with the file itself as the
@@ -999,7 +1001,8 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.9...HEAD
+[0.0.9]: https://github.com/hai-hq/refhir/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/hai-hq/refhir/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/hai-hq/refhir/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/hai-hq/refhir/compare/v0.0.5...v0.0.6
