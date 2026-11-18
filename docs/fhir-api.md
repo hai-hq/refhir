@@ -29,6 +29,29 @@ concurrency conflicts. A `transaction` Bundle is one atomic commit, which is wha
 `PUT` does not create a resource under an id the client chooses unless you opt in; see
 [Resource ids](#resource-ids).
 
+A request body (or a `/sync` message) may be up to 32 MiB, which takes a 10 MB file sent as a
+`Binary` in JSON; `[server].max_request_bytes` changes it. A larger one is refused with `413` and an
+`OperationOutcome` whose code is `too-costly`, and nothing is written.
+
+### Files: `Binary`
+
+A `Binary` can be sent and fetched as the file itself, as well as as a resource:
+
+- **Create or update with the file as the body**: `POST /Binary` or `PUT /Binary/[id]` with the
+  file's own `Content-Type` (`application/pdf`, `image/png`, ...). The server stores a `Binary`
+  whose `contentType` is that type and whose `data` is the body, byte for byte. An
+  `X-Security-Context: Patient/123` header becomes its `securityContext`. A body sent as
+  `application/fhir+json` (or XML) is the `Binary` resource, as for any other type.
+- **Read the file**: `GET /Binary/[id]` with an `Accept` that names a type other than a FHIR one
+  (`Accept: application/pdf`) returns the content itself, with the `Binary`'s `contentType` as its
+  `Content-Type` and its `securityContext` in `X-Security-Context`. `Accept: application/fhir+json`,
+  no `Accept` at all, or `_format=json` (which wins over the `Accept`) returns the resource. A
+  `vread` of a version is the same.
+
+Over [`/sync`](sync-protocol.md) a `Binary` is a resource like any other, with its content in `data`
+as base64. The server does not apply `securityContext` to who may read a `Binary`: it is stored and
+returned, and access is decided by the token's scopes, as for any other type.
+
 ### When a resource was written
 
 The server sets `meta.lastUpdated` on every version it writes, to the time it received the write: a

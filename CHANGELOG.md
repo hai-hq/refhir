@@ -10,6 +10,35 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **`Binary` as FHIR R4 has it.** A `Binary` can be created or updated with the file itself as the
+  body: its `Content-Type` becomes `contentType` and `X-Security-Context` becomes `securityContext`.
+  A read whose `Accept` names a type that is not a FHIR format, with no `_format`, returns the file
+  with its own `Content-Type`. Before, such a create was a `400` (`invalid JSON`) and such a read
+  returned the resource.
+- **`[server].max_request_bytes`** (`REFHIR_MAX_REQUEST_BYTES`): one limit on a request's size for a
+  server, a replica and every tenant of a host, 32 MiB by default.
+
+### Changed
+
+- **A tenant host takes requests up to 32 MiB**, the same as a single server. Before, a request to a
+  tenant above 2 MB was refused (a 10 MB file is about 13.4 MB as JSON), as was one a replica
+  forwarded. Above the limit the answer is now a `413` with an `OperationOutcome` (`too-costly`) on
+  every path, and a `/sync` mutation above it gets a failed `MutationResponse` with that outcome
+  instead of a socket that closes.
+- **`_format` wins over `Accept`** when they ask for different formats, as FHIR has it.
+
+### Fixed
+
+- **A host with many tenants no longer exits when its writer lease check is slow.** The session
+  that holds the tenants' leases checks them every 2 seconds and gives each check 5 seconds. A check
+  that ran out of time, on a busy machine or behind a lock, made the host exit (`writer lease lost,
+  exiting: ... db error`) though the session and its leases were intact. It now checks again on the
+  next tick. A session that really fails is replaced, and each lease taken back on the new one where
+  no other process has taken it in between; the host exits only when it cannot open a session at
+  all. The reason it logs now carries the database's own message.
+
 ## [0.0.8] - 2026-11-13
 
 ### Added

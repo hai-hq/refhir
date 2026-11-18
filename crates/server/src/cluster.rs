@@ -37,11 +37,6 @@ pub const FORWARDED: &str = "x-refhir-forwarded";
 /// tenant (or of no tenant) refuses it.
 pub const TENANT: &str = "x-refhir-tenant";
 
-/// How much of a request body a replica buffers so it can replay it: what the primary's handlers
-/// accept, which is axum's default body limit (the server sets none of its own). A replica holding
-/// more would only be holding what the primary then refuses.
-const MAX_BUFFERED_BODY: usize = 2 * 1024 * 1024;
-
 tokio::task_local! {
     /// The highest timestamp an operation reported while serving this request.
     static REPORTED_TS: Cell<u64>;
@@ -332,12 +327,14 @@ pub(crate) async fn cluster_layer(
         );
     }
 
-    // Replica: buffer the request so it can be replayed on the primary.
+    // Replica: buffer the request so it can be replayed on the primary. It holds as much as the
+    // primary takes (the one `max_request_bytes`), and refuses more as the primary would.
     let (parts, body) = request.into_parts();
-    let bytes = match axum::body::to_bytes(body, MAX_BUFFERED_BODY).await {
-        Ok(bytes) => bytes,
-        Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
-    };
+    let bytes =
+        match crate::http::read_body(&parts.headers, body, app.config.max_request_bytes).await {
+            Ok(bytes) => bytes,
+            Err(response) => return finish((response, 0), role),
+        };
     let (method, uri, headers) = (
         parts.method.clone(),
         parts.uri.clone(),

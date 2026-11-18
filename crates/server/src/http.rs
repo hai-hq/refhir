@@ -85,10 +85,18 @@ pub struct ServerConfig {
     /// process of another tenant, so a replica pointed at the wrong primary cannot write into a
     /// tenant that is not its own. `None` is a database with no tenants.
     pub tenant: Option<String>,
+    /// The largest request this server takes, in bytes: the body of a REST request (what a
+    /// replica buffers to forward, too), or one `/sync` message. Above it the answer is a 413 with
+    /// an OperationOutcome (`too-costly`), and nothing is written.
+    pub max_request_bytes: usize,
 }
 
 /// The page a search `GET` that names no `_count` gets. FHIR leaves the page size to the server.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
+
+/// What [`ServerConfig::max_request_bytes`] is unless it is set: room for a 10 MB file sent as a
+/// `Binary` in JSON (base64 makes it about 13.4 MB), and for a transaction of many resources.
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 
 /// The database-backed governance tables, as passed in `ServerConfig::governance_store`.
 #[derive(Clone)]
@@ -134,6 +142,7 @@ impl Default for ServerConfig {
             governance_store: None,
             default_page_size: DEFAULT_PAGE_SIZE,
             tenant: None,
+            max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
         }
     }
 }
@@ -472,6 +481,10 @@ pub fn tenant_app(
     // with a request it cannot serve. The limits come before that, so that a request is turned
     // away before a replica buffers its body to forward it or waits for a snapshot.
     let router = router
+        // Every body is held to `max_request_bytes` by `limit_body`, before any handler reads it,
+        // so axum's own limit (2 MB, answered in plain text) is off.
+        .layer(axum::extract::DefaultBodyLimit::disable())
+        .layer(middleware::from_fn_with_state(state.clone(), limit_body))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             crate::cluster::cluster_layer,
@@ -895,7 +908,7 @@ async fn reject_patient_http(
     path: &str,
     request: &mut Request<Body>,
 ) -> Option<Response> {
-    let body = match buffered_body(request).await {
+    let body = match buffered_body(app, request).await {
         Ok(body) => body,
         Err(response) => return Some(response),
     };
@@ -913,27 +926,93 @@ async fn reject_patient_http(
     None
 }
 
-async fn buffered_body(request: &mut Request<Body>) -> Result<Option<Value>, Response> {
+async fn buffered_body(
+    app: &AppState,
+    request: &mut Request<Body>,
+) -> Result<Option<Value>, Response> {
     if request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD {
         return Ok(None);
     }
-    let bytes = axum::body::to_bytes(
-        std::mem::replace(request.body_mut(), Body::empty()),
-        32 * 1024 * 1024,
-    )
-    .await
-    .map_err(|_| {
-        outcome(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "too-costly",
-            "request body is too large",
-        )
-    })?;
+    let body = std::mem::replace(request.body_mut(), Body::empty());
+    let bytes = read_body(request.headers(), body, app.config.max_request_bytes).await?;
     *request.body_mut() = Body::from(bytes.clone());
     if bytes.is_empty() {
         return Ok(None);
     }
-    parse_body(&bytes).map(Some)
+    let segments: Vec<&str> = request
+        .uri()
+        .path()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    match segments.as_slice() {
+        [kind] => request_resource(kind, None, request.headers(), &bytes).map(Some),
+        [kind, id] => request_resource(kind, Some(id), request.headers(), &bytes).map(Some),
+        _ => parse_body(&bytes).map(Some),
+    }
+}
+
+/// Holds the body of every request to [`ServerConfig::max_request_bytes`], whichever route it is
+/// for, and answers a larger one with a 413 OperationOutcome before anything reads it. The body
+/// is handed on whole, so the handlers' own reading of it cannot fail on its size.
+async fn limit_body(State(app): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    if matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    match read_body(&parts.headers, body, app.config.max_request_bytes).await {
+        Ok(bytes) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Err(response) => response,
+    }
+}
+
+/// A request's body, read whole: at most `limit` bytes, or a 413 OperationOutcome. One that says
+/// in `Content-Length` that it is larger is refused before any of it is read.
+pub(crate) async fn read_body(
+    headers: &HeaderMap,
+    body: Body,
+    limit: usize,
+) -> Result<Bytes, Response> {
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if declared.is_some_and(|length| length > limit as u64) {
+        return Err(too_large(limit));
+    }
+    axum::body::to_bytes(body, limit).await.map_err(|err| {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+        while let Some(cause) = source {
+            if cause.is::<http_body_util::LengthLimitError>() {
+                return too_large(limit);
+            }
+            source = cause.source();
+        }
+        outcome(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            &format!("could not read the request body: {err}"),
+        )
+    })
+}
+
+/// The answer to a request larger than [`ServerConfig::max_request_bytes`].
+pub(crate) fn too_large(limit: usize) -> Response {
+    outcome(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "too-costly",
+        &too_large_text(limit),
+    )
+}
+
+pub(crate) fn too_large_text(limit: usize) -> String {
+    format!("the request is larger than the {limit} bytes this server accepts")
 }
 
 fn forbidden_response(message: &str) -> Response {
@@ -990,6 +1069,7 @@ async fn sync_ws(
                 url: crate::cluster::sync_url(base),
                 bearer: crate::auth::resolve_token(&headers, query.as_deref()),
                 tenant: app.config.tenant.clone(),
+                max_message: app.config.max_request_bytes,
             })
     } else {
         None
@@ -1001,28 +1081,32 @@ async fn sync_ws(
         public_url: app.public_url.clone(),
         fallback: crate::auth::issuer(&app, &headers),
     };
-    ws.on_upgrade(move |socket| async move {
-        // The permit is held as long as the connection is.
-        let _permit = permit;
-        let stop = app.stop.clone();
-        // A server that stops being served closes its sockets.
-        tokio::select! {
-            _ = sync::handle_socket(
-                socket,
-                sync::Served {
-                    db: app.db,
-                    catalog: app.catalog,
-                    store: app.store,
-                    cards,
-                },
-                session,
-                scope,
-                upstream,
-            ) => {}
-            _ = stop.stopped() => {}
-        }
-    })
-    .into_response()
+    let cap = sync::socket_cap(app.config.max_request_bytes);
+    ws.max_message_size(cap)
+        .max_frame_size(cap)
+        .on_upgrade(move |socket| async move {
+            // The permit is held as long as the connection is.
+            let _permit = permit;
+            let stop = app.stop.clone();
+            // A server that stops being served closes its sockets.
+            tokio::select! {
+                _ = sync::handle_socket(
+                    socket,
+                    sync::Served {
+                        db: app.db,
+                        catalog: app.catalog,
+                        store: app.store,
+                        cards,
+                        max_message: app.config.max_request_bytes,
+                    },
+                    session,
+                    scope,
+                    upstream,
+                ) => {}
+                _ = stop.stopped() => {}
+            }
+        })
+        .into_response()
 }
 
 async fn bundle_post(
@@ -1057,7 +1141,7 @@ async fn create(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let resource = match parse_body(&body) {
+    let resource = match request_resource(&resource_type, None, &headers, &body) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1540,6 +1624,9 @@ async fn read(
     )
     .await
     {
+        Ok(result) if wants_binary_content(&resource_type, &headers, &params) => {
+            binary_content(result.value)
+        }
         Ok(result) => resource_response(
             StatusCode::OK,
             result.value,
@@ -1556,7 +1643,7 @@ async fn update(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let resource = match parse_body(&body) {
+    let resource = match request_resource(&resource_type, Some(&id), &headers, &body) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1674,6 +1761,8 @@ async fn instance_history(
 async fn vread(
     State(app): State<AppState>,
     Path((resource_type, id, vid)): Path<(String, String, String)>,
+    headers: HeaderMap,
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
     if let Some(response) = archiver_read(&app, &resource_type) {
         return response;
@@ -1687,6 +1776,9 @@ async fn vread(
     )
     .await
     {
+        Ok(result) if wants_binary_content(&resource_type, &headers, &params) => {
+            binary_content(result.value)
+        }
         Ok(result) => resource_response(StatusCode::OK, result.value, None, false),
         Err(err) => error_response(err),
     }
@@ -2540,12 +2632,162 @@ fn parse_body(bytes: &[u8]) -> Result<Value, Response> {
     })
 }
 
+/// The resource as a request sends it. A `Binary` may be sent as its content alone (R4
+/// http.html#binary): a body whose `Content-Type` is not a FHIR format is the content, that type is
+/// its `contentType`, and `X-Security-Context` is its `securityContext`. Anything else is the
+/// resource in JSON or XML.
+fn request_resource(
+    resource_type: &str,
+    id: Option<&str>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Value, Response> {
+    let raw = (resource_type == "Binary")
+        .then(|| headers.get(header::CONTENT_TYPE))
+        .flatten()
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| {
+            let media = media_type(value);
+            !media.is_empty() && !is_fhir_media_type(&media)
+        });
+    let Some(content_type) = raw else {
+        return parse_body(body);
+    };
+    use base64::Engine as _;
+    let mut binary = serde_json::Map::new();
+    binary.insert("resourceType".into(), json!("Binary"));
+    if let Some(id) = id {
+        binary.insert("id".into(), json!(id));
+    }
+    binary.insert("contentType".into(), json!(content_type));
+    if let Some(context) = headers
+        .get("x-security-context")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        binary.insert("securityContext".into(), json!({"reference": context}));
+    }
+    if !body.is_empty() {
+        binary.insert(
+            "data".into(),
+            json!(base64::engine::general_purpose::STANDARD.encode(body)),
+        );
+    }
+    Ok(Value::Object(binary))
+}
+
+/// `type/subtype` of a `Content-Type` or of one range of an `Accept`, lower case, with no
+/// parameters.
+fn media_type(value: &str) -> String {
+    value
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// The media types a FHIR resource is sent and asked for in (R4 http.html#mime-type), with the
+/// plain JSON and XML ones a client may use for them.
+fn is_fhir_media_type(media: &str) -> bool {
+    matches!(
+        media,
+        "application/fhir+json"
+            | "application/json+fhir"
+            | "application/json"
+            | "application/fhir+xml"
+            | "application/xml+fhir"
+            | "application/xml"
+            | "text/xml"
+            | "application/fhir+turtle"
+            | "text/turtle"
+    )
+}
+
+/// Whether a read of a `Binary` asks for its content rather than the resource (R4
+/// http.html#binary): no `_format` asks for a FHIR format, and the `Accept` names a type that is
+/// not one. An `Accept` that is missing or is only `*/*` gets the resource, as for any other type.
+fn wants_binary_content(
+    resource_type: &str,
+    headers: &HeaderMap,
+    params: &[(String, String)],
+) -> bool {
+    if resource_type != "Binary" || params.iter().any(|(key, _)| key == "_format") {
+        return false;
+    }
+    let Some(accept) = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mut other = false;
+    for range in accept.split(',') {
+        let media = media_type(range);
+        if media.is_empty() || media == "*/*" {
+            continue;
+        }
+        if is_fhir_media_type(&media) || media.contains("fhir") {
+            return false;
+        }
+        other = true;
+    }
+    other
+}
+
+/// A `Binary`'s content, as its `contentType`, with its `securityContext` in `X-Security-Context`.
+fn binary_content(value: Value) -> Response {
+    use base64::Engine as _;
+    let data = value.get("data").and_then(Value::as_str).unwrap_or("");
+    // base64Binary may carry whitespace; the decoder does not take it.
+    let decoded = if data.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+        base64::engine::general_purpose::STANDARD.decode(compact)
+    } else {
+        base64::engine::general_purpose::STANDARD.decode(data)
+    };
+    let Ok(bytes) = decoded else {
+        return outcome(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "exception",
+            "this Binary's data is not valid base64, so its content cannot be returned; ask for \
+             the resource (Accept: application/fhir+json) instead",
+        );
+    };
+    let content_type = value
+        .get("contentType")
+        .and_then(Value::as_str)
+        .and_then(|text| axum::http::HeaderValue::from_str(text).ok())
+        .unwrap_or_else(|| axum::http::HeaderValue::from_static("application/octet-stream"));
+    let mut response = (StatusCode::OK, bytes).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, content_type);
+    if let Some(etag) = value
+        .pointer("/meta/versionId")
+        .and_then(Value::as_str)
+        .and_then(|version| format!("W/\"{version}\"").parse().ok())
+    {
+        headers.insert(header::ETAG, etag);
+    }
+    if let Some(context) = value
+        .pointer("/securityContext/reference")
+        .and_then(Value::as_str)
+        .and_then(|text| axum::http::HeaderValue::from_str(text).ok())
+    {
+        headers.insert("x-security-context", context);
+    }
+    response
+}
+
 fn prefer_xml(headers: &HeaderMap, params: &[(String, String)]) -> bool {
-    if params.iter().any(|(key, value)| {
-        key == "_format"
-            && (value == "xml" || value.contains("fhir+xml") || value == "application/xml")
-    }) {
-        return true;
+    // `_format` is there for clients that cannot set `Accept`, and wins over it.
+    if let Some((_, value)) = params.iter().find(|(key, _)| key == "_format") {
+        return value == "xml"
+            || value.contains("fhir+xml")
+            || value == "application/xml"
+            || value == "text/xml";
     }
     headers
         .get(header::ACCEPT)

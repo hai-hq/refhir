@@ -25,6 +25,12 @@ bind = "0.0.0.0:8080"
 # link of the Bundle. A client that asks for _count gets what it asked for. 0 returns every match
 # in one response. REFHIR_DEFAULT_PAGE_SIZE.
 # default_page_size = 100
+# The largest request the server takes, in bytes: a REST request's body, or one `/sync` message.
+# A larger one is refused with 413 and an OperationOutcome (`too-costly`); a `/sync` message more
+# than twice as large closes the socket (1009). The default, 32 MiB, takes a 10 MB Binary as JSON
+# (base64 makes it about 13.4 MB). It is the same on a tenant host, for every tenant.
+# REFHIR_MAX_REQUEST_BYTES.
+# max_request_bytes = 33554432
 
 [database]
 kind = "sqlite" # sqlite | memory | postgres

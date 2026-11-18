@@ -28,6 +28,17 @@ pub struct Upstream {
     pub bearer: Option<String>,
     /// The tenant this replica serves, which the primary checks against its own.
     pub tenant: Option<String>,
+    /// The largest message this replica's own socket takes, and so the largest answer it reads
+    /// from the primary's (see [`socket_cap`]).
+    pub max_message: usize,
+}
+
+/// The largest message a `/sync` socket reads, for a request limit of `limit` bytes. A message up
+/// to the limit is run; one between the limit and twice it is read, so that it can be answered
+/// with a `too-costly` outcome like a REST request; a larger one closes the socket (1009, message
+/// too big), as reading it to answer would cost what the limit is there to spare.
+pub(crate) fn socket_cap(limit: usize) -> usize {
+    limit.saturating_mul(2)
 }
 
 /// Runs one mutation on the primary over a connection of its own and returns its
@@ -64,9 +75,15 @@ async fn forward_mutation(
             request.headers_mut().insert(crate::cluster::TENANT, value);
         }
     }
+    // The primary's answer echoes what was written, so it is as large as the request may be.
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(socket_cap(upstream.max_message)),
+        max_frame_size: Some(socket_cap(upstream.max_message)),
+        ..Default::default()
+    };
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_tungstenite::connect_async(request),
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
     )
     .await
     .map_err(|_| "connecting to the primary timed out".to_string())?
@@ -273,6 +290,9 @@ pub struct Served {
     pub catalog: Arc<RwLock<Catalog>>,
     pub store: Arc<dyn ConformanceStore>,
     pub cards: Cards,
+    /// The server's request limit ([`crate::ServerConfig::max_request_bytes`]), which each
+    /// message is held to.
+    pub max_message: usize,
 }
 
 pub async fn handle_socket(
@@ -287,6 +307,7 @@ pub async fn handle_socket(
         catalog,
         store,
         cards,
+        max_message,
     } = served;
     let (mut sink, mut stream) = socket.split();
     let (inv_tx, mut inv_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -312,6 +333,11 @@ pub async fn handle_socket(
                         }
                     }
                     Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Text(text))) if text.len() > max_message => {
+                        if too_large(&mut sink, &text, max_message).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(Ok(Message::Text(text))) => {
                         // The token was checked when the socket opened. It is looked at again
                         // before anything it asks for is run, so a revoked one does nothing more.
@@ -326,7 +352,18 @@ pub async fn handle_socket(
                         }
                     }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(Err(err)) => {
+                        // Most often a message larger than the socket reads (`socket_cap`): say
+                        // so, where the connection still takes a frame.
+                        tracing::debug!(target: ENGINE, "sync socket read failed: {err}");
+                        let _ = sink
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: axum::extract::ws::close_code::SIZE,
+                                reason: "message too big".into(),
+                            })))
+                            .await;
+                        break;
+                    }
                 }
             }
             Some(inv) = inv_rx.recv() => {
@@ -968,6 +1005,47 @@ async fn send_transition(
 }
 
 /// Tell the client why the connection is about to end. The caller then drops it.
+/// The answer to a message larger than the server's request limit, which is not run: for a
+/// mutation, a failed `MutationResponse` with a `too-costly` outcome, as REST answers 413; for
+/// anything else, a fatal error. `Err` when the socket is to close.
+async fn too_large(
+    sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
+    text: &str,
+    limit: usize,
+) -> Result<(), ()> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        #[serde(rename = "requestId")]
+        request_id: Option<u64>,
+    }
+    let diagnostics = http::too_large_text(limit);
+    match serde_json::from_str::<Envelope>(text) {
+        Ok(Envelope {
+            kind: Some(kind),
+            request_id: Some(request_id),
+        }) if kind == "Mutation" => {
+            tracing::warn!(target: ENGINE, bytes = text.len(), limit, "sync Mutation refused: too large");
+            send_json(
+                sink,
+                &json!({
+                    "type": "MutationResponse",
+                    "requestId": request_id,
+                    "success": false,
+                    "result": http::outcome_json("too-costly", &diagnostics),
+                    "ts": Value::Null
+                }),
+            )
+            .await
+        }
+        _ => {
+            fatal(sink, &diagnostics).await?;
+            Err(())
+        }
+    }
+}
+
 async fn fatal(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     message: &str,

@@ -957,6 +957,7 @@ impl Manager {
             min_ts_wait: Duration::from_millis(250),
             sync_token_recheck: Duration::from_secs(30),
             default_page_size: self.cfg.default_page_size,
+            max_request_bytes: self.cfg.max_request_bytes,
             jobs: Some(refhir_server::SharedJobStore::new(Arc::new(
                 persistence.clone(),
             ))),

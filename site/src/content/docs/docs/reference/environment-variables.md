@@ -23,6 +23,7 @@ between deployments, so they stay out of the config file.
 | `REFHIR_TENANTS_WARM_UP` | `0`, `false`, `no` or `off` stops a primary that serves every tenant from making the packages and catalogs a new tenant starts from when it starts. On by default. The same as `[tenants].warm_up`. See [How long a new tenant takes](/docs/operate/clustering/#how-long-a-new-tenant-takes). |
 | `REFHIR_ADMIN_TOKEN` | The bearer token of the tenant admin API (`/admin/tenants`). Without one the admin API refuses everything. The same as `[tenants].admin_token`; prefer the variable, and treat the token as a database password. |
 | `REFHIR_DEFAULT_PAGE_SIZE` | How many matches a search `GET` returns on a page when it names no `_count`, with a `next` link for the rest. The default is 100, and `0` returns every match in one response. Overrides `[server].default_page_size`. There is no flag. |
+| `REFHIR_MAX_REQUEST_BYTES` | The largest request the server takes, in bytes: a REST request's body or one `/sync` message. The default is 33554432 (32 MiB), room for a 10 MB file as a `Binary` in JSON; a larger request is refused with `413` (`too-costly`). Overrides `[server].max_request_bytes`. There is no flag. |
 | `REFHIR_UPDATE_AS_CREATE` | Set to `true` to let `PUT [type]/[id]` create a resource under the id the client names. The same as `--update-as-create`. |
 
 ## Packages
