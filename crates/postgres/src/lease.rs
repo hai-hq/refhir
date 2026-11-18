@@ -15,11 +15,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use postgres::{GenericClient, Transaction};
+use postgres::error::SqlState;
+use postgres::{Client, GenericClient, Transaction};
 use refhir_persistence::{Lease, PersistError, PersistenceGlobalKey};
 
 use crate::scope::Scope;
-use crate::{definite, Conn};
+use crate::{definite, Conn, ErrorText};
 
 /// `pg_try_advisory_lock` key for the writer lease of a database in the classic layout.
 const LEASE_KEY: i64 = 0x7265_6668_6972_0001;
@@ -32,6 +33,18 @@ pub(crate) const LEASE_NAMESPACE: i32 = 0x7265_6668;
 
 /// How often the lease connection checks that it still holds the lease.
 const KEEPALIVE: Duration = Duration::from_secs(2);
+
+/// How many times a process whose lease session failed opens another to take its leases back
+/// before it gives up and exits, [`KEEPALIVE`] apart.
+const REOPEN_ATTEMPTS: u32 = 5;
+
+/// A statement Postgres canceled (its `statement_timeout` ran out: a database too busy to answer
+/// in time, or a lock someone holds on `persistence_globals`) on a session that is still open. The
+/// session, and every advisory lock it holds, are still there: nobody else can have taken the
+/// lease, so the check is simply tried again on the next tick.
+fn canceled_on_open_session(client: &Client, err: &postgres::Error) -> bool {
+    !client.is_closed() && err.code() == Some(&SqlState::QUERY_CANCELED)
+}
 
 /// What a process that serves many tenants is told when it loses one tenant's lease.
 pub(crate) type LostHook = Box<dyn Fn(&str) + Send + Sync>;
@@ -213,6 +226,7 @@ impl LeaseHub {
     }
 
     /// The tenant ids whose lease this process holds.
+    #[cfg(test)]
     pub(crate) fn held(&self) -> Vec<i32> {
         let mut ids: Vec<i32> = self
             .held
@@ -233,7 +247,7 @@ impl LeaseHub {
     ) -> Result<Option<u64>, PersistError> {
         let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
         if session.as_ref().is_some_and(|conn| conn.is_closed()) {
-            self.session_failed("the lease session closed");
+            self.reopen(&mut session, "the lease session closed");
         }
         if session.is_none() {
             let mut client = Conn::new(crate::connect_client(&self.url)?);
@@ -294,10 +308,7 @@ impl LeaseHub {
             Ok(None) => Ok(None),
             Err(err) => {
                 if client.is_closed() {
-                    if !self.held().is_empty() {
-                        self.session_failed(&err.to_string());
-                    }
-                    *session = None;
+                    self.reopen(&mut session, &err.to_string());
                 }
                 Err(err)
             }
@@ -338,6 +349,114 @@ impl LeaseHub {
         }
     }
 
+    /// The lease session failed (`reason`), and every lock it held went with it. Opens another
+    /// and takes each held tenant's lease back, which is safe only where nobody took it in between:
+    /// whoever takes a lease moves its epoch while holding the lock, so a lock that is free again
+    /// and an epoch that is still this process's own mean the tenant was never anyone else's. A
+    /// tenant that was is lost alone, as one whose epoch moved is. A process that cannot open a
+    /// session at all, after [`REOPEN_ATTEMPTS`] tries, cannot tell which tenants are still its own,
+    /// and exits.
+    ///
+    /// Called with the session's lock held, so no tenant is opened on a session being replaced.
+    fn reopen(&self, session: &mut Option<Conn>, reason: &str) {
+        // Dropping it closes it, and with it any lock it still had.
+        *session = None;
+        let held: Vec<(i32, u64)> = self
+            .held
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(id, held)| (*id, held.epoch))
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            target: "refhir",
+            "the session that holds the tenants' leases failed ({reason}); taking them back on \
+             another"
+        );
+        for attempt in 1..=REOPEN_ATTEMPTS {
+            if attempt > 1 {
+                std::thread::sleep(KEEPALIVE);
+            }
+            match self.take_back(&held) {
+                Ok((client, lost)) => {
+                    *session = Some(client);
+                    for (id, why) in lost {
+                        let state = self
+                            .held
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .remove(&id)
+                            .and_then(|held| held.state.upgrade());
+                        if let Some(state) = state {
+                            state.mark_lost(&format!("tenant {id}: {why}"));
+                        }
+                    }
+                    tracing::info!(target: "refhir", attempt, "the tenants' leases are held on a new session");
+                    return;
+                }
+                Err(err) => tracing::warn!(
+                    target: "refhir",
+                    attempt,
+                    "could not take the tenants' leases back: {err}"
+                ),
+            }
+        }
+        self.session_failed(reason)
+    }
+
+    /// One try of [`Self::reopen`]: a new session holding the lease of each of `held` that is still
+    /// this process's, and the tenants that are not, with why. Any failure drops the session, and
+    /// with it the locks this try took, so the next try starts clean.
+    fn take_back(&self, held: &[(i32, u64)]) -> Result<(Conn, Vec<(i32, String)>), PersistError> {
+        let mut client = Conn::new(crate::connect_client(&self.url)?);
+        client
+            .batch_execute("SET statement_timeout = '5s'")
+            .map_err(definite)?;
+        let key = PersistenceGlobalKey::WriterEpoch.as_str();
+        let mut lost = Vec::new();
+        for &(id, epoch) in held {
+            let scope = Scope::Tenant(id);
+            crate::set_tenant(&mut client, scope)?;
+            let got: bool = client
+                .query_one(
+                    "SELECT pg_try_advisory_lock($1, $2)",
+                    &[&LEASE_NAMESPACE, &id],
+                )
+                .map_err(definite)?
+                .get(0);
+            if !got {
+                lost.push((id, "another process holds its lease now".to_string()));
+                continue;
+            }
+            let current = client
+                .query_opt(
+                    &format!(
+                        "SELECT json_value FROM persistence_globals WHERE {}key = $1",
+                        scope.and()
+                    ),
+                    &[&key],
+                )
+                .map_err(definite)?
+                .map(|row| row.get::<_, String>(0));
+            let why = match current {
+                Some(text) if text.trim().parse::<u64>().ok() == Some(epoch) => continue,
+                Some(text) => format!("epoch is now {text}, this process held {epoch}"),
+                None => "the writer epoch row is gone".to_string(),
+            };
+            client
+                .execute(
+                    "SELECT pg_advisory_unlock($1, $2)",
+                    &[&LEASE_NAMESPACE, &id],
+                )
+                .map_err(definite)?;
+            lost.push((id, why));
+        }
+        Ok((client, lost))
+    }
+
     /// Every lease went with the session, and another process may hold them now.
     fn session_failed(&self, reason: &str) -> ! {
         lost(&format!(
@@ -367,11 +486,26 @@ impl LeaseHub {
         let rows = {
             let mut session = self.session.lock().unwrap_or_else(|p| p.into_inner());
             let Some(client) = session.as_mut() else {
-                self.session_failed("the lease session is gone");
+                self.reopen(&mut session, "the lease session is gone");
+                return;
             };
             match client.simple_query(&batch) {
                 Ok(rows) => rows,
-                Err(err) => self.session_failed(&err.to_string()),
+                Err(err) if canceled_on_open_session(client, &err) => {
+                    tracing::warn!(
+                        target: "refhir",
+                        "the writer lease check did not finish in time ({}); the session still \
+                         holds the leases, checking again in {}s",
+                        err.error_text(),
+                        KEEPALIVE.as_secs()
+                    );
+                    return;
+                }
+                Err(err) => {
+                    let reason = err.error_text();
+                    self.reopen(&mut session, &reason);
+                    return;
+                }
             }
         };
         let mut seen: HashMap<i32, String> = HashMap::new();
@@ -454,7 +588,14 @@ fn keepalive(mut client: Conn, scope: Scope, epoch: u64, release: Arc<AtomicBool
                 }
             }
             Ok(None) => lost("the writer epoch row is gone"),
-            Err(err) => lost(&format!("lease connection failed: {err}")),
+            Err(err) if canceled_on_open_session(&client, &err) => tracing::warn!(
+                target: "refhir",
+                "the writer lease check did not finish in time ({}); the session still holds the \
+                 lease, checking again in {}s",
+                err.error_text(),
+                KEEPALIVE.as_secs()
+            ),
+            Err(err) => lost(&format!("lease connection failed: {}", err.error_text())),
         }
     }
 }

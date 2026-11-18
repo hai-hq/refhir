@@ -6821,13 +6821,17 @@ mod cluster {
         let read = call(&cluster.replica_app, "GET", "/Patient/nobody", None, &[]).await;
         assert_eq!(header(&read, "x-refhir-role"), "replica");
 
-        // A replica buffers no more of a request than the primary's handlers would take.
+        // A replica buffers no more of a request than the primary would take, and refuses more
+        // as the primary would.
         let mut big = patient("big");
-        big["text"] = json!({"status": "generated", "div": "x".repeat(3 * 1024 * 1024)});
+        big["text"] =
+            json!({"status": "generated", "div": "x".repeat(crate::DEFAULT_MAX_REQUEST_BYTES)});
         let refused = call(&cluster.replica_app, "POST", "/Patient", Some(big), &[]).await;
         assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(
-            refused.headers.get("x-refhir-role").is_none(),
+        assert_eq!(refused.body["issue"][0]["code"], "too-costly");
+        assert_eq!(
+            header(&refused, "x-refhir-role"),
+            "replica",
             "the replica refused it itself, without forwarding"
         );
     }

@@ -30,7 +30,7 @@ pub use governance::{
 pub use health_cards::{IssuerKey, RotateError, Rotated};
 pub use http::{
     app, app_parts, app_with, tenant_app, AppState, ServerConfig, SharedGovernanceStore, Stop,
-    TenantApp, DEFAULT_PAGE_SIZE,
+    TenantApp, DEFAULT_MAX_REQUEST_BYTES, DEFAULT_PAGE_SIZE,
 };
 pub use jobs::{export_everything, SharedJobStore};
 
@@ -137,6 +137,8 @@ pub async fn shutdown_signal() {
 
 #[cfg(test)]
 mod billing_tests;
+#[cfg(test)]
+mod binary_tests;
 #[cfg(test)]
 mod booking_tests;
 #[cfg(test)]

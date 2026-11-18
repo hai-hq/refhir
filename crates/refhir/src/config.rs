@@ -233,6 +233,9 @@ pub struct ServerSection {
     /// How many matches a search returns on a page when it names no `_count`. 0 returns them all.
     /// See `[server] default_page_size` in `refhir.toml.example`.
     pub default_page_size: Option<usize>,
+    /// The largest request body (or `/sync` message) the server takes, in bytes. See
+    /// `[server] max_request_bytes` in `refhir.toml.example`.
+    pub max_request_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -492,6 +495,8 @@ pub struct ResolvedConfig {
     pub sdc_archiver: bool,
     /// Matches on the page of a search that names no `_count`; 0 is every match.
     pub default_page_size: usize,
+    /// The largest request body, or `/sync` message, in bytes; above it the answer is a 413.
+    pub max_request_bytes: usize,
     /// Observing by default: usage, the request log and the audit trail are on, and nothing is
     /// limited until an operator sizes a limit for their traffic.
     pub governance: GovernanceConfig,
@@ -533,6 +538,7 @@ impl ResolvedConfig {
             trace_engine: false,
             sdc_archiver: false,
             default_page_size: refhir_server::DEFAULT_PAGE_SIZE,
+            max_request_bytes: refhir_server::DEFAULT_MAX_REQUEST_BYTES,
             governance: GovernanceConfig::observing(),
             role: Role::Primary,
             primary_url: None,
@@ -563,6 +569,12 @@ impl ResolvedConfig {
         }
         if let Some(size) = file.server.default_page_size {
             self.default_page_size = size;
+        }
+        if let Some(bytes) = file.server.max_request_bytes {
+            if bytes == 0 {
+                return Err("server.max_request_bytes must be a positive number".into());
+            }
+            self.max_request_bytes = bytes;
         }
 
         match file.database.kind.as_deref() {
@@ -1052,6 +1064,15 @@ pub fn apply_env(cfg: &mut ResolvedConfig) -> Result<(), String> {
         cfg.default_page_size = size.parse::<usize>().map_err(|_| {
             format!("REFHIR_DEFAULT_PAGE_SIZE must be a number (0 for no limit), not `{size}`")
         })?;
+    }
+    if let Some(bytes) = env_value("REFHIR_MAX_REQUEST_BYTES") {
+        cfg.max_request_bytes = bytes
+            .parse::<usize>()
+            .ok()
+            .filter(|bytes| *bytes > 0)
+            .ok_or_else(|| {
+                format!("REFHIR_MAX_REQUEST_BYTES must be a number of bytes above 0, not `{bytes}`")
+            })?;
     }
     if let Some(value) = env_value("REFHIR_UPDATE_AS_CREATE") {
         cfg.update_as_create = matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes");

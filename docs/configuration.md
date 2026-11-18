@@ -10,6 +10,8 @@ Configuration file search order: `./refhir.toml`, `/etc/refhir/refhir.toml`, or 
 
 `[server].default_page_size` (or `REFHIR_DEFAULT_PAGE_SIZE`, and it has no CLI flag) is how many matches a search `GET` returns on a page when it names no `_count`: 100 by default, and `0` returns every match in one response. See [FHIR API](fhir-api.md#search).
 
+`[server].max_request_bytes` (or `REFHIR_MAX_REQUEST_BYTES`, and it has no CLI flag) is the largest request the server takes, in bytes: a REST request's body, or one `/sync` message. It is 33554432 (32 MiB) by default, room for a 10 MB file sent as a `Binary` in JSON. A larger request is refused with `413` and an `OperationOutcome` (`too-costly`); a `/sync` message more than twice as large closes the socket (close code 1009). A replica holds a request to the same limit before it sends it to the primary, and a host that serves every tenant (`--all-tenants`) applies it to each tenant. A `/sync` client must read messages as large as the limit for a reply that carries a large `Binary`.
+
 ## Upgrading a package
 
 Start the server with a newer version of a package it already holds (`--package ./ig-0.2.0`, `name@0.2.0`, or `[conformance].packages`) and it serves what that version defines. The newest version of a package is the one in force, so the same `--package` can stay on every start and moving to a new release is a change to it.

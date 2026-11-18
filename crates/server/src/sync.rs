@@ -28,6 +28,17 @@ pub struct Upstream {
     pub bearer: Option<String>,
     /// The tenant this replica serves, which the primary checks against its own.
     pub tenant: Option<String>,
+    /// The largest message this replica's own socket takes, and so the largest answer it reads
+    /// from the primary's (see [`socket_cap`]).
+    pub max_message: usize,
+}
+
+/// The largest message a `/sync` socket reads, for a request limit of `limit` bytes. A message up
+/// to the limit is run; one between the limit and twice it is read, so that it can be answered
+/// with a `too-costly` outcome like a REST request; a larger one closes the socket (1009, message
+/// too big), as reading it to answer would cost what the limit is there to spare.
+pub(crate) fn socket_cap(limit: usize) -> usize {
+    limit.saturating_mul(2)
 }
 
 /// Runs one mutation on the primary over a connection of its own and returns its
@@ -64,9 +75,15 @@ async fn forward_mutation(
             request.headers_mut().insert(crate::cluster::TENANT, value);
         }
     }
+    // The primary's answer echoes what was written, so it is as large as the request may be.
+    let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_message_size: Some(socket_cap(upstream.max_message)),
+        max_frame_size: Some(socket_cap(upstream.max_message)),
+        ..Default::default()
+    };
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
-        tokio_tungstenite::connect_async(request),
+        tokio_tungstenite::connect_async_with_config(request, Some(config), false),
     )
     .await
     .map_err(|_| "connecting to the primary timed out".to_string())?
@@ -273,6 +290,9 @@ pub struct Served {
     pub catalog: Arc<RwLock<Catalog>>,
     pub store: Arc<dyn ConformanceStore>,
     pub cards: Cards,
+    /// The server's request limit ([`crate::ServerConfig::max_request_bytes`]), which each
+    /// message is held to.
+    pub max_message: usize,
 }
 
 pub async fn handle_socket(
@@ -287,6 +307,7 @@ pub async fn handle_socket(
         catalog,
         store,
         cards,
+        max_message,
     } = served;
     let (mut sink, mut stream) = socket.split();
     let (inv_tx, mut inv_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -321,12 +342,31 @@ pub async fn handle_socket(
                                 break;
                             }
                         }
+                        if text.len() > max_message {
+                            if too_large(&mut sink, scope.as_ref(), &text, max_message).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         if handle_text(&mut sink, &engine, &mut live, session.as_ref(), scope.as_ref(), upstream.as_ref(), &text).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
+                    Some(Err(err)) => {
+                        tracing::debug!(target: ENGINE, "sync socket read failed: {err}");
+                        // A message larger than the socket reads (`socket_cap`) is said to be so,
+                        // where the connection still takes a frame.
+                        if is_too_big(&err) {
+                            let _ = sink
+                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: axum::extract::ws::close_code::SIZE,
+                                    reason: "message too big".into(),
+                                })))
+                                .await;
+                        }
+                        break;
+                    }
                 }
             }
             Some(inv) = inv_rx.recv() => {
@@ -965,6 +1005,74 @@ async fn send_transition(
         }),
     )
     .await
+}
+
+/// Whether a socket read failed on a message or frame larger than the socket reads.
+fn is_too_big(err: &axum::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error as Wire;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = source {
+        if matches!(cause.downcast_ref::<Wire>(), Some(Wire::Capacity(_))) {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+/// The answer to a message larger than the server's request limit, which is not run: for a
+/// mutation, a failed `MutationResponse` with a `too-costly` outcome, as REST answers 413; for
+/// anything else, a fatal error. `Err` when the socket is to close. It is counted, with the bytes
+/// it brought, as a message of the class it asked for.
+async fn too_large(
+    sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
+    scope: Option<&Arc<RequestScope>>,
+    text: &str,
+    limit: usize,
+) -> Result<(), ()> {
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(rename = "type")]
+        kind: Option<String>,
+        #[serde(rename = "requestId")]
+        request_id: Option<u64>,
+        #[serde(rename = "udfPath")]
+        udf_path: Option<String>,
+    }
+    let diagnostics = http::too_large_text(limit);
+    let envelope = serde_json::from_str::<Envelope>(text).ok();
+    let path = envelope
+        .as_ref()
+        .and_then(|envelope| envelope.udf_path.clone())
+        .unwrap_or_else(|| "sync".to_string());
+    let class = envelope
+        .as_ref()
+        .and_then(|envelope| envelope.udf_path.as_deref())
+        .map_or(Class::Sync, classify_operation);
+    let message = SyncMessage::begin(scope, class, &path, text.len());
+    match envelope {
+        Some(Envelope {
+            kind: Some(kind),
+            request_id: Some(request_id),
+            ..
+        }) if kind == "Mutation" => {
+            tracing::warn!(target: ENGINE, bytes = text.len(), limit, "sync Mutation refused: too large");
+            let response = json!({
+                "type": "MutationResponse",
+                "requestId": request_id,
+                "success": false,
+                "result": http::outcome_json("too-costly", &diagnostics),
+                "ts": Value::Null
+            });
+            message.done(413, || json_len(&response));
+            send_json(sink, &response).await
+        }
+        _ => {
+            message.done(413, || 0);
+            fatal(sink, &diagnostics).await?;
+            Err(())
+        }
+    }
 }
 
 /// Tell the client why the connection is about to end. The caller then drops it.

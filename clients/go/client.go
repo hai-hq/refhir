@@ -876,7 +876,9 @@ func dialSocket(ctx context.Context, wsURL, token string) (*websocket.Conn, erro
 		}
 		return nil, err
 	}
-	conn.SetReadLimit(16 << 20)
+	// A reply echoes what was written, and the server takes requests of up to 32 MiB (its
+	// max_request_bytes) and reads messages of up to twice that, so a reply can be as large.
+	conn.SetReadLimit(64 << 20)
 	return conn, nil
 }
 
