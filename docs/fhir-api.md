@@ -37,10 +37,13 @@ A request body (or a `/sync` message) may be up to 32 MiB, which takes a 10 MB f
 
 A `Binary` can be sent and fetched as the file itself, as well as as a resource:
 
-- **Create or update with the file as the body**: `POST /Binary` or `PUT /Binary/[id]` with the
+- **Create or update with the file as the body**: `POST /Binary`, `PUT /Binary/[id]` or a
+  conditional `PUT /Binary?...` with the
   file's own `Content-Type` (`application/pdf`, `image/png`, ...). The server stores a `Binary`
   whose `contentType` is that type and whose `data` is the body, byte for byte. An
-  `X-Security-Context: Patient/123` header becomes its `securityContext`. A body sent as
+  `X-Security-Context: Patient/123` header becomes its `securityContext`. A file is taken up to
+  what fits in the request limit as base64 JSON (about 24 MiB of the default 32 MiB), so that the
+  `Binary` can also be sent back as JSON; a larger one is a `413`. A body sent as
   `application/fhir+json` (or XML) is the `Binary` resource, as for any other type.
 - **Read the file**: `GET /Binary/[id]` with an `Accept` that names a type other than a FHIR one
   (`Accept: application/pdf`) returns the content itself, with the `Binary`'s `contentType` as its

@@ -333,11 +333,6 @@ pub async fn handle_socket(
                         }
                     }
                     Some(Ok(Message::Pong(_))) => {}
-                    Some(Ok(Message::Text(text))) if text.len() > max_message => {
-                        if too_large(&mut sink, &text, max_message).await.is_err() {
-                            break;
-                        }
-                    }
                     Some(Ok(Message::Text(text))) => {
                         // The token was checked when the socket opened. It is looked at again
                         // before anything it asks for is run, so a revoked one does nothing more.
@@ -347,21 +342,29 @@ pub async fn handle_socket(
                                 break;
                             }
                         }
+                        if text.len() > max_message {
+                            if too_large(&mut sink, scope.as_ref(), &text, max_message).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         if handle_text(&mut sink, &engine, &mut live, session.as_ref(), scope.as_ref(), upstream.as_ref(), &text).await.is_err() {
                             break;
                         }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(err)) => {
-                        // Most often a message larger than the socket reads (`socket_cap`): say
-                        // so, where the connection still takes a frame.
                         tracing::debug!(target: ENGINE, "sync socket read failed: {err}");
-                        let _ = sink
-                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                                code: axum::extract::ws::close_code::SIZE,
-                                reason: "message too big".into(),
-                            })))
-                            .await;
+                        // A message larger than the socket reads (`socket_cap`) is said to be so,
+                        // where the connection still takes a frame.
+                        if is_too_big(&err) {
+                            let _ = sink
+                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: axum::extract::ws::close_code::SIZE,
+                                    reason: "message too big".into(),
+                                })))
+                                .await;
+                        }
                         break;
                     }
                 }
@@ -1004,12 +1007,26 @@ async fn send_transition(
     .await
 }
 
-/// Tell the client why the connection is about to end. The caller then drops it.
+/// Whether a socket read failed on a message or frame larger than the socket reads.
+fn is_too_big(err: &axum::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error as Wire;
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = source {
+        if matches!(cause.downcast_ref::<Wire>(), Some(Wire::Capacity(_))) {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
 /// The answer to a message larger than the server's request limit, which is not run: for a
 /// mutation, a failed `MutationResponse` with a `too-costly` outcome, as REST answers 413; for
-/// anything else, a fatal error. `Err` when the socket is to close.
+/// anything else, a fatal error. `Err` when the socket is to close. It is counted, with the bytes
+/// it brought, as a message of the class it asked for.
 async fn too_large(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
+    scope: Option<&Arc<RequestScope>>,
     text: &str,
     limit: usize,
 ) -> Result<(), ()> {
@@ -1019,33 +1036,46 @@ async fn too_large(
         kind: Option<String>,
         #[serde(rename = "requestId")]
         request_id: Option<u64>,
+        #[serde(rename = "udfPath")]
+        udf_path: Option<String>,
     }
     let diagnostics = http::too_large_text(limit);
-    match serde_json::from_str::<Envelope>(text) {
-        Ok(Envelope {
+    let envelope = serde_json::from_str::<Envelope>(text).ok();
+    let path = envelope
+        .as_ref()
+        .and_then(|envelope| envelope.udf_path.clone())
+        .unwrap_or_else(|| "sync".to_string());
+    let class = envelope
+        .as_ref()
+        .and_then(|envelope| envelope.udf_path.as_deref())
+        .map_or(Class::Sync, classify_operation);
+    let message = SyncMessage::begin(scope, class, &path, text.len());
+    match envelope {
+        Some(Envelope {
             kind: Some(kind),
             request_id: Some(request_id),
+            ..
         }) if kind == "Mutation" => {
             tracing::warn!(target: ENGINE, bytes = text.len(), limit, "sync Mutation refused: too large");
-            send_json(
-                sink,
-                &json!({
-                    "type": "MutationResponse",
-                    "requestId": request_id,
-                    "success": false,
-                    "result": http::outcome_json("too-costly", &diagnostics),
-                    "ts": Value::Null
-                }),
-            )
-            .await
+            let response = json!({
+                "type": "MutationResponse",
+                "requestId": request_id,
+                "success": false,
+                "result": http::outcome_json("too-costly", &diagnostics),
+                "ts": Value::Null
+            });
+            message.done(413, || json_len(&response));
+            send_json(sink, &response).await
         }
         _ => {
+            message.done(413, || 0);
             fatal(sink, &diagnostics).await?;
             Err(())
         }
     }
 }
 
+/// Tell the client why the connection is about to end. The caller then drops it.
 async fn fatal(
     sink: &mut (impl SinkExt<Message, Error = axum::Error> + Unpin),
     message: &str,

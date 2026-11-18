@@ -934,7 +934,8 @@ async fn buffered_body(
         return Ok(None);
     }
     let body = std::mem::replace(request.body_mut(), Body::empty());
-    let bytes = read_body(request.headers(), body, app.config.max_request_bytes).await?;
+    let limit = app.config.max_request_bytes;
+    let bytes = read_body(request.headers(), body, limit).await?;
     *request.body_mut() = Body::from(bytes.clone());
     if bytes.is_empty() {
         return Ok(None);
@@ -946,8 +947,8 @@ async fn buffered_body(
         .filter(|part| !part.is_empty())
         .collect();
     match segments.as_slice() {
-        [kind] => request_resource(kind, None, request.headers(), &bytes).map(Some),
-        [kind, id] => request_resource(kind, Some(id), request.headers(), &bytes).map(Some),
+        [kind] => request_resource(kind, None, request.headers(), &bytes, limit).map(Some),
+        [kind, id] => request_resource(kind, Some(id), request.headers(), &bytes, limit).map(Some),
         _ => parse_body(&bytes).map(Some),
     }
 }
@@ -956,10 +957,11 @@ async fn buffered_body(
 /// for, and answers a larger one with a 413 OperationOutcome before anything reads it. The body
 /// is handed on whole, so the handlers' own reading of it cannot fail on its size.
 async fn limit_body(State(app): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    if matches!(
-        *request.method(),
-        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
-    ) {
+    // Whatever the method: a `GET` route can read a body too (`$summary`). Only a body known to be
+    // empty, as most `GET`s and every socket upgrade have, is passed on untouched.
+    if axum::body::HttpBody::size_hint(request.body()).exact() == Some(0)
+        && !request.headers().contains_key(header::CONTENT_LENGTH)
+    {
         return next.run(request).await;
     }
     let (parts, body) = request.into_parts();
@@ -1141,7 +1143,13 @@ async fn create(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let resource = match request_resource(&resource_type, None, &headers, &body) {
+    let resource = match request_resource(
+        &resource_type,
+        None,
+        &headers,
+        &body,
+        app.config.max_request_bytes,
+    ) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1643,7 +1651,13 @@ async fn update(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let resource = match request_resource(&resource_type, Some(&id), &headers, &body) {
+    let resource = match request_resource(
+        &resource_type,
+        Some(&id),
+        &headers,
+        &body,
+        app.config.max_request_bytes,
+    ) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -1837,9 +1851,16 @@ async fn conditional_update(
     State(app): State<AppState>,
     Path(resource_type): Path<String>,
     Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let resource = match parse_body(&body) {
+    let resource = match request_resource(
+        &resource_type,
+        None,
+        &headers,
+        &body,
+        app.config.max_request_bytes,
+    ) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -2641,6 +2662,7 @@ fn request_resource(
     id: Option<&str>,
     headers: &HeaderMap,
     body: &[u8],
+    limit: usize,
 ) -> Result<Value, Response> {
     let raw = (resource_type == "Binary")
         .then(|| headers.get(header::CONTENT_TYPE))
@@ -2654,6 +2676,26 @@ fn request_resource(
     let Some(content_type) = raw else {
         return parse_body(body);
     };
+    // Stored as base64 it is a third larger. Content the server could not take back as the
+    // resource (a `PUT` of what a read returned, a `/sync` mutation) is refused here, so that
+    // whatever is created this way can also be sent again as JSON.
+    const ROOM: usize = 1024;
+    let encoded = body.len().div_ceil(3) * 4;
+    if encoded
+        .saturating_add(content_type.len())
+        .saturating_add(ROOM)
+        > limit
+    {
+        return Err(outcome(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too-costly",
+            &format!(
+                "the content is {} bytes; as a Binary in JSON (base64) it would be larger than \
+                 the {limit} bytes this server accepts",
+                body.len()
+            ),
+        ));
+    }
     use base64::Engine as _;
     let mut binary = serde_json::Map::new();
     binary.insert("resourceType".into(), json!("Binary"));
@@ -2741,12 +2783,18 @@ fn wants_binary_content(
 fn binary_content(value: Value) -> Response {
     use base64::Engine as _;
     let data = value.get("data").and_then(Value::as_str).unwrap_or("");
-    // base64Binary may carry whitespace; the decoder does not take it.
+    // What the validator lets through: whitespace anywhere, and padding or none.
+    const LENIENT: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
+            .with_decode_allow_trailing_bits(true),
+    );
     let decoded = if data.bytes().any(|byte| byte.is_ascii_whitespace()) {
         let compact: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
-        base64::engine::general_purpose::STANDARD.decode(compact)
+        LENIENT.decode(compact)
     } else {
-        base64::engine::general_purpose::STANDARD.decode(data)
+        LENIENT.decode(data)
     };
     let Ok(bytes) = decoded else {
         return outcome(

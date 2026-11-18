@@ -193,6 +193,22 @@ async fn raw_content_is_stored_as_sent_with_its_type_and_security_context() {
     assert!(stored.get("securityContext").is_none(), "{stored}");
     assert_eq!(decoded(&stored), replaced);
 
+    // A conditional update takes content too.
+    let conditional = request(
+        &app,
+        "PUT",
+        &format!("/Binary?_id={id}"),
+        &[("content-type", "text/plain")],
+        b"conditional".to_vec(),
+    )
+    .await;
+    assert_eq!(conditional.status, StatusCode::OK, "{}", conditional.json());
+    let stored = request(&app, "GET", &format!("/Binary/{id}"), &[], Vec::new())
+        .await
+        .json();
+    assert_eq!(stored["contentType"], "text/plain");
+    assert_eq!(decoded(&stored), b"conditional");
+
     // A body sent as FHIR JSON is still the resource, not content.
     let resource = json!({"resourceType": "Binary", "contentType": "text/plain", "data": "aGk="});
     let made = request(
@@ -261,6 +277,30 @@ async fn a_read_returns_the_content_unless_a_fhir_format_is_asked_for() {
     .await;
     assert_eq!(formatted.content_type, "application/fhir+json");
     assert_eq!(formatted.json()["id"], id.as_str());
+
+    // Data the validator takes, unpadded and with a line break, is still returned as content.
+    let unpadded = request(
+        &app,
+        "POST",
+        "/Binary",
+        &[("content-type", "application/fhir+json")],
+        json!({"resourceType": "Binary", "contentType": "text/plain", "data": "QUJD\nRA"})
+            .to_string()
+            .into_bytes(),
+    )
+    .await;
+    assert_eq!(unpadded.status, StatusCode::CREATED, "{}", unpadded.json());
+    let unpadded_id = unpadded.json()["id"].as_str().unwrap().to_string();
+    let content_of = request(
+        &app,
+        "GET",
+        &format!("/Binary/{unpadded_id}"),
+        &[("accept", "text/plain")],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(content_of.status, StatusCode::OK);
+    assert_eq!(content_of.bytes, b"ABCD");
 
     // No `Accept` at all is the resource, as for every other type.
     let plain = request(&app, "GET", &uri, &[], Vec::new()).await;
@@ -372,7 +412,30 @@ async fn a_ten_megabyte_file_goes_through_a_tenant_host_over_rest() {
     .await;
     assert_eq!(declared.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(declared.json()["issue"][0]["code"], "too-costly");
+    // Content that fits the limit raw but not as base64 JSON is refused: it could not be sent
+    // back as the resource.
+    let raw = request(
+        &router,
+        "POST",
+        "/t/a/Binary",
+        &[("content-type", "application/pdf")],
+        vec![7u8; DEFAULT_MAX_REQUEST_BYTES / 4 * 3],
+    )
+    .await;
+    assert_eq!(raw.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(raw.json()["issue"][0]["code"], "too-costly");
     assert_eq!(binaries(&router).await, before);
+    // A GET that a route reads a body for is held to the limit too.
+    let summary = request(
+        &router,
+        "GET",
+        "/t/a/Patient/p1/$summary",
+        &[],
+        vec![b' '; DEFAULT_MAX_REQUEST_BYTES + 1],
+    )
+    .await;
+    assert_eq!(summary.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(summary.json()["issue"][0]["code"], "too-costly");
 
     let at = binary_json_of_size(DEFAULT_MAX_REQUEST_BYTES);
     let taken = request(

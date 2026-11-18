@@ -336,6 +336,56 @@ fn a_lease_session_that_dies_is_reopened_and_its_leases_taken_back() {
         .unwrap();
 }
 
+/// While the lease session is down its locks are free, and a tenant another process took in that
+/// time has a new epoch. That tenant is lost alone when the session is reopened; the others are
+/// taken back.
+#[test]
+fn a_tenant_taken_while_the_lease_session_was_down_is_lost_alone() {
+    let Some(admin) = test_url("tenancy: lease taken while down") else {
+        return;
+    };
+    let url = shared(&admin, "tshtaken", &["a", "b"]);
+    let first = connections(&operator_url(&url), 2);
+    let a = PostgresPersistence::open_tenant(&first, "a", 1).unwrap();
+    let b = PostgresPersistence::open_tenant(&first, "b", 1).unwrap();
+    let (told, heard) = std::sync::mpsc::channel();
+    a.on_writer_lease_lost(move |reason| {
+        let _ = told.send(reason.to_string());
+    });
+    for tenant in [&a, &b] {
+        assert!(matches!(
+            tenant.try_acquire_writer_lease().unwrap(),
+            Lease::Held { .. }
+        ));
+    }
+    let id = crate::tenancy_tests::tenant_id(&url, "a");
+    let admin_client = || client(&url);
+    let old: i32 = admin_client()
+        .query_one(
+            "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted \
+             AND objsubid = 2 AND classid = $1::int4::oid AND objid = $2::int4::oid \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            &[&crate::lease::LEASE_NAMESPACE, &id],
+        )
+        .unwrap()
+        .get(0);
+    // In one go, so the hub's next check (every 2 s) finds both: the session ends and another
+    // process takes `a` (its epoch moves) before this one can look.
+    admin_client()
+        .batch_execute(&format!(
+            "SELECT pg_terminate_backend({old}); \
+             UPDATE persistence_globals SET json_value = '999' \
+             WHERE instance_id = {id} AND key = 'writer_epoch'"
+        ))
+        .unwrap();
+    let reason = heard.recv_timeout(Duration::from_secs(20)).expect("told");
+    assert!(reason.contains("999"), "{reason}");
+    assert!(a.writer_lease_lost() && !b.writer_lease_lost());
+    assert_eq!(first.lease.held().len(), 1);
+    b.write(&[doc("kept", 5, "x")], &[], ConflictStrategy::Error)
+        .unwrap();
+}
+
 /// A replica of each tenant listens on the one connection the process shares, and hears only
 /// its own tenant's publishes.
 #[test]
