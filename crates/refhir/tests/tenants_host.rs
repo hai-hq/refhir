@@ -1637,3 +1637,190 @@ fn a_tenant_given_its_own_address_names_it_and_can_be_moved_without_a_restart() 
     assert!(body["settings"].get("public_url").is_none(), "{body}");
     assert_eq!(smart(tenant)["issuer"], template(tenant));
 }
+
+const TARIFF: &str = "https://example.org/fhir/CodeSystem/tariff";
+const TARIFF_SET: &str = "https://example.org/fhir/ValueSet/tariff";
+
+/// Writes version `version` of a package of tariff codes into `dir`, in place of what is there: a
+/// code system with `codes` and a value set of all of it, as a package of an organization's own
+/// codes has.
+fn write_tariff_package(dir: &Path, version: &str, codes: &[&str]) {
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("package.json"),
+        json!({"name": "example.tariff", "version": version, "fhirVersion": "4.0.1"}).to_string(),
+    )
+    .unwrap();
+    let concepts: Vec<Value> = codes
+        .iter()
+        .map(|code| json!({"code": code, "display": format!("Tariff {code}")}))
+        .collect();
+    std::fs::write(
+        dir.join("CodeSystem-tariff.json"),
+        json!({
+            "resourceType": "CodeSystem", "id": "tariff", "url": TARIFF, "version": version,
+            "name": "Tariff", "status": "active", "content": "complete", "concept": concepts,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("ValueSet-tariff.json"),
+        json!({
+            "resourceType": "ValueSet", "id": "tariff", "url": TARIFF_SET, "version": version,
+            "name": "Tariff", "status": "active", "compose": {"include": [{"system": TARIFF}]},
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Whether tenant `tenant` finds `code` of the tariff code system with `$lookup`, checked against
+/// what `$expand` of the value set of it says.
+fn finds_tariff_code(host: &Host, tenant: &str, code: &str) -> bool {
+    let (status, found) = call(
+        "GET",
+        &format!(
+            "{}/t/{tenant}/CodeSystem/$lookup?system={TARIFF}&code={code}",
+            host.base()
+        ),
+        &[],
+        None,
+    );
+    let (expanded, expansion) = call(
+        "GET",
+        &format!(
+            "{}/t/{tenant}/ValueSet/$expand?url={TARIFF_SET}",
+            host.base()
+        ),
+        &[],
+        None,
+    );
+    let listed = expansion["expansion"]["contains"]
+        .as_array()
+        .is_some_and(|codes| codes.iter().any(|entry| entry["code"] == code));
+    // A code that is not there is an OperationOutcome, not Parameters.
+    if status == 200 && found["resourceType"] == "Parameters" {
+        assert_eq!(expanded, 200, "{expansion}");
+        assert!(listed, "{code} is looked up and not expanded: {expansion}");
+        true
+    } else {
+        assert!(!listed, "{code} is expanded and not looked up: {found}");
+        false
+    }
+}
+
+#[test]
+fn a_tenant_is_given_a_package_and_its_newer_versions_without_being_made_again() {
+    let Some(admin) = admin_url("tenants host: a tenant's packages changed") else {
+        return;
+    };
+    let (_database, app) = database_of_an_ordinary_role(&admin, "hostpackages");
+    let mut host = Host::start("packages", &app, &[]);
+    host.wait_ready();
+    let tenant = "clinic";
+    let path = format!("/admin/tenants/{tenant}");
+    let (status, body) = host.admin("POST", "/admin/tenants", Some(create_body(tenant)));
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["settings"]["packages"], json!([]), "{body}");
+    assert!(!finds_tariff_code(&host, tenant, "A-1"));
+
+    // Given the package by PATCH, the tenant serves its code system at once, and lists it.
+    let package = host.dir.join("tariff-package");
+    let spec = package.to_str().unwrap().to_string();
+    write_tariff_package(&package, "1.0.0", &["A-1", "OLD-1"]);
+    let (status, body) = host.admin("PATCH", &path, Some(json!({"packages": [spec]})));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["settings"]["packages"], json!([spec]), "{body}");
+    assert!(
+        body["packages"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name": "example.tariff", "version": "1.0.0"})),
+        "{body}"
+    );
+    assert!(finds_tariff_code(&host, tenant, "A-1"));
+    assert!(finds_tariff_code(&host, tenant, "OLD-1"));
+    let (_, read) = host.admin("GET", &path, None);
+    assert_eq!(read["settings"]["packages"], json!([spec]), "{read}");
+
+    // A newer version where the package was. With a package that cannot be read beside it, the
+    // request is refused and nothing of it is installed or recorded.
+    write_tariff_package(&package, "2.0.0", &["A-1", "NEW-1"]);
+    let missing = host.dir.join("no-such-package");
+    let missing = missing.to_str().unwrap();
+    let (status, body) = host.admin("PATCH", &path, Some(json!({"packages": [spec, missing]})));
+    assert_eq!(status, 422, "{body}");
+    assert!(body["error"].as_str().unwrap().contains(missing), "{body}");
+    let (_, read) = host.admin("GET", &path, None);
+    assert_eq!(read["settings"]["packages"], json!([spec]), "{read}");
+    assert!(
+        read["packages"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({"name": "example.tariff", "version": "1.0.0"})),
+        "{read}"
+    );
+    assert!(finds_tariff_code(&host, tenant, "OLD-1"));
+    assert!(!finds_tariff_code(&host, tenant, "NEW-1"));
+
+    // The same list again installs the newer version over the older: what it removed is gone,
+    // what it added is found.
+    let (status, body) = host.admin("PATCH", &path, Some(json!({"packages": [spec]})));
+    assert_eq!(status, 200, "{body}");
+    let tariffs: Vec<&Value> = body["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"] == "example.tariff")
+        .collect();
+    assert_eq!(
+        tariffs,
+        [&json!({"name": "example.tariff", "version": "2.0.0"})],
+        "{body}"
+    );
+    assert!(finds_tariff_code(&host, tenant, "A-1"));
+    assert!(finds_tariff_code(&host, tenant, "NEW-1"));
+    assert!(!finds_tariff_code(&host, tenant, "OLD-1"));
+
+    // The same version again changes nothing.
+    let installs = |log: &str| log.matches("`clinic`: installed example.tariff@").count();
+    let before = installs(&host.log());
+    assert_eq!(before, 2, "{}", host.log());
+    let (status, again) = host.admin("PATCH", &path, Some(json!({"packages": [spec]})));
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["settings"], body["settings"]);
+    assert_eq!(again["packages"], body["packages"]);
+    assert_eq!(installs(&host.log()), before, "{}", host.log());
+    assert!(finds_tariff_code(&host, tenant, "NEW-1"));
+
+    // A tenant that cannot open, for a package that is not there, is put right by PATCH: the list
+    // is checked, kept, and installed as the tenant opens.
+    let (code, said) = cli(&app, &["create", "broken", "--package", missing]);
+    assert_eq!(code, 0, "{said}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, health) = call("GET", &format!("{}/healthz", host.base()), &[], None);
+        if health["tenants"]["broken"]["status"] == "unavailable" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "broken opened:\n{}", host.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/broken",
+        Some(json!({"packages": [missing]})),
+    );
+    assert_eq!(status, 422, "{body}");
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/broken",
+        Some(json!({"packages": [spec]})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["settings"]["packages"], json!([spec]), "{body}");
+    host.wait_serving("broken");
+    assert!(finds_tariff_code(&host, "broken", "NEW-1"));
+}

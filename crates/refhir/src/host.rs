@@ -143,6 +143,9 @@ struct Opened {
     auth_store: Arc<dyn AuthStore>,
     /// The registry's `updated_at` of the tenant as this process last acted on it.
     applied: Mutex<String>,
+    /// The packages the tenant was given (`TenantSettings::packages`) as this process installed
+    /// them: when the registry lists others, it is opened again, which installs them.
+    packages: Mutex<Vec<String>>,
 }
 
 /// One tenant's place in the process: being opened, open, or neither.
@@ -555,7 +558,17 @@ impl Manager {
             return;
         }
         let settings = Self::settings_of(&tenant);
-        if settings.health_cards.enabled != opened.cards.is_some() {
+        // A tenant given other packages is opened again, which installs them; what its primary
+        // installs reaches a replica's catalog as any install does.
+        let packages_changed = {
+            let mut packages = opened.packages.lock().expect("packages");
+            let changed = *packages != settings.packages;
+            if self.cfg.role == Role::Replica {
+                packages.clone_from(&settings.packages);
+            }
+            changed && self.cfg.role != Role::Replica
+        };
+        if packages_changed || settings.health_cards.enabled != opened.cards.is_some() {
             // What the tenant is made of changes: it is opened again, from what the registry says
             // by then.
             *applied = tenant.updated_at;
@@ -980,6 +993,7 @@ impl Manager {
             cards: health_cards,
             auth_store,
             applied: Mutex::new(String::new()),
+            packages: Mutex::new(settings.packages.clone()),
         }))
     }
 
@@ -1246,6 +1260,42 @@ fn checked_public_url(url: Option<&str>) -> Result<Option<String>, AdminError> {
         .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))
 }
 
+/// A change of a tenant's settings, for the audit trail: its subtype and what it was.
+type Change = (&'static str, Value);
+
+/// The packages the admin API was given, checked for what can be told from the list alone: an
+/// empty one is a `422`.
+fn check_package_specs(specs: &[String]) -> Result<(), AdminError> {
+    if specs.iter().any(|spec| spec.trim().is_empty()) {
+        return Err(AdminError::invalid(
+            "a package is name@version, a directory or a .tgz",
+        ));
+    }
+    Ok(())
+}
+
+/// Why installing packages failed, with the status to say it with: a problem with the package is a
+/// `422`; the database or the registry failing is a `503`, worth asking again.
+fn install_error(context: String, err: refhir_fhir::FhirError) -> AdminError {
+    match err {
+        refhir_fhir::FhirError::Storage(_) => {
+            AdminError::new(StatusCode::SERVICE_UNAVAILABLE, format!("{context}: {err}"))
+        }
+        _ => AdminError::invalid(format!("{context}: {err}")),
+    }
+}
+
+/// The packages in force in `store`, as `name@version`.
+fn in_force(store: &dyn ConformanceStore) -> Result<Vec<String>, AdminError> {
+    let packages = store
+        .load_packages()
+        .map_err(|err| AdminError::new(StatusCode::SERVICE_UNAVAILABLE, err.to_string()))?;
+    Ok(packages
+        .into_iter()
+        .map(|package| format!("{}@{}", package.name, package.version))
+        .collect())
+}
+
 /// Waits for something the tenant's primary makes, unless the tenant is cancelled meanwhile.
 fn wait_for<T>(
     name: &str,
@@ -1294,11 +1344,7 @@ impl TenantAdmin for Manager {
                  for testing) and start it again",
             ));
         }
-        if settings.packages.iter().any(|spec| spec.trim().is_empty()) {
-            return Err(AdminError::invalid(
-                "a package is name@version, a directory or a .tgz",
-            ));
-        }
+        check_package_specs(&settings.packages)?;
         self.refuse_taken_address(
             &request.name,
             self.address(&request.name, &settings).as_deref(),
@@ -1485,54 +1531,29 @@ impl TenantAdmin for Manager {
 
     fn update(&self, name: &str, request: UpdateTenant) -> Result<Value, AdminError> {
         let tenant = self.live_tenant(name)?;
-        let current = Self::settings_of(&tenant);
-        let mut raw = match &tenant.settings {
-            Value::Object(_) => tenant.settings.clone(),
-            _ => json!({}),
+        // The whole request is checked before anything is installed.
+        self.plan_update(name, &tenant, &request)?;
+        let installed = match &request.packages {
+            Some(packages) => self.install_tenant_packages(name, packages)?,
+            None => Vec::new(),
         };
-        let mut changes = Vec::new();
-        if let Some(change) = &request.health_cards {
-            let cards = change
-                .resolve(&current.health_cards, false)
-                .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
-            if cards != current.health_cards {
-                changes.push((
-                    "health-cards-settings",
-                    json!({
-                        "tenant": name,
-                        "health_cards": {
-                            "from": current.health_cards.report(),
-                            "to": cards.report(),
-                        },
-                    }),
-                ));
-                raw["health_cards"] = serde_json::to_value(&cards).expect("settings json");
-            }
+        // An install can take minutes: the change is made to the tenant as it is now, so what
+        // another request changed meanwhile stays.
+        let tenant = match &request.packages {
+            Some(_) => self.live_tenant(name)?,
+            None => tenant,
+        };
+        let (raw, mut changes) = self.plan_update(name, &tenant, &request)?;
+        if !installed.is_empty() && !changes.iter().any(|(subtype, _)| *subtype == "packages") {
+            let packages = Self::settings_of(&tenant).packages;
+            changes.push((
+                "packages",
+                json!({"tenant": name, "packages": {"from": packages, "to": packages}}),
+            ));
         }
-        if let Some(change) = &request.public_url {
-            let url = checked_public_url(change.as_deref())?;
-            if url != current.public_url {
-                let next = TenantSettings {
-                    public_url: url.clone(),
-                    ..current.clone()
-                };
-                let to = self.address(name, &next);
-                self.refuse_taken_address(name, to.as_deref())?;
-                changes.push((
-                    "public-url",
-                    json!({
-                        "tenant": name,
-                        "public_url": {"from": self.address(name, &current), "to": to},
-                    }),
-                ));
-                match url {
-                    Some(url) => raw["public_url"] = json!(url),
-                    None => {
-                        if let Some(members) = raw.as_object_mut() {
-                            members.remove("public_url");
-                        }
-                    }
-                }
+        for (subtype, detail) in &mut changes {
+            if *subtype == "packages" {
+                detail["installed"] = json!(installed);
             }
         }
         if changes.is_empty() {
@@ -1543,6 +1564,11 @@ impl TenantAdmin for Manager {
             .update_tenant_settings(name, &raw)
             .map_err(Self::admin_error)?
             .ok_or_else(|| AdminError::not_found(name))?;
+        if request.packages.is_some() {
+            // A tenant that failed to open, perhaps for a package it no longer lists, is tried
+            // again at once with the list it now has.
+            self.forget_failures(name);
+        }
         // Recorded before it is applied: a tenant that is opened again flushes its audit trail
         // as it stops, and a row recorded after that would be lost.
         match self.opened(name) {
@@ -1669,6 +1695,175 @@ impl Manager {
             ));
         }
         Ok(tenant)
+    }
+
+    /// What `request` changes of `tenant`: its settings as they are to be written, and the changes
+    /// for the audit trail. Checks the request, and changes nothing.
+    fn plan_update(
+        &self,
+        name: &str,
+        tenant: &Tenant,
+        request: &UpdateTenant,
+    ) -> Result<(Value, Vec<Change>), AdminError> {
+        let mut raw = match &tenant.settings {
+            Value::Object(_) => tenant.settings.clone(),
+            _ => json!({}),
+        };
+        let mut changes = Vec::new();
+        let current = Self::settings_of(tenant);
+        if let Some(change) = &request.health_cards {
+            let cards = change
+                .resolve(&current.health_cards, false)
+                .map_err(|message| AdminError::new(StatusCode::BAD_REQUEST, message))?;
+            if cards != current.health_cards {
+                changes.push((
+                    "health-cards-settings",
+                    json!({
+                        "tenant": name,
+                        "health_cards": {
+                            "from": current.health_cards.report(),
+                            "to": cards.report(),
+                        },
+                    }),
+                ));
+                raw["health_cards"] = serde_json::to_value(&cards).expect("settings json");
+            }
+        }
+        if let Some(change) = &request.public_url {
+            let url = checked_public_url(change.as_deref())?;
+            if url != current.public_url {
+                let next = TenantSettings {
+                    public_url: url.clone(),
+                    ..current.clone()
+                };
+                let to = self.address(name, &next);
+                self.refuse_taken_address(name, to.as_deref())?;
+                changes.push((
+                    "public-url",
+                    json!({
+                        "tenant": name,
+                        "public_url": {"from": self.address(name, &current), "to": to},
+                    }),
+                ));
+                match url {
+                    Some(url) => raw["public_url"] = json!(url),
+                    None => {
+                        if let Some(members) = raw.as_object_mut() {
+                            members.remove("public_url");
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(packages) = &request.packages {
+            check_package_specs(packages)?;
+            if *packages != current.packages {
+                changes.push((
+                    "packages",
+                    json!({
+                        "tenant": name,
+                        "packages": {"from": current.packages, "to": packages},
+                    }),
+                ));
+                raw["packages"] = json!(packages);
+            }
+        }
+        Ok((raw, changes))
+    }
+
+    /// Installs in tenant `name` what is new or newer in `specs`, as the tenant's start does: a
+    /// newer version of a package replaces the older one, a version that is installed (or older
+    /// than one that is) is skipped. Every package is read, with what it depends on, before any is
+    /// installed, so one that cannot be read is refused with nothing written; one refused as it is
+    /// stored has its install undone. Answers `name@version` of each package put in force.
+    ///
+    /// A tenant this process does not serve (it failed to open, or another process holds it) is
+    /// only checked: the list it is given is installed by whoever opens it next, which for a
+    /// process that serves it now is at once (see `apply_changes`). The tenant serves requests
+    /// meanwhile, from the catalog it had until the new one is loaded.
+    fn install_tenant_packages(
+        &self,
+        name: &str,
+        specs: &[String],
+    ) -> Result<Vec<String>, AdminError> {
+        // Reading (and perhaps fetching) the packages holds nothing: the tenant can be stopped
+        // meanwhile.
+        let opened = self.opened(name);
+        let elsewhere;
+        let store: &dyn ConformanceStore = match &opened {
+            Some(opened) => &opened.persistence,
+            None => {
+                elsewhere = PostgresPersistence::open_tenant(&self.shared, name, 1)
+                    .map_err(Self::admin_error)?;
+                &elsewhere
+            }
+        };
+        let mut wanted = Vec::new();
+        for spec in specs {
+            let check = refhir_fhir::check_install(store, spec).map_err(|err| {
+                install_error(
+                    format!("package `{spec}` cannot be installed, so nothing was changed"),
+                    err,
+                )
+            })?;
+            if check.installs {
+                wanted.push(spec.clone());
+            }
+        }
+        let Some(opened) = opened.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // Held by whoever opens or stops the tenant: it is not stopped under the install.
+        let busy = self
+            .entries
+            .lock()
+            .expect("entries")
+            .get(name)
+            .map(|entry| entry.busy.clone());
+        let Some(busy) = busy else {
+            return Ok(Vec::new());
+        };
+        let _busy = busy.lock().unwrap_or_else(|p| p.into_inner());
+        if !self
+            .opened(name)
+            .is_some_and(|now| Arc::ptr_eq(&now, opened))
+        {
+            // Stopped or opened again meanwhile: whoever opens it installs the list.
+            return Ok(Vec::new());
+        }
+        let _installing = refhir_fhir::install_guard();
+        let before = in_force(store)?;
+        let result = crate::install_extra_packages(store, &opened.db, &opened.catalog, &wanted);
+        let installed: Vec<String> = in_force(store)?
+            .into_iter()
+            .filter(|package| !before.contains(package))
+            .collect();
+        for package in &installed {
+            tracing::info!("tenant `{name}`: installed {package}");
+        }
+        if let Err(err) = result {
+            let stay = if installed.is_empty() {
+                String::new()
+            } else {
+                format!(" ({} installed, and stay)", installed.join(", "))
+            };
+            return Err(install_error(
+                format!(
+                    "the packages could not all be installed, and the tenant's settings were not \
+                     changed{stay}"
+                ),
+                err,
+            ));
+        }
+        *opened.packages.lock().expect("packages") = specs.to_vec();
+        if !installed.is_empty() {
+            // The install left the tenant a catalog of its own; if it now holds what others do,
+            // it is put with theirs.
+            if let Err(err) = refhir_fhir::share_catalog(store, &opened.catalog) {
+                tracing::warn!("tenant `{name}` keeps a catalog of its own: {err}");
+            }
+        }
+        Ok(installed)
     }
 
     /// `self` as the `Arc` it lives in (the admin API holds it as one).

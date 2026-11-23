@@ -10,6 +10,19 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Added
+
+- **A tenant's packages can be changed after it is made.** `PATCH /admin/tenants/{name}` takes
+  `packages`, the list `POST /admin/tenants` takes: what is new or newer in it is installed in the
+  tenant while it serves (a newer version replaces the older, the same version is skipped), and the
+  list is kept in the tenant's settings. A package that cannot be read is a `422` and changes
+  nothing. Before, a tenant's packages were set only when it was made.
+
+### Security
+
+- **`url` is 2.5.9** (it was 2.5.8), for RUSTSEC-2026-0592: `Url::origin()` on a `blob:` URL nested
+  deeply enough overflows the stack.
+
 ## [0.0.9] - 2026-11-20
 
 ### Added
