@@ -47,9 +47,9 @@ pub use conform::{commit_operation, repair_conformance};
 pub use error::{outcome_code, FhirError};
 pub use memory::release_unused_memory;
 pub use npm::{
-    install_package, install_with, package_downloads_allowed, packages_installed,
-    parse_package_spec, unexpandable_value_sets, NpmRegistry, PackageFetcher, PackageSpec,
-    DOWNLOAD_VARIABLE,
+    check_install, check_with, install_package, install_with, package_downloads_allowed,
+    packages_installed, parse_package_spec, unexpandable_value_sets, NpmRegistry, PackageCheck,
+    PackageFetcher, PackageSpec, DOWNLOAD_VARIABLE,
 };
 pub use package::{
     cards_dir, collect_superseded, cross_version_dir, default_r4_registry_specs,

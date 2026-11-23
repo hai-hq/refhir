@@ -287,7 +287,7 @@ on the public one.
 | `POST /admin/tenants` | Creates a tenant and opens it before it answers: `201` with the tenant. Idempotent: the same body again is `200` with the tenant that is there, and a different body for an existing name is `409`. A tenant that cannot be opened is not kept (`422`), so the request can be sent again once it is fixed |
 | `GET /admin/tenants` | Every tenant, with its status and how this process serves it |
 | `GET /admin/tenants/{name}` | One tenant: status, settings, its public URL, the packages and versions it holds, its size (documents and index rows, in rows and bytes), whether it holds the compiled catalog that tenants with the same definitions share (`served.shared_catalog`), and this process's counters for it |
-| `PATCH /admin/tenants/{name}` | Changes what the body names of a tenant that exists, and leaves the rest. Today that is `health_cards` and `public_url` (below). The change is kept in the registry and every process that serves the tenant applies it within moments, with no restart; a request that is not valid is a `400` and changes nothing |
+| `PATCH /admin/tenants/{name}` | Changes what the body names of a tenant that exists, and leaves the rest. Today that is `packages`, `health_cards` and `public_url` (below). The change is kept in the registry and every process that serves the tenant applies it within moments, with no restart; a request that is not valid is a `400` and changes nothing |
 | `POST /admin/tenants/{name}/health-cards/rotate` | Makes a new Health Cards signing key for the tenant, which signs from then on, and keeps the replaced key's public half in the tenant's key set: `200` with `{"tenant", "kid", "replaced_kid", "keys"}`. `409` for a tenant that does not issue cards or whose key was changed by a request at the same time (ask again), `404` for no such tenant |
 | `DELETE /admin/tenants/{name}` | Soft delete: the tenant is not served from then on, and its rows are removed once the grace period is over. `?grace=24h` (`30s`, `15m`, `24h`, `7d`; default `[tenants] delete_grace`, 7 days) and `?export=false` change that. `grace=0` removes it at once |
 | `POST /admin/tenants/{name}/restore` | Brings back a deleted tenant whose rows have not been removed |
@@ -325,6 +325,34 @@ reports `settings.health_cards` as `{"enabled", "issuer"}` and, for a tenant tha
 `health_cards` as `{"kid", "keys"}`: the thumbprint of the key that signs and of every key its key
 set holds. Replacing a tenant's key, keeping the cards it signed valid, and the audit trail of both
 are described under [a tenant's issuer and keys](health-cards.md#a-tenants-issuer-and-keys).
+
+#### A tenant's packages
+
+A tenant is given its packages when it is made, and can be given more, or newer versions of the
+ones it has, later. `PATCH /admin/tenants/{name}` takes `packages`, the whole list, in the form
+`POST /admin/tenants` takes it:
+
+```bash
+curl -X PATCH "$REFHIR/admin/tenants/acme" -H "authorization: Bearer $ADMIN_TOKEN" \
+  -H 'content-type: application/json' -d '{"packages": ["/etc/refhir/packages/acme-profiles"]}'
+```
+
+What is new or newer in each is installed as a server's `--package` installs it: a newer version of
+a package replaces the one the tenant has, and a version it has (or one older than it has) is
+skipped. The tenant goes on serving meanwhile, and from the answer on serves what was installed.
+The list is kept in the tenant's settings as given and the answer reports it as
+`settings.packages`, with the versions the tenant holds as `packages`. The same request again
+changes nothing, so it is safe to send at every start of whatever manages the tenants. A package
+left out of the list is not taken away.
+
+Every package of the list is read, with what it depends on, before any is installed: one that
+cannot be read (a path that is not there, a `package.json` or resource that does not parse) is a
+`422` that names it, and nothing is installed or recorded. A package refused as it is stored is
+undone; any earlier in the same list stay installed, and the `422` names them. When the
+[audit trail](governance.md) is on, a change is recorded there with the subtype `packages`.
+
+A directory a tenant lists is read again whenever the tenant is opened, so a newer version put in
+its place reaches the tenant at the process's next start without a request.
 
 #### A tenant's own address
 

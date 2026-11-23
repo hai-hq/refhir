@@ -1535,6 +1535,27 @@ impl TenantAdmin for Manager {
                 }
             }
         }
+        // Last, once the rest of the request is known to be good: installing is the one change
+        // made before the settings are written.
+        if let Some(packages) = &request.packages {
+            if packages.iter().any(|spec| spec.trim().is_empty()) {
+                return Err(AdminError::invalid(
+                    "a package is name@version, a directory or a .tgz",
+                ));
+            }
+            let installed = self.install_tenant_packages(name, packages)?;
+            if !installed.is_empty() || *packages != current.packages {
+                changes.push((
+                    "packages",
+                    json!({
+                        "tenant": name,
+                        "packages": {"from": current.packages, "to": packages},
+                        "installed": installed,
+                    }),
+                ));
+                raw["packages"] = json!(packages);
+            }
+        }
         if changes.is_empty() {
             return Ok(self.describe(&tenant));
         }
@@ -1669,6 +1690,78 @@ impl Manager {
             ));
         }
         Ok(tenant)
+    }
+
+    /// Installs in tenant `name` what is new or newer in `specs`, as the tenant's start does: a
+    /// newer version of a package replaces the older one, a version that is installed (or older
+    /// than one that is) is skipped. Every package is read, with what it depends on, before any is
+    /// installed, so one that cannot be read is refused with nothing written; one refused as it is
+    /// stored has its install undone. Answers `name@version` of each package of `specs` installed.
+    ///
+    /// The tenant serves requests meanwhile, from the catalog it had until the new one is loaded.
+    fn install_tenant_packages(
+        &self,
+        name: &str,
+        specs: &[String],
+    ) -> Result<Vec<String>, AdminError> {
+        let not_open = || {
+            AdminError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("tenant `{name}` is not open here, so its packages cannot be installed: try again when it is"),
+            )
+        };
+        // Held by whoever opens or stops the tenant: the tenant is not stopped under the install,
+        // and two installs in it do not run at once.
+        let busy = self
+            .entries
+            .lock()
+            .expect("entries")
+            .get(name)
+            .map(|entry| entry.busy.clone())
+            .ok_or_else(not_open)?;
+        let _busy = busy.lock().unwrap_or_else(|p| p.into_inner());
+        let opened = self.opened(name).ok_or_else(not_open)?;
+        let store: &dyn ConformanceStore = &opened.persistence;
+        let mut wanted = Vec::new();
+        for spec in specs {
+            let check = refhir_fhir::check_install(store, spec).map_err(|err| {
+                AdminError::invalid(format!(
+                    "package `{spec}` cannot be installed, so nothing was changed: {err}"
+                ))
+            })?;
+            if check.installs {
+                wanted.push((spec, format!("{}@{}", check.name, check.version)));
+            }
+        }
+        let mut installed = Vec::new();
+        for (spec, package) in wanted {
+            if let Err(err) = refhir_fhir::install_package(store, &opened.db, &opened.catalog, spec)
+            {
+                let before = if installed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} installed before it, and stay)", installed.join(", "))
+                };
+                return Err(AdminError::invalid(format!(
+                    "package `{spec}` could not be installed, and the tenant's settings were not \
+                     changed{before}: {err}"
+                )));
+            }
+            tracing::info!("tenant `{name}`: installed {package}");
+            installed.push(package);
+        }
+        if installed.is_empty() {
+            return Ok(installed);
+        }
+        // As the tenant's start does after its packages: what they refer to and none holds.
+        refhir_fhir::install_builtin_terminology(store, &opened.db, &opened.catalog)
+            .map_err(|err| AdminError::internal(err.to_string()))?;
+        // The install left the tenant a catalog of its own; if it now holds what others do, it
+        // is put with theirs.
+        if let Err(err) = refhir_fhir::share_catalog(store, &opened.catalog) {
+            tracing::warn!("tenant `{name}` keeps a catalog of its own: {err}");
+        }
+        Ok(installed)
     }
 
     /// `self` as the `Arc` it lives in (the admin API holds it as one).

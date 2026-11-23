@@ -181,6 +181,12 @@ pub struct UpdateTenant {
     /// takes it away, so the host's template makes it again.
     #[serde(default, deserialize_with = "present")]
     pub public_url: Option<Option<String>>,
+    /// The tenant's packages (see [`TenantSettings::packages`]), the whole list, as
+    /// `POST /admin/tenants` takes it. What is new or newer in them is installed as the tenant's
+    /// start installs it (a newer version replaces the older, the same version is skipped), and
+    /// the list is kept as given. A package left out of the list is not taken away.
+    #[serde(default)]
+    pub packages: Option<Vec<String>>,
 }
 
 /// A member that is there, as `Some`, whether it is `null` (`Some(None)`) or not.
@@ -268,6 +274,8 @@ pub trait TenantAdmin: Send + Sync {
     fn restore(&self, name: &str) -> Result<Value, AdminError>;
     /// Changes what `request` names of tenant `name`, and answers the tenant as it is. A change
     /// of the tenant's settings is served by every process that serves it without a restart.
+    /// Packages are installed before anything is recorded: a package that cannot be is a `422`,
+    /// and the tenant's settings stay as they were.
     fn update(&self, name: &str, request: UpdateTenant) -> Result<Value, AdminError>;
     /// Replaces tenant `name`'s Health Cards signing key (see
     /// [`IssuerKey::rotate_tenant`](crate::IssuerKey::rotate_tenant)): `{"tenant", "kid",

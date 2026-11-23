@@ -19,7 +19,7 @@ use crate::catalog::Catalog;
 use crate::error::FhirError;
 use crate::package::{
     finish_install, newer_version, note_newer_installed, package_identity, package_root,
-    read_manifest, run_backfills, stage_package_deferred,
+    read_manifest, read_package, run_backfills, stage_package_deferred,
 };
 use crate::run::RunResult;
 use crate::s3::S3Source;
@@ -159,6 +159,80 @@ pub fn install_with(
     let parsed = parse_package_spec(spec)?;
     install_tree(store, db, catalog, parsed, fetcher, cache)?;
     Ok(())
+}
+
+/// What installing a package would do, found without installing it (see [`check_install`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageCheck {
+    /// The package, as its `package.json` names it.
+    pub name: String,
+    pub version: String,
+    /// Whether installing it stores anything: neither this version nor a newer one is installed.
+    pub installs: bool,
+}
+
+/// Checks that `spec` (a directory, a `.tgz` or `name@version`) can be installed in `store`,
+/// writing nothing: the package is read (fetched, for `name@version`, as an install would fetch
+/// it) with what it depends on, and every package that would be stored is read whole, every
+/// resource parsed. What fails here would fail the install before it stored anything. What passes
+/// can still be refused as it is stored (a search parameter that clashes with one installed), in
+/// which case that package's install is undone.
+pub fn check_install(store: &dyn ConformanceStore, spec: &str) -> Result<PackageCheck, FhirError> {
+    let registry = NpmRegistry::from_env()?;
+    check_with(store, spec, &registry, &registry.cache_dir)
+}
+
+/// [`check_install`] with the fetcher and cache given.
+pub fn check_with(
+    store: &dyn ConformanceStore,
+    spec: &str,
+    fetcher: &dyn PackageFetcher,
+    cache: &Path,
+) -> Result<PackageCheck, FhirError> {
+    let parsed = parse_package_spec(spec)?;
+    let installed = store.load_packages().map_err(FhirError::from)?;
+    let held = |name: &str, version: &str| {
+        held_exactly(&installed, name, version)
+            || newer_version(&installed, name, version).is_some()
+    };
+    if let PackageSpec::Npm { name, version } = &parsed {
+        if held(name, version) {
+            return Ok(PackageCheck {
+                name: name.clone(),
+                version: version.clone(),
+                installs: false,
+            });
+        }
+    }
+    let root = materialize(&parsed, fetcher, cache)?;
+    let (name, version) = package_identity(&root.dir)?;
+    if held(&name, &version) {
+        return Ok(PackageCheck {
+            name,
+            version,
+            installs: false,
+        });
+    }
+    let order = Resolver::new(
+        installed
+            .iter()
+            .map(|package| (package.name.clone(), package.version.clone())),
+        fetcher,
+        cache,
+    )
+    .resolve(root, name.clone(), version.clone())?;
+    for node in &order {
+        if held_exactly(&installed, &node.name, &node.version) {
+            continue;
+        }
+        read_package(&node.staged.dir)
+            .map_err(|err| FhirError::Invalid(format!("{}@{}: {err}", node.name, node.version)))?;
+    }
+    Ok(PackageCheck {
+        name,
+        version,
+        installs: true,
+    })
 }
 
 /// Whether every `name@version` spec is in the database, or has been replaced there by a newer
