@@ -18,6 +18,11 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   list is kept in the tenant's settings. A package that cannot be read is a `422` and changes
   nothing. Before, a tenant's packages were set only when it was made.
 
+### Security
+
+- **`url` is 2.5.9** (it was 2.5.8), for RUSTSEC-2026-0592: `Url::origin()` on a `blob:` URL nested
+  deeply enough overflows the stack.
+
 ## [0.0.9] - 2026-11-20
 
 ### Added
