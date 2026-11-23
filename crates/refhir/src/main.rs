@@ -1129,13 +1129,24 @@ fn install_packages(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let PackagePlan::Bundled(release, extra) = plan;
     install_release_defaults(store, db, catalog, *release)?;
-    for spec in extra {
+    install_extra_packages(store, db, catalog, extra)?;
+    Ok(())
+}
+
+/// Installs `specs` beyond the release's packages, then what the packages refer to and none of
+/// them holds (ISO 4217 for `currencies`): what a server's start installs after the release's
+/// packages, and what a tenant given packages later installs. A database that had the packages
+/// before this server carried that terminology gets it here too.
+fn install_extra_packages(
+    store: &dyn ConformanceStore,
+    db: &Database,
+    catalog: &RwLock<Catalog>,
+    specs: &[String],
+) -> Result<(), refhir_fhir::FhirError> {
+    for spec in specs {
         refhir_fhir::install_package(store, db, catalog, spec)?;
     }
-    // What the packages refer to and none of them holds (ISO 4217 for `currencies`). A database
-    // that had the packages before this server carried it gets it here too.
-    refhir_fhir::install_builtin_terminology(store, db, catalog)?;
-    Ok(())
+    refhir_fhir::install_builtin_terminology(store, db, catalog)
 }
 
 fn print_help() {

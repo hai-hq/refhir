@@ -36,6 +36,15 @@ fn install_lock() -> &'static Mutex<()> {
     &LOCK
 }
 
+/// Held while packages are installed into a running server: `$install` holds it, and so must any
+/// other caller, so that two installs into one store never run at once. Waits for an install that
+/// is running.
+pub fn install_guard() -> std::sync::MutexGuard<'static, ()> {
+    install_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackageSpec {
     Dir(PathBuf),

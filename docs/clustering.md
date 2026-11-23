@@ -348,8 +348,14 @@ left out of the list is not taken away.
 Every package of the list is read, with what it depends on, before any is installed: one that
 cannot be read (a path that is not there, a `package.json` or resource that does not parse) is a
 `422` that names it, and nothing is installed or recorded. A package refused as it is stored is
-undone; any earlier in the same list stay installed, and the `422` names them. When the
+undone; any earlier in the same list stay installed, and the `422` names them. The database or the
+package registry failing meanwhile is a `503`: ask again. When the
 [audit trail](governance.md) is on, a change is recorded there with the subtype `packages`.
+
+A tenant that is not open on the process that answers (one that fails to open, say for a package
+that is gone) has its list checked the same way and kept, and is opened again at once with it: a
+`PATCH` is how such a tenant is put right. A process that serves the tenant elsewhere opens it again
+when it hears of the change, which installs the list (a moment of `starting`).
 
 A directory a tenant lists is read again whenever the tenant is opened, so a newer version put in
 its place reaches the tenant at the process's next start without a request.

@@ -1794,4 +1794,33 @@ fn a_tenant_is_given_a_package_and_its_newer_versions_without_being_made_again()
     assert_eq!(again["packages"], body["packages"]);
     assert_eq!(installs(&host.log()), before, "{}", host.log());
     assert!(finds_tariff_code(&host, tenant, "NEW-1"));
+
+    // A tenant that cannot open, for a package that is not there, is put right by PATCH: the list
+    // is checked, kept, and installed as the tenant opens.
+    let (code, said) = cli(&app, &["create", "broken", "--package", missing]);
+    assert_eq!(code, 0, "{said}");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (_, health) = call("GET", &format!("{}/healthz", host.base()), &[], None);
+        if health["tenants"]["broken"]["status"] == "unavailable" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "broken opened:\n{}", host.log());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/broken",
+        Some(json!({"packages": [missing]})),
+    );
+    assert_eq!(status, 422, "{body}");
+    let (status, body) = host.admin(
+        "PATCH",
+        "/admin/tenants/broken",
+        Some(json!({"packages": [spec]})),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["settings"]["packages"], json!([spec]), "{body}");
+    host.wait_serving("broken");
+    assert!(finds_tariff_code(&host, "broken", "NEW-1"));
 }
