@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.10] - 2026-11-24
+
 ### Added
 
 - **A tenant's packages can be changed after it is made.** `PATCH /admin/tenants/{name}` takes
@@ -1014,7 +1016,8 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.10...HEAD
+[0.0.10]: https://github.com/hai-hq/refhir/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/hai-hq/refhir/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/hai-hq/refhir/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/hai-hq/refhir/compare/v0.0.6...v0.0.7
