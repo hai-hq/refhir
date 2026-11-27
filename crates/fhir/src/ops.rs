@@ -275,7 +275,7 @@ pub fn require_references(
             )));
         }
         for reference in reference_strings(resource, &element.path) {
-            check_reference(tx, catalog, model, element, &reference)?;
+            check_reference(tx, catalog, model, element, resource, &reference)?;
         }
     }
     Ok(())
@@ -286,6 +286,7 @@ fn check_reference(
     catalog: &Catalog,
     model: &ResourceModel,
     element: &crate::catalog::ReferenceElement,
+    resource: &Value,
     reference: &str,
 ) -> Result<(), FhirError> {
     let relative = format!(
@@ -298,11 +299,10 @@ fn check_reference(
             .map(String::as_str)
             .unwrap_or("Resource")
     );
-    if reference.starts_with('#') {
-        return match catalog.reference_policy() {
-            ReferencePolicy::Fhir => Ok(()),
-            ReferencePolicy::Strict => Err(FhirError::Invalid(relative)),
-        };
+    // A resource contained in this one is there whatever the policy, so `#id` is checked the same
+    // way under both: it has to name one of them, of a type the element allows (R4 ref-1).
+    if let Some(local) = reference.strip_prefix('#') {
+        return check_contained(model, element, resource, local);
     }
     if reference.contains("://") {
         return match catalog.reference_policy() {
@@ -333,6 +333,40 @@ fn check_reference(
         )));
     }
     Ok(())
+}
+
+/// `#local` in `element` of `resource`: one of its `contained` resources has the id `local`, and
+/// that resource is of a type the element may point at.
+fn check_contained(
+    model: &ResourceModel,
+    element: &crate::catalog::ReferenceElement,
+    resource: &Value,
+    local: &str,
+) -> Result<(), FhirError> {
+    let found = resource
+        .get("contained")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|item| item.get("id").and_then(Value::as_str) == Some(local));
+    let Some(found) = found else {
+        return Err(FhirError::Invalid(format!(
+            "{}.{} #{local} names no resource in {}.contained",
+            model.name, element.path, model.name
+        )));
+    };
+    let type_name = found
+        .get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    reject_target(
+        element,
+        type_name,
+        &format!(
+            "{}.{} #{local} is a contained {type_name}, which it cannot point at",
+            model.name, element.path
+        ),
+    )
 }
 
 fn reject_target(

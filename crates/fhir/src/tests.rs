@@ -9577,15 +9577,16 @@ fn a_reference_in_a_choice_element_of_any_resource_is_checked_not_only_billing()
         "payload.contentReference Patient/nobody does not exist",
     );
 
-    // A medication held in the resource itself is a reference to something that is not on the
-    // server, which is what `strict` refuses for every element: the Medication has to be written.
+    // A medication held in the resource itself is there under either policy, and one it does not
+    // hold is a reference to nothing under either.
     let request = |reference: &str| {
         json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
             "subject": {"reference": "Patient/pat"},
             "contained": [{"resourceType": "Medication", "id": "med1"}],
             "medicationReference": {"reference": reference}})
     };
-    refused(create(request("#med1")), "must be a relative reference");
+    create(request("#med1")).unwrap();
+    refused(create(request("#med2")), "#med2 names no resource");
     create(json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
         "subject": {"reference": "Patient/pat"}, "medicationReference": {"reference": "Medication/para"}}))
     .unwrap();
@@ -9595,6 +9596,191 @@ fn a_reference_in_a_choice_element_of_any_resource_is_checked_not_only_billing()
         .unwrap()
         .set_reference_policy(ReferencePolicy::Fhir);
     create(request("#med1")).unwrap();
+    refused(create(request("#med2")), "#med2 names no resource");
+}
+
+/// A resource with `contained` and the `#id` references to them (R4 references 2.3.0.4), the
+/// element that holds the reference, and the reference parameter over it if there is one.
+fn contained_cases() -> Vec<(Value, &'static str)> {
+    vec![
+        (
+            json!({"resourceType": "Observation", "status": "final", "code": {"text": "weight"},
+                "contained": [{"resourceType": "Patient", "id": "p", "name": [{"family": "Ade"}]}],
+                "subject": {"reference": "#p"}}),
+            "subject",
+        ),
+        (
+            json!({"resourceType": "MedicationRequest", "status": "active", "intent": "order",
+                "subject": {"reference": "Patient/pat"},
+                "contained": [{"resourceType": "Medication", "id": "m",
+                    "code": {"text": "paracetamol 500 mg"}}],
+                "medicationReference": {"reference": "#m"}}),
+            "medicationReference",
+        ),
+        (
+            json!({"resourceType": "ActivityDefinition", "status": "active", "kind": "ServiceRequest",
+                "contained": [{"resourceType": "SpecimenDefinition", "id": "specimen",
+                    "typeCollected": {"text": "venous blood"}}],
+                "specimenRequirement": [{"reference": "#specimen"}]}),
+            "specimenRequirement",
+        ),
+    ]
+}
+
+#[test]
+fn a_reference_to_a_contained_resource_is_written_and_read_back_as_sent() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": {"resourceType": "Patient", "id": "pat"}}),
+    );
+    for (sent, element) in contained_cases() {
+        let type_name = sent["resourceType"].as_str().unwrap().to_string();
+        // Create (the `/sync` mutation; HTTP `POST` runs the same one), then read.
+        let created = run_op(
+            &harness,
+            &format!("{type_name}/create"),
+            &json!({"resource": sent}),
+        )
+        .unwrap_or_else(|err| panic!("{type_name}: {err}"))
+        .value;
+        let id = created["id"].as_str().unwrap().to_string();
+        let read = apply(&harness, &format!("{type_name}/read"), json!({"id": id}));
+        assert_eq!(read["contained"], sent["contained"], "{type_name}");
+        assert_eq!(read[element], sent[element], "{type_name}");
+
+        // Update to a changed contained resource, then read again.
+        let mut changed = sent.clone();
+        changed["id"] = json!(id);
+        changed["contained"][0]["text"] = json!({"status": "generated",
+            "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\">changed</div>"});
+        apply(
+            &harness,
+            &format!("{type_name}/update"),
+            json!({"id": id, "resource": changed}),
+        );
+        let read = apply(&harness, &format!("{type_name}/read"), json!({"id": id}));
+        assert_eq!(read["contained"], changed["contained"], "{type_name}");
+        assert_eq!(read[element], sent[element], "{type_name}");
+
+        // Found by search with its `contained` as it was written.
+        let found = apply(&harness, &format!("{type_name}/search"), json!({"_id": id}));
+        assert_eq!(found["total"], 1, "{type_name}: {found}");
+        assert_eq!(
+            found["entry"][0]["resource"]["contained"], changed["contained"],
+            "{type_name}"
+        );
+    }
+}
+
+#[test]
+fn a_contained_reference_must_name_a_contained_resource_and_each_must_be_named() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    let create = |resource: Value| {
+        let path = format!("{}/create", resource["resourceType"].as_str().unwrap());
+        run_op(&harness, &path, &json!({"resource": resource}))
+    };
+    let observation = |contained: Value, subject: &str| {
+        json!({"resourceType": "Observation", "status": "final", "code": {"text": "weight"},
+            "contained": contained, "subject": {"reference": subject}})
+    };
+    let patient = json!([{"resourceType": "Patient", "id": "p"}]);
+
+    // `#id` with no contained resource of that id, or none at all.
+    for (contained, subject) in [(patient.clone(), "#q"), (json!([]), "#p")] {
+        let err = create(observation(contained, subject)).unwrap_err();
+        assert!(err.to_string().contains("names no resource"), "{err}");
+    }
+    // A contained resource of a type the element does not point at.
+    let err = create(observation(
+        json!([{"resourceType": "Medication", "id": "p"}]),
+        "#p",
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("contained Medication"), "{err}");
+    // A contained resource nothing in the resource refers to (dom-3).
+    let mut lonely = observation(patient.clone(), "#p");
+    lonely["contained"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"resourceType": "Patient", "id": "nobody"}));
+    let err = create(lonely).unwrap_err();
+    assert!(err.to_string().contains("dom-3"), "{err}");
+    // A contained resource that holds `contained`, a version or a security label of its own
+    // (dom-2, dom-4, dom-5).
+    for (nested, rule) in [
+        (
+            // The inner one is referred to, so it is dom-2 alone that refuses it.
+            json!({"resourceType": "Patient", "id": "p",
+                "contained": [{"resourceType": "Organization", "id": "inner"}],
+                "managingOrganization": {"reference": "#inner"}}),
+            "dom-2",
+        ),
+        (
+            json!({"resourceType": "Patient", "id": "p", "meta": {"versionId": "1"}}),
+            "dom-4",
+        ),
+        (
+            json!({"resourceType": "Patient", "id": "p", "meta": {"lastUpdated": "2026-11-27T10:00:00Z"}}),
+            "dom-4",
+        ),
+        (
+            json!({"resourceType": "Patient", "id": "p", "meta": {"security": [
+                {"system": "http://terminology.hl7.org/CodeSystem/v3-Confidentiality", "code": "R"}]}}),
+            "dom-5",
+        ),
+    ] {
+        let err = create(observation(json!([nested]), "#p")).unwrap_err();
+        // The message is the first issue; the rule may be further down the OperationOutcome.
+        assert!(format!("{err:?}").contains(rule), "{rule}: {err:?}");
+    }
+    let found = apply(&harness, "Observation/search", json!({}));
+    assert_eq!(found["total"], 0, "nothing refused was written");
+}
+
+#[test]
+fn a_contained_reference_is_no_search_value_and_include_does_not_follow_it() {
+    let harness = empty();
+    install_package_dir(&harness.store, &harness.db, &harness.catalog, r4_dir()).unwrap();
+    // A Patient on the server with the same id as the contained one, which a reference to the
+    // contained one must not be taken for.
+    apply(
+        &harness,
+        "Patient/create",
+        json!({"resource": {"resourceType": "Patient", "id": "p"}}),
+    );
+    let (sent, _) = contained_cases().remove(0);
+    let id = run_op(&harness, "Observation/create", &json!({"resource": sent}))
+        .unwrap()
+        .value["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for include in ["Observation:subject", "Observation:patient", "*"] {
+        let found = apply(
+            &harness,
+            "Observation/search",
+            json!({"_id": id, "_include": include}),
+        );
+        let entries = found["entry"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{include}: {found}");
+        assert_eq!(entries[0]["resource"]["id"], id.as_str());
+        assert_eq!(entries[0]["resource"]["contained"], sent["contained"]);
+    }
+    for subject in ["p", "Patient/p", "#p"] {
+        let found = apply(&harness, "Observation/search", json!({"subject": subject}));
+        assert_eq!(found["total"], 0, "subject={subject}: {found}");
+    }
+    let found = apply(
+        &harness,
+        "Patient/search",
+        json!({"_id": "p", "_revinclude": "Observation:subject"}),
+    );
+    assert_eq!(found["entry"].as_array().unwrap().len(), 1, "{found}");
 }
 
 fn claim_response(currency: &str) -> Value {

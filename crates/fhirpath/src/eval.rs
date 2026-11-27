@@ -2578,6 +2578,19 @@ fn materialize_one(
         .and_then(|value| value.as_array())
         .cloned()
         .unwrap_or_default();
+    // An element that holds a resource (`contained`, `Bundle.entry.resource`) is typed by the
+    // abstract `Resource`, which has none of the elements of the resource in it: the resource is of
+    // the type it names, and is read as one, so `contained.contained` (dom-2) finds what is there.
+    if matches!(fhir_type, Some("Resource" | "DomainResource")) {
+        if let Some(name) = resource_type(value) {
+            return Value::Node {
+                json: value.clone(),
+                path: name.clone(),
+                fhir_type: Some(name),
+                extensions,
+            };
+        }
+    }
     let mut json = value.clone();
     if let Some(fhir_type) = fhir_type {
         json = coerce_primitive(&json, fhir_type);
