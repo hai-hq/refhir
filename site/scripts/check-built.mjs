@@ -335,6 +335,20 @@ if (readPage('llms-full.txt') !== null && llms) {
     if (!rel.startsWith('docs/') || /http-equiv="refresh"/i.test(fs.readFileSync(file, 'utf8'))) continue;
     if (!listed.has(`/${rel}.md`)) fail(`${rel}/ has no Markdown copy listed in llms.txt`);
   }
+  // Commands that pin a release (the image tag, VERSION= for the archives) name the current one, so a
+  // release that bumps Cargo.toml fails here until the docs follow. The changelog names old ones.
+  const release = workspaceVersionFrom(fs.readFileSync(path.resolve(dist, '..', '..', 'Cargo.toml'), 'utf8'));
+  let pins = 0;
+  for (const urlPath of listed) {
+    if (urlPath === '/docs/reference/changelog.md' || !fs.existsSync(path.join(dist, urlPath))) continue;
+    const text = fs.readFileSync(path.join(dist, urlPath), 'utf8');
+    for (const [pin, version] of text.matchAll(/(?:ghcr\.io\/hai-hq\/refhir:|\bVERSION=)(\d+\.\d+\.\d+)\b/g)) {
+      pins++;
+      if (version !== release) fail(`${urlPath} pins ${pin}, but Cargo.toml says ${release}`);
+    }
+  }
+  if (pins === 0) fail('no docs page pins a release; the install page should');
+
   for (const urlPath of listed) {
     let fence = false;
     for (const line of (fs.existsSync(path.join(dist, urlPath)) ? fs.readFileSync(path.join(dist, urlPath), 'utf8') : '').split('\n')) {

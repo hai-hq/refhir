@@ -118,7 +118,8 @@ from `haihq.org/refhir` to this site.
   checks search and sharing: every page has a title, description, canonical url, one h1 and share
   tags with no duplicates; the structured data matches `Cargo.toml`; the share image is the 1200 by
   630 file the tags declare; robots.txt and the sitemap are right; llms.txt lists a `.md` copy of
-  every docs page and no copy has MDX left in it. See `CLAIMS.md`.
+  every docs page and no copy has MDX left in it; the release the docs pin is the one in
+  `Cargo.toml`. See `CLAIMS.md`.
 - **The share image** is `docs/brand/og-image.png`. To change it, redesign it at 1200 by 630 and keep
   it under 600 KB; the check fails otherwise.
 - **A Node error** on Cloudflare usually means the project's Node version is older than 22.12. Set

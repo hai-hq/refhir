@@ -48,6 +48,9 @@ changelog says so. The clients are released at the same version:
    - Set the new version in the root `Cargo.toml`, then run `cargo check` so `Cargo.lock`
      follows. CI builds with `--locked` and fails on a stale lockfile.
    - In `clients/ts`, run `npm version X.Y.Z --no-git-tag-version`.
+   - In `site/src/content/docs/docs/install.mdx` and `docs/getting-started.md`, set the pinned image
+     tag (`ghcr.io/hai-hq/refhir:X.Y.Z`) and `VERSION=X.Y.Z`. The site build fails until they match
+     `Cargo.toml`.
    - In `CHANGELOG.md`, rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a new empty
      `## [Unreleased]` above it, and update the link definitions at the bottom.
    - Preview the notes: `scripts/release-notes.sh X.Y.Z`.
