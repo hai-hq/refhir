@@ -51,7 +51,11 @@ behaviour as a fact. When a fix merges, update its pages in the same change:
 2. A page from an existing document: add an entry to `synced` in `docs-manifest.mjs` and list its
    slug in `sidebar`. The manifest is an explicit allowlist, and only files git tracks can be
    listed, so private or ignored files are never published.
-3. `npm test` checks that every synced page is in the sidebar and every sidebar slug has a page.
+3. An article: add `src/content/docs/docs/articles/<name>.md` with a `title`, a `description`, a
+   `date` (`2026-12-14`) and an `author`. That is all: the sidebar and the
+   articles index (`/docs/articles/`) list articles newest first, and the date
+   and author show under the title. `draft: true` keeps one out of the build.
+4. `npm test` checks that every synced page is in the sidebar and every sidebar slug has a page.
    The build fails on any link that does not resolve.
 
 ## Deploying
@@ -113,8 +117,8 @@ from `haihq.org/refhir` to this site.
   generated.
 - **`sync-content` fails** when a listed file is not tracked by git, or a link points at a file that
   does not exist.
-- **`check-built` fails** when the landing page breaks a promise: it loads something from another
-  origin, uses a claim the project cannot back up, or grows past its JavaScript budget. It also
+- **`check-built` fails** when the landing page breaks a promise: a page loads something from another
+  origin (serve a video and its poster from the site, under `public/media/`), uses a claim the project cannot back up, or grows past its JavaScript budget. It also
   checks search and sharing: every page has a title, description, canonical url, one h1 and share
   tags with no duplicates; the structured data matches `Cargo.toml`; the share image is the 1200 by
   630 file the tags declare; robots.txt and the sitemap are right; llms.txt lists a `.md` copy of

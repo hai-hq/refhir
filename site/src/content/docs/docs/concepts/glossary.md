@@ -18,7 +18,7 @@ wall-clock time. Compare timestamps as numbers.
 
 **Live query.** A subscription to the result of a query, over the `/sync` WebSocket. The server
 re-runs the query when a commit could have changed its answer, and pushes the new full result. Also
-called a reactive query. See [How live queries work](/docs/concepts/how-it-works/).
+called a reactive query. See [How live FHIR queries work](/docs/concepts/how-it-works/).
 
 **`meta.versionId`.** The version of a resource. ReFHIR sets it to the commit timestamp of the
 write that produced that version, so it also orders versions. A mismatched `If-Match` is refused
@@ -56,7 +56,7 @@ sees the newest version of each resource at or before _t_.
 
 **Subscription.** The FHIR R4 resource that asks to be notified. ReFHIR delivers `rest-hook` and
 `websocket` Subscriptions. It is not the same as a live query. See
-[Live queries and FHIR Subscriptions](/docs/concepts/vs-subscriptions/).
+[Real-time FHIR: live queries and Subscriptions](/docs/concepts/vs-subscriptions/).
 
 **Transaction.** A `Bundle` of type `transaction`. It commits at one timestamp or not at all, and a
 subscriber sees all of its effects on a query result or none of them.

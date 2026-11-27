@@ -114,4 +114,4 @@ socket is connected is not kept.
 - **R4 only.** The `Subscription` resource is implemented. R5 topic-based subscriptions are not.
 
 To keep a screen or a process in step with the current result, use a live query instead. See
-[Live queries and FHIR Subscriptions](/docs/concepts/vs-subscriptions/).
+[Real-time FHIR: live queries and Subscriptions](/docs/concepts/vs-subscriptions/).

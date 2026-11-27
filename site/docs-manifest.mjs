@@ -12,6 +12,9 @@
 //   title        only needed when the source has no Markdown H1
 //   description  page description for search and social previews
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 export const synced = [
   // Start
   {
@@ -170,6 +173,24 @@ export const synced = [
 // configuration file. They are listed here so the sidebar and its tests know they exist.
 export const generated = [{ slug: 'docs/reference/cli' }, { slug: 'docs/reference/config-file' }];
 
+// Articles are the files in src/content/docs/docs/articles/, so adding one is adding a file. Each has
+// a `date` (YYYY-MM-DD) and an `author` in its front matter, and they are listed newest first after
+// the index page. A draft (`draft: true`) is left out. The build and the tests run from site/.
+export function articleSlugs(dir = path.join(process.cwd(), 'src/content/docs/docs/articles')) {
+  if (!fs.existsSync(dir)) return [];
+  const found = [];
+  for (const name of fs.readdirSync(dir)) {
+    const match = name.match(/^(.+)\.mdx?$/);
+    if (!match || match[1] === 'index') continue;
+    const front = fs.readFileSync(path.join(dir, name), 'utf8').match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? '';
+    if (/^draft:\s*true\s*$/m.test(front)) continue;
+    const date = front.match(/^date:\s*['"]?(\d{4}-\d{2}-\d{2})/m)?.[1] ?? '';
+    found.push({ slug: `docs/articles/${match[1]}`, date });
+  }
+  found.sort((a, b) => b.date.localeCompare(a.date) || a.slug.localeCompare(b.slug));
+  return found.map((a) => a.slug);
+}
+
 // Sidebar groups, in display order. Each item is a page slug.
 export const sidebar = [
   { label: 'Start', items: ['docs/introduction', 'docs/install', 'docs/getting-started', 'docs/tutorial'] },
@@ -224,6 +245,7 @@ export const sidebar = [
       'docs/reference/changelog',
     ],
   },
+  { label: 'Articles', items: ['docs/articles', ...articleSlugs()] },
   {
     label: 'Project',
     collapsed: true,

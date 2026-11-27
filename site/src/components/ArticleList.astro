@@ -1,0 +1,64 @@
+---
+// Every published article, newest first, for the articles index page. An article is any page in
+// src/content/docs/docs/articles/ other than the index.
+import { getCollection } from 'astro:content';
+
+import { isoDate, showDate } from '../lib/articles';
+
+const articles = (await getCollection('docs', (e) => e.id.startsWith('docs/articles/') && !e.data.draft)).sort(
+  (a, b) => (b.data.date?.getTime() ?? 0) - (a.data.date?.getTime() ?? 0) || a.id.localeCompare(b.id),
+);
+---
+
+{
+  articles.length === 0 ? (
+    <p>No articles yet.</p>
+  ) : (
+    <ul class="articles not-content">
+      {articles.map((a) => (
+        <li>
+          <a href={`/${a.id}/`}>{a.data.title}</a>
+          <p class="meta">
+            {a.data.author && <span>{a.data.author}</span>}
+            {a.data.date && <time datetime={isoDate(a.data.date)}>{showDate(a.data.date)}</time>}
+          </p>
+          {a.data.description && <p>{a.data.description}</p>}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+<style>
+  .articles {
+    list-style: none;
+    padding: 0;
+    margin-top: 1.5rem;
+    display: grid;
+    gap: 1.75rem;
+  }
+  .articles a {
+    font-size: var(--sl-text-xl);
+    font-weight: 600;
+    color: var(--sl-color-white);
+    text-decoration: none;
+  }
+  .articles a:hover {
+    text-decoration: underline;
+  }
+  .articles p {
+    margin: 0.25rem 0 0;
+    color: var(--sl-color-gray-2);
+  }
+  .articles .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 0.75rem;
+    color: var(--sl-color-gray-3);
+    font-size: var(--sl-text-sm);
+  }
+  .meta span + time::before {
+    content: '·';
+    margin-inline-end: 0.75rem;
+  }
+</style>

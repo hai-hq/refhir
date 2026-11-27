@@ -1,14 +1,16 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { generated, sidebar, synced } from '../docs-manifest.mjs';
+import { articleSlugs, generated, sidebar, synced } from '../docs-manifest.mjs';
 import { listRepoFiles, siteRoot } from './lib/repo.mjs';
 
 const { files } = listRepoFiles();
+// A page is <slug>.md(x), or <slug>/index.md(x) for a section's index such as docs/articles.
 const authored = (slug) =>
-  ['.md', '.mdx'].some((ext) => fs.existsSync(path.join(siteRoot, 'src/content/docs', `${slug}${ext}`)));
+  ['.md', '.mdx', '/index.md', '/index.mdx'].some((ext) => fs.existsSync(path.join(siteRoot, 'src/content/docs', `${slug}${ext}`)));
 const sidebarSlugs = sidebar.flatMap((group) => group.items);
 
 test('every synced source is a file the repository tracks', () => {
@@ -47,7 +49,7 @@ test('every page written in site/ is in the sidebar, so none is an orphan', () =
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       if (entry.isDirectory()) walk(full);
-      else if (/\.mdx?$/.test(entry.name)) pages.push(path.relative(path.join(siteRoot, 'src/content/docs'), full).replace(/\.mdx?$/, ''));
+      else if (/\.mdx?$/.test(entry.name)) pages.push(path.relative(path.join(siteRoot, 'src/content/docs'), full).replace(/\.mdx?$/, '').replace(/\/index$/, ''));
     }
   };
   walk(root);
@@ -56,4 +58,24 @@ test('every page written in site/ is in the sidebar, so none is an orphan', () =
 
 test('no slug appears in the sidebar twice', () => {
   assert.equal(new Set(sidebarSlugs).size, sidebarSlugs.length);
+});
+
+test('articles are listed newest first, and drafts are left out', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'articles-'));
+  const write = (name, front) => fs.writeFileSync(path.join(dir, name), `---\ntitle: T\n${front}\n---\n\nBody.\n`);
+  write('index.mdx', '');
+  write('older.md', 'date: 2026-12-01');
+  write('newer.mdx', "date: '2027-01-05'");
+  write('draft.md', 'date: 2027-02-01\ndraft: true');
+  assert.deepEqual(articleSlugs(dir), ['docs/articles/newer', 'docs/articles/older']);
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('every article has a date and an author', () => {
+  for (const slug of articleSlugs()) {
+    const file = ['.md', '.mdx'].map((ext) => path.join(siteRoot, 'src/content/docs', `${slug}${ext}`)).find(fs.existsSync);
+    const front = fs.readFileSync(file, 'utf8').split('---')[1];
+    assert.match(front, /^date:\s*['"]?\d{4}-\d{2}-\d{2}/m, `${slug} has no date`);
+    assert.match(front, /^author:\s*\S/m, `${slug} has no author`);
+  }
 });
