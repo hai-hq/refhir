@@ -28,7 +28,8 @@ struct Ctx<'a> {
     /// Evaluate the way R4 `ElementDefinition.constraint` expressions were written and checked
     /// (by the HL7 reference validator), where that differs from normative FHIRPath:
     /// `as()` applies to each item, where normative FHIRPath rejects a collection; and `is`
-    /// on an empty collection is `false`, where normative FHIRPath answers empty.
+    /// on an empty collection is `false` as an operand of a boolean operator, where normative
+    /// FHIRPath answers empty.
     r4_invariant: bool,
 }
 
@@ -69,8 +70,8 @@ pub fn evaluate_at(
 
 /// Like `evaluate_at`, but the way R4 `ElementDefinition.constraint` expressions were written
 /// for: `as()` keeps every item that casts (`dom-3` calls `descendants().as(canonical)`), and
-/// an empty collection `is` no type (`ras-2` is `probability is decimal implies ...`, which a
-/// prediction without a probability meets).
+/// a type test of nothing is false as an operand of `and`, `or`, `xor` or `implies` (`ras-2` is
+/// `probability is decimal implies ...`, which a prediction without a probability meets).
 pub fn evaluate_invariant(
     expr: &Expr,
     focus: &Json,
@@ -390,9 +391,7 @@ impl Ctx<'_> {
 
     fn is_type(&self, items: &[Value], target: &str) -> Result<Option<bool>, Error> {
         let Some(item) = singleton(items)? else {
-            // Normative FHIRPath answers empty, and an invariant that answers empty fails. R4
-            // invariants use `x is T implies ...` as a guard that holds when there is no x.
-            return Ok(self.r4_invariant.then_some(false));
+            return Ok(None);
         };
         Ok(Some(self.value_is(item, target)))
     }
@@ -561,6 +560,28 @@ impl Ctx<'_> {
         }
     }
 
+    /// An operand of `and`, `or`, `xor` or `implies`. Normative FHIRPath answers empty for a type
+    /// test of nothing, and an invariant that answers empty fails; R4 invariants use
+    /// `x is T implies ...` as a guard that holds when there is no x. So in an invariant, and only
+    /// as such an operand, a type test of nothing is false. `(x is T).empty()` keeps its meaning.
+    fn logic_operand(
+        &self,
+        expr: &Expr,
+        focus: &[Value],
+        ordered: bool,
+    ) -> Result<Option<bool>, Error> {
+        let value = bool_operand(&self.eval(expr, focus, ordered)?.items)?;
+        let type_test = match expr {
+            Expr::Is(..) => true,
+            Expr::Call { name, .. } => name == "is",
+            _ => false,
+        };
+        if value.is_none() && type_test && self.r4_invariant {
+            return Ok(Some(false));
+        }
+        Ok(value)
+    }
+
     fn eval_logic(
         &self,
         op: BinOp,
@@ -569,8 +590,8 @@ impl Ctx<'_> {
         focus: &[Value],
         ordered: bool,
     ) -> Result<Outcome, Error> {
-        let left = bool_operand(&self.eval(left, focus, ordered)?.items)?;
-        let right = bool_operand(&self.eval(right, focus, ordered)?.items)?;
+        let left = self.logic_operand(left, focus, ordered)?;
+        let right = self.logic_operand(right, focus, ordered)?;
         let value = match op {
             BinOp::And => match (left, right) {
                 (Some(false), _) | (_, Some(false)) => Some(false),

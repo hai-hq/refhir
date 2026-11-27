@@ -9134,12 +9134,24 @@ async fn a_free_text_answer_to_open_choice_is_accepted_over_rest_and_sync_alike(
             "status": "active",
             "item": [{
                 "linkId": "followup.1", "type": kind, "text": "Is the pain there all the time?",
-                "answerOption": [{"valueString": "All the time"}, {"valueString": "Comes and goes"}]
+                "answerOption": [
+                    {"valueString": "All the time"},
+                    {"valueString": "Comes and goes"},
+                    {"valueCoding": {
+                        "system": "http://example.org/pain-pattern", "code": "intermittent",
+                        "display": "Intermittent"
+                    }}
+                ]
             }]
         })
     };
     let free_text = json!({"valueString": "No — not all the time (comes and goes)"});
     let option = json!({"valueString": "Comes and goes"});
+    // A coded option, named by system and code; the client's display need not be the option's.
+    let coded = json!({"valueCoding": {
+        "system": "http://example.org/pain-pattern", "code": "intermittent",
+        "display": "Comes and goes"
+    }});
     let mut written = 0;
     for kind in ["open-choice", "choice"] {
         let url = format!("http://example.org/Questionnaire/{kind}");
@@ -9152,7 +9164,11 @@ async fn a_free_text_answer_to_open_choice_is_accepted_over_rest_and_sync_alike(
         )
         .await;
         assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
-        for (answer, accepted) in [(&free_text, kind == "open-choice"), (&option, true)] {
+        for (answer, accepted) in [
+            (&free_text, kind == "open-choice"),
+            (&option, true),
+            (&coded, true),
+        ] {
             for contained in [true, false] {
                 written += 1;
                 let mut response = json!({

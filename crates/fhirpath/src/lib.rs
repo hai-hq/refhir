@@ -153,18 +153,34 @@ mod context_tests {
         }
     }
 
-    /// Normative FHIRPath answers empty for `{} is T`. An R4 invariant reads it as false, so a
-    /// guard such as ras-2's `probability is decimal implies (probability as decimal) <= 100`
-    /// holds when there is no probability, as the HL7 reference validator has it.
+    /// Normative FHIRPath answers empty for `{} is T`. As an operand of a boolean operator in an
+    /// R4 invariant it is false, so a guard such as ras-2's
+    /// `probability is decimal implies (probability as decimal) <= 100` holds when there is no
+    /// probability, as the HL7 reference validator has it. Anywhere else it stays empty.
     #[test]
-    fn an_empty_collection_is_no_type_in_an_invariant() {
-        for expression in ["{} is System.Decimal", "{}.is(System.Decimal)"] {
-            assert_eq!(answer(expression, false), None, "{expression}");
-            assert_eq!(answer(expression, true), Some(false), "{expression}");
+    fn an_empty_collection_is_no_type_in_an_invariant_guard() {
+        for invariant in [false, true] {
+            for expression in ["{} is System.Decimal", "{}.is(System.Decimal)"] {
+                assert_eq!(answer(expression, invariant), None, "{expression}");
+                let tested = format!("({expression}).empty()");
+                assert_eq!(answer(&tested, invariant), Some(true), "{tested}");
+            }
         }
-        let guard = "{} is System.Decimal implies ({} as System.Decimal) <= 100";
-        assert_eq!(answer(guard, false), None);
-        assert_eq!(answer(guard, true), Some(true));
+        for guard in [
+            "{} is System.Decimal implies ({} as System.Decimal) <= 100",
+            "{}.is(System.Decimal) implies ({} as System.Decimal) <= 100",
+            "({} is System.Decimal).not() or false",
+        ] {
+            let expected = if guard.contains("not()") {
+                None
+            } else {
+                Some(true)
+            };
+            assert_eq!(answer(guard, false), None, "{guard}");
+            assert_eq!(answer(guard, true), expected, "{guard}");
+        }
+        assert_eq!(answer("({} is System.Decimal) or true", true), Some(true));
+        assert_eq!(answer("({} is System.Decimal) and true", true), Some(false));
         let present = "150.0 is System.Decimal implies (150.0 as System.Decimal) <= 100";
         assert_eq!(answer(present, true), Some(false));
         let within = "50.0 is System.Decimal implies (50.0 as System.Decimal) <= 100";
