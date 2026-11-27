@@ -258,6 +258,74 @@ mod tests {
         assert!(prepare_completed(&mut chart, &present).is_ok());
     }
 
+    /// R4 `open-choice`: a Coding from the options, or free text in `valueString`. `choice`
+    /// takes only its options. The same whether the Questionnaire is contained or canonical.
+    #[test]
+    fn open_choice_takes_free_text_and_choice_takes_only_its_options() {
+        let url = "http://example.org/Questionnaire/asked";
+        let asked = |kind: &str| {
+            json!({
+                "resourceType": "Questionnaire",
+                "id": "asked",
+                "url": url,
+                "status": "active",
+                "item": [{
+                    "linkId": "followup.1", "type": kind, "text": "How often?",
+                    "answerOption": [
+                        {"valueString": "All the time"},
+                        {"valueString": "Comes and goes"},
+                        {"valueCoding": {"system": "http://example.org/often", "code": "daily"}}
+                    ]
+                }]
+            })
+        };
+        let response = |canonical: &str, contained: Option<Json>, answer: Json| {
+            let mut resource = json!({
+                "resourceType": "QuestionnaireResponse",
+                "questionnaire": canonical,
+                "status": "completed",
+                "item": [{"linkId": "followup.1", "text": "How often?", "answer": [answer]}]
+            });
+            if let Some(questionnaire) = contained {
+                resource["contained"] = json!([questionnaire]);
+            }
+            resource
+        };
+        let free_text = json!({"valueString": "No — not all the time (comes and goes)"});
+        let option_text = json!({"valueString": "Comes and goes"});
+        let option_coding =
+            json!({"valueCoding": {"system": "http://example.org/often", "code": "daily"}});
+        let other_coding =
+            json!({"valueCoding": {"system": "http://example.org/often", "code": "weekly"}});
+        for (kind, answer, accepted) in [
+            ("open-choice", &free_text, true),
+            ("open-choice", &option_text, true),
+            ("open-choice", &option_coding, true),
+            ("open-choice", &other_coding, false),
+            ("choice", &free_text, false),
+            ("choice", &option_text, true),
+            ("choice", &option_coding, true),
+        ] {
+            let contained = response("#asked", Some(asked(kind)), answer.clone());
+            let canonical = response(url, None, answer.clone());
+            let mut chart = MemoryChart::new(vec![asked(kind)]);
+            for (how, resource) in [("contained", contained), ("canonical", canonical)] {
+                let outcome = prepare_completed(&mut chart, &resource);
+                assert_eq!(
+                    outcome.is_ok(),
+                    accepted,
+                    "{kind} {how} {answer}: {outcome:?}"
+                );
+                if let Err(outcome) = outcome {
+                    assert_eq!(
+                        outcome["issue"][0]["diagnostics"],
+                        "answer is not an allowed option"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn assembles_a_subquestionnaire_and_prefixes_link_ids() {
         let child = json!({

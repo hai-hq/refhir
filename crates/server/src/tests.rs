@@ -9067,3 +9067,216 @@ async fn over_http_a_resource_says_when_it_was_written_and_is_found_and_listed_b
         .unwrap()
         .contains("invalid _since"));
 }
+
+/// One transaction sent over REST (`POST /`) and over `/sync` (`Bundle/transaction`): both
+/// accept it, or both refuse it with the same OperationOutcome. `Ok` holds REST's response
+/// Bundle, `Err` the OperationOutcome.
+async fn transacted_alike(
+    app: &axum::Router,
+    sync_url: &str,
+    entries: Value,
+) -> Result<Value, Value> {
+    let bundle = json!({"resourceType": "Bundle", "type": "transaction", "entry": entries});
+    let rest = send(app, "POST", "/", Some(bundle.clone()), None).await;
+    let synced = sync_mutation(sync_url, "Bundle/transaction", json!({"resource": bundle})).await;
+    if rest.status.is_success() {
+        assert_eq!(
+            synced["success"], true,
+            "REST accepted, /sync refused: {synced}"
+        );
+        return Ok(rest.body);
+    }
+    assert!(rest.status.is_client_error(), "{}", rest.body);
+    assert_eq!(
+        synced["success"], false,
+        "REST refused, /sync accepted: {}",
+        rest.body
+    );
+    assert_eq!(synced["result"], rest.body, "/sync refused differently");
+    Err(rest.body)
+}
+
+fn diagnostics(outcome: &Value) -> String {
+    outcome["issue"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|issue| issue["diagnostics"].as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// A server over the whole R4 package, with Patient/p1, and its `/sync` address.
+async fn r4_app_with_a_patient() -> (axum::Router, String) {
+    let store = Arc::new(SqlitePersistence::open_in_memory().unwrap());
+    let db = Arc::new(Database::open(store.clone()).unwrap());
+    let catalog = Arc::new(RwLock::new(Catalog::empty()));
+    install_package_dir(store.as_ref(), &db, &catalog, r4_dir()).unwrap();
+    catalog.write().unwrap().set_update_create(true);
+    let app = app(db, catalog, store);
+    assert_eq!(put(&app, patient("p1")).await.status, StatusCode::CREATED);
+    let addr = sync_gaps::serve(app.clone()).await;
+    (app, format!("ws://{addr}/sync"))
+}
+
+/// R4 `open-choice` takes a Coding from the options or free text in `valueString`; `choice`
+/// takes only its options. A completed QuestionnaireResponse is held to that over REST and over
+/// `/sync` alike, whether its Questionnaire is contained (`#asked`, as SDC adaptive forms are)
+/// or found by canonical.
+#[tokio::test]
+async fn a_free_text_answer_to_open_choice_is_accepted_over_rest_and_sync_alike() {
+    let (app, sync_url) = r4_app_with_a_patient().await;
+    let questionnaire = |kind: &str, url: &str| {
+        json!({
+            "resourceType": "Questionnaire",
+            "id": "asked",
+            "url": url,
+            "status": "active",
+            "item": [{
+                "linkId": "followup.1", "type": kind, "text": "Is the pain there all the time?",
+                "answerOption": [{"valueString": "All the time"}, {"valueString": "Comes and goes"}]
+            }]
+        })
+    };
+    let free_text = json!({"valueString": "No — not all the time (comes and goes)"});
+    let option = json!({"valueString": "Comes and goes"});
+    let mut written = 0;
+    for kind in ["open-choice", "choice"] {
+        let url = format!("http://example.org/Questionnaire/{kind}");
+        let created = send(
+            &app,
+            "POST",
+            "/Questionnaire",
+            Some(questionnaire(kind, &url)),
+            None,
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::CREATED, "{}", created.body);
+        for (answer, accepted) in [(&free_text, kind == "open-choice"), (&option, true)] {
+            for contained in [true, false] {
+                written += 1;
+                let mut response = json!({
+                    "resourceType": "QuestionnaireResponse",
+                    "id": format!("qr{written}"),
+                    "status": "completed",
+                    "subject": {"reference": "Patient/p1"},
+                    "item": [{
+                        "linkId": "followup.1",
+                        "text": "Is the pain there all the time?",
+                        "answer": [answer]
+                    }]
+                });
+                if contained {
+                    response["questionnaire"] = json!("#asked");
+                    response["contained"] = json!([questionnaire(kind, &url)]);
+                } else {
+                    response["questionnaire"] = json!(url);
+                }
+                let entries = json!([{
+                    "resource": response,
+                    "request": {"method": "PUT", "url": format!("QuestionnaireResponse/qr{written}")}
+                }]);
+                let outcome = transacted_alike(&app, &sync_url, entries).await;
+                let case = format!("{kind} contained={contained} {answer}");
+                match outcome {
+                    Ok(_) => assert!(accepted, "accepted {case}"),
+                    Err(outcome) => {
+                        assert!(!accepted, "refused {case}: {outcome}");
+                        assert!(
+                            diagnostics(&outcome).contains("answer is not an allowed option"),
+                            "{case}: {outcome}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// ras-2 is `probability is decimal implies (probability as decimal) <= 100`: a prediction
+/// without a probability meets it, as does a range, and only a decimal over 100 breaks it.
+#[tokio::test]
+async fn a_risk_prediction_without_a_probability_is_accepted() {
+    let (app, sync_url) = r4_app_with_a_patient().await;
+    let risk = |id: &str, probability: Option<(&str, Value)>| {
+        let mut prediction = json!({
+            "qualitativeRisk": {"text": "Moderate"},
+            "rationale": "NEWS2 of 5 from the last set of observations"
+        });
+        if let Some((key, value)) = probability {
+            prediction[key] = value;
+        }
+        json!([{
+            "resource": {
+                "resourceType": "RiskAssessment",
+                "id": id,
+                "status": "final",
+                "subject": {"reference": "Patient/p1"},
+                "occurrenceDateTime": "2026-11-27T10:00:00Z",
+                "method": {"text": "NEWS2"},
+                "prediction": [prediction]
+            },
+            "request": {"method": "PUT", "url": format!("RiskAssessment/{id}")}
+        }])
+    };
+    for (id, probability, accepted) in [
+        ("none", None, true),
+        ("fifty", Some(("probabilityDecimal", json!(50))), true),
+        ("over", Some(("probabilityDecimal", json!(150))), false),
+        (
+            "range",
+            Some((
+                "probabilityRange",
+                json!({"low": {"value": 10}, "high": {"value": 150}}),
+            )),
+            true,
+        ),
+    ] {
+        match transacted_alike(&app, &sync_url, risk(id, probability)).await {
+            Ok(_) => assert!(accepted, "{id} was accepted"),
+            Err(outcome) => {
+                assert!(!accepted, "{id} was refused: {outcome}");
+                assert!(diagnostics(&outcome).contains("ras-2"), "{id}: {outcome}");
+            }
+        }
+    }
+}
+
+/// R4 `Reference.reference` is 0..1: a Composition whose author names who wrote it only by
+/// `display` has its required author. One with no author at all does not.
+#[tokio::test]
+async fn a_required_reference_may_be_display_only() {
+    let (app, sync_url) = r4_app_with_a_patient().await;
+    let composition = |id: &str, author: Option<Value>| {
+        let mut resource = json!({
+            "resourceType": "Composition",
+            "id": id,
+            "status": "final",
+            "type": {"text": "Clinic note"},
+            "subject": {"reference": "Patient/p1"},
+            "date": "2026-11-27T10:00:00Z",
+            "title": "Clinic note"
+        });
+        if let Some(author) = author {
+            resource["author"] = author;
+        }
+        json!([{"resource": resource, "request": {"method": "PUT", "url": format!("Composition/{id}")}}])
+    };
+    let display_only = composition("c1", Some(json!([{"display": "Dr Ann Clinician"}])));
+    assert!(transacted_alike(&app, &sync_url, display_only)
+        .await
+        .is_ok());
+    let stored = send(&app, "GET", "/Composition/c1", None, None).await;
+    assert_eq!(stored.body["author"][0]["display"], "Dr Ann Clinician");
+    let identified = composition(
+        "c2",
+        Some(json!([{"identifier": {"system": "http://example.org/staff", "value": "77"}}])),
+    );
+    assert!(transacted_alike(&app, &sync_url, identified).await.is_ok());
+    let none = transacted_alike(&app, &sync_url, composition("c3", None)).await;
+    let outcome = none.expect_err("a Composition without an author");
+    assert!(
+        diagnostics(&outcome).contains("Composition.author"),
+        "{outcome}"
+    );
+}

@@ -150,9 +150,13 @@ fn check_item(
                     link_id,
                 ));
             }
+            // R4 `open-choice`: a Coding from the options, or free text in `valueString`. Only
+            // `choice` (and a coding answered to `open-choice`) must be one of the options.
+            let free_text = item_type == "open-choice" && answer.get("valueString").is_some();
             if let Some(options) = definition
                 .get("answerOption")
                 .and_then(|item| item.as_array())
+                .filter(|_| !free_text)
             {
                 if !options.is_empty()
                     && !options

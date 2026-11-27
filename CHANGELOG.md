@@ -10,6 +10,23 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Fixed
+
+- **A free-text answer to an `open-choice` question is accepted.** R4 `open-choice` takes a Coding
+  from the item's `answerOption`s or free text in `valueString`; a completed QuestionnaireResponse
+  answering one in the patient's own words was refused with "answer is not an allowed option". A
+  `choice` item still takes only its options, and so does a coding answered to `open-choice`. The
+  rule is the same over REST and `/sync`, with a contained or a canonical Questionnaire.
+- **A `RiskAssessment` prediction without a probability is accepted.** ras-2,
+  `probability is decimal implies (probability as decimal) <= 100`, failed when there was no
+  probability. In R4 invariants `is` on an empty collection is now `false` (as the HL7 validator
+  has it), so the guard holds; elsewhere FHIRPath still answers empty, as FHIRPath 2.0.0 says.
+- **A required Reference may be display-only.** An element such as `Composition.author` needed a
+  `reference` in it ("Composition.author.reference is required"), though R4 `Reference.reference`
+  is 0..1. Any Reference now meets it, one with only a `display` or an `identifier` included; this
+  applied to every resource with a required top-level Reference. A missing element is refused with
+  "{Type}.{element} is required".
+
 ## [0.0.10] - 2026-11-24
 
 ### Added

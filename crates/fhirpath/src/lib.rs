@@ -122,6 +122,55 @@ mod context_tests {
         assert_eq!(text, vec!["a".to_string(), "b".to_string()]);
     }
 
+    fn answer(expression: &str, invariant: bool) -> Option<bool> {
+        let expr = parse(expression).unwrap();
+        let root = json!({});
+        let items = if invariant {
+            evaluate_invariant(&expr, &root, "", &root, &root, &Model::new(), &EmptyHost)
+        } else {
+            evaluate(&expr, &root, &Model::new(), &EmptyHost)
+        }
+        .unwrap();
+        assert!(items.len() <= 1, "{expression}");
+        items.first().map(|item| item.as_singleton_bool().unwrap())
+    }
+
+    #[test]
+    fn implies_follows_the_fhirpath_truth_table() {
+        for invariant in [false, true] {
+            for right in ["true", "false", "{}"] {
+                assert_eq!(
+                    answer(&format!("false implies {right}"), invariant),
+                    Some(true)
+                );
+            }
+            assert_eq!(answer("true implies true", invariant), Some(true));
+            assert_eq!(answer("true implies false", invariant), Some(false));
+            assert_eq!(answer("true implies {}", invariant), None);
+            assert_eq!(answer("{} implies true", invariant), Some(true));
+            assert_eq!(answer("{} implies false", invariant), None);
+            assert_eq!(answer("{} implies {}", invariant), None);
+        }
+    }
+
+    /// Normative FHIRPath answers empty for `{} is T`. An R4 invariant reads it as false, so a
+    /// guard such as ras-2's `probability is decimal implies (probability as decimal) <= 100`
+    /// holds when there is no probability, as the HL7 reference validator has it.
+    #[test]
+    fn an_empty_collection_is_no_type_in_an_invariant() {
+        for expression in ["{} is System.Decimal", "{}.is(System.Decimal)"] {
+            assert_eq!(answer(expression, false), None, "{expression}");
+            assert_eq!(answer(expression, true), Some(false), "{expression}");
+        }
+        let guard = "{} is System.Decimal implies ({} as System.Decimal) <= 100";
+        assert_eq!(answer(guard, false), None);
+        assert_eq!(answer(guard, true), Some(true));
+        let present = "150.0 is System.Decimal implies (150.0 as System.Decimal) <= 100";
+        assert_eq!(answer(present, true), Some(false));
+        let within = "50.0 is System.Decimal implies (50.0 as System.Decimal) <= 100";
+        assert_eq!(answer(within, true), Some(true));
+    }
+
     #[test]
     fn membership_is_false_when_the_collection_is_empty() {
         let root = json!({});
