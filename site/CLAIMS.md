@@ -5,8 +5,9 @@ and where the repository backs it. If a source changes, change the page; if you 
 source for a sentence, remove the sentence.
 
 `scripts/check-built.mjs` enforces the negative half of this file at build time: the built page
-may not use certain words (certification, benchmark, throughput and similar claims) and may not
-load anything from another origin.
+may not use certain words (certification, benchmark, throughput and similar claims), and no page
+may load anything from another origin. That includes video: a video and its poster are served from
+the site itself, under `/media/`.
 
 Code on the page is not copied by hand. `src/lib/repo.ts` reads the snippets from the README when
 the site builds, so they are what the project ships.
@@ -15,7 +16,7 @@ The page is visual first. At the project owner's request the page no longer carr
 stands" section, the hero's facts line and feature strip, the "simulation" and "illustration" captions, the
 npm note and the agents note are all gone. That makes the "must not say" table below more important, not less:
 the page still must not claim certification, stable APIs, performance figures or a comparison with another FHIR
-server. The TypeScript client is on npm (`@haihq/refhir` 0.0.1; `npm view @haihq/refhir` shows it). The page
+server. The TypeScript client is on npm (`@haihq/refhir` 0.0.4 on 2026-11-27; `npm view @haihq/refhir version` shows the latest). The page
 carries its message in a terminal, two timelines, a comparison grid, an interactive demo, a figure and a loop,
 and keeps prose to a line or two per section, because nobody reads a wall of text on a landing page. Each
 claim below has a source.
@@ -59,7 +60,7 @@ The landing page's `<head>` carries structured data, and `scripts/check-built.mj
 
 | Where | Claim | Source |
 |---|---|---|
-| Title and description | ReFHIR is an open-source FHIR server, written in Rust, that keeps query results live | `README.md` (intro), `rust-toolchain.toml` |
+| Title and description | ReFHIR is an open-source FHIR server, written in Rust, that keeps query results live, in real time: ask once, and the new answer arrives when the data changes | `README.md` (intro), `rust-toolchain.toml` |
 | JSON-LD `SoftwareApplication` | Version, Apache-2.0 license, free, application category, a Linux container image or a build from source, the GitHub repository | `Cargo.toml` (compared at build time), `LICENSE`, `docs/releasing.md` (artifacts) |
 | JSON-LD `Organization` | HAIHQ's own description of itself | haihq.org |
 | Share image | The wordmark, the headline with a faded echo behind "updates itself.", and "An open-source FHIR server with live queries" | `README.md` (intro) |

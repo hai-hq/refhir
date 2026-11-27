@@ -26,7 +26,7 @@ ws://host/sync   subscribe: Observation?patient=Patient/123&status=final
 
 The idea behind it is one sentence: **queries, not events, are the primary unit of
 synchronization.** An event says that something changed. A live query says what the answer is now,
-which is what a screen or an agent needs. [How live queries work](/docs/concepts/how-it-works/) shows what the server does, and
+which is what a screen or an agent needs. [How live FHIR queries work](/docs/concepts/how-it-works/) shows what the server does, and
 [Live queries for AI agents](/docs/concepts/agents/) covers why it matters for agents that act on state
 that may have changed while they were thinking.
 
@@ -44,7 +44,7 @@ ReFHIR moves that work into the server.
 - **Software that already speaks FHIR** can use it, because ReFHIR is also a standard FHIR server: REST,
   search, transactions and [SMART on FHIR](/docs/guides/smart/) authorization.
 
-See [Live queries and FHIR Subscriptions](/docs/concepts/vs-subscriptions/) for how it differs from the
+See [Real-time FHIR: live queries and Subscriptions](/docs/concepts/vs-subscriptions/) for how it differs from the
 notification feature FHIR already has.
 
 ## Who it is for

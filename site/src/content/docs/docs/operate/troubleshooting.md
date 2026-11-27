@@ -190,7 +190,7 @@ writes at the primary, or give the replica `--primary-url`.
 
 After a dropped connection the clients resubscribe and the next result is current, but nothing tells
 a watcher that changes happened in between. If that matters, treat every result as the whole truth
-and re-evaluate. See [How live queries work](/docs/concepts/how-it-works/).
+and re-evaluate. See [How live FHIR queries work](/docs/concepts/how-it-works/).
 
 ## Questions
 

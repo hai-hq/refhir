@@ -1,6 +1,8 @@
 ---
-title: Live queries and FHIR Subscriptions
-description: How ReFHIR's live queries differ from the FHIR Subscriptions it also delivers, and when to use each.
+title: "Real-time FHIR: live queries and Subscriptions"
+description: "Two ways to get real-time FHIR updates: how ReFHIR's live queries differ from the FHIR Subscriptions it also delivers, and when to use each."
+sidebar:
+  label: Live queries and Subscriptions
 ---
 
 FHIR already has a way to be told that something happened: the `Subscription` resource. ReFHIR
@@ -41,7 +43,7 @@ Both are available on the same server, on different endpoints. `/sync` is not
 ## Which to use
 
 - Use a **live query** when something needs to show or reason about the current state: a screen, a
-  worklist, an agent's working context. See [How live queries work](/docs/concepts/how-it-works/).
+  worklist, an agent's working context. See [How live FHIR queries work](/docs/concepts/how-it-works/).
 - Use a **Subscription** when another system should be told that a resource was created or
   updated and can act on that one resource. See [Subscriptions](/docs/guides/subscriptions/).
 

@@ -2,7 +2,8 @@
 // the end of `npm run build`, so a change that breaks a promise fails CI instead of shipping.
 //
 //   - Every internal link and asset resolves to a file in dist/.
-//   - Nothing is loaded from another origin (links to other sites are fine; loading from them is not).
+//   - Nothing is loaded from another origin, on any page (links to other sites are fine; loading from
+//     them is not). Video and audio count: a video is served from the site itself, with its poster.
 //   - The page has one h1, and every image has alt text.
 //   - The page makes none of the claims the project cannot back up (see CLAIMS.md).
 //   - The page's JavaScript stays small.
@@ -90,23 +91,32 @@ function scriptBytes(file, counted) {
 
 const isExternal = (url) => /^(https?:)?\/\//i.test(url);
 
+// Everything a page loads from a URL: scripts, images, stylesheets, frames, and video or audio with
+// their sources, captions and poster image. A video is served from the site itself (/media/…).
+const loadedUrls = (html) => [
+  ...attributes(html, 'script', 'src'),
+  ...attributes(html, 'img', 'src'),
+  ...attributes(html, 'iframe', 'src'),
+  ...attributes(html, 'video', 'src'),
+  ...attributes(html, 'video', 'poster'),
+  ...attributes(html, 'audio', 'src'),
+  ...attributes(html, 'source', 'src'),
+  ...attributes(html, 'track', 'src'),
+  ...attributes(html, 'link', 'href').filter(({ tag }) => !/rel="(canonical|alternate|sitemap)"/i.test(tag)),
+];
+
 const landing = readPage('index.html');
 if (landing) {
   // Links and assets that stay on the site must exist.
-  for (const { value } of [...attributes(landing, 'a', 'href'), ...attributes(landing, 'img', 'src')]) {
+  const media = ['video', 'audio', 'source', 'track'].flatMap((tag) => attributes(landing, tag, 'src'));
+  for (const { value } of [...attributes(landing, 'a', 'href'), ...attributes(landing, 'img', 'src'), ...media, ...attributes(landing, 'video', 'poster')]) {
     if (isExternal(value) || value.startsWith('mailto:') || value.startsWith('#')) continue;
     if (!exists(value)) fail(`index.html links to ${value}, which is not in dist/`);
     else if (!hasAnchor(value)) fail(`index.html links to ${value}, but that page has no element with that id`);
   }
 
   // Nothing may be loaded from another origin.
-  const loads = [
-    ...attributes(landing, 'script', 'src'),
-    ...attributes(landing, 'img', 'src'),
-    ...attributes(landing, 'iframe', 'src'),
-    ...attributes(landing, 'link', 'href').filter(({ tag }) => !/rel="(canonical|alternate|sitemap)"/i.test(tag)),
-  ];
-  for (const { value } of loads) {
+  for (const { value } of loadedUrls(landing)) {
     if (isExternal(value)) fail(`index.html loads ${value} from another origin`);
   }
   if (/url\(\s*["']?https?:/i.test(landing)) fail('index.html has a CSS url() to another origin');
@@ -285,6 +295,16 @@ for (const file of pages) {
     if (!new RegExp(`property="${property}"`, 'i').test(html)) fail(`${name}: missing ${property}`);
   }
   if (/<meta name="robots"[^>]*noindex/i.test(html)) fail(`${name}: marked noindex`);
+  // Docs pages and articles load nothing from another origin either, and a video they show is in
+  // dist/. The landing page had these checks above.
+  if (name !== 'index.html') {
+    for (const { value } of loadedUrls(html)) if (isExternal(value)) fail(`${name} loads ${value} from another origin`);
+    for (const tag of ['video', 'audio', 'source', 'track']) {
+      for (const { value } of [...attributes(html, tag, 'src'), ...(tag === 'video' ? attributes(html, tag, 'poster') : [])]) {
+        if (!isExternal(value) && !value.startsWith('data:') && !exists(value)) fail(`${name} loads ${value}, which is not in dist/`);
+      }
+    }
+  }
   for (const [map, value, label] of [[titles, title, 'title'], [descriptions, description, 'description']]) {
     if (map.has(value)) fail(`${name} repeats the ${label} of ${map.get(value)}`);
     map.set(value, name);

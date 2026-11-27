@@ -1,6 +1,6 @@
 ---
-title: How live queries work
-description: "What happens between a subscription and a pushed result: the query, the read set, the snapshot and the transition."
+title: How live FHIR queries work
+description: "How a real-time FHIR query works in ReFHIR, from subscription to pushed result: the query, the read set, the snapshot and the transition."
 ---
 
 A live query keeps a client current on the answer to a FHIR query. This page follows one from

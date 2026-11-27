@@ -97,7 +97,7 @@ is comparing positions in the server's commit order.
 
 ## Next
 
-- [How live queries work](/docs/concepts/how-it-works/) explains the machinery.
+- [How live FHIR queries work](/docs/concepts/how-it-works/) explains the machinery.
 - [The TypeScript client](/docs/sdks/typescript/) covers `latest()`, `next()` and errors.
-- [Live queries and FHIR Subscriptions](/docs/concepts/vs-subscriptions/) explains how this differs from
+- [Real-time FHIR: live queries and Subscriptions](/docs/concepts/vs-subscriptions/) explains how this differs from
   notifications.

@@ -113,3 +113,15 @@ test('a page starts with its title, address and description', () => {
   const md = pageMarkdown(entry('docs/install', 'Install'), { site: SITE, slugs: new Set() });
   assert.equal(md, `# Install\n\nURL: ${SITE}/docs/install/\n\n> Install page.\n\nBody.\n`);
 });
+
+test('an article adds its author and date under the description', () => {
+  const article = entry('docs/articles/live', 'Live');
+  article.data = { ...article.data, author: 'A. Writer', date: new Date('2026-12-14') };
+  const md = pageMarkdown(article, { site: SITE, slugs: new Set() });
+  assert.equal(md, `# Live\n\nURL: ${SITE}/docs/articles/live/\n\n> Live page.\n\nA. Writer, 2026-12-14\n\nBody.\n`);
+});
+
+test('the articles list is dropped, since llms.txt lists the articles', () => {
+  const mdx = `import ArticleList from '../ArticleList.astro';\n\nNewest first.\n\n<ArticleList />`;
+  assert.equal(toPlainMarkdown(mdx, { mdx: true }), 'Newest first.');
+});

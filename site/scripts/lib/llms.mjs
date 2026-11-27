@@ -9,7 +9,8 @@ export const markdownPath = (slug) => `/${slug}.md`;
 // The Starlight components the .mdx pages use, and what each becomes in plain Markdown. A page
 // that uses any other component fails the build, so a new one is handled here rather than leaking
 // into the Markdown as a raw tag.
-const DROPPED = ['Tabs', 'Steps'];
+// ArticleList (the articles index) is dropped too: llms.txt lists every article under Articles.
+const DROPPED = ['Tabs', 'Steps', 'ArticleList'];
 const ASIDE_LABEL = { note: 'Note', tip: 'Tip', caution: 'Caution', danger: 'Danger' };
 
 const attr = (attrs, name) => attrs.match(new RegExp(`\\b${name}="([^"]*)"`))?.[1];
@@ -194,6 +195,11 @@ export function pageMarkdown(entry, { site, slugs }) {
   const body = toPlainMarkdown(entry.body ?? '', { mdx, page: entry.filePath ?? entry.id });
   const parts = [`# ${entry.data.title}`, '', `URL: ${site.replace(/\/$/, '')}/${entry.id}/`, ''];
   if (entry.data.description) parts.push(`> ${entry.data.description}`, '');
+  // An article's byline: who wrote it and the day it was published.
+  if (entry.data.date) {
+    const day = new Date(entry.data.date).toISOString().slice(0, 10);
+    parts.push(entry.data.author ? `${entry.data.author}, ${day}` : day, '');
+  }
   parts.push(absoluteLinks(body, { site, slugs }), '');
   return parts.join('\n');
 }

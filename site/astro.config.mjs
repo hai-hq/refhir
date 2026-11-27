@@ -36,6 +36,8 @@ export default defineConfig({
         './src/styles/brand.css',
       ],
       sidebar,
+      // Adds the date and author under an article's title.
+      components: { PageTitle: './src/components/PageTitle.astro' },
       // The docs use ```env fences; Shiki calls that language dotenv.
       expressiveCode: { shiki: { langAlias: { env: 'dotenv' } } },
       head: [

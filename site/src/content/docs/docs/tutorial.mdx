@@ -115,6 +115,31 @@ The watcher has printed this by now:
 3 active: Bee, Cho, Dee
 ```
 
+## Two windows, one answer
+
+Open a fourth terminal beside the watcher, go to `live-patients` and start a second watcher:
+
+```bash
+node watch.mjs
+```
+
+It prints the current answer at once, `3 active: Bee, Cho, Dee`. Now create one more patient:
+
+```bash
+curl -s -X POST http://127.0.0.1:8080/Patient \
+  -H 'Content-Type: application/fhir+json' \
+  -d '{"resourceType":"Patient","active":true,"name":[{"family":"Eve"}]}'
+```
+
+Both windows print the same new line at the same moment:
+
+```text
+4 active: Bee, Cho, Dee, Eve
+```
+
+Neither program knows about the other. Each asked the server the same question, and the server sent
+the new answer to both.
+
 ## What you just saw
 
 - **A new match appears.** Creating Ann and Bee changed what the query returns, so the server re-ran
@@ -132,7 +157,7 @@ because every push is a full result and the newest one is the one that is true.
 
 ## Where to go next
 
-- [How live queries work](/docs/concepts/how-it-works/) explains what the server does between your
+- [How live FHIR queries work](/docs/concepts/how-it-works/) explains what the server does between your
   write and your next line of output.
 - [React hooks](/docs/sdks/react/) give you the same live result in a component.
 - [Live queries for AI agents](/docs/concepts/agents/) uses the same idea to notice that an agent's
