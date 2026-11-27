@@ -41,10 +41,10 @@ file, and each page has a Markdown copy at its address with `.md` in place of th
     A multi-architecture image (amd64 and arm64) is published for every release.
 
     ```bash
-    docker run --rm -p 8080:8080 -v refhir-data:/data ghcr.io/hai-hq/refhir:0.0.11
+    docker run --rm -p 8080:8080 -v refhir-data:/data ghcr.io/hai-hq/refhir:0.0.12
     ```
 
-    The tags are `0.0.11`, `0.0` and `latest`. Pin a version in anything you keep.
+    The tags are `0.0.12`, `0.0` and `latest`. Pin a version in anything you keep.
 
     The image's default configuration listens on `0.0.0.0:8080`, keeps a SQLite database at
     `/data/refhir.sqlite` and caches packages in `/data/package-cache`, so mount a volume at `/data`
@@ -56,7 +56,7 @@ file, and each page has a Markdown copy at its address with `.md` in place of th
     holds one folder with the `refhir` binary, `LICENSE`, `NOTICE`, `README.md` and `CHANGELOG.md`.
 
     ```bash
-    VERSION=0.0.11
+    VERSION=0.0.12
     PLATFORM=linux-amd64        # or linux-arm64, or macos-arm64
     BASE=https://github.com/hai-hq/refhir/releases/download/v$VERSION
 

@@ -1,6 +1,6 @@
 {
   "name": "@haihq/refhir",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "description": "TypeScript client for ReFHIR /sync and FHIR REST",
   "type": "module",
   "license": "Apache-2.0",
