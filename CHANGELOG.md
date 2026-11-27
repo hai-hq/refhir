@@ -10,6 +10,31 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Fixed
+
+- **A free-text answer to an `open-choice` question is accepted.** R4 `open-choice` takes a Coding
+  from the item's `answerOption`s or free text in `valueString`; a completed QuestionnaireResponse
+  answering one in the patient's own words was refused with "answer is not an allowed option". A
+  `choice` item still takes only its options, and so does a coding answered to `open-choice`. The
+  rule is the same over REST and `/sync`, with a contained or a canonical Questionnaire.
+- **A coded answer is its option whatever its `display`.** An answer was compared with an
+  `answerOption` as a whole, so a `valueCoding` with the option's system and code but another
+  `display` (or none) was "not an allowed option". A Coding now matches on `system` and `code`, and
+  on `version` when both name one.
+- **A `choice` item can have integer, date, time and Reference options.** Every answer to one was
+  refused with "answer type does not match the item"; a `choice` answer may now be any type R4
+  allows in `answerOption.value[x]`, and must still be one of the options.
+- **A `RiskAssessment` prediction without a probability is accepted.** ras-2,
+  `probability is decimal implies (probability as decimal) <= 100`, failed when there was no
+  probability. In an R4 invariant, a type test of nothing (`{} is T`) is now `false` where it is an
+  operand of `and`, `or`, `xor` or `implies` (as the HL7 validator has it), so the guard holds;
+  anywhere else it is still empty, as FHIRPath 2.0.0 says.
+- **A required Reference may be display-only.** An element such as `Composition.author` needed a
+  `reference` in it ("Composition.author.reference is required"), though R4 `Reference.reference`
+  is 0..1. Any Reference now meets it, one with only a `display` or an `identifier` included; this
+  applied to every resource with a required top-level Reference. A missing element is refused with
+  "{Type}.{element} is required".
+
 ## [0.0.10] - 2026-11-24
 
 ### Added

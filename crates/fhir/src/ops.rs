@@ -266,14 +266,15 @@ pub fn require_references(
     resource: &Value,
 ) -> Result<(), FhirError> {
     for element in &model.references {
-        let references = reference_strings(resource, &element.path);
-        if element.min >= 1 && references.is_empty() {
+        // A required element needs a Reference, not a `reference` in it: R4 `Reference.reference`
+        // is 0..1, so `{"display": "Dr Ann"}` or an `identifier` alone meets `Composition.author`.
+        if element.min >= 1 && element_values(resource, &element.path).is_empty() {
             return Err(FhirError::Invalid(format!(
-                "{}.{}.reference is required",
+                "{}.{} is required",
                 model.name, element.path
             )));
         }
-        for reference in references {
+        for reference in reference_strings(resource, &element.path) {
             check_reference(tx, catalog, model, element, &reference)?;
         }
     }
@@ -362,6 +363,15 @@ fn absolute_type(reference: &str) -> Option<&str> {
 }
 
 pub(crate) fn reference_strings(resource: &Value, path: &str) -> Vec<String> {
+    let mut references = Vec::new();
+    for value in element_values(resource, path) {
+        push_reference(&mut references, value);
+    }
+    references
+}
+
+/// Every value of the element at `path`, an array's items one by one. JSON `null`s are none.
+fn element_values<'a>(resource: &'a Value, path: &str) -> Vec<&'a Value> {
     let mut current = vec![resource];
     for segment in path.split('.') {
         let mut next = Vec::new();
@@ -383,18 +393,15 @@ pub(crate) fn reference_strings(resource: &Value, path: &str) -> Vec<String> {
         }
         current = next;
     }
-    let mut references = Vec::new();
+    let mut values = Vec::new();
     for value in current {
         match value {
-            Value::Array(items) => {
-                for item in items {
-                    push_reference(&mut references, item);
-                }
-            }
-            other => push_reference(&mut references, other),
+            Value::Array(items) => values.extend(items.iter().filter(|item| !item.is_null())),
+            Value::Null => {}
+            other => values.push(other),
         }
     }
-    references
+    values
 }
 
 fn push_reference(references: &mut Vec<String>, value: &Value) {

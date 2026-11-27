@@ -150,15 +150,15 @@ fn check_item(
                     link_id,
                 ));
             }
+            // R4 `open-choice`: a Coding from the options, or free text in `valueString`. Only
+            // `choice` (and a coding answered to `open-choice`) must be one of the options.
+            let free_text = item_type == "open-choice" && answer.get("valueString").is_some();
             if let Some(options) = definition
                 .get("answerOption")
                 .and_then(|item| item.as_array())
+                .filter(|_| !free_text)
             {
-                if !options.is_empty()
-                    && !options
-                        .iter()
-                        .any(|option| value_of(option) == Some(value) || option == answer)
-                {
+                if !options.is_empty() && !options.iter().any(|option| is_option(option, answer)) {
                     issues.push(issue("error", "answer is not an allowed option", link_id));
                 }
             }
@@ -231,14 +231,56 @@ fn type_matches(item_type: &str, answer: &Json) -> bool {
         "quantity" => "valueQuantity",
         "reference" => "valueReference",
         "attachment" => "valueAttachment",
-        "coding" | "choice" => "valueCoding",
+        "coding" => "valueCoding",
+        // R4 `answerOption.value[x]`: what a `choice` item's options, and so its answers, may be.
+        "choice" => {
+            return keys.iter().any(|key| {
+                matches!(
+                    *key,
+                    "valueInteger"
+                        | "valueDate"
+                        | "valueTime"
+                        | "valueString"
+                        | "valueCoding"
+                        | "valueReference"
+                )
+            })
+        }
         "string" | "text" => "valueString",
         _ => return true,
     };
-    keys.contains(&expected)
-        || (item_type == "choice"
-            && (keys.contains(&"valueString") || keys.contains(&"valueCoding")))
-        || (item_type == "url" && keys.contains(&"valueUrl"))
+    keys.contains(&expected) || (item_type == "url" && keys.contains(&"valueUrl"))
+}
+
+/// Whether `answer` gives the value of `option`: the same `value[x]`, and for a Coding the same
+/// `system` and `code` (and `version` when both name one). R4 identifies a coded option by those,
+/// so a `display` the client wrote differently, or left out, is still that option.
+fn is_option(option: &Json, answer: &Json) -> bool {
+    let Some((key, wanted)) = value_entry(option) else {
+        return false;
+    };
+    let Some(given) = answer.get(key) else {
+        return false;
+    };
+    if key != "valueCoding" {
+        return given == wanted;
+    }
+    fn field<'a>(coding: &'a Json, name: &str) -> Option<&'a str> {
+        coding.get(name).and_then(|value| value.as_str())
+    }
+    field(given, "system") == field(wanted, "system")
+        && field(given, "code") == field(wanted, "code")
+        && match (field(given, "version"), field(wanted, "version")) {
+            (Some(given), Some(wanted)) => given == wanted,
+            _ => true,
+        }
+}
+
+fn value_entry(node: &Json) -> Option<(&str, &Json)> {
+    node.as_object()?
+        .iter()
+        .find(|(key, _)| key.starts_with("value") && *key != "value")
+        .map(|(key, value)| (key.as_str(), value))
 }
 
 fn as_number(value: &Json) -> Option<f64> {

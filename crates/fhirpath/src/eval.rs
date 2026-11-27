@@ -25,8 +25,12 @@ struct Ctx<'a> {
     this_item: Option<Value>,
     index: Option<i64>,
     total: Option<Value>,
-    /// R4 invariants apply `as()` to each item. Normative FHIRPath rejects a collection.
-    map_cast: bool,
+    /// Evaluate the way R4 `ElementDefinition.constraint` expressions were written and checked
+    /// (by the HL7 reference validator), where that differs from normative FHIRPath:
+    /// `as()` applies to each item, where normative FHIRPath rejects a collection; and `is`
+    /// on an empty collection is `false` as an operand of a boolean operator, where normative
+    /// FHIRPath answers empty.
+    r4_invariant: bool,
 }
 
 pub fn evaluate_expr(
@@ -64,10 +68,10 @@ pub fn evaluate_at(
     )
 }
 
-/// Like `evaluate_at`, but `as()` keeps every item that casts.
-///
-/// R4 `ElementDefinition.constraint` expressions were written for that behavior.
-/// `dom-3` calls `descendants().as(canonical)`.
+/// Like `evaluate_at`, but the way R4 `ElementDefinition.constraint` expressions were written
+/// for: `as()` keeps every item that casts (`dom-3` calls `descendants().as(canonical)`), and
+/// a type test of nothing is false as an operand of `and`, `or`, `xor` or `implies` (`ras-2` is
+/// `probability is decimal implies ...`, which a prediction without a probability meets).
 pub fn evaluate_invariant(
     expr: &Expr,
     focus: &Json,
@@ -100,7 +104,7 @@ fn evaluate_focused(
     root_resource: &Json,
     model: &Model,
     host: &dyn Host,
-    map_cast: bool,
+    r4_invariant: bool,
 ) -> Result<Vec<Value>, Error> {
     let focus_node = node_from_json(
         focus,
@@ -117,7 +121,7 @@ fn evaluate_focused(
         this_item: None,
         index: None,
         total: None,
-        map_cast,
+        r4_invariant,
     };
     let outcome = ctx.eval(expr, std::slice::from_ref(&focus_node), true)?;
     Ok(outcome.items)
@@ -393,7 +397,7 @@ impl Ctx<'_> {
     }
 
     fn cast(&self, items: &[Value], target: &str) -> Result<Vec<Value>, Error> {
-        if self.map_cast && items.len() > 1 {
+        if self.r4_invariant && items.len() > 1 {
             let mut kept = Vec::new();
             for item in items {
                 kept.extend(cast_one(item, target));
@@ -556,6 +560,28 @@ impl Ctx<'_> {
         }
     }
 
+    /// An operand of `and`, `or`, `xor` or `implies`. Normative FHIRPath answers empty for a type
+    /// test of nothing, and an invariant that answers empty fails; R4 invariants use
+    /// `x is T implies ...` as a guard that holds when there is no x. So in an invariant, and only
+    /// as such an operand, a type test of nothing is false. `(x is T).empty()` keeps its meaning.
+    fn logic_operand(
+        &self,
+        expr: &Expr,
+        focus: &[Value],
+        ordered: bool,
+    ) -> Result<Option<bool>, Error> {
+        let value = bool_operand(&self.eval(expr, focus, ordered)?.items)?;
+        let type_test = match expr {
+            Expr::Is(..) => true,
+            Expr::Call { name, .. } => name == "is",
+            _ => false,
+        };
+        if value.is_none() && type_test && self.r4_invariant {
+            return Ok(Some(false));
+        }
+        Ok(value)
+    }
+
     fn eval_logic(
         &self,
         op: BinOp,
@@ -564,8 +590,8 @@ impl Ctx<'_> {
         focus: &[Value],
         ordered: bool,
     ) -> Result<Outcome, Error> {
-        let left = bool_operand(&self.eval(left, focus, ordered)?.items)?;
-        let right = bool_operand(&self.eval(right, focus, ordered)?.items)?;
+        let left = self.logic_operand(left, focus, ordered)?;
+        let right = self.logic_operand(right, focus, ordered)?;
         let value = match op {
             BinOp::And => match (left, right) {
                 (Some(false), _) | (_, Some(false)) => Some(false),
@@ -946,7 +972,7 @@ impl Ctx<'_> {
             this_item,
             index,
             total,
-            map_cast: self.map_cast,
+            r4_invariant: self.r4_invariant,
         }
     }
 
