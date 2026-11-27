@@ -10,6 +10,8 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+## [0.0.11] - 2026-11-27
+
 ### Fixed
 
 - **A free-text answer to an `open-choice` question is accepted.** R4 `open-choice` takes a Coding
@@ -1041,7 +1043,8 @@ The first release. Everything below is new.
   Docker Compose cluster behind HAProxy, and an Inferno profile for SMART conformance runs.
 - `refhir --version`.
 
-[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.10...HEAD
+[Unreleased]: https://github.com/hai-hq/refhir/compare/v0.0.11...HEAD
+[0.0.11]: https://github.com/hai-hq/refhir/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/hai-hq/refhir/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/hai-hq/refhir/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/hai-hq/refhir/compare/v0.0.7...v0.0.8
