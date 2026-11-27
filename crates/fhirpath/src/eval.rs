@@ -400,14 +400,22 @@ impl Ctx<'_> {
         if self.r4_invariant && items.len() > 1 {
             let mut kept = Vec::new();
             for item in items {
-                kept.extend(cast_one(item, target));
+                kept.extend(self.cast_one(item, target));
             }
             return Ok(kept);
         }
         let Some(item) = singleton(items)? else {
             return Ok(vec![]);
         };
-        Ok(cast_one(item, target))
+        Ok(self.cast_one(item, target))
+    }
+
+    fn cast_one(&self, item: &Value, target: &str) -> Vec<Value> {
+        let cast = cast_one(item, target);
+        if cast.is_empty() && self.abstract_resource(item, target) {
+            return vec![item.clone()];
+        }
+        cast
     }
 
     fn eval_unary(
@@ -1263,7 +1271,27 @@ impl Ctx<'_> {
                 return false;
             }
         }
-        name == target || (namespace == "System" && system_name(target) == Some(name))
+        name == target
+            || (namespace == "System" && system_name(target) == Some(name))
+            || self.abstract_resource(item, target)
+    }
+
+    /// Whether `item` is a resource and `target` the abstract type every resource (`Resource`), or
+    /// every one but `Bundle`, `Binary` and `Parameters` (`DomainResource`), is a kind of. A
+    /// resource is typed by its own `resourceType`, so `ofType(Resource)` and `as(Resource)` ask
+    /// for this, not for the name.
+    fn abstract_resource(&self, item: &Value, target: &str) -> bool {
+        let Value::Node { json, .. } = item else {
+            return false;
+        };
+        let Some(name) = json.get("resourceType").and_then(|value| value.as_str()) else {
+            return false;
+        };
+        match simple_name(target) {
+            "Resource" => true,
+            "DomainResource" => !matches!(name, "Bundle" | "Binary" | "Parameters"),
+            _ => false,
+        }
     }
 
     fn resolve(&self, input: &Outcome) -> Result<Outcome, Error> {

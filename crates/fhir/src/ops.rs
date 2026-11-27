@@ -265,6 +265,81 @@ pub fn require_references(
     model: &ResourceModel,
     resource: &Value,
 ) -> Result<(), FhirError> {
+    let contained = contained_items(model, resource)?;
+    references_of(tx, catalog, model, resource, (resource, &contained))?;
+    // A contained resource's own references are checked as they would be if it were written by
+    // itself, so `strict` holds inside it too; a `#` from it names the container (R4 dom-3).
+    for (local, item) in &contained {
+        // A type the server has no model of is the validator's to refuse.
+        let Ok(inner) = catalog.get(item_type(item)) else {
+            continue;
+        };
+        references_of(tx, catalog, inner, item, (resource, &contained)).map_err(
+            |err| match err {
+                FhirError::Invalid(text) => {
+                    FhirError::Invalid(format!("{}.contained #{local}: {text}", model.name))
+                }
+                other => other,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// The resources in `resource`'s `contained`, by id. Each names its type, and no two have the
+/// same id, so a `#id` names one of them and only one.
+fn contained_items<'a>(
+    model: &ResourceModel,
+    resource: &'a Value,
+) -> Result<Vec<(&'a str, &'a Value)>, FhirError> {
+    let mut items = Vec::new();
+    let list = resource.get("contained").and_then(Value::as_array);
+    for (index, item) in list.into_iter().flatten().enumerate() {
+        let id = item.get("id").and_then(Value::as_str);
+        let named = id.map_or_else(|| format!("[{index}]"), |id| format!(" #{id}"));
+        if item.get("resourceType").and_then(Value::as_str).is_none() {
+            return Err(FhirError::Invalid(format!(
+                "{}.contained{named} has no resourceType",
+                model.name
+            )));
+        }
+        if item.get("contained").is_some() {
+            return Err(FhirError::Invalid(format!(
+                "{}.contained{named} has contained resources of its own, which R4 does not allow (dom-2)",
+                model.name
+            )));
+        }
+        let Some(id) = id else {
+            continue;
+        };
+        if items.iter().any(|(seen, _)| *seen == id) {
+            return Err(FhirError::Invalid(format!(
+                "{}.contained has more than one resource with the id {id}",
+                model.name
+            )));
+        }
+        items.push((id, item));
+    }
+    Ok(items)
+}
+
+fn item_type(item: &Value) -> &str {
+    item.get("resourceType")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+/// The container and its contained resources by id, which a `#` reference is checked against.
+type Container<'a> = (&'a Value, &'a [(&'a str, &'a Value)]);
+
+/// Checks the references of `resource`, the container itself or one of the resources in it.
+fn references_of(
+    tx: &mut Transaction,
+    catalog: &Catalog,
+    model: &ResourceModel,
+    resource: &Value,
+    container: Container<'_>,
+) -> Result<(), FhirError> {
     for element in &model.references {
         // A required element needs a Reference, not a `reference` in it: R4 `Reference.reference`
         // is 0..1, so `{"display": "Dr Ann"}` or an `identifier` alone meets `Composition.author`.
@@ -275,7 +350,7 @@ pub fn require_references(
             )));
         }
         for reference in reference_strings(resource, &element.path) {
-            check_reference(tx, catalog, model, element, resource, &reference)?;
+            check_reference(tx, catalog, model, element, resource, container, &reference)?;
         }
     }
     Ok(())
@@ -287,6 +362,7 @@ fn check_reference(
     model: &ResourceModel,
     element: &crate::catalog::ReferenceElement,
     resource: &Value,
+    container: Container<'_>,
     reference: &str,
 ) -> Result<(), FhirError> {
     let relative = format!(
@@ -302,7 +378,7 @@ fn check_reference(
     // A resource contained in this one is there whatever the policy, so `#id` is checked the same
     // way under both: it has to name one of them, of a type the element allows (R4 ref-1).
     if let Some(local) = reference.strip_prefix('#') {
-        return check_contained(model, element, resource, local);
+        return check_contained(model, element, resource, container, local);
     }
     if reference.contains("://") {
         return match catalog.reference_policy() {
@@ -335,35 +411,37 @@ fn check_reference(
     Ok(())
 }
 
-/// `#local` in `element` of `resource`: one of its `contained` resources has the id `local`, and
-/// that resource is of a type the element may point at.
+/// `#local` in `element` of `resource`: one of the container's `contained` resources has the id
+/// `local`, or, from inside one of them, a bare `#` names the container; and what it names is of a
+/// type the element may point at.
 fn check_contained(
     model: &ResourceModel,
     element: &crate::catalog::ReferenceElement,
     resource: &Value,
+    (container, contained): Container<'_>,
     local: &str,
 ) -> Result<(), FhirError> {
-    let found = resource
-        .get("contained")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .find(|item| item.get("id").and_then(Value::as_str) == Some(local));
+    let inside = !std::ptr::eq(resource, container);
+    let found = if local.is_empty() && inside {
+        Some(container)
+    } else {
+        contained
+            .iter()
+            .find(|(id, _)| *id == local)
+            .map(|(_, item)| *item)
+    };
     let Some(found) = found else {
         return Err(FhirError::Invalid(format!(
-            "{}.{} #{local} names no resource in {}.contained",
-            model.name, element.path, model.name
+            "{}.{} #{local} names no resource in the contained resources",
+            model.name, element.path
         )));
     };
-    let type_name = found
-        .get("resourceType")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let type_name = item_type(found);
     reject_target(
         element,
         type_name,
         &format!(
-            "{}.{} #{local} is a contained {type_name}, which it cannot point at",
+            "{}.{} #{local} is a {type_name}, which it cannot point at",
             model.name, element.path
         ),
     )
