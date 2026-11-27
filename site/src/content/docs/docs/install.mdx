@@ -7,6 +7,25 @@ import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 Choose the way that suits where you will run it. They all start the same server.
 
+## Set up ReFHIR with your agent
+
+Paste this into your coding assistant (Claude Code, Cursor, Codex or another).
+
+```text title="Prompt" wrap
+Read https://refhir.haihq.org/llms.txt, then set up ReFHIR for this project:
+1. Start a server: docker run --rm -p 8080:8080 -v refhir-data:/data ghcr.io/hai-hq/refhir:latest
+   Without Docker, follow https://refhir.haihq.org/docs/install.md
+2. Wait until curl -s http://127.0.0.1:8080/readyz prints {"status":"ok"}.
+3. npm install @haihq/refhir, then use dial() and client.search() for live queries,
+   or useFHIRQuery from @haihq/refhir/react in React.
+   See https://refhir.haihq.org/docs/sdks/typescript.md
+```
+
+[llms.txt](/llms.txt) lists every docs page, [llms-full.txt](/llms-full.txt) holds them all in one
+file, and each page has a Markdown copy at its address with `.md` in place of the last slash.
+
+## Install it yourself
+
 <Aside type="note" title="The first start installs the FHIR packages">
   On the first start ReFHIR installs `hl7.fhir.r4.core` 4.0.1, the Structured Data Capture package
   and what they depend on. The release archives and the Docker image carry them in a prepared file
@@ -22,10 +41,10 @@ Choose the way that suits where you will run it. They all start the same server.
     A multi-architecture image (amd64 and arm64) is published for every release.
 
     ```bash
-    docker run --rm -p 8080:8080 -v refhir-data:/data ghcr.io/hai-hq/refhir:0.0.1
+    docker run --rm -p 8080:8080 -v refhir-data:/data ghcr.io/hai-hq/refhir:0.0.10
     ```
 
-    The tags are `0.0.1`, `0.0` and `latest`. Pin a version in anything you keep.
+    The tags are `0.0.10`, `0.0` and `latest`. Pin a version in anything you keep.
 
     The image's default configuration listens on `0.0.0.0:8080`, keeps a SQLite database at
     `/data/refhir.sqlite` and caches packages in `/data/package-cache`, so mount a volume at `/data`
@@ -37,7 +56,7 @@ Choose the way that suits where you will run it. They all start the same server.
     holds one folder with the `refhir` binary, `LICENSE`, `NOTICE`, `README.md` and `CHANGELOG.md`.
 
     ```bash
-    VERSION=0.0.1
+    VERSION=0.0.10
     PLATFORM=linux-amd64        # or linux-arm64, or macos-arm64
     BASE=https://github.com/hai-hq/refhir/releases/download/v$VERSION
 

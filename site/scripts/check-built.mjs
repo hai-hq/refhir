@@ -311,6 +311,55 @@ for (const file of ['robots.txt', 'sitemap-index.xml', '_headers']) {
   if (!fs.existsSync(path.join(dist, file))) fail(`${file} is missing from dist/`);
 }
 
+// The docs as plain text for AI coding assistants (scripts/lib/llms.mjs): llms.txt and
+// llms-full.txt exist, every page llms.txt lists is in dist/, every docs page has its .md copy, and
+// no copy carries a leftover MDX import or component tag outside its code blocks.
+const llms = readPage('llms.txt');
+if (readPage('llms-full.txt') !== null && llms) {
+  if (!llms.startsWith('# ReFHIR\n\n> ')) fail('llms.txt does not open with the title and the summary quote');
+  for (const pattern of FORBIDDEN) {
+    const hit = llms.match(pattern);
+    if (hit) fail(`llms.txt contains "${hit[0]}", which the project cannot back up (${pattern})`);
+  }
+  // The transform refuses components it does not know; this catches one it let through. Markdown
+  // pages may name FHIR types in angle brackets, so only Starlight's own components count here.
+  const STARLIGHT_TAG = /<\/?(Aside|Badge|Card|CardGrid|Code|FileTree|Icon|LinkButton|LinkCard|Steps|TabItem|Tabs)[\s>/]/;
+  const listed = new Set();
+  for (const [, url] of llms.matchAll(/^- \[[^\]]+\]\(([^)]+)\)/gm)) {
+    if (!url.startsWith(`${ORIGIN}/`)) fail(`llms.txt links to ${url}, which is not on ${ORIGIN}`);
+    else if (!exists(new URL(url).pathname)) fail(`llms.txt links to ${url}, which is not in dist/`);
+    listed.add(new URL(url).pathname);
+  }
+  for (const file of pages) {
+    const rel = path.relative(dist, path.dirname(file));
+    if (!rel.startsWith('docs/') || /http-equiv="refresh"/i.test(fs.readFileSync(file, 'utf8'))) continue;
+    if (!listed.has(`/${rel}.md`)) fail(`${rel}/ has no Markdown copy listed in llms.txt`);
+  }
+  // Commands that pin a release (the image tag, VERSION= for the archives) name the current one, so a
+  // release that bumps Cargo.toml fails here until the docs follow. The changelog names old ones.
+  const release = workspaceVersionFrom(fs.readFileSync(path.resolve(dist, '..', '..', 'Cargo.toml'), 'utf8'));
+  let pins = 0;
+  for (const urlPath of listed) {
+    if (urlPath === '/docs/reference/changelog.md' || !fs.existsSync(path.join(dist, urlPath))) continue;
+    const text = fs.readFileSync(path.join(dist, urlPath), 'utf8');
+    for (const [pin, version] of text.matchAll(/(?:ghcr\.io\/hai-hq\/refhir:|\bVERSION=)(\d+\.\d+\.\d+)\b/g)) {
+      pins++;
+      if (version !== release) fail(`${urlPath} pins ${pin}, but Cargo.toml says ${release}`);
+    }
+  }
+  if (pins === 0) fail('no docs page pins a release; the install page should');
+
+  for (const urlPath of listed) {
+    let fence = false;
+    for (const line of (fs.existsSync(path.join(dist, urlPath)) ? fs.readFileSync(path.join(dist, urlPath), 'utf8') : '').split('\n')) {
+      if (/^\s*(```|~~~)/.test(line)) fence = !fence;
+      else if (!fence && (/^import\s.+\sfrom\s/.test(line) || STARLIGHT_TAG.test(line.replace(/`[^`]*`/g, '')))) {
+        fail(`${urlPath} has MDX left in it: ${line.trim().slice(0, 80)}`);
+      }
+    }
+  }
+}
+
 if (problems.length > 0) {
   console.error(`check-built: ${problems.length} problem(s)\n`);
   for (const message of problems) console.error(`  - ${message}`);

@@ -23,6 +23,11 @@ Node 22.12 or newer.
   synced page, edit the original file; each page's "Edit page" link goes to it.
 - **Pages that exist only on the website** are real files under `src/content/docs/docs/`.
 - **The landing page** is `src/pages/index.astro`.
+- **Plain text for AI coding assistants** is built from the docs: `/llms.txt` (an index in the
+  llmstxt.org format, in sidebar order), `/llms-full.txt` (every page in one file) and a `.md` copy
+  beside each page (`/docs/tutorial.md` next to `/docs/tutorial/`). `src/pages/llms.txt.ts`,
+  `llms-full.txt.ts` and `[...slug].md.ts` serve them; `scripts/lib/llms.mjs` turns MDX into plain
+  Markdown and refuses a Starlight component it does not know, so a new one is added there.
 - **Brand files** come from `docs/brand/`; the sync step copies them to `public/brand/` and
   `src/assets/brand/` (gitignored).
 
@@ -82,6 +87,8 @@ curl -sI https://refhir.haihq.org/ | head -n 12      # security headers from pub
 curl -s  https://refhir.haihq.org/robots.txt
 curl -sI https://refhir.haihq.org/sitemap-index.xml | head -n 1
 curl -sI https://<name>.pages.dev/ | grep -i x-robots-tag   # expect: noindex
+curl -sI https://refhir.haihq.org/llms.txt | grep -i content-type          # expect: text/plain; charset=utf-8
+curl -sI https://refhir.haihq.org/docs/tutorial.md | grep -i content-type  # expect: text/plain; charset=utf-8
 ```
 
 Open `/docs/install/`, search for a page with the search box, and switch between light and dark.
@@ -110,7 +117,9 @@ from `haihq.org/refhir` to this site.
   origin, uses a claim the project cannot back up, or grows past its JavaScript budget. It also
   checks search and sharing: every page has a title, description, canonical url, one h1 and share
   tags with no duplicates; the structured data matches `Cargo.toml`; the share image is the 1200 by
-  630 file the tags declare; robots.txt and the sitemap are right. See `CLAIMS.md`.
+  630 file the tags declare; robots.txt and the sitemap are right; llms.txt lists a `.md` copy of
+  every docs page and no copy has MDX left in it; the release the docs pin is the one in
+  `Cargo.toml`. See `CLAIMS.md`.
 - **The share image** is `docs/brand/og-image.png`. To change it, redesign it at 1200 by 630 and keep
   it under 600 KB; the check fails otherwise.
 - **A Node error** on Cloudflare usually means the project's Node version is older than 22.12. Set
