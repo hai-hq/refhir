@@ -7665,6 +7665,12 @@ mod durable_jobs {
     }
 
     fn boot(sqlite: &Path, export_dir: &Path, first: bool) -> Boot {
+        boot_with(sqlite, export_dir, first, true)
+    }
+
+    /// `boot`, with or without the job runner. A server without one claims no job, so a test can
+    /// write job rows beside it that no sweep of its takes first.
+    fn boot_with(sqlite: &Path, export_dir: &Path, first: bool, jobs: bool) -> Boot {
         let persistence = Arc::new(SqlitePersistence::open(sqlite).unwrap());
         let db = Arc::new(Database::open(persistence.clone()).unwrap());
         let catalog = if first {
@@ -7685,7 +7691,7 @@ mod durable_jobs {
             store,
             crate::ServerConfig {
                 export_dir: export_dir.display().to_string(),
-                jobs: Some(crate::SharedJobStore::new(job_store)),
+                jobs: jobs.then(|| crate::SharedJobStore::new(job_store)),
                 ..Default::default()
             },
         );
@@ -7762,7 +7768,9 @@ mod durable_jobs {
     async fn jobs_left_running_are_run_again_when_the_server_starts() {
         let sqlite = unique("recover.sqlite");
         let export_dir = unique("recover-export");
-        let first = boot(&sqlite, &export_dir, true);
+        // No job runner: its sweep would take the expired rows below before the test has made
+        // them what a dead server leaves, and run them as its own.
+        let first = boot_with(&sqlite, &export_dir, true, false);
         put(&first.app, patient("again")).await;
 
         // What a process killed mid-export leaves behind, plus rows that must not be rerun. The
