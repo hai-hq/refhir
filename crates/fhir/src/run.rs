@@ -36,6 +36,9 @@ pub const CONTROL_ARGS: [&str; 5] = [
 /// Retries after an OCC conflict. The first attempt is not counted.
 pub const MAX_OCC_FAILURES: usize = 4;
 
+/// How long a retry after an OCC conflict waits for the write it lost to be published.
+const OCC_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 const ENGINE: &str = "refhir_engine";
 
 #[derive(Debug)]
@@ -186,6 +189,11 @@ fn run_in_transaction(
                     write_ts = conflict.write_ts.as_u64(),
                     "occ conflict, retrying operation"
                 );
+                // The write this one lost to may still be persisting: it has its timestamp but is
+                // not in the snapshot yet. A retry begun now would read what it read before and
+                // lose to the same write again, every attempt in a few microseconds, so it waits
+                // until that write is published (or the wait runs out, and it tries anyway).
+                db.wait_for_ts(conflict.write_ts, OCC_WAIT);
                 continue;
             }
             Err(err) => return Err(RunError::Commit(err)),

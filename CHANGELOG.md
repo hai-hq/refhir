@@ -10,6 +10,28 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
 
 ## [Unreleased]
 
+### Fixed
+
+- **A reference to a contained resource is accepted.** `"subject": {"reference": "#p"}` with a
+  Patient `p` in the resource's `contained`, as R4 allows, was refused under the default `strict`
+  policy with "must be a relative reference". It is now accepted under `strict` and `fhir` when a
+  contained resource has that id and is of a type the element may point at, and refused when none
+  does (under `fhir` it used to be accepted either way). A contained resource nothing refers to is
+  still refused (dom-3), and so are two with one id and one with no `resourceType`. The references
+  inside a contained resource are checked as if it were written by itself, `strict` included; a
+  bare `#` from one names the resource that holds it. `contained` is kept as it was sent; a `#id` reference is not a search value
+  of its own, so a search for `Patient/p` does not find it and `_include` adds nothing for it.
+- **A contained resource with `contained` of its own is refused (dom-2).** In FHIRPath, a resource
+  in `contained`, `Bundle.entry.resource` or `Parameters.parameter.resource` was read as the
+  abstract `Resource`, which has none of its elements, so `contained.contained` was always empty
+  and dom-2 never failed. Such a resource is now read as the type it names, and `ofType` and `as`
+  still take it for a `Resource` (and a `DomainResource`, unless it is a Bundle, Binary or
+  Parameters).
+- **Two writes to one resource at once both succeed under load.** A write that lost to another
+  retried at once, before the other had been published, so it read the same snapshot and lost to
+  the same write again; when the store was slow, all four retries were used up in microseconds and
+  the client got a `409`. A retry now waits for the write it lost to be published first.
+
 ## [0.0.11] - 2026-11-27
 
 ### Fixed

@@ -2121,6 +2121,10 @@ fn name_strings(resource: &Value, path: &[String]) -> Vec<String> {
     parts
 }
 
+/// The references a node holds, as a reference parameter indexes and matches them. A `#id` names
+/// a resource contained in the one that holds it, which is not a record of its own (R4 references
+/// 2.3.0.4): it is no value of the parameter, so nothing is indexed for it and `_include` does not
+/// follow it.
 fn reference_tokens(resource: &Value, path: &[String]) -> Vec<String> {
     nodes_at(resource, path)
         .into_iter()
@@ -2128,6 +2132,7 @@ fn reference_tokens(resource: &Value, path: &[String]) -> Vec<String> {
             node.get("reference")
                 .and_then(|item| item.as_str())
                 .or_else(|| node.as_str())
+                .filter(|text| !text.starts_with('#'))
                 .map(|text| text.to_string())
         })
         .collect()
