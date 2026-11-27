@@ -27,6 +27,10 @@ protocol. When it does, the entry says so under **Changed**. Database upgrades a
   and dom-2 never failed. Such a resource is now read as the type it names, and `ofType` and `as`
   still take it for a `Resource` (and a `DomainResource`, unless it is a Bundle, Binary or
   Parameters).
+- **Two writes to one resource at once both succeed under load.** A write that lost to another
+  retried at once, before the other had been published, so it read the same snapshot and lost to
+  the same write again; when the store was slow, all four retries were used up in microseconds and
+  the client got a `409`. A retry now waits for the write it lost to be published first.
 
 ## [0.0.11] - 2026-11-27
 
