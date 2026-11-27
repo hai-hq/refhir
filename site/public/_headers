@@ -18,6 +18,18 @@
 /apple-touch-icon.png
   Cache-Control: public, max-age=86400
 
+# The docs as plain text for AI coding assistants: /llms.txt, /llms-full.txt and a .md copy of each
+# docs page. text/plain shows in every browser; the files are rebuilt with each deploy.
+/llms.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600
+/llms-full.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600
+/docs/*.md
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=3600
+
 # Preview deployments on *.pages.dev must not be indexed.
 https://:project.pages.dev/*
   X-Robots-Tag: noindex

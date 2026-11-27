@@ -64,8 +64,11 @@ export default defineConfig({
         { tag: 'link', attrs: { rel: 'apple-touch-icon', href: '/apple-touch-icon.png' } },
       ],
       // Docs show commands against http://127.0.0.1:8080, so local links are expected. Relative
-      // links and bad anchors still fail the build.
-      plugins: [starlightLinksValidator({ errorOnLocalLinks: false })],
+      // links and bad anchors still fail the build. The plain-text docs (src/pages/llms*.txt.ts and
+      // the .md copies) are endpoints, not Starlight pages, so the validator cannot see them.
+      plugins: [
+        starlightLinksValidator({ errorOnLocalLinks: false, exclude: ['/llms.txt', '/llms-full.txt', '/docs/**/*.md'] }),
+      ],
     }),
   ],
 });
