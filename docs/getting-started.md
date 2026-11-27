@@ -17,7 +17,7 @@ Use this when you only want to **run** ReFHIR, not build it from source.
 
 **1. Get an image**
 
-- **Release image**: `ghcr.io/hai-hq/refhir:latest`, or pin a version such as `ghcr.io/hai-hq/refhir:0.0.10`
+- **Release image**: `ghcr.io/hai-hq/refhir:latest`, or pin a version such as `ghcr.io/hai-hq/refhir:0.0.11`
 - **Build from the repo** (no registry needed):
 
   ```bash
